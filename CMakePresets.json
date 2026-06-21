@@ -1,0 +1,103 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "description": "Shared settings. Unix Makefiles generator (ninja is not installed locally; CI may override).",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "CMAKE_CXX_EXTENSIONS": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug",
+      "description": "No optimization, assertions on.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release",
+      "description": "Optimized, NDEBUG.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "base",
+      "displayName": "ASan",
+      "description": "AddressSanitizer + LeakSanitizer.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LOCKSTEP_SANITIZER": "asan"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "displayName": "TSan",
+      "description": "ThreadSanitizer.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LOCKSTEP_SANITIZER": "tsan"
+      }
+    },
+    {
+      "name": "ubsan",
+      "inherits": "base",
+      "displayName": "UBSan",
+      "description": "UndefinedBehaviorSanitizer (no-recover).",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LOCKSTEP_SANITIZER": "ubsan"
+      }
+    },
+    {
+      "name": "msan",
+      "inherits": "base",
+      "displayName": "MSan",
+      "description": "MemorySanitizer. Linux/LLVM-only; configures without instrumentation on macOS (see cmake/Sanitizers.cmake).",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LOCKSTEP_SANITIZER": "msan"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug",   "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan",    "configurePreset": "asan" },
+    { "name": "tsan",    "configurePreset": "tsan" },
+    { "name": "ubsan",   "configurePreset": "ubsan" },
+    { "name": "msan",    "configurePreset": "msan" }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    { "name": "debug",   "inherits": "base", "configurePreset": "debug" },
+    { "name": "release", "inherits": "base", "configurePreset": "release" },
+    { "name": "asan",    "inherits": "base", "configurePreset": "asan" },
+    { "name": "tsan",    "inherits": "base", "configurePreset": "tsan" },
+    { "name": "ubsan",   "inherits": "base", "configurePreset": "ubsan" },
+    { "name": "msan",    "inherits": "base", "configurePreset": "msan" }
+  ]
+}

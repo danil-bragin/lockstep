@@ -1,0 +1,23 @@
+# Lockstep C++23 formatting. Based on Google style with project tweaks.
+---
+Language: Cpp
+BasedOnStyle: Google
+Standard: c++20            # newest value Apple clang-format 17 accepts; c++23 formatting rules are a superset and unaffected here
+ColumnLimit: 100
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+AccessModifierOffset: -1
+NamespaceIndentation: None
+FixNamespaceComments: true
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Attach
+AlwaysBreakTemplateDeclarations: Yes
+IncludeBlocks: Regroup
+SortIncludes: CaseSensitive
+SeparateDefinitionBlocks: Always
+...

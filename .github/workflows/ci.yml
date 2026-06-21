@@ -1,0 +1,258 @@
+# =============================================================================
+# Lockstep CI -- gate-as-code: the FULL universal merge gate (master-plan §8).
+#
+# This workflow IS the gate. It runs on ubuntu-latest with the LLVM/clang
+# toolchain, which (unlike the macOS / Apple-clang dev host) provides ALL of:
+# ASan, TSan, UBSan, MSan, clang-tidy, and scan-build. Every stage below runs
+# FOR REAL here. The local mirror is scripts/gate.sh (which honestly SKIPs the
+# three host-limited stages on macOS).
+#
+# REQUIRED STATUS CHECKS -- the gate cannot be bypassed.
+#   Every job below is intended to be configured as a REQUIRED status check on
+#   the protected default branch (Settings -> Branches -> Branch protection ->
+#   "Require status checks to pass before merging"), so that NO PR merges unless
+#   the whole §8 battery is green. Per cardinal rule 2, "the verification
+#   battery is the gate"; per spec C0.5 it is "encoded directly in CI so it
+#   cannot be bypassed." Add each job name (compile, lint, clang-tidy,
+#   scan-build, sanitizers (asan|tsan|ubsan|msan), sim-battery,
+#   spec-conformance, linearizability, mutation, gate-summary) to the required
+#   list when enabling branch protection.
+#
+# ORDERED STAGES (master-plan §8), expressed via `needs:` dependencies:
+#   compile (debug+release)
+#     -> lint (forbidden-call) + clang-tidy + scan-build (static analysis)
+#       -> sanitizers: ASan, TSan, UBSan, MSan   (matrix; build + ctest)
+#         -> deterministic simulation battery     [Phase 0 no-op hook]
+#           -> conforms-to-formal-spec             [Phase 0 no-op hook]
+#             -> applicable linearizability checks [Phase 0 no-op hook]
+#               -> mutation score not regressed
+#
+# Phase 0 reality: the sim-battery / spec-conformance / linearizability stages
+# have nothing to run yet, so each is an explicit, clearly-commented no-op hook
+# that echoes a banner and succeeds -- wired now, real in Phase >= 2.
+#
+# CMake presets used (defined by A1 in CMakePresets.json):
+#   debug release asan tsan ubsan msan
+# =============================================================================
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pin the LLVM/clang toolchain everywhere so MSan/TSan instrumentation and the
+  # static-analysis tools all come from the same, consistent toolchain.
+  CC: clang
+  CXX: clang++
+  LOCKSTEP_MUTATION_THRESHOLD: "100.0"
+
+jobs:
+  # ===========================================================================
+  # STAGE 1 -- COMPILE (debug + release build matrix)
+  # ===========================================================================
+  compile:
+    name: compile (${{ matrix.preset }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (llvm/clang, cmake, ninja)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tools clang-tidy cmake ninja-build
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test (ctest)
+        run: ctest --preset ${{ matrix.preset }}
+
+  # ===========================================================================
+  # STAGE 2 -- LINT + STATIC ANALYSIS
+  #   (a) forbidden-call lint   (b) clang-tidy   (c) clang static analyzer
+  # ===========================================================================
+  lint:
+    name: lint (forbidden-call)
+    runs-on: ubuntu-latest
+    needs: compile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Forbidden-call lint (cardinal rule 1 -- whole tree except providers/)
+        run: python3 tools/lint/forbidden_calls.py .
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-latest
+    needs: compile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tools clang-tidy cmake ninja-build
+      - name: Configure (debug -> emits compile_commands.json)
+        run: cmake --preset debug
+      - name: Run clang-tidy over tracked C++ (providers/ exempt)
+        run: |
+          git ls-files '*.cpp' '*.hpp' '*.cc' '*.h' \
+            | grep -v '^providers/' \
+            | xargs -r clang-tidy -p build/debug
+
+  scan-build:
+    name: scan-build (clang static analyzer)
+    runs-on: ubuntu-latest
+    needs: compile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tools clang-tidy cmake ninja-build
+      - name: Configure under scan-build
+        run: scan-build --use-cc=clang --use-c++=clang++ cmake --preset debug
+      - name: Build under scan-build (--status-bugs fails on any finding)
+        run: scan-build --status-bugs cmake --build --preset debug
+
+  # ===========================================================================
+  # STAGE 3 -- SANITIZERS (ASan / TSan / UBSan / MSan), separate matrix jobs.
+  #   Each: configure -> build -> ctest under the sanitizer preset.
+  # ===========================================================================
+  sanitizers:
+    name: sanitizer (${{ matrix.preset }})
+    runs-on: ubuntu-latest
+    needs: [lint, clang-tidy, scan-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan, tsan, ubsan, msan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (llvm/clang has MSan; Apple clang does not)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tools cmake ninja-build
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test (ctest under sanitizer)
+        run: ctest --preset ${{ matrix.preset }}
+
+  # ===========================================================================
+  # STAGE 4 -- DETERMINISTIC SIMULATION BATTERY   [Phase 0 no-op hook]
+  #   Real in Phase >= 2 (sim harness + fault storms + seed-burn, spec C2.*).
+  # ===========================================================================
+  sim-battery:
+    name: deterministic simulation battery
+    runs-on: ubuntu-latest
+    needs: sanitizers
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sim battery (placeholder hook)
+        run: "echo 'Phase 0: no-op hook (wired for Phase >=2)'"
+
+  # ===========================================================================
+  # STAGE 5 -- CONFORMS-TO-FORMAL-SPEC            [Phase 0 no-op hook]
+  #   Real in Phase >= 4/5 (TLA+ model-checked in TLC; specs/ exists, empty now).
+  # ===========================================================================
+  spec-conformance:
+    name: conforms-to-formal-spec
+    runs-on: ubuntu-latest
+    needs: sim-battery
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spec conformance (placeholder hook)
+        run: "echo 'Phase 0: no-op hook (wired for Phase >=2)'"
+
+  # ===========================================================================
+  # STAGE 6 -- APPLICABLE LINEARIZABILITY CHECKS  [Phase 0 no-op hook]
+  #   Real in Phase >= 4/5 (Elle/Jepsen-style, one checker per D5 level).
+  # ===========================================================================
+  linearizability:
+    name: linearizability checks
+    runs-on: ubuntu-latest
+    needs: spec-conformance
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linearizability (placeholder hook)
+        run: "echo 'Phase 0: no-op hook (wired for Phase >=2)'"
+
+  # ===========================================================================
+  # STAGE 7 -- MUTATION SCORE NOT REGRESSED (adequacy meta-gate, §6.7).
+  #   Runs end-to-end now; fails the gate on any regression below threshold.
+  # ===========================================================================
+  mutation:
+    name: mutation score not regressed
+    runs-on: ubuntu-latest
+    needs: linearizability
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Mutation runner (threshold-gated)
+        run: python3 tools/mutation/run_mutation.py --threshold "${LOCKSTEP_MUTATION_THRESHOLD}"
+
+  # ===========================================================================
+  # GATE SUMMARY -- single fan-in check. Make THIS a required status check (in
+  # addition to / instead of each leaf) so the whole ordered battery must be
+  # green before merge. Fails if any upstream job failed or was skipped.
+  # ===========================================================================
+  gate-summary:
+    name: gate-summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - compile
+      - lint
+      - clang-tidy
+      - scan-build
+      - sanitizers
+      - sim-battery
+      - spec-conformance
+      - linearizability
+      - mutation
+    steps:
+      - name: Verify all gate stages succeeded
+        run: |
+          echo "compile=${{ needs.compile.result }}"
+          echo "lint=${{ needs.lint.result }}"
+          echo "clang-tidy=${{ needs.clang-tidy.result }}"
+          echo "scan-build=${{ needs.scan-build.result }}"
+          echo "sanitizers=${{ needs.sanitizers.result }}"
+          echo "sim-battery=${{ needs.sim-battery.result }}"
+          echo "spec-conformance=${{ needs.spec-conformance.result }}"
+          echo "linearizability=${{ needs.linearizability.result }}"
+          echo "mutation=${{ needs.mutation.result }}"
+          if [ "${{ needs.compile.result }}" != "success" ] \
+            || [ "${{ needs.lint.result }}" != "success" ] \
+            || [ "${{ needs.clang-tidy.result }}" != "success" ] \
+            || [ "${{ needs.scan-build.result }}" != "success" ] \
+            || [ "${{ needs.sanitizers.result }}" != "success" ] \
+            || [ "${{ needs.sim-battery.result }}" != "success" ] \
+            || [ "${{ needs.spec-conformance.result }}" != "success" ] \
+            || [ "${{ needs.linearizability.result }}" != "success" ] \
+            || [ "${{ needs.mutation.result }}" != "success" ]; then
+            echo "GATE: FAIL -- one or more required stages did not succeed."
+            exit 1
+          fi
+          echo "GATE: PASS -- full universal merge gate green."

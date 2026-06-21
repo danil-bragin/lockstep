@@ -1,0 +1,55 @@
+# Lockstep clang-tidy config — modern C++23 discipline (cardinal rules 6 & 7).
+#
+# HOST CAVEAT: clang-tidy is NOT part of the Apple command-line toolchain, so it
+# is SKIPPED locally by scripts/gate.sh ([SKIP host-limited]); CI runs it for
+# real on ubuntu + upstream llvm. This file is the authoritative check set.
+#
+# Rationale for the enabled families:
+#   bugprone-*           : real correctness traps.
+#   cppcoreguidelines-*  : RAII, ownership, no naked new/delete (rule 6).
+#   modernize-*          : C++23 idioms; prefer smart pointers, =default, etc.
+#   performance-*        : cheap wins, no behavior change.
+#   readability-*        : consistency.
+#   misc-*               : misc correctness.
+#   concurrency-*        : guards against threading mistakes (rule 7).
+#
+# Disabled (with reason) to keep signal high:
+#   -modernize-use-trailing-return-type : stylistic, not enforced.
+#   -readability-identifier-length      : short loop vars are fine.
+#   -readability-magic-numbers / cppcoreguidelines-avoid-magic-numbers : noisy.
+#   -modernize-avoid-c-arrays           : revisit when std::span lands.
+#   -cppcoreguidelines-pro-type-vararg  : std::printf-family in tooling/tests.
+
+Checks: >
+  -*,
+  bugprone-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  readability-*,
+  misc-*,
+  concurrency-*,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -modernize-avoid-c-arrays,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-pro-type-vararg,
+  -misc-include-cleaner
+
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(core|providers|storage|log|txn|query|harness|bench|tests)/.*'
+FormatStyle: file
+
+CheckOptions:
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: camelBack
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: '_'
