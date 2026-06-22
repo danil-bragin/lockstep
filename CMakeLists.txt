@@ -36,6 +36,7 @@ add_subdirectory(log)
 add_subdirectory(txn)
 add_subdirectory(query)
 add_subdirectory(harness)
+add_subdirectory(consensus)
 add_subdirectory(bench)
 
 if(BUILD_TESTING)

@@ -384,6 +384,40 @@ else()
     "storage_wisckey_test not built (Phase 3 step 6 pending).")
 endif()
 
+# --- Phase 4 Stage M: consensus verification machinery teeth gate ------------
+# P4-MACHINERY gate (specs/Consensus.tla; briefs/phase4.md Stage M). Proves the
+# consensus SEAM (consensus/ConsensusNode.hpp) + the conformance / linearizability
+# / cross-check HARNESS have TEETH — BEFORE either real Raft impl exists. Asserts
+# (A) each deliberately-WRONG ConsensusNode stub is FLAGGED by the conformance
+# checker mapping to the Consensus.tla invariant it breaks (ElectionSafety /
+# LogMatching / StateMachineSafety / LeaderAppendOnly), with witness + replayable
+# seed; (B) the no-op "always-follower" baseline does NOT false-positive the
+# safety checkers yet makes NO progress (vacuous safety ≠ correctness); (C) the
+# dual-impl cross-check agrees impl-vs-itself and catches a divergent pair; (D)
+# determinism — same seed ⇒ byte-identical ObservedRun (in-test + external diff).
+# Links the header-only consensus lib + runtime + sim PRNG/disk/network + harness
+# (the driver wires SimNetwork + SimDisk on the scheduler; reuses the harness
+# Verdict shape). Non-provider TU → forbidden-lint scans it. Inherits TIMEOUT 90.
+if(TARGET lockstep_consensus AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim AND TARGET lockstep_harness)
+  add_executable(lockstep_consensus_harness_test consensus_harness_test.cpp)
+  target_include_directories(lockstep_consensus_harness_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_consensus_harness_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus
+      lockstep_harness
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME consensus_harness_test COMMAND lockstep_consensus_harness_test)
+else()
+  message(WARNING
+    "lockstep_consensus / runtime / providers_sim / harness not all found; "
+    "consensus_harness_test not built (Phase 4 Stage M pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
