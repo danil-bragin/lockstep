@@ -42,6 +42,8 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <lockstep/core/Error.hpp>
 #include <lockstep/core/Future.hpp>
@@ -70,6 +72,18 @@ inline constexpr Seq kNoSeq = 0;
 struct Snapshot {
     Seq at = kNoSeq;
 };
+
+// A half-open key range [lo, hi) for scan(): keys k with lo <= k < hi. An empty
+// `hi` (the default) means "unbounded above" — every key with lo <= k.
+struct Range {
+    Key lo;       // inclusive lower bound (empty == from the smallest key)
+    Key hi;       // exclusive upper bound (empty == unbounded above)
+    bool hi_unbounded = true;  // when true, `hi` is ignored (scan to the end)
+};
+
+// One (Key,Value) pair returned by scan(), in key-ascending order. Tombstoned /
+// not-visible keys are omitted (a scan returns only LIVE values at the snapshot).
+using KeyValue = std::pair<Key, Value>;
 
 // Engine — the abstract single-node MVCC KV store. All methods async on the
 // scheduler. A real engine (WAL+memtable+SSTable+compaction+WiscKey) and the
@@ -108,8 +122,14 @@ public:
     // mutation committed before this call survives a subsequent crash (V-DUR).
     [[nodiscard]] virtual Future<Error> sync() = 0;
 
-    // scan(range, Snapshot) → ordered [(Key,Value)] is added when the SSTable
-    // lands (storage-engine.md §1/§5 step 4); not part of the step-1 seam.
+    // scan(range, snap) → the LIVE (Key,Value) pairs whose key is in [range.lo,
+    // range.hi) at snapshot snap.at, KEY-ASCENDING. For each key in range, the
+    // newest version with seq <= snap.at is taken; a key whose newest visible
+    // version is a tombstone (or has no version ≤ snap.at) is OMITTED. A pure
+    // function of (range, snap.at) under the same MVCC rule as get (V-SNAP).
+    // Spans the memtable + every durable SSTable, merged newest-version-per-key
+    // (storage-engine.md §1/§5 step 4).
+    [[nodiscard]] virtual Future<std::vector<KeyValue>> scan(Range range, Snapshot snap) = 0;
 };
 
 }  // namespace lockstep::storage

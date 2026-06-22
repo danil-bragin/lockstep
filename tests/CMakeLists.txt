@@ -282,6 +282,39 @@ else()
     "storage_engine_test not built (Phase 3 step 2 pending).")
 endif()
 
+# --- Phase 3 step 4: SSTable layer (flush + manifest + bloom + scan) ----------
+# P3-SSTABLE gate (specs/storage-engine.md §2/§3/§6; §5 step 4). The memtable
+# flushes to immutable on-disk SSTables (per-block CRC + sparse index + bloom +
+# CRC'd footer), atomically installed via a CRC'd Seq-contiguous MANIFEST; reads
+# span memtable + SSTables (newest→oldest); scan() merges them at a snapshot.
+# Asserts (A) DIFFERENTIAL WITH FLUSHES — WalEngine(LSM) vs Oracle over a seed
+# sweep, get+scan, 0 mismatch (the core gate, with many forced flushes); (B)
+# METAMORPHIC — a forced flush changes no visible get/scan value (flush ⊥ change
+# reads); (C) CRASH-DURING-FLUSH — crash incl. mid-flush under the full fault
+# envelope, recover from the manifest's committed SSTable set + WAL prefix to a
+# valid oracle PREFIX, 0 fabrication, no half-SSTable surviving (V-PREFIX/
+# V-NOTORN, atomic install); (D) BLOOM no false negative (a present key is never
+# skipped); (E) determinism — same seed ⇒ byte-identical recovered reads + WAL +
+# SSTable on-disk fingerprint (V-DET). Links the header-only storage lib +
+# runtime + sim PRNG + SimDisk. Non-provider TU → forbidden-lint scans it.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_sstable_test storage_sstable_test.cpp)
+  target_include_directories(lockstep_storage_sstable_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_sstable_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_sstable_test COMMAND lockstep_storage_sstable_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_sstable_test not built (Phase 3 step 4 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never

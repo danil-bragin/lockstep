@@ -88,6 +88,13 @@ public:
         return f;
     }
 
+    [[nodiscard]] Future<std::vector<KeyValue>> scan(Range range, Snapshot snap) override {
+        Promise<std::vector<KeyValue>> p = make_promise<std::vector<KeyValue>>(sched_);
+        Future<std::vector<KeyValue>> f = p.get_future();
+        p.set_value(scan_impl(range, snap.at));
+        return f;
+    }
+
 protected:
     // One MVCC version of a key: the value, and whether it is a tombstone (delete).
     struct Version {
@@ -135,6 +142,27 @@ protected:
             return std::nullopt;
         }
         return newest->value;
+    }
+
+    // The MVCC range read: for every key in [range.lo, range.hi) (key-ascending,
+    // since keys_ is sorted), take the newest version with seq <= at and emit it
+    // if it is a live value. Reuses lookup() so the per-key rule is identical to
+    // get — the obviously-correct definition the harness checks scan against.
+    [[nodiscard]] virtual std::vector<KeyValue> scan_impl(const Range& range, Seq at) const {
+        std::vector<KeyValue> out;
+        for (const KeyVersions& kv : keys_) {
+            if (kv.key < range.lo) {
+                continue;
+            }
+            if (!range.hi_unbounded && !(kv.key < range.hi)) {
+                continue;  // key >= hi: past the half-open upper bound.
+            }
+            const std::optional<Value> v = lookup(kv.key, at);
+            if (v.has_value()) {
+                out.emplace_back(kv.key, *v);
+            }
+        }
+        return out;
     }
 
     // Find the version list for `key`, or nullptr. Keys are kept sorted; a linear

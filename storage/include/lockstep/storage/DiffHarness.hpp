@@ -70,6 +70,7 @@ enum class DiffOpKind : std::uint8_t {
     Get,
     Snapshot,
     Sync,
+    Scan,
 };
 
 [[nodiscard]] inline const char* diff_op_name(DiffOpKind k) noexcept {
@@ -79,6 +80,7 @@ enum class DiffOpKind : std::uint8_t {
         case DiffOpKind::Get:      return "get";
         case DiffOpKind::Snapshot: return "snapshot";
         case DiffOpKind::Sync:     return "sync";
+        case DiffOpKind::Scan:     return "scan";
     }
     return "?";
 }
@@ -117,6 +119,19 @@ struct DiffConfig {
 // Render an optional<Value> for a witness ("∅" for nullopt; the raw bytes else).
 [[nodiscard]] inline std::string render_opt(const std::optional<Value>& v) {
     return v.has_value() ? ("\"" + *v + "\"") : std::string("nil");
+}
+
+// Render a scan result (ordered [(k,v)]) for a witness.
+[[nodiscard]] inline std::string render_kvs(const std::vector<KeyValue>& kvs) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < kvs.size(); ++i) {
+        if (i != 0) {
+            out += ",";
+        }
+        out += kvs[i].first + "=" + kvs[i].second;
+    }
+    out += "]";
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,16 +173,18 @@ struct DiffConfig {
             out.steps = step + 1;
             // Draw the op kind with a mutation-heavy mix so versions pile up and
             // reads straddle snapshots. Weights are fixed (deterministic).
-            const std::uint64_t roll = r.uniform(10);
+            const std::uint64_t roll = r.uniform(20);
             DiffOpKind kind;
-            if (roll < 4) {
+            if (roll < 8) {
                 kind = DiffOpKind::Put;       // 40%
-            } else if (roll < 6) {
+            } else if (roll < 12) {
                 kind = DiffOpKind::Del;       // 20%
-            } else if (roll < 9) {
-                kind = DiffOpKind::Get;       // 30%
+            } else if (roll < 17) {
+                kind = DiffOpKind::Get;       // 25%
+            } else if (roll < 19) {
+                kind = DiffOpKind::Scan;      // 10%
             } else {
-                // 10% split between snapshot + sync.
+                // 5% split between snapshot + sync.
                 kind = (r.uniform(2) == 0) ? DiffOpKind::Snapshot : DiffOpKind::Sync;
             }
 
@@ -248,6 +265,32 @@ struct DiffConfig {
                             the_seed, step, kind, Key{}, kNoSeq,
                             eref.ok() ? "ok" : "err", esut.ok() ? "ok" : "err",
                             "sync durability-barrier disagreement (V-DUR)"};
+                        co_return;
+                    }
+                    break;
+                }
+                case DiffOpKind::Scan: {
+                    // Pick a snapshot in [0,frontier] + a half-open key range over
+                    // the tiny key alphabet (sometimes unbounded above) so the scan
+                    // straddles versions + boundaries. Draws are identical for both
+                    // engines. The merged ordered (k,v) list must MATCH (V-SNAP).
+                    const Seq at = static_cast<Seq>(r.uniform(frontier + 1));
+                    const std::uint64_t a = r.uniform(c.n_keys);
+                    const std::uint64_t b = r.uniform(c.n_keys + 1);
+                    Range range;
+                    range.lo = mk_key(a);
+                    const bool unbounded = (r.uniform(3) == 0);
+                    range.hi_unbounded = unbounded;
+                    range.hi = unbounded ? Key{} : mk_key(b);
+                    const Snapshot snap{at};
+                    const std::vector<KeyValue> rref = co_await ref_e.scan(range, snap);
+                    const std::vector<KeyValue> rsut = co_await sut_e.scan(range, snap);
+                    if (rref != rsut) {
+                        out.ok = false;
+                        out.witness = DiffWitness{
+                            the_seed, step, kind, range.lo, at,
+                            render_kvs(rref), render_kvs(rsut),
+                            "scan result disagreement (V-SNAP / ordering)"};
                         co_return;
                     }
                     break;
