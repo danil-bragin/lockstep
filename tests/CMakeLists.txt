@@ -69,3 +69,37 @@ else()
     "lockstep_runtime / lockstep_providers_sim not found; runtime determinism "
     "self-test not built (Phase 1 substrate pending).")
 endif()
+
+# --- Phase 2 sim-provider tests (pre-wired by orchestrator; disjoint ownership) -
+# S1 owns sim_network_test.cpp, S2 owns sim_disk_test.cpp. Targets pre-registered
+# here so the provider agents never edit this shared file. Each builds only if its
+# source exists (so a half-landed batch still configures green) and links the
+# header-only runtime + sim providers. tests/ is on the include path for shared
+# harness headers. These are non-provider TUs → forbidden-lint scans them.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
+  foreach(sim_test sim_network_test sim_disk_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${sim_test}.cpp")
+      add_executable(lockstep_${sim_test} ${sim_test}.cpp)
+      target_include_directories(lockstep_${sim_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+      target_link_libraries(lockstep_${sim_test}
+        PRIVATE
+          lockstep_warnings
+          lockstep_sanitizers
+          lockstep_runtime
+          lockstep_providers_sim)
+      add_test(NAME ${sim_test} COMMAND lockstep_${sim_test})
+    endif()
+  endforeach()
+endif()
+
+# --- Harness liveness invariant (orchestrator) -------------------------------
+# Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
+# livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
+# an unbounded spin that saturates the host. Backprop from the SimBus::in_side_a
+# off-by-one infinite loop (mid+0 vs mid+1) that hung standalone yet slipped a
+# timeout-less ctest. Deterministic sims finish in well under a second; 90s is a
+# generous ceiling that still kills any true hang fast.
+get_property(_lockstep_all_tests DIRECTORY PROPERTY TESTS)
+if(_lockstep_all_tests)
+  set_tests_properties(${_lockstep_all_tests} PROPERTIES TIMEOUT 90)
+endif()
