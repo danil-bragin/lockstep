@@ -511,6 +511,41 @@ else()
     "(Phase 5 Stage M pending).")
 endif()
 
+# --- Phase 5 Stage I: the REAL deterministic distributed-txn executor ---------
+# P5-IMPL gate (specs/CommitOrdering.tla; briefs/phase5.md C5.1-C5.6). The FIRST
+# real Lockstep transaction executor (txn/DeterministicExecutor.hpp): one-shot
+# submission (C5.1), Calvin-style deterministic SEQUENTIAL commit ordering over
+# the seqLog (C5.2, no 2PC), OLLP recon + bounded re-sequence at the txn's
+# serialization-point snapshot (C5.3), the four D5 read levels each served to
+# EXACTLY its contract (C5.4/C5.5), deterministic abort/retry + ExactlyOnce apply
+# (C5.6) — backed by the REAL Phase-3 MVCC storage::WalEngine driven on the
+# deterministic core::Scheduler. Asserts, over a seed sweep (<=64 in-gate, env
+# override): the Stage-M DiffHarness + ALL 8 checkers pass with 0 violations
+# (differential-vs-oracle match, strict-serializable/linearizable, each D5 level
+# EXACTLY its contract, OLLP sound + retry terminates, ExactlyOnce) + PROGRESS
+# (txns commit, not vacuous) + DETERMINISM (same seed => byte-identical rendered
+# outcome). Links the txn lib + the real storage engine + runtime + sim PRNG/
+# disk (the executor drives the engine on a scheduler internally). Non-provider
+# TU -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_txn AND TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_txn_impl_test txn_impl_test.cpp)
+  target_include_directories(lockstep_txn_impl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_txn_impl_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME txn_impl_test COMMAND lockstep_txn_impl_test)
+else()
+  message(WARNING
+    "lockstep_txn / storage / runtime / providers_sim not all found; "
+    "txn_impl_test not built (Phase 5 Stage I pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
