@@ -11,7 +11,25 @@
 // FRAME (network message): [u8 type][u64 op_id][u8 op_kind][u64 client_ep]
 //   [u8 ok][u64 commit_seq][u8 present][str key][str value][str cas_old]
 //   [str error]   — where str = [u32 len][len bytes].
-// WAL RECORD (durable log entry): [u64 seq][u8 present][str key][str value].
+// WAL RECORD (durable log entry): [u64 seq][u8 present][str key][str value]
+//   [u32 crc32]  — a PER-RECORD integrity trailer (see below).
+//
+// WAL PER-RECORD INTEGRITY (durability bug fix, spec §4 C-INT/C-DUR, Phase 3
+// "no torn corruption survives recovery"). The length-prefix bounds checks alone
+// do NOT catch a torn/bit-rotted durable tail that happens to still parse: such a
+// frame decodes into a WalRecord with a GARBAGE value, which recovery would apply
+// as a committed value NO CLIENT EVER WROTE (fabricated durable value). To make a
+// torn/corrupt record a CLEAN decode FAILURE, every WAL record carries a trailing
+// 32-bit checksum over the record body ([seq][present][key][value]). On decode we
+// recompute it and reject on mismatch — so a torn tail is LOST (not applied) and
+// recovery yields a consistent PREFIX of the durable write history.
+//
+// CHECKSUM ALGORITHM — CRC-32 (ISO 3309 / IEEE 802.3), hand-rolled, no library:
+//   * Reflected (LSB-first) bit order, reversed polynomial 0xEDB88320
+//     (the bit-reversal of 0x04C11DB7), init = 0xFFFFFFFF, final XOR 0xFFFFFFFF.
+//   * Computed byte-by-byte with the standard reflected inner loop. This is the
+//     same CRC-32 as zlib/PNG, but implemented inline so there is NO external
+//     dependency and the result is fully byte-deterministic on every host.
 //
 // FORBIDDEN here (harness/ is NOT lint-exempt): wall-clock, std::thread/atomics,
 // std::*_distribution, any nondeterminism. Pure byte manipulation.
@@ -151,6 +169,23 @@ private:
     std::size_t pos_ = 0;
 };
 
+// ---- WAL per-record integrity checksum (hand-rolled CRC-32) ---------------
+
+// CRC-32 (reflected, poly 0xEDB88320, init/xorout 0xFFFFFFFF) over `data`.
+// Hand-rolled, branch-deterministic, no table needed (computed inline). Identical
+// to zlib/PNG CRC-32, but with no external dependency.
+[[nodiscard]] inline std::uint32_t crc32(std::span<const std::byte> data) noexcept {
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::byte b : data) {
+        crc ^= static_cast<std::uint32_t>(static_cast<std::uint8_t>(b));
+        for (int k = 0; k < 8; ++k) {
+            const std::uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
 // ---- frame codec ----------------------------------------------------------
 
 [[nodiscard]] inline std::vector<std::byte> encode_frame(const Frame& f) {
@@ -226,12 +261,21 @@ private:
     put_u8(out, present ? 1u : 0u);
     put_str(out, key);
     put_str(out, value);
+    // Trailing per-record CRC-32 over the record body just written. A torn or
+    // bit-rotted body will not match this checksum on decode → clean failure.
+    const std::uint32_t crc =
+        crc32(std::span<const std::byte>(out.data(), out.size()));
+    put_u32(out, crc);
     return out;
 }
 
 // Decode one WAL record from the front of `data`. On success sets `consumed` to
-// the byte length of the record. On a short/torn tail returns false (the caller
-// stops at the last complete record — a consistent durable prefix).
+// the byte length of the record (body + the 4-byte CRC trailer). Returns false on
+// a short/torn tail OR on a CRC MISMATCH (a torn/bit-rotted body that still parses
+// within bounds). The caller stops at the first failing record — applying the
+// valid prefix and discarding the torn record and everything after it, so a torn
+// tail is LOST but NEVER applied as a fabricated committed value. (spec §4 C-INT/
+// C-DUR; Phase 3 "no torn corruption survives recovery → consistent PREFIX".)
 [[nodiscard]] inline bool decode_wal_record(std::span<const std::byte> data,
                                             WalRecord& rec,
                                             std::size_t& consumed) {
@@ -244,6 +288,18 @@ private:
         return false;
     }
     if (!r.str(rec.key) || !r.str(rec.value)) {
+        return false;
+    }
+    const std::size_t body_len = r.consumed();  // [seq][present][key][value]
+    std::uint32_t stored_crc = 0;
+    if (!r.u32(stored_crc)) {
+        return false;  // CRC trailer torn off the tail
+    }
+    // Recompute the CRC over the record body and verify. A mismatch means the
+    // body (e.g. a value) was corrupted/torn — reject so recovery stops here.
+    const std::uint32_t actual_crc =
+        crc32(std::span<const std::byte>(data.data(), body_len));
+    if (actual_crc != stored_crc) {
         return false;
     }
     rec.present = present != 0;

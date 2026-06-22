@@ -298,7 +298,14 @@ private:
                     std::span<const std::byte>(durable.data() + pos,
                                                durable.size() - pos),
                     rec, consumed)) {
-                break;  // torn/partial tail: stop at the consistent prefix
+                // First record that fails to decode/verify (short tail OR CRC
+                // mismatch from a torn/bit-rotted body). STOP here: apply only
+                // the valid PREFIX, discard this record and everything after it.
+                // A length-prefixed log cannot reliably resync past a corruption,
+                // and consistent-prefix is the contract — so we never try to skip
+                // ahead. A torn tail (or torn middle) is LOST, never applied as a
+                // fabricated committed value. (spec §4 C-INT/C-DUR; Phase 3.)
+                break;
             }
             apply_record(nd, rec.key, rec.value, rec.seq, rec.present);
             if (rec.seq > max_seq) {
