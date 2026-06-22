@@ -253,6 +253,35 @@ else()
     "storage_diff_test not built (Phase 3 step 1 pending).")
 endif()
 
+# --- Phase 3 step 2: real storage engine (WAL + memtable + MVCC + recovery) ---
+# P3-ENGINE-CORE gate (specs/storage-engine.md §2/§4; §5 step 2). The FIRST real
+# Lockstep engine (storage/WalEngine.hpp). Asserts (A) DIFFERENTIAL no-faults —
+# WalEngine vs Oracle over a seed sweep, 0 mismatch (the core gate); (B) CRASH-
+# CONSISTENCY under the full fault envelope — crash() at seeded points, recover()
+# to a valid oracle PREFIX, 0 fabrication (V-PREFIX/V-NOTORN); (B') durable-
+# survives on an honest disk (V-DUR); (C) MVCC under concurrent writers — a
+# snapshot stays stable (V-SNAP); (D) determinism — same seed ⇒ byte-identical
+# recovered reads + on-disk durable image fingerprint (V-DET). Links the header-
+# only storage lib + runtime + sim PRNG + SimDisk. Non-provider TU → forbidden-
+# lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_engine_test storage_engine_test.cpp)
+  target_include_directories(lockstep_storage_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_engine_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_engine_test COMMAND lockstep_storage_engine_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_engine_test not built (Phase 3 step 2 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
