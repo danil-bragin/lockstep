@@ -49,3 +49,6 @@ tools/tla/tla2tools.jar
 states/
 *.st
 states_*/
+
+# mutation-engine backups — never commit (a stray one = interrupted mutation)
+*.mutbak

@@ -18,6 +18,13 @@
 //       by the caller; the scheduler itself reads no clock and no randomness.
 //   L6: no real threads, no locks, no atomics, no wall-clock.
 //
+// run() drives to QUIESCENCE (no ready work AND no pending timers). For systems
+// with a perpetual timer (e.g. a Raft heartbeat loop) that never quiesce, the
+// ADDITIVE run_until(deadline) / run_for(d) primitives drive the SAME loop but
+// STOP once virtual time would have to advance strictly past `deadline`, leaving
+// later timers pending. They obey L1-L6 identically (pure fn of seed/tasks/
+// deadline); run()'s existing semantics are unchanged.
+//
 // The Scheduler implements IScheduler (spawn/run) and detail::SchedulerSink (the
 // narrow surface Future/Task use to schedule waiters + record trace). SimClock
 // implements IClock and is bound to one Scheduler's virtual time.
@@ -101,6 +108,56 @@ public:
         }
         trace(TraceAction::RunEnd, {});
     }
+
+    // ADDITIVE bounded run (does NOT change run()'s semantics). Drives the ready
+    // queue and advances virtual time EXACTLY as run() does, but STOPS and returns
+    // once virtual time would have to advance strictly BEYOND `deadline` to make
+    // further progress. A timer whose due tick is <= deadline is fired (advancing
+    // vtime up to its due tick); a timer due strictly AFTER deadline is left
+    // pending (vtime is NOT advanced to it) — so a perpetual heartbeat loop, which
+    // always has a future timer pending, no longer wedges the loop forever.
+    //
+    // DETERMINISM (L1-L6, same as run()):
+    //   * Pure function of (seed, tasks, deadline): no wall-clock, no threads, no
+    //     randomness read here. The ONLY new input is `deadline`, a fixed scalar.
+    //   * L1: the single resume site below is the only handle.resume() (mirrors
+    //     run()); scheduling only ever pushes onto the FIFO ready queue.
+    //   * L3: ready order is the same strict FIFO; timer firing order is the same
+    //     deterministic (due, arm_seq) key — fire_earliest_timers() is reused
+    //     verbatim, so when fired the result is byte-identical to run().
+    //   * L4: vtime advances ONLY when the ready queue is empty, and never past
+    //     the earliest pending timer; here it additionally refuses to advance past
+    //     `deadline`. Timers strictly after the deadline stay pending in arm order.
+    //   * Idempotent boundary: a timer due EXACTLY at `deadline` fires (the run
+    //     covers the closed interval [start, deadline]); only strictly-later timers
+    //     are deferred. Running run_until(d1) then run_until(d2>=d1) yields the same
+    //     state as a single run_until(d2) (no work is skipped or double-fired).
+    // run() itself is untouched and the Phase-1 determinism self-test (which never
+    // calls this) is byte-identical.
+    void run_until(Tick deadline) {
+        trace(TraceAction::RunStart, {});
+        for (;;) {
+            if (!ready_.empty()) {
+                detail::ReadyItem item = ready_.pop();
+                trace(TraceAction::Resume, std::string("seq=") + std::to_string(item.seq));
+                item.handle.resume(); // the ONE and ONLY resume site (L1)
+                continue;
+            }
+            // L4: ready queue empty. Stop if no timers pend OR the earliest
+            // pending timer is due strictly AFTER the deadline (leave it pending;
+            // do not advance vtime past `deadline`).
+            if (timers_.empty() || earliest_timer_due() > deadline) {
+                break;
+            }
+            fire_earliest_timers();
+        }
+        trace(TraceAction::RunEnd, {});
+    }
+
+    // ADDITIVE: run for `d` ticks of virtual time from the current vtime. Thin
+    // wrapper over run_until; same determinism guarantees. A non-positive `d`
+    // drains only the currently-ready work at the present tick.
+    void run_for(Duration d) { run_until(vtime_ + (d > 0 ? d : 0)); }
 
     // ---- detail::SchedulerSink ------------------------------------------
 
@@ -199,6 +256,21 @@ private:
             trace(TraceAction::TimerFire, std::string("arm=") + std::to_string(t.arm_seq));
             t.promise.set_value();
         }
+    }
+
+    // The due tick of the earliest pending timer (deterministic min by the same
+    // (due, arm_seq) key used to fire). Caller must ensure timers_ is non-empty.
+    // Used only by the additive run_until() to decide whether the next timer falls
+    // within the deadline; reading it never advances the clock or mutates state.
+    [[nodiscard]] Tick earliest_timer_due() const noexcept {
+        assert(!timers_.empty());
+        std::size_t min_idx = 0;
+        for (std::size_t i = 1; i < timers_.size(); ++i) {
+            if (timer_less(timers_[i], timers_[min_idx])) {
+                min_idx = i;
+            }
+        }
+        return timers_[min_idx].due;
     }
 
     static bool timer_less(const Timer& a, const Timer& b) noexcept {

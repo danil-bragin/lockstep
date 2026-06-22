@@ -22,8 +22,14 @@
 // its seed; replay is byte-identical (the gate proves it with an external diff).
 //
 // BOUNDED: a fixed submit budget; a bounded number of fault episodes; a hard
-// virtual-time horizon on each "settle" wait. The scheduler reaches quiescence
-// (run() returns) → no livelock; inherits the CTest TIMEOUT 90 ceiling.
+// virtual-time horizon on each "settle" wait. A REAL Raft node runs a perpetual
+// heartbeat timer, so the scheduler NEVER quiesces (run() would spin forever
+// advancing virtual time). Instead the driver computes a virtual-time DEADLINE
+// (the workload + fault + settle horizon below) and drives with
+// Scheduler::run_until(deadline): the cluster is observed/snapshotted up to the
+// deadline, then the driver STOPS (heartbeats still pending is fine) — no
+// livelock; inherits the CTest TIMEOUT 90 ceiling. Pure fn of (seed): the
+// deadline is a deterministic fn of cfg, identical across replays.
 //
 // FORBIDDEN here (consensus/ is NOT lint-exempt): wall-clock, std::thread/atomics,
 // std::*_distribution, unordered iteration affecting output, any nondeterminism.
@@ -353,6 +359,43 @@ inline void finalize_committed_log(ClusterRunState* st) {
     st->run.committed_log = std::move(seq);
 }
 
+// Compute the virtual-time DEADLINE the driver runs to. A deterministic upper
+// bound (pure fn of cfg) on how long the longest concurrent coroutine chain can
+// take, PLUS a settle margin — so every client session, the fault schedule, and
+// the final settle all have room to complete within [0, deadline]. The driver
+// then STOPS (a real node's perpetual heartbeat timer stays pending past here;
+// that is fine — we have already snapshotted the whole evolution).
+inline Tick compute_deadline(const ClusterConfig* cfg) {
+    // Worst-case per-submit chain: a client gap, then waiting for a leader to
+    // (re)emerge after a fault, then the full replication/commit deadline. The
+    // await_leader budget inside client_driver is election_timeout_max * 4.
+    const Tick per_submit = cfg->client_gap_max +
+                            cfg->election_timeout_max * 4 + cfg->request_deadline;
+    const Tick client_chain = static_cast<Tick>(cfg->submits_per_client) * per_submit;
+
+    // Worst-case fault schedule: `episodes` steps, each up to election_timeout_max
+    // * 3 of delay (mirrors fault_driver's episode count + max step).
+    const std::uint64_t episodes =
+        (cfg->partition_episodes + cfg->crash_episodes) * 2 + 2;
+    const Tick fault_chain =
+        static_cast<Tick>(episodes) * (cfg->election_timeout_max * 3);
+
+    // The final settle coroutine advances settle_ticks * 4.
+    const Tick settle = cfg->settle_ticks * 4;
+
+    // The chains run CONCURRENTLY (client + fault + settle on one scheduler); the
+    // horizon is the longest of them, plus a generous settle margin so any in-
+    // flight election/replication that started near the end still completes.
+    Tick horizon = client_chain;
+    if (fault_chain > horizon) {
+        horizon = fault_chain;
+    }
+    if (settle > horizon) {
+        horizon = settle;
+    }
+    return horizon + settle + cfg->election_timeout_max * 4;
+}
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -430,7 +473,12 @@ inline void finalize_committed_log(ClusterRunState* st) {
     st->sched.spawn(detail::settle_and_snapshot(
         st, cfg.settle_ticks * 4, cfg.heartbeat_interval * 2));
 
-    st->sched.run();  // drive to quiescence (no work + no timers) → terminates
+    // Drive to a virtual-time DEADLINE (not quiescence): a real node's perpetual
+    // heartbeat timer never lets run() return, so we run_until() the computed
+    // workload+fault+settle horizon, then STOP (later heartbeats stay pending).
+    // Deterministic: the deadline is a pure fn of cfg, so replays are identical.
+    const Tick deadline = detail::compute_deadline(&cfg);
+    st->sched.run_until(deadline);
 
     // Final snapshot + reconstruct the committed log (cross-check payload).
     detail::snapshot(st);
