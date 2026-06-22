@@ -110,9 +110,10 @@ using core::Offset;
 // ---------------------------------------------------------------------------
 struct SstEntry {
     Key key;
-    Value value;
+    Value value;       // inline value, OR (vlog==true) the encoded VlogPtr
     Seq seq = kNoSeq;
     bool tombstone = false;
+    bool vlog = false;  // WiscKey large-value separation: `value` is a VlogPtr
 };
 
 // Fixed framing constants — the on-disk contract.
@@ -346,7 +347,11 @@ private:
         put_u32(out, static_cast<std::uint32_t>(e.key.size()));
         put_u32(out, static_cast<std::uint32_t>(e.value.size()));
         put_u64(out, e.seq);
-        out.push_back(static_cast<std::byte>(e.tombstone ? 1u : 0u));
+        // flags byte: bit0 = tombstone, bit1 = vlog-pointer (WiscKey). bit0 alone
+        // is the legacy 0/1 tomb encoding, so this stays backward-compatible.
+        const std::uint8_t flags =
+            static_cast<std::uint8_t>((e.tombstone ? 1u : 0u) | (e.vlog ? 2u : 0u));
+        out.push_back(static_cast<std::byte>(flags));
         append_bytes(out, e.key);
         append_bytes(out, e.value);
     }
@@ -387,8 +392,9 @@ public:
     struct Hit {
         bool covered = false;
         bool tombstone = false;
-        Value value;
+        Value value;       // inline value, OR (vlog==true) the encoded VlogPtr
         Seq seq = kNoSeq;
+        bool vlog = false;  // WiscKey: `value` is a VlogPtr — the caller derefs
     };
 
     [[nodiscard]] Hit lookup(const Key& key, Seq at) const {
@@ -437,8 +443,9 @@ public:
     // merges across tables + the memtable picking the newest seq per key.
     struct ScanCand {
         Seq seq = kNoSeq;
-        Value value;
+        Value value;       // inline value, OR (vlog==true) the encoded VlogPtr
         bool tombstone = false;
+        bool vlog = false;  // WiscKey: `value` is a VlogPtr — the caller derefs
     };
     void scan_into(const Key& lo, const Key& hi, Seq at, bool hi_unbounded,
                    std::vector<std::pair<Key, ScanCand>>& acc) const {
@@ -453,7 +460,7 @@ public:
                 if (!hi_unbounded && !(e.key < hi)) {
                     continue;
                 }
-                acc.emplace_back(e.key, ScanCand{e.seq, e.value, e.tombstone});
+                acc.emplace_back(e.key, ScanCand{e.seq, e.value, e.tombstone, e.vlog});
             }
         }
     }
@@ -513,6 +520,7 @@ private:
                 hit.seq = e.seq;
                 hit.tombstone = e.tombstone;
                 hit.value = e.value;
+                hit.vlog = e.vlog;
             }
         }
     }
@@ -776,7 +784,7 @@ private:
             const std::uint32_t klen = get_u32(dp.data() + pos);
             const std::uint32_t vlen = get_u32(dp.data() + pos + 4);
             const std::uint64_t seq = get_u64(dp.data() + pos + 8);
-            const std::uint8_t tomb = std::to_integer<std::uint8_t>(dp[pos + 16]);
+            const std::uint8_t flags = std::to_integer<std::uint8_t>(dp[pos + 16]);
             pos += 17;
             const std::uint64_t body = static_cast<std::uint64_t>(klen) + vlen;
             if (pos + body > dp.size()) {
@@ -784,7 +792,8 @@ private:
             }
             SstEntry e;
             e.seq = seq;
-            e.tombstone = (tomb == 1);
+            e.tombstone = (flags & 1u) != 0u;
+            e.vlog = (flags & 2u) != 0u;
             e.key.assign(reinterpret_cast<const char*>(dp.data() + pos), klen);
             e.value.assign(reinterpret_cast<const char*>(dp.data() + pos + klen), vlen);
             pos += static_cast<std::size_t>(body);

@@ -94,6 +94,7 @@
 #include <lockstep/storage/Codec.hpp>
 #include <lockstep/storage/Engine.hpp>
 #include <lockstep/storage/SSTable.hpp>
+#include <lockstep/storage/ValueLog.hpp>
 
 namespace lockstep::storage {
 
@@ -117,8 +118,9 @@ using core::Scheduler;
 struct WalRecord {
     Seq seq = kNoSeq;
     Key key;
-    Value value;
+    Value value;       // inline value, OR (when vlog==true) the encoded VlogPtr
     bool tombstone = false;
+    bool vlog = false;  // WiscKey: `value` holds a 16-byte VlogPtr, not the value
 };
 
 // The fixed framing constants (the on-disk contract).
@@ -131,7 +133,10 @@ inline constexpr std::size_t kWalCrcBytes = 4;
     std::vector<std::byte> buf;
     buf.reserve(kWalHeaderBytes + r.key.size() + r.value.size() + kWalCrcBytes);
     put_u32(buf, kWalMagic);
-    buf.push_back(static_cast<std::byte>(r.tombstone ? 1u : 0u));
+    // type: 0 = inline put | 1 = del (tombstone) | 2 = put with a vlog pointer
+    // (WiscKey large-value separation — `value` holds a fixed 16-byte VlogPtr).
+    const std::uint8_t type = r.tombstone ? 1u : (r.vlog ? 2u : 0u);
+    buf.push_back(static_cast<std::byte>(type));
     put_u64(buf, r.seq);
     put_u32(buf, static_cast<std::uint32_t>(r.key.size()));
     put_u32(buf, static_cast<std::uint32_t>(r.value.size()));
@@ -170,8 +175,8 @@ struct DecodeResult {
         return dr;  // not a record boundary — corrupt/garbage
     }
     const std::uint8_t type = std::to_integer<std::uint8_t>(p[4]);
-    if (type > 1) {
-        return dr;  // unknown record type — corrupt
+    if (type > 2) {
+        return dr;  // unknown record type — corrupt (0=put,1=del,2=vlog-ptr put)
     }
     const std::uint64_t seq = get_u64(p + 5);
     const std::uint32_t klen = get_u32(p + 13);
@@ -196,6 +201,7 @@ struct DecodeResult {
     WalRecord r;
     r.seq = seq;
     r.tombstone = (type == 1);
+    r.vlog = (type == 2);
     r.key.assign(reinterpret_cast<const char*>(p + kWalHeaderBytes), klen);
     r.value.assign(reinterpret_cast<const char*>(p + kWalHeaderBytes + klen), vlen);
     dr.ok = true;
@@ -212,8 +218,9 @@ class Memtable {
 public:
     struct Version {
         Seq seq = kNoSeq;
-        Value value;
+        Value value;       // inline value, OR (vlog==true) the encoded VlogPtr
         bool tombstone = false;
+        bool vlog = false;  // WiscKey: `value` is a VlogPtr, deref on read
     };
     struct KeyVersions {
         Key key;
@@ -221,9 +228,9 @@ public:
     };
 
     // Insert a version (commit order ⇒ already Seq-ascending append).
-    void insert(const Key& key, Seq seq, Value value, bool tombstone) {
+    void insert(const Key& key, Seq seq, Value value, bool tombstone, bool vlog = false) {
         KeyVersions& kv = versions_for(key);
-        kv.versions.push_back(Version{seq, std::move(value), tombstone});
+        kv.versions.push_back(Version{seq, std::move(value), tombstone, vlog});
     }
 
     // MVCC read: newest version of key with seq <= at; ∅ if none or it is a
@@ -243,8 +250,9 @@ public:
     struct Hit {
         bool covered = false;
         bool tombstone = false;
-        Value value;
+        Value value;       // inline value, OR (vlog==true) the encoded VlogPtr
         Seq seq = kNoSeq;
+        bool vlog = false;  // WiscKey: `value` is a VlogPtr — the caller derefs
     };
     [[nodiscard]] Hit lookup_hit(const Key& key, Seq at) const {
         Hit hit;
@@ -267,6 +275,7 @@ public:
         hit.tombstone = newest->tombstone;
         hit.value = newest->value;
         hit.seq = newest->seq;
+        hit.vlog = newest->vlog;
         return hit;
     }
 
@@ -377,6 +386,30 @@ public:
     // `n` (n>=2), the next flush merges them all into one. 0 disables compaction.
     void set_compaction_trigger(std::size_t n) noexcept { compaction_trigger_ = n; }
 
+    // Enable WiscKey LARGE-VALUE SEPARATION (C3.6): a value whose byte length is
+    // STRICTLY GREATER than `threshold` is written to the value log and the LSM
+    // stores only a 16-byte pointer. `vlog_base_id` is the IDiskFactory id of the
+    // FIRST vlog generation (compaction rewrites live values into the NEXT id and
+    // reclaims the old one); it lives in a disjoint id range from SSTable ids so
+    // the two never collide on the factory. threshold 0 disables separation (every
+    // value stays inline — the pre-WiscKey behaviour). Requires LSM mode (factory).
+    void set_value_log(std::size_t threshold,
+                       std::uint64_t vlog_base_id = kDefaultVlogBaseId) noexcept {
+        value_threshold_ = threshold;
+        vlog_base_id_ = vlog_base_id;
+        if (vlog_gen_ < vlog_base_id_) {
+            vlog_gen_ = vlog_base_id_;
+        }
+    }
+
+    // The id range vlogs occupy on the IDiskFactory — high so it never collides
+    // with SSTable ids (which start at 0). A test's fingerprint/reclaim covers it.
+    static constexpr std::uint64_t kDefaultVlogBaseId = 1ull << 32;
+
+    // Bounded retries for a TRANSIENT vlog read io-fault (a durable value that the
+    // sim's per-op fault coin flipped). The durable bytes exist; a retry resolves.
+    static constexpr int kVlogReadRetries = 32;
+
     // Set the GC READ WATERMARK (V-GC): the oldest live snapshot Seq — no live
     // snapshot reads as-of a version below this. Compaction may then drop any
     // version of a key that is shadowed by a newer version with seq <= watermark
@@ -409,44 +442,61 @@ public:
         // SSTables hold older flushed versions. We find the newest version with
         // seq <= snap.at across BOTH, memtable first then SSTables newest→oldest.
         // The first source that COVERS the key with the highest such seq wins.
-        // V-SNAP: never a version > snap.at; pure fn of (key, at).
+        // V-SNAP: never a version > snap.at; pure fn of (key, at). WiscKey: when the
+        // winning version is a vlog-pointer, DEREF it against the vlog (async read +
+        // CRC verify) — so get() is a coroutine on the scheduler.
         Promise<std::optional<Value>> p = make_promise<std::optional<Value>>(sched_);
         Future<std::optional<Value>> f = p.get_future();
+        sched_->spawn(get_task(std::move(p), std::move(key), snap.at));
+        return f;
+    }
 
-        // Find the version with the MAXIMUM seq <= snap.at across the memtable AND
-        // every SSTable, and use it. We do NOT assume "memtable is always newest":
-        // after a crash, a lying-fsync-truncated WAL can leave the memtable holding
-        // an OLDER version than a durably-installed SSTable holds for the same key.
-        // So the read MERGES BY SEQ — the highest qualifying seq wins (it is the
-        // true newest version <= at), then a tombstone at that seq ⇒ ∅. (In normal
-        // operation the memtable IS newest, so this still picks it.)
+    core::Task get_task(Promise<std::optional<Value>> p, Key key, Seq at) {
+        // Find the version with the MAXIMUM seq <= at across the memtable AND every
+        // SSTable. We do NOT assume "memtable is always newest": after a crash a
+        // lying-fsync-truncated WAL can leave the memtable holding an OLDER version
+        // than a durably-installed SSTable for the same key. So merge BY SEQ — the
+        // highest qualifying seq wins; a tombstone at that seq ⇒ ∅.
         Seq best_seq = kNoSeq;
         bool best_tomb = false;
+        bool best_vlog = false;
         Value best_val;
         bool found = false;
 
-        const Memtable::Hit mh = mem_.lookup_hit(key, snap.at);
+        const Memtable::Hit mh = mem_.lookup_hit(key, at);
         if (mh.covered && (!found || mh.seq >= best_seq)) {
             best_seq = mh.seq;
             best_tomb = mh.tombstone;
+            best_vlog = mh.vlog;
             best_val = mh.value;
             found = true;
         }
         for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
-            const SSTableReader::Hit h = sst->lookup(key, snap.at);
+            const SSTableReader::Hit h = sst->lookup(key, at);
             if (h.covered && (!found || h.seq >= best_seq)) {
                 best_seq = h.seq;
                 best_tomb = h.tombstone;
+                best_vlog = h.vlog;
                 best_val = h.value;
                 found = true;
             }
         }
         if (!found || best_tomb) {
             p.set_value(std::nullopt);
-        } else {
-            p.set_value(std::optional<Value>(best_val));
+            co_return;
         }
-        return f;
+        if (best_vlog) {
+            // Deref the pointer against its vlog generation (CRC-verified). A
+            // pointer that fails to resolve at READ time means the value was lost —
+            // but at read time (post-recovery) a resolvable prefix has already been
+            // established, so a live pointer always resolves. We still never
+            // fabricate: a failed deref returns ∅ rather than garbage (V-NOTORN).
+            const std::optional<Value> v = co_await deref_value(best_val);
+            p.set_value(v);
+            co_return;
+        }
+        p.set_value(std::optional<Value>(best_val));
+        co_return;
     }
 
     [[nodiscard]] Future<Snapshot> snapshot() override {
@@ -457,44 +507,150 @@ public:
     }
 
     [[nodiscard]] Future<Error> sync() override {
-        // The durability barrier: forward to the disk. After ok, every record
-        // appended before this survives a crash (V-DUR). A lying fsync keeps a
-        // tail un-durable — lost on crash, never fabricated (V-PREFIX).
-        return disk_->sync();
+        // The durability barrier (V-DUR). WiscKey: a large-value commit wrote the
+        // value to the vlog AND a pointer to the WAL — BOTH must be made durable by
+        // the same barrier, so sync the active vlog FIRST (value before pointer in
+        // durability order), then the WAL. After ok, every committed record + its
+        // referenced value survives a crash. A lying fsync keeps a tail un-durable
+        // (lost on crash, never fabricated — V-PREFIX); recovery's deref catches a
+        // pointer whose vlog tail was dropped and stops the prefix there.
+        if (!value_log_active()) {
+            return disk_->sync();
+        }
+        Promise<Error> p = make_promise<Error>(sched_);
+        Future<Error> f = p.get_future();
+        sched_->spawn(sync_task(std::move(p)));
+        return f;
+    }
+
+    core::Task sync_task(Promise<Error> p) {
+        IDisk& vdisk = factory_->disk_for(vlog_gen_);
+        const Error ve = co_await vdisk.sync();
+        const Error we = co_await disk_->sync();
+        // Surface the first error (WAL durability is the headline barrier). Both
+        // being ok is the common case; a lying/io fault on either is reported.
+        p.set_value(ve.ok() ? we : ve);
+        co_return;
+    }
+
+    // WiscKey is active iff a positive threshold AND an LSM factory are present.
+    [[nodiscard]] bool value_log_active() const noexcept {
+        return value_threshold_ > 0 && factory_ != nullptr;
+    }
+
+    // Dereference a vlog-pointer (the encoded VlogPtr held as `ptr_bytes`) against
+    // its generation's vlog disk. Reads ONLY the pointed-at record window and CRC-
+    // verifies it; returns ∅ (never garbage) on a bad pointer / torn / missing
+    // region (V-NOTORN). Async: reads via IDisk. Holds no container ref across the
+    // await — `ptr_bytes` + the read buffer are owned locals (V-RKV1).
+    core::Future<std::optional<Value>> deref_value(Value ptr_bytes) {
+        Promise<std::optional<Value>> p = make_promise<std::optional<Value>>(sched_);
+        Future<std::optional<Value>> f = p.get_future();
+        sched_->spawn(deref_task(std::move(p), std::move(ptr_bytes)));
+        return f;
+    }
+
+    // True iff EVERY vlog-pointer entry in `reader` resolves (CRC-verified) against
+    // its vlog generation. Used at recovery to reject an SSTable whose values did
+    // not durably survive (a dangling pointer ⇒ not a valid prefix). Async (reads).
+    core::Future<bool> sstable_vlog_pointers_resolve(const SSTableReader& reader) {
+        Promise<bool> p = make_promise<bool>(sched_);
+        Future<bool> f = p.get_future();
+        std::vector<SstEntry> entries;
+        reader.collect_entries(entries);
+        sched_->spawn(verify_vlog_task(std::move(p), std::move(entries)));
+        return f;
+    }
+
+    core::Task verify_vlog_task(Promise<bool> p, std::vector<SstEntry> entries) {
+        for (const SstEntry& e : entries) {
+            if (!e.vlog) {
+                continue;
+            }
+            const Value ptr_bytes = e.value;  // owned copy (V-RKV1)
+            const std::optional<Value> v = co_await deref_value(ptr_bytes);
+            if (!v.has_value()) {
+                p.set_value(false);
+                co_return;
+            }
+        }
+        p.set_value(true);
+        co_return;
+    }
+
+    core::Task deref_task(Promise<std::optional<Value>> p, Value ptr_bytes) {
+        VlogPtr ptr;
+        if (factory_ == nullptr || !VlogPtr::decode(ptr_bytes, ptr) ||
+            ptr.value_off < kVlogRecordHeaderBytes) {
+            p.set_value(std::nullopt);
+            co_return;
+        }
+        // The record spans [value_off - header, value_off + vlen + crc). Read just
+        // that window from the pointer's generation disk and verify locally.
+        const std::uint64_t rec_off = ptr.value_off - kVlogRecordHeaderBytes;
+        const std::size_t rec_len =
+            kVlogRecordHeaderBytes + static_cast<std::size_t>(ptr.vlen) + kVlogCrcBytes;
+        std::vector<std::byte> buf(rec_len);
+        IDisk& vdisk = factory_->disk_for(ptr.gen);
+        // A TRANSIENT read io-fault (the sim's per-op coin flip) does NOT mean the
+        // value is absent — the durable bytes are there; the read just faulted.
+        // RETRY (bounded) so a transient fault never fabricates an absence. A
+        // NotFound (region past the durable end) or Corruption (bit-rot) is NOT
+        // transient → return ∅ (never a fabricated value, V-NOTORN). The bound is
+        // generous; with a finite fault probability a retry resolves deterministically.
+        Error re{};
+        for (int attempt = 0; attempt < kVlogReadRetries; ++attempt) {
+            re = co_await vdisk.read(rec_off, std::span<std::byte>(buf.data(), buf.size()));
+            if (re.ok() || re.code != ErrorCode::IoFault) {
+                break;  // success, or a non-transient error — stop retrying.
+            }
+        }
+        if (!re.ok()) {
+            p.set_value(std::nullopt);  // past-end / corruption / persistent fault — never fabricate.
+            co_return;
+        }
+        // Re-base the pointer to offset 0 within the read window and verify.
+        VlogPtr local = ptr;
+        local.value_off = kVlogRecordHeaderBytes;
+        p.set_value(vlog_deref(buf, local));
+        co_return;
     }
 
     [[nodiscard]] Future<std::vector<KeyValue>> scan(Range range, Snapshot snap) override {
         // LSM range read (§1/§5): merge the memtable + every SSTable at the
         // snapshot, newest-version-per-key, dropping tombstones, key-ascending.
-        // All sources are in-memory after load → no await. Pure fn of (range, at).
+        // WiscKey: a surviving entry that is a vlog-pointer is DEREF'd (async), so
+        // scan is a coroutine on the scheduler.
         Promise<std::vector<KeyValue>> p = make_promise<std::vector<KeyValue>>(sched_);
         Future<std::vector<KeyValue>> f = p.get_future();
+        sched_->spawn(scan_task(std::move(p), std::move(range), snap.at));
+        return f;
+    }
 
-        // Collect, per key, the NEWEST (seq, value, tombstone) with seq <= at,
-        // across the memtable and all SSTables. The memtable + a later-installed
-        // SSTable both supply candidates; we keep the highest seq per key.
+    core::Task scan_task(Promise<std::vector<KeyValue>> p, Range range, Seq at) {
+        // Collect, per key, the NEWEST (seq, value, tombstone, vlog) with seq <= at,
+        // across the memtable and all SSTables, keeping the highest seq per key.
         struct Best {
             Seq seq = kNoSeq;
             Value value;
             bool tombstone = false;
+            bool vlog = false;
             bool present = false;
         };
-        // Keep candidates in a sorted vector keyed by Key (deterministic, no hash).
-        std::vector<std::pair<Key, Best>> merged;
-        auto offer = [&](const Key& k, Seq s, const Value& v, bool tomb) {
-            // Insert/merge in sorted position; keep the highest seq.
+        std::vector<std::pair<Key, Best>> merged;  // sorted-by-Key (deterministic)
+        auto offer = [&](const Key& k, Seq s, const Value& v, bool tomb, bool vl) {
             std::size_t i = 0;
             while (i < merged.size() && merged[i].first < k) {
                 ++i;
             }
             if (i < merged.size() && merged[i].first == k) {
                 if (s >= merged[i].second.seq) {
-                    merged[i].second = Best{s, v, tomb, true};
+                    merged[i].second = Best{s, v, tomb, vl, true};
                 }
                 return;
             }
             merged.insert(merged.begin() + static_cast<std::ptrdiff_t>(i),
-                          std::pair<Key, Best>{k, Best{s, v, tomb, true}});
+                          std::pair<Key, Best>{k, Best{s, v, tomb, vl, true}});
         };
 
         auto in_range = [&](const Key& k) {
@@ -507,35 +663,46 @@ public:
             return true;
         };
 
-        // Memtable candidates: for each key, its newest version <= at.
         for (const Memtable::KeyVersions& kv : mem_.keys()) {
             if (!in_range(kv.key)) {
                 continue;
             }
-            const Memtable::Hit h = mem_.lookup_hit(kv.key, snap.at);
+            const Memtable::Hit h = mem_.lookup_hit(kv.key, at);
             if (h.covered) {
-                offer(kv.key, h.seq, h.value, h.tombstone);
+                offer(kv.key, h.seq, h.value, h.tombstone, h.vlog);
             }
         }
-        // SSTable candidates (each contributes every entry in range <= at; the
-        // offer() merge keeps the newest seq per key across all sources).
         for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
             std::vector<std::pair<Key, SSTableReader::ScanCand>> acc;
             const Key hi = range.hi_unbounded ? Key{} : range.hi;
-            sst->scan_into(range.lo, hi, snap.at, range.hi_unbounded, acc);
+            sst->scan_into(range.lo, hi, at, range.hi_unbounded, acc);
             for (const auto& c : acc) {
-                offer(c.first, c.second.seq, c.second.value, c.second.tombstone);
+                offer(c.first, c.second.seq, c.second.value, c.second.tombstone,
+                      c.second.vlog);
             }
         }
 
+        // Materialise the surviving live values (deref vlog pointers). We DON'T hold
+        // a reference into `merged` across the await — copy the pointer bytes out
+        // first (V-RKV1); `merged` is not mutated during the deref loop anyway.
         std::vector<KeyValue> out;
-        for (const auto& m : merged) {
-            if (m.second.present && !m.second.tombstone) {
-                out.emplace_back(m.first, m.second.value);
+        for (std::size_t i = 0; i < merged.size(); ++i) {
+            if (!merged[i].second.present || merged[i].second.tombstone) {
+                continue;
+            }
+            if (merged[i].second.vlog) {
+                const Value ptr_bytes = merged[i].second.value;  // owned copy
+                const Key k = merged[i].first;                   // owned copy
+                const std::optional<Value> v = co_await deref_value(ptr_bytes);
+                if (v.has_value()) {
+                    out.emplace_back(k, *v);
+                }
+            } else {
+                out.emplace_back(merged[i].first, merged[i].second.value);
             }
         }
         p.set_value(std::move(out));
-        return f;
+        co_return;
     }
 
     // ---- crash recovery (C3.8) — sim-only entry, not part of Engine.hpp -----
@@ -625,11 +792,41 @@ private:
     }
 
     core::Task commit_task(Promise<Seq> p, Seq seq, Key key, Value value, bool tombstone) {
+        // WiscKey LARGE-VALUE SEPARATION (C3.6): if value-log is enabled and this
+        // is a put of a value STRICTLY LONGER than the threshold, append the value
+        // to the active vlog generation FIRST (so its durability shares this
+        // commit's sync barrier — V-DUR), then store only the 16/24-byte pointer in
+        // the WAL record + memtable. The vlog append precedes the WAL append, so on
+        // the durable image the value bytes sit before the pointer that references
+        // them; recovery derefs the pointer and drops any commit whose vlog region
+        // did not survive (V-NOTORN). A small value or a tombstone stays inline.
+        bool is_vlog = false;
+        Value stored = value;  // what the LSM stores: inline value OR the pointer
+        if (!tombstone && value_log_active() && value.size() > value_threshold_) {
+            IDisk& vdisk = factory_->disk_for(vlog_gen_);
+            const VlogEncoded enc =
+                encode_vlog_record(value, vlog_len_, vlog_gen_);
+            Offset voff = 0;
+            const Error ve = co_await vdisk.append(
+                std::span<const std::byte>(enc.bytes.data(), enc.bytes.size()), voff);
+            if (ve.ok()) {
+                // The append landed (possibly torn — recovery's CRC catches a torn
+                // tail; the in-memory pointer below still resolves pre-crash). Track
+                // the logical vlog length so the next record's base_off is correct.
+                vlog_len_ += enc.bytes.size();
+                stored = enc.ptr.encode();
+                is_vlog = true;
+            }
+            // On an io-fault the vlog append had NO effect (no bytes); fall back to
+            // storing the value INLINE so the commit is still correct + durable.
+        }
+
         WalRecord rec;
         rec.seq = seq;
         rec.tombstone = tombstone;
+        rec.vlog = is_vlog;
         rec.key = key;            // keep a copy for the post-await memtable insert
-        rec.value = value;
+        rec.value = stored;
         const std::vector<std::byte> bytes = encode_record(rec);
 
         Offset off = 0;
@@ -641,7 +838,7 @@ private:
                   // commit, and a crash before sync drops it cleanly (V-PREFIX).
 
         // Insert AFTER the await — we held no memtable reference across it.
-        mem_.insert(key, seq, std::move(value), tombstone);
+        mem_.insert(key, seq, std::move(stored), tombstone, is_vlog);
 
         // Flush BEFORE returning the commit Seq if the memtable is over the
         // threshold AND we are in LSM mode. Flush is crash-safe (atomic-install
@@ -695,11 +892,27 @@ private:
         if (manifest_disk_ == nullptr || factory_ == nullptr || mem_.empty()) {
             co_return;
         }
+        // WiscKey: the memtable versions we are about to flush may carry vlog
+        // pointers into the ACTIVE write generation whose value bytes are still
+        // staged/lying. The SSTable we install must NOT reference a non-durable
+        // vlog region (else a crash leaves a DANGLING pointer that reads ∅ where a
+        // committed value should be — a prefix violation). So make the active vlog
+        // DURABLE before the SSTable is installed (value before pointer, V-NOTORN).
+        // A lying/io fault here aborts the flush (the data stays in memtable + WAL).
+        if (value_log_active() && vlog_len_ > 0) {
+            IDisk& vdisk = factory_->disk_for(vlog_gen_);
+            const Error vse = co_await vdisk.sync();
+            if (!vse.ok()) {
+                co_return;
+            }
+        }
         // (1) snapshot the memtable → entries (key-asc, seq-asc — its native order).
         std::vector<SstEntry> entries;
         for (const Memtable::KeyVersions& kv : mem_.keys()) {
             for (const Memtable::Version& v : kv.versions) {
-                entries.push_back(SstEntry{kv.key, v.value, v.seq, v.tombstone});
+                // Carry the WiscKey vlog flag so a separated value's POINTER (not
+                // the value) is what flushes to the SSTable (no value rewrite).
+                entries.push_back(SstEntry{kv.key, v.value, v.seq, v.tombstone, v.vlog});
             }
         }
         if (entries.empty()) {
@@ -802,14 +1015,28 @@ private:
 
         // (2) k-way merge + version GC under the watermark. The watermark is the
         // oldest live snapshot Seq; below-shadowed versions are dropped (V-GC).
-        const std::vector<SstEntry> merged = compact_merge(runs, read_watermark_);
+        std::vector<SstEntry> merged = compact_merge(runs, read_watermark_);
+
+        // (2b) WiscKey VLOG GC (V-GC for values): the version GC above already
+        // dropped dead LSM entries; their large values in the OLD vlog generations
+        // are now garbage. Rewrite the SURVIVING vlog-pointer values into a FRESH
+        // vlog generation and re-point the merged entries at it. After the merged
+        // SSTable + this fresh vlog are durable and the inputs obsoleted, the OLD
+        // input vlog generations hold ONLY dead values → reclaimable. (Conservative
+        // + correct: we never drop a generation the active WRITE log or a surviving
+        // SSTable/WAL prefix still references — see reclaim filter below.)
+        std::vector<std::uint64_t> reclaim_gens;
+        if (value_log_active()) {
+            co_await rewrite_vlog_for_compaction(merged, reclaim_gens);
+        }
+
         if (merged.empty()) {
             // GC dropped everything (e.g. a single tombstone fully below the
             // watermark). We still must obsolete the inputs to reclaim them, but
             // there is no merged SSTable to install. Handle by obsoleting only.
             co_await obsolete_and_truncate(input_ids, /*new_id_present=*/false,
                                            /*new_id=*/0, /*new_reader=*/nullptr,
-                                           covered_max);
+                                           covered_max, reclaim_gens);
             co_return;
         }
 
@@ -860,19 +1087,119 @@ private:
 
         // (5)+(6) obsolete the inputs + raise the WAL-truncation watermark.
         co_await obsolete_and_truncate(input_ids, /*new_id_present=*/true, new_id,
-                                       std::move(new_reader), covered_max);
+                                       std::move(new_reader), covered_max, reclaim_gens);
+        co_return;
+    }
+
+    // ---- WiscKey VLOG GC: rewrite live values into a fresh generation -----------
+    //
+    // For every SURVIVING entry in `merged` that is a vlog-pointer, read its value
+    // from the OLD generation, append it to a FRESH vlog generation, and re-point
+    // the entry at the new generation. Sync the fresh vlog so its values are durable
+    // BEFORE the merged SSTable that references them is installed (durability order:
+    // value before pointer, V-NOTORN). The set of OLD input generations no longer
+    // referenced by any SURVIVING source becomes reclaimable (returned in
+    // `reclaim_gens`); the active WRITE generation is never reclaimed (the memtable
+    // tail + un-truncated WAL prefix may still point into it). A read fault on an
+    // old value is conservative: we KEEP the old pointer (do not rewrite) so the
+    // value is never dropped — that generation then stays referenced + is NOT
+    // reclaimed (no silent loss).
+    core::Task rewrite_vlog_for_compaction(std::vector<SstEntry>& merged,
+                                           std::vector<std::uint64_t>& reclaim_gens) {
+        // Gather the OLD generations referenced by the surviving entries.
+        std::vector<std::uint64_t> old_gens;
+        bool any_vlog = false;
+        for (const SstEntry& e : merged) {
+            if (!e.vlog) {
+                continue;
+            }
+            any_vlog = true;
+            VlogPtr ptr;
+            if (VlogPtr::decode(e.value, ptr)) {
+                bool seen = false;
+                for (std::uint64_t g : old_gens) {
+                    if (g == ptr.gen) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    old_gens.push_back(ptr.gen);
+                }
+            }
+        }
+        if (!any_vlog) {
+            co_return;  // nothing separated — pure-inline compaction.
+        }
+
+        // Allocate a fresh generation for the rewritten live values.
+        const std::uint64_t fresh_gen = vlog_base_id_ + (++vlog_gen_counter_);
+        IDisk& fresh = factory_->disk_for(fresh_gen);
+        std::uint64_t fresh_len = 0;
+        bool kept_an_old_gen = false;  // a deref failure forced us to keep an old ptr
+
+        for (SstEntry& e : merged) {
+            if (!e.vlog) {
+                continue;
+            }
+            // Deref the old value (owned copy of the pointer bytes — V-RKV1).
+            const Value old_ptr_bytes = e.value;
+            const std::optional<Value> v = co_await deref_value(old_ptr_bytes);
+            if (!v.has_value()) {
+                // Could not read the old value (io-fault). KEEP the old pointer so
+                // the value is never lost; its generation stays referenced.
+                kept_an_old_gen = true;
+                continue;
+            }
+            // Append the value to the fresh generation; re-point the entry.
+            const VlogEncoded enc = encode_vlog_record(*v, fresh_len, fresh_gen);
+            Offset voff = 0;
+            const Error ae = co_await fresh.append(
+                std::span<const std::byte>(enc.bytes.data(), enc.bytes.size()), voff);
+            if (!ae.ok()) {
+                kept_an_old_gen = true;  // keep old pointer; do not lose the value.
+                continue;
+            }
+            fresh_len += enc.bytes.size();
+            e.value = enc.ptr.encode();
+        }
+        // Make the fresh vlog durable BEFORE the merged SSTable install references it.
+        const Error fse = co_await fresh.sync();
+        if (!fse.ok()) {
+            // The fresh vlog did not durably land. We cannot safely re-point; the
+            // merged entries we already re-pointed would dangle. Abort the rewrite:
+            // restore is impossible here, so conservatively reclaim NOTHING and let
+            // the next compaction retry. (The merged entries still point at the
+            // fresh gen in memory; but since we reclaim nothing AND the SSTable
+            // install is yet to come, a crash drops the half state — old set stays.)
+            co_return;
+        }
+
+        // Old input generations are reclaimable iff NOT the active write generation
+        // (the memtable tail / un-truncated WAL may still reference it) AND we did
+        // not have to keep an old pointer for them. Conservative: if any deref/append
+        // failed we reclaim nothing this round (a later compaction retries).
+        if (!kept_an_old_gen) {
+            for (std::uint64_t g : old_gens) {
+                if (g != vlog_gen_) {
+                    reclaim_gens.push_back(g);
+                }
+            }
+        }
         co_return;
     }
 
     // Append OBSOLETE records for each input id, then a WAL-TRUNCATE record, each
     // CRC'd + entry_no-contiguous + synced. On success swap the in-memory live set
     // (drop obsoleted readers, add the merged reader if present), reclaim the old
-    // disks, and raise wal_trunc_seq_. A failure mid-way leaves a valid recoverable
-    // prefix (the manifest fold tolerates a partial obsolete suffix — see recovery).
+    // disks (+ reclaimable vlog generations), and raise wal_trunc_seq_. A failure
+    // mid-way leaves a valid recoverable prefix (the manifest fold tolerates a
+    // partial obsolete suffix — see recovery).
     core::Task obsolete_and_truncate(std::vector<std::uint64_t> input_ids,
                                      bool new_id_present, std::uint64_t new_id,
                                      std::unique_ptr<SSTableReader> new_reader,
-                                     Seq covered_max) {
+                                     Seq covered_max,
+                                     std::vector<std::uint64_t> reclaim_gens) {
         for (std::uint64_t oid : input_ids) {
             const std::vector<std::byte> ob =
                 encode_manifest_obsolete(++manifest_tip_, oid);
@@ -937,6 +1264,17 @@ private:
         }
         sstables_ = std::move(kept);
         (void)new_id;
+
+        // WiscKey VLOG GC: reclaim the OLD vlog generations now superseded by the
+        // fresh rewrite. Safe ONLY here — after the merged SSTable INSTALL, the
+        // input OBSOLETEs, AND the WAL-TRUNCATE are all durable: no surviving
+        // SSTable, no un-truncated WAL prefix, and not the active write log
+        // references them, so they hold only dead values. A crash BEFORE this
+        // point leaves them intact (recovery re-reads them via the old pointers).
+        for (std::uint64_t g : reclaim_gens) {
+            reclaimed_vlog_ids_.push_back(g);
+            factory_->reclaim(g);  // free the dead vlog generation's bytes.
+        }
         co_return;
     }
 
@@ -951,6 +1289,16 @@ private:
 
         wal_trunc_seq_ = kNoSeq;
         obsoleted_ids_.clear();
+
+        // WiscKey: start the post-recovery WRITE generation FRESH (past every used
+        // generation) so new appends never land inside a partially-durable old vlog
+        // (offset confusion). Old generations stay on their disks + readable via the
+        // self-identifying pointer.gen for already-committed pointers. The recovered
+        // active write log begins empty (vlog_len_ = 0).
+        if (value_log_active()) {
+            vlog_gen_ = vlog_base_id_ + (++vlog_gen_counter_);
+            vlog_len_ = 0;
+        }
 
         // (0) LSM: FOLD the append-only manifest to compute the LIVE SSTable set +
         // the WAL-truncation watermark, THEN load the survivors. The manifest mixes
@@ -1030,6 +1378,17 @@ private:
             if (!lerr.ok()) {
                 break;
             }
+            // WiscKey: an installed SSTable may carry vlog pointers whose value
+            // bytes did NOT durably survive (a lying-fsync dropped the vlog tail
+            // BEFORE the flush, or a vlog generation was lost). A pointer that does
+            // not resolve means that committed version is NOT durable → the SSTable
+            // is not a valid prefix. REJECT it (Seq-contiguity at SSTable grain): its
+            // data, if it predates the crash, is still in the WAL prefix (replayed
+            // with the SAME deref discipline). Never advance the tip past a dangling
+            // pointer (that would leave a hole below the tip — a V-PREFIX violation).
+            if (value_log_active() && !(co_await sstable_vlog_pointers_resolve(*reader))) {
+                break;
+            }
             if (reader->max_seq > last_seq_) {
                 last_seq_ = reader->max_seq;
             }
@@ -1100,8 +1459,23 @@ private:
             if (dr.record.seq != expect) {
                 break;
             }
+            // WiscKey CRASH DISCIPLINE (V-NOTORN / V-PREFIX — the crux): a record
+            // that carries a vlog POINTER is part of the prefix ONLY IF its value
+            // durably survived in the vlog. The vlog append+sync shares this
+            // commit's barrier, so the value bytes should be durable BEFORE the
+            // WAL pointer is. If the pointer does NOT resolve (vlog region torn /
+            // lying-fsync-dropped / past the durable end / CRC-mismatch), the
+            // commit was NOT fully durable → it is NOT part of the recovered prefix.
+            // We treat it EXACTLY like a corrupt WAL record: STOP here. A torn/
+            // missing vlog region can therefore never resolve to a fabricated value.
+            if (dr.record.vlog) {
+                const std::optional<Value> v = co_await deref_value(dr.record.value);
+                if (!v.has_value()) {
+                    break;  // pointer's value not durable → prefix ends here.
+                }
+            }
             mem_.insert(dr.record.key, dr.record.seq, dr.record.value,
-                        dr.record.tombstone);
+                        dr.record.tombstone, dr.record.vlog);
             // The WAL prefix extends the tip; never lower it below an installed
             // SSTable's max (the WAL replays from seq 1 upward, SSTable seqs may
             // already have raised last_seq_ above the current WAL position).
@@ -1133,6 +1507,24 @@ private:
     Seq read_watermark_ = kNoSeq;             // oldest live snapshot Seq (V-GC bound)
     Seq wal_trunc_seq_ = kNoSeq;              // WAL records <= this are SSTable-covered
     std::vector<std::uint64_t> obsoleted_ids_;  // backings reclaimed by compaction
+
+    // ---- WiscKey value-log (C3.6) state -----------------------------------
+    std::size_t value_threshold_ = 0;          // value len > this ⇒ separated (0=off)
+    std::uint64_t vlog_base_id_ = kDefaultVlogBaseId;  // factory id base for vlogs
+    std::uint64_t vlog_gen_ = kDefaultVlogBaseId;      // active WRITE generation id
+    std::uint64_t vlog_len_ = 0;               // logical len of the active vlog
+    std::uint64_t vlog_gen_counter_ = 0;     // monotonic vlog generation allocator
+    std::vector<std::uint64_t> reclaimed_vlog_ids_;    // vlog generations reclaimed by GC
+
+public:
+    // ---- WiscKey introspection (tests / fingerprints; never used for ordering) --
+    // The active write generation id + its logical length (the active vlog metric).
+    [[nodiscard]] std::uint64_t vlog_active_gen() const noexcept { return vlog_gen_; }
+    [[nodiscard]] std::uint64_t vlog_active_len() const noexcept { return vlog_len_; }
+    // Vlog generations reclaimed by compaction GC (the disk-GC proof for values).
+    [[nodiscard]] const std::vector<std::uint64_t>& reclaimed_vlog_ids() const noexcept {
+        return reclaimed_vlog_ids_;
+    }
 };
 
 }  // namespace lockstep::storage

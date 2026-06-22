@@ -351,6 +351,39 @@ else()
     "storage_compaction_test not built (Phase 3 step 5 pending).")
 endif()
 
+# --- Phase 3 step 6: WiscKey large-value separation ---------------------------
+# P3-WISCKEY gate (specs/storage-engine.md §1/§2/§3/§6 V-NOTORN/V-PREFIX/V-GC;
+# master-plan D4). A value over a size threshold is written ONCE to an append-only
+# VALUE LOG (CRC'd records); the LSM stores only a small {gen,offset,len,crc}
+# pointer. Small values stay inline. Asserts (A) DIFFERENTIAL WITH LARGE VALUES —
+# WalEngine(LSM+WiscKey) vs an INLINE Oracle over a seed sweep on a mixed small/
+# large workload, get+scan, 0 mismatch (the value is identical inline or
+# separated); (B) WRITE-AMP — a compaction of large values writes FAR fewer
+# SSTable bytes than rewriting them inline would (the WiscKey point); (C) CRASH-
+# AROUND-VLOG — crash incl. around the vlog append / between vlog and WAL under the
+# full fault envelope (torn + lying-fsync on WAL + vlog), recover to a valid oracle
+# PREFIX, 0 fabrication, no pointer resolving to a torn/fabricated value
+# (V-NOTORN); (D) determinism — same seed ⇒ byte-identical recovered reads + WAL +
+# SSTable + VLOG on-disk fingerprint (V-DET). Links the header-only storage lib +
+# runtime + sim PRNG + SimDisk. Non-provider TU → forbidden-lint scans it.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_wisckey_test storage_wisckey_test.cpp)
+  target_include_directories(lockstep_storage_wisckey_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_wisckey_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_wisckey_test COMMAND lockstep_storage_wisckey_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_wisckey_test not built (Phase 3 step 6 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
