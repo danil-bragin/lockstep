@@ -224,6 +224,35 @@ else()
     "kv_seedburn_test not built (Phase 2 batch 2 C2.7/C2.8 pending).")
 endif()
 
+# --- Phase 3 step 1: storage differential harness self-test ------------------
+# P3-MACHINERY self-test (specs/storage-engine.md §4/§5 step 1). Proves the
+# storage VERIFICATION MACHINERY before any real engine: the Engine interface
+# seam + trivial Oracle + differential harness. Asserts (a) Oracle-vs-Oracle is an
+# always-match baseline across a seed sweep (the comparator compares), (b) TEETH —
+# deliberately-WRONG engines (off-by-one snapshot bound; a delete that doesn't
+# delete) are FLAGGED with a replayable witness (a harness that passes a known-
+# wrong engine is itself the bug), and (c) the harness is a pure fn of seed
+# (same seed ⇒ byte-identical witness). Links the header-only storage lib + the
+# runtime + sim PRNG (the harness drives the seeded op stream on the scheduler).
+# Non-provider code → forbidden-lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_diff_test storage_diff_test.cpp)
+  target_include_directories(lockstep_storage_diff_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_diff_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_diff_test COMMAND lockstep_storage_diff_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_diff_test not built (Phase 3 step 1 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
