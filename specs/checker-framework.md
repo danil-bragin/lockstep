@@ -70,9 +70,16 @@ KV-register correctness checkers (per key unless noted):
 - V-TOY1: under FULL fault envelope + seed-burn → C-INT, C-MONO, C-LIN, C-DUR hold (or a real bug found & reported reproducibly).
 
 ## §6 Harness-has-teeth (the batch-2 GATE proper)
-- V-TEETH1: feed the checker set a DELIBERATELY-BROKEN counter (e.g. drops an increment on partition, or returns a stale read) → checkers MUST flag it, with witness + replayable seed. A green run on a known-buggy system halts batch 2.
+- V-TEETH1: feed the checker set a DELIBERATELY-BROKEN KV system (e.g. drops a write on partition, serves a stale read, skips the cas compare) via `run_kv_sim_with` → checkers MUST flag it, with witness + replayable seed. A green run on a known-buggy system halts batch 2.
 - V-TEETH2: mutation testing of the harness/checkers themselves passes (the checkers' own tests have teeth).
 - V-TEETH3: every induced failure auto-shrinks (C2.8) to a minimal fault schedule + replays byte-identically.
+
+### §6.1 [DECISION-E RESOLVED — accept non-consensus limit (human gate, 2026-06-22)]
+Toy KV system is non-consensus (spec §5) → inherently non-linearizable under leader failover. ∴ batch-2 honest-system gate:
+- ASSERT (must hold, achievable without consensus): C-DUR durability (post WAL-CRC fix) + C-INT no-fabrication (no INT-1 fabricated value, no DUR-2). A fabrication/durability violation HALTS.
+- TRACK + report reproducibly (⊥ fail the gate): expected failover anomalies — C-LIN non-linearizable, C-MONO read-your-writes, C-INT/INT-2 lost-ack. These are the documented non-consensus limit; real linearizability-under-failover is earned in Phase 4 (consensus).
+- BATCH-2 GATE PROPER = §6 harness-has-teeth (V-TEETH1 buggy-system flagged) + seed reproducibility (V-SEED) + mutation-of-harness (V-TEETH2). NOT honest-system-passes-everything.
+- Found-bug record: WAL torn-value fabrication FIXED (commit per-record CRC-32 + recover-to-prefix); honest sweep C-DUR 4→0, no fabrication. See [[backprop-wal-torn-fabrication]].
 
 ## §7 Seed / replay / shrinking contract
 - V-SEED1: every run logs its seed; one-command replay reproduces byte-identically (extends Phase 1 infra).
