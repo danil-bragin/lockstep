@@ -92,6 +92,27 @@ if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
   endforeach()
 endif()
 
+# --- Phase 2 batch 2 stage A: checker framework + history recorder self-test --
+# B2A FOUNDATION self-test (specs/checker-framework.md §2/§3; briefs/
+# phase2-batch2.md BRIEF B2A). Builds a synthetic history via HistoryRecorder,
+# runs CheckerRunner with the example checkers, asserts verdicts AND determinism
+# (same seed/inputs ⇒ byte-identical history render + verdicts). Links the
+# header-only harness (core::Tick) — no system-under-test (decoupled). Inherits
+# the directory-wide TIMEOUT 90 set below.
+if(TARGET lockstep_harness)
+  add_executable(lockstep_checker_framework_test checker_framework_test.cpp)
+  target_link_libraries(lockstep_checker_framework_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_harness)
+  add_test(NAME checker_framework_test COMMAND lockstep_checker_framework_test)
+else()
+  message(WARNING
+    "lockstep_harness target not found; checker_framework_test not built "
+    "(Phase 2 batch 2 stage A pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
