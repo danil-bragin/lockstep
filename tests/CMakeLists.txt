@@ -315,6 +315,42 @@ else()
     "storage_sstable_test not built (Phase 3 step 4 pending).")
 endif()
 
+# --- Phase 3 step 5: compaction + version GC + WAL truncation -----------------
+# P3-COMPACTION gate (specs/storage-engine.md §2 V-GC/V-PREFIX/V-NOTORN; §3/§6;
+# §5 step 5). Size-tiered compaction k-way-merges the live SSTable set into ONE,
+# dropping versions no live snapshot can see (GC under a watermark), then
+# truncates the WAL prefix the merged set durably covers — all atomic via the
+# append-only, CRC'd, entry_no-contiguous MANIFEST (INSTALL/OBSOLETE/WAL-TRUNCATE
+# records). Asserts (A) DIFFERENTIAL WITH COMPACTION — WalEngine(LSM+compaction)
+# vs Oracle over a seed sweep, get+scan, 0 mismatch (many flushes+compactions);
+# (B) METAMORPHIC — a forced compaction changes no visible get/scan value
+# (compaction ⊥ change reads); (C) GC-SAFETY (V-GC) — a held live snapshot still
+# sees its versions after a watermark-bounded compaction AND dead versions are
+# reclaimed (space drops); (D) CRASH-DURING-COMPACTION — crash incl. mid-
+# compaction under the full fault envelope, recover from the folded manifest live
+# set + WAL prefix to a valid oracle PREFIX, 0 fabrication, no half-/mixed-SSTable
+# loss (V-PREFIX/V-NOTORN, atomic install+obsolete); (E) determinism — same seed
+# ⇒ byte-identical recovered reads + WAL + SSTable on-disk fingerprint (V-DET).
+# Links the header-only storage lib + runtime + sim PRNG + SimDisk. Non-provider
+# TU → forbidden-lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_compaction_test storage_compaction_test.cpp)
+  target_include_directories(lockstep_storage_compaction_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_compaction_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_compaction_test COMMAND lockstep_storage_compaction_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_compaction_test not built (Phase 3 step 5 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never

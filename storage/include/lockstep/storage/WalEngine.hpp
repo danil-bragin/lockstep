@@ -331,6 +331,13 @@ public:
     // Return the IDisk for `sstable_id`, creating it on first request. Stable for
     // the lifetime of the run so recovery re-opens the same backing.
     [[nodiscard]] virtual IDisk& disk_for(std::uint64_t sstable_id) = 0;
+
+    // Reclaim the backing disk for an OBSOLETED SSTable (compaction superseded it;
+    // its manifest OBSOLETE record is durable). The default is a no-op (the disk
+    // simply stops being referenced); a sim factory may zero/free its bytes so the
+    // determinism fingerprint reflects the reclaim. Called AFTER the obsolete
+    // record is durable, so a crash before reclaim just re-obsoletes on recovery.
+    virtual void reclaim(std::uint64_t /*sstable_id*/) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -365,6 +372,29 @@ public:
           manifest_disk_(&manifest_disk),
           factory_(&factory),
           flush_threshold_(flush_threshold) {}
+
+    // Set the SIZE-TIERED compaction trigger: when the LIVE SSTable count reaches
+    // `n` (n>=2), the next flush merges them all into one. 0 disables compaction.
+    void set_compaction_trigger(std::size_t n) noexcept { compaction_trigger_ = n; }
+
+    // Set the GC READ WATERMARK (V-GC): the oldest live snapshot Seq — no live
+    // snapshot reads as-of a version below this. Compaction may then drop any
+    // version of a key that is shadowed by a newer version with seq <= watermark
+    // (it can never be observed by a live snapshot). DEFAULT 0 ⇒ nothing is
+    // droppable by the snapshot rule (every historical version is conservatively
+    // retained). A caller that knows its oldest live snapshot raises this so
+    // compaction reclaims truly-dead versions. The watermark is monotonic: a
+    // request below the current value is ignored (a live snapshot never gets
+    // older). It is clamped to the committed tip so it never exceeds reality.
+    void set_read_watermark(Seq w) noexcept {
+        if (w > last_seq_) {
+            w = last_seq_;
+        }
+        if (w > read_watermark_) {
+            read_watermark_ = w;
+        }
+    }
+    [[nodiscard]] Seq read_watermark() const noexcept { return read_watermark_; }
 
     [[nodiscard]] Future<Seq> put(Key key, Value value) override {
         return commit(std::move(key), std::move(value), /*tombstone=*/false);
@@ -547,8 +577,37 @@ public:
         return f;
     }
 
+    // Force an immediate compaction: k-way merge ALL live SSTables into ONE,
+    // applying version GC under the read watermark, atomically install the merged
+    // SSTable, obsolete the inputs, and raise the WAL-truncation watermark (test +
+    // metamorphic hook; sim-only). A no-op with < 2 SSTables. Crash-safe.
+    [[nodiscard]] Future<Error> force_compact() {
+        Promise<Error> p = make_promise<Error>(sched_);
+        Future<Error> f = p.get_future();
+        sched_->spawn(force_compact_task(std::move(p)));
+        return f;
+    }
+
     [[nodiscard]] Seq last_seq() const noexcept { return last_seq_; }
     [[nodiscard]] std::size_t sstable_count() const noexcept { return sstables_.size(); }
+
+    // The WAL-truncation watermark: WAL records with seq <= this are covered by
+    // the durable SSTable set and skipped on recovery (their prefix is reclaimable).
+    [[nodiscard]] Seq wal_trunc_seq() const noexcept { return wal_trunc_seq_; }
+
+    // Total decoded version count across every live SSTable + the memtable — the
+    // GC-space metric the GC-safety test measures before/after a compaction.
+    [[nodiscard]] std::size_t live_version_count() const noexcept {
+        std::size_t n = mem_.version_count();
+        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+            n += sst->entry_count();
+        }
+        return n;
+    }
+    // Reclaimed SSTable backing ids (obsoleted by compaction) — the disk-GC proof.
+    [[nodiscard]] const std::vector<std::uint64_t>& obsoleted_ids() const noexcept {
+        return obsoleted_ids_;
+    }
 
 private:
     // The write path: assign Seq, append the CRC-tagged record (awaiting the
@@ -593,6 +652,13 @@ private:
         // remain readable from memory + WAL; the next flush retries.
         if (flush_threshold_ > 0 && mem_.version_count() > flush_threshold_) {
             co_await do_flush();
+            // SIZE-TIERED COMPACTION (C3.4): once the live SSTable count reaches
+            // the trigger, merge them all into one (deterministic, inline on the
+            // scheduler — no background thread). Crash-safe (atomic install +
+            // obsolete via the manifest). A failure leaves the live set intact.
+            if (compaction_trigger_ >= 2 && sstables_.size() >= compaction_trigger_) {
+                co_await do_compact();
+            }
         }
         p.set_value(seq);
         co_return;
@@ -600,6 +666,12 @@ private:
 
     core::Task force_flush_task(Promise<Error> p) {
         co_await do_flush();
+        p.set_value(Error{});
+        co_return;
+    }
+
+    core::Task force_compact_task(Promise<Error> p) {
+        co_await do_compact();
         p.set_value(Error{});
         co_return;
     }
@@ -688,6 +760,186 @@ private:
         co_return;
     }
 
+    // ---- COMPACTION (C3.4) + VERSION GC (V-GC) + WAL TRUNCATION ----------------
+    //
+    // Merge ALL live SSTables into ONE, dropping versions no live snapshot can see,
+    // then truncate the WAL prefix the merged set now durably covers. CRASH-SAFE
+    // via the append-only manifest, reusing the step-3 atomic-install discipline at
+    // a coarser grain:
+    //   (1) snapshot the live SSTable set (ids + entries) + the max covered seq.
+    //   (2) k-way merge their entries + GC under the read watermark → merged run.
+    //   (3) build the merged SSTable image, append to a NEW disk, SYNC it.
+    //   (4) append a CRC'd INSTALL manifest record (new id) + SYNC → the merged
+    //       SSTable is now LIVE. A crash before this: the merged bytes are inert,
+    //       the OLD set is still installed → reads unchanged (no loss).
+    //   (5) append a CRC'd OBSOLETE record per OLD id + SYNC → the inputs are now
+    //       dead (recovery will not load them). A crash between (4) and (5): BOTH
+    //       old + new load; the read path merges by max-seq → identical values, no
+    //       fabrication, no loss (just transient redundancy, healed next compaction).
+    //   (6) append a CRC'd WAL-TRUNCATE record at the contiguous prefix the merged
+    //       SSTable durably covers + SYNC → recovery may skip that WAL prefix. A
+    //       crash before this: the WAL is replayed in full (harmless duplicates).
+    //   (7) swap the in-memory live set (drop obsoleted, add merged), reclaim the
+    //       old disks, raise wal_trunc_seq_. NEVER a mix that loses/fabricates.
+    core::Task do_compact() {
+        if (manifest_disk_ == nullptr || factory_ == nullptr || sstables_.size() < 2) {
+            co_return;
+        }
+        // (1) snapshot the live inputs. Entries (key-asc/seq-asc within each run),
+        // ids (to obsolete), and the max seq covered (the truncation candidate).
+        std::vector<std::vector<SstEntry>> runs;
+        std::vector<std::uint64_t> input_ids;
+        Seq covered_max = kNoSeq;
+        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+            std::vector<SstEntry> run;
+            sst->collect_entries(run);
+            runs.push_back(std::move(run));
+            input_ids.push_back(sst->sstable_id);
+            if (sst->max_seq > covered_max) {
+                covered_max = sst->max_seq;
+            }
+        }
+
+        // (2) k-way merge + version GC under the watermark. The watermark is the
+        // oldest live snapshot Seq; below-shadowed versions are dropped (V-GC).
+        const std::vector<SstEntry> merged = compact_merge(runs, read_watermark_);
+        if (merged.empty()) {
+            // GC dropped everything (e.g. a single tombstone fully below the
+            // watermark). We still must obsolete the inputs to reclaim them, but
+            // there is no merged SSTable to install. Handle by obsoleting only.
+            co_await obsolete_and_truncate(input_ids, /*new_id_present=*/false,
+                                           /*new_id=*/0, /*new_reader=*/nullptr,
+                                           covered_max);
+            co_return;
+        }
+
+        // (3) build + durably write the merged SSTable.
+        const SstBuildResult built = SSTableBuilder::build(merged);
+        const std::uint64_t new_id = next_sstable_id_++;
+        IDisk& ndisk = factory_->disk_for(new_id);
+        Offset off = 0;
+        const Error ae = co_await ndisk.append(
+            std::span<const std::byte>(built.bytes.data(), built.bytes.size()), off);
+        if (!ae.ok()) {
+            co_return;  // merged image did not land — abort, live set untouched.
+        }
+        const Error se = co_await ndisk.sync();
+        if (!se.ok()) {
+            co_return;
+        }
+
+        // (4) INSTALL the merged SSTable (atomic — live only after this sync).
+        ManifestRecord mr;
+        mr.kind = ManifestKind::Install;
+        mr.entry_no = ++manifest_tip_;
+        mr.sstable_id = new_id;
+        mr.sst_len = built.bytes.size();
+        mr.min_seq = built.min_seq;
+        mr.max_seq = built.max_seq;
+        const std::vector<std::byte> mbytes = encode_manifest(mr);
+        Offset moff = 0;
+        const Error me = co_await manifest_disk_->append(
+            std::span<const std::byte>(mbytes.data(), mbytes.size()), moff);
+        if (!me.ok()) {
+            --manifest_tip_;
+            co_return;
+        }
+        const Error mse = co_await manifest_disk_->sync();
+        if (!mse.ok()) {
+            --manifest_tip_;
+            co_return;
+        }
+
+        // Build the in-memory reader for the merged SSTable (parsed via the same
+        // validated path as recovery) so it can be installed once obsoletes land.
+        auto new_reader = std::make_unique<SSTableReader>();
+        if (!SSTableLoader::parse(built.bytes, new_id, *new_reader)) {
+            // Should never happen (we just built it); be safe — keep old set live.
+            co_return;
+        }
+
+        // (5)+(6) obsolete the inputs + raise the WAL-truncation watermark.
+        co_await obsolete_and_truncate(input_ids, /*new_id_present=*/true, new_id,
+                                       std::move(new_reader), covered_max);
+        co_return;
+    }
+
+    // Append OBSOLETE records for each input id, then a WAL-TRUNCATE record, each
+    // CRC'd + entry_no-contiguous + synced. On success swap the in-memory live set
+    // (drop obsoleted readers, add the merged reader if present), reclaim the old
+    // disks, and raise wal_trunc_seq_. A failure mid-way leaves a valid recoverable
+    // prefix (the manifest fold tolerates a partial obsolete suffix — see recovery).
+    core::Task obsolete_and_truncate(std::vector<std::uint64_t> input_ids,
+                                     bool new_id_present, std::uint64_t new_id,
+                                     std::unique_ptr<SSTableReader> new_reader,
+                                     Seq covered_max) {
+        for (std::uint64_t oid : input_ids) {
+            const std::vector<std::byte> ob =
+                encode_manifest_obsolete(++manifest_tip_, oid);
+            Offset ooff = 0;
+            const Error oe = co_await manifest_disk_->append(
+                std::span<const std::byte>(ob.data(), ob.size()), ooff);
+            if (!oe.ok()) {
+                --manifest_tip_;
+                co_return;  // a partial obsolete suffix — recovery heals it.
+            }
+            const Error ose = co_await manifest_disk_->sync();
+            if (!ose.ok()) {
+                --manifest_tip_;
+                co_return;
+            }
+        }
+
+        // WAL-TRUNCATE: the merged set durably covers seqs up to covered_max. We
+        // only advance the watermark over the CONTIGUOUS committed prefix that the
+        // SURVIVING SSTable set fully covers, so a record below it is genuinely
+        // reproducible from SSTables. covered_max is the max seq of the inputs we
+        // just merged; the merged output covers the same [.., covered_max] (GC
+        // never drops the newest-visible version). We never lower the watermark.
+        if (covered_max > wal_trunc_seq_) {
+            const std::vector<std::byte> tr =
+                encode_manifest_wal_trunc(++manifest_tip_, covered_max);
+            Offset toff = 0;
+            const Error te = co_await manifest_disk_->append(
+                std::span<const std::byte>(tr.data(), tr.size()), toff);
+            if (!te.ok()) {
+                --manifest_tip_;
+                co_return;
+            }
+            const Error tse = co_await manifest_disk_->sync();
+            if (!tse.ok()) {
+                --manifest_tip_;
+                co_return;
+            }
+            wal_trunc_seq_ = covered_max;
+        }
+
+        // (7) swap the in-memory live set. Remove obsoleted readers, add the merged
+        // reader (if any). Reclaim the obsoleted backing disks.
+        std::vector<std::unique_ptr<SSTableReader>> kept;
+        for (std::unique_ptr<SSTableReader>& sst : sstables_) {
+            bool obsolete = false;
+            for (std::uint64_t oid : input_ids) {
+                if (sst->sstable_id == oid) {
+                    obsolete = true;
+                    break;
+                }
+            }
+            if (obsolete) {
+                obsoleted_ids_.push_back(sst->sstable_id);
+                factory_->reclaim(sst->sstable_id);  // free the obsolete disk
+            } else {
+                kept.push_back(std::move(sst));
+            }
+        }
+        if (new_id_present && new_reader != nullptr) {
+            kept.push_back(std::move(new_reader));
+        }
+        sstables_ = std::move(kept);
+        (void)new_id;
+        co_return;
+    }
+
     core::Task recover_task(Promise<Error> p, std::size_t durable_len,
                             std::size_t manifest_len) {
         // Fresh recovery state.
@@ -697,8 +949,24 @@ private:
         manifest_tip_ = 0;
         next_sstable_id_ = 0;
 
-        // (0) LSM: replay the manifest to load the committed SSTable set FIRST.
-        // Stop-at-first-corrupt AND stop-at-gap on entry_no (Seq-contiguity).
+        wal_trunc_seq_ = kNoSeq;
+        obsoleted_ids_.clear();
+
+        // (0) LSM: FOLD the append-only manifest to compute the LIVE SSTable set +
+        // the WAL-truncation watermark, THEN load the survivors. The manifest mixes
+        // INSTALL / OBSOLETE / WAL-TRUNCATE records, one shared entry_no sequence.
+        // Stop-at-first-corrupt AND stop-at-gap on entry_no (Seq-contiguity): a
+        // torn manifest tail can never install/obsolete past a missing earlier
+        // record. We fold in entry_no ORDER so an OBSOLETE after its INSTALL
+        // correctly removes it (a crash between INSTALL and OBSOLETE leaves BOTH
+        // the old + the merged SSTable live — the read path merges by max-seq, so
+        // values are identical, no loss, no fabrication).
+        struct LiveRec {
+            std::uint64_t sstable_id = 0;
+            std::uint64_t sst_len = 0;
+            Seq max_seq = kNoSeq;
+        };
+        std::vector<LiveRec> live;  // live INSTALLs in install order (old→new)
         if (manifest_len > 0 && manifest_disk_ != nullptr && factory_ != nullptr) {
             std::vector<std::byte> man(manifest_len);
             const Error mre =
@@ -709,46 +977,75 @@ private:
                 while (mpos < man.size()) {
                     const ManifestDecode md = decode_manifest(man, mpos);
                     if (!md.ok) {
-                        break;  // torn/corrupt manifest tail → install-prefix end.
+                        break;  // torn/corrupt manifest tail → fold-prefix end.
                     }
                     if (md.record.entry_no != expect_entry) {
-                        break;  // a gap in install order → stop (Seq-contiguity).
+                        break;  // a gap in entry order → stop (Seq-contiguity).
                     }
-                    // Load + fully validate the referenced SSTable. A rejected
-                    // SSTable (torn/corrupt) is skipped — NOT installed.
-                    IDisk& sdisk = factory_->disk_for(md.record.sstable_id);
-                    auto reader = std::make_unique<SSTableReader>();
-                    Error lerr{};
-                    co_await SSTableLoader::load(sdisk, md.record.sst_len,
-                                                 md.record.sstable_id, *reader, lerr);
-                    if (!lerr.ok()) {
-                        // The manifest record is valid but its SSTable failed
-                        // integrity (torn/corrupt bytes). STOP the install prefix
-                        // here — a later SSTable must NOT load past a missing
-                        // earlier one (that would leave a Seq GAP inside the
-                        // prefix, the exact stop-at-first-corrupt + Seq-contiguity
-                        // lesson applied at the SSTable granularity). The dropped
-                        // SSTable's data, if it predates the crash, is still in the
-                        // WAL prefix.
-                        break;
+                    switch (md.record.kind) {
+                        case ManifestKind::Install:
+                            live.push_back(LiveRec{md.record.sstable_id,
+                                                   md.record.sst_len, md.record.max_seq});
+                            if (md.record.sstable_id + 1 > next_sstable_id_) {
+                                next_sstable_id_ = md.record.sstable_id + 1;
+                            }
+                            break;
+                        case ManifestKind::Obsolete: {
+                            // Drop the obsoleted SSTable from the live set + reclaim
+                            // its disk (compaction superseded it; durably recorded).
+                            std::vector<LiveRec> filtered;
+                            for (const LiveRec& lr : live) {
+                                if (lr.sstable_id == md.record.sstable_id) {
+                                    obsoleted_ids_.push_back(lr.sstable_id);
+                                    factory_->reclaim(lr.sstable_id);
+                                } else {
+                                    filtered.push_back(lr);
+                                }
+                            }
+                            live = std::move(filtered);
+                            break;
+                        }
+                        case ManifestKind::WalTrunc:
+                            if (md.record.wal_trunc_seq > wal_trunc_seq_) {
+                                wal_trunc_seq_ = md.record.wal_trunc_seq;
+                            }
+                            break;
                     }
-                    // An installed SSTable's versions are durably committed: its
-                    // max_seq is part of the recovered prefix tip even if a lying-
-                    // fsync truncated the WAL below it. In-order flushes cover a
-                    // contiguous [1, max_sst] prefix.
-                    if (reader->max_seq > last_seq_) {
-                        last_seq_ = reader->max_seq;
-                    }
-                    sstables_.push_back(std::move(reader));
-                    // Track install state so post-recovery flushes continue the
-                    // contiguous entry numbering + non-colliding sstable ids.
                     manifest_tip_ = md.record.entry_no;
-                    if (md.record.sstable_id + 1 > next_sstable_id_) {
-                        next_sstable_id_ = md.record.sstable_id + 1;
-                    }
                     mpos += md.consumed;
                 }
             }
+        }
+
+        // Load + fully validate every SURVIVING SSTable in install order. A
+        // rejected SSTable (torn/corrupt) STOPS the load prefix — a later table
+        // must not load past a missing earlier one (Seq-contiguity at SSTable
+        // granularity); its data, if it predates the crash, is still in the WAL.
+        Seq loaded_sst_max = kNoSeq;
+        for (const LiveRec& lr : live) {
+            IDisk& sdisk = factory_->disk_for(lr.sstable_id);
+            auto reader = std::make_unique<SSTableReader>();
+            Error lerr{};
+            co_await SSTableLoader::load(sdisk, lr.sst_len, lr.sstable_id, *reader, lerr);
+            if (!lerr.ok()) {
+                break;
+            }
+            if (reader->max_seq > last_seq_) {
+                last_seq_ = reader->max_seq;
+            }
+            if (reader->max_seq > loaded_sst_max) {
+                loaded_sst_max = reader->max_seq;
+            }
+            sstables_.push_back(std::move(reader));
+        }
+        // SAFETY CLAMP: only skip WAL records the LOADED SSTable set actually
+        // covers. If an SSTable referenced by a WAL-TRUNCATE watermark failed to
+        // load (torn/rejected), we must NOT skip its WAL prefix — replay it. The
+        // loaded survivors cover a contiguous [1, loaded_sst_max] prefix, so clamp
+        // the effective truncation to that. (Never skip a record we cannot
+        // reproduce from an SSTable — that would lose a committed value.)
+        if (wal_trunc_seq_ > loaded_sst_max) {
+            wal_trunc_seq_ = loaded_sst_max;
         }
 
         // (1) replay the WAL prefix into the memtable (over the SSTable set).
@@ -772,11 +1069,25 @@ private:
         // the WAL prefix extends it. We do NOT reset it to 0 here.
         mem_.clear();
         std::size_t pos = 0;
-        Seq expect = kNoSeq + 1;  // the first valid commit Seq is 1.
+        // WAL-TRUNCATION (C3.4): records with seq <= wal_trunc_seq_ are durably
+        // covered by the loaded SSTable set, so the WAL prefix below the watermark
+        // is reclaimable — recovery SKIPS replaying it (proving the SSTables alone
+        // reconstruct that prefix). Contiguity still applies from the watermark up:
+        // the first non-truncated record must be exactly wal_trunc_seq_+1.
+        Seq expect = wal_trunc_seq_ + 1;  // first replayed Seq after the watermark.
         while (pos < image.size()) {
             const DecodeResult dr = try_decode(image, pos);
             if (!dr.ok) {
                 break;  // first corrupt/torn record → consistent-prefix boundary.
+            }
+            // A record at/below the truncation watermark is covered by an SSTable;
+            // skip replaying it (it is logically truncated). It must be contiguous
+            // BELOW the watermark too (a gap in the truncated prefix would mean a
+            // lost commit the SSTables claim to cover — but we clamped the watermark
+            // to the loaded SSTable max, so [1, wal_trunc_seq_] is fully covered).
+            if (dr.record.seq <= wal_trunc_seq_) {
+                pos += dr.consumed;
+                continue;
             }
             // SEQ-CONTIGUITY GUARD (V-PREFIX): a torn/io-faulted append can drop a
             // record from the MIDDLE of the log while LATER records still land —
@@ -816,6 +1127,12 @@ private:
     std::vector<std::unique_ptr<SSTableReader>> sstables_;  // install order (old→new)
     std::uint64_t next_sstable_id_ = 0;       // next SSTable backing id
     std::uint64_t manifest_tip_ = 0;          // last committed manifest entry_no
+
+    // ---- compaction (C3.4) + GC (V-GC) + WAL-truncation state -------------
+    std::size_t compaction_trigger_ = 0;      // live SSTable count to compact at (0=off)
+    Seq read_watermark_ = kNoSeq;             // oldest live snapshot Seq (V-GC bound)
+    Seq wal_trunc_seq_ = kNoSeq;              // WAL records <= this are SSTable-covered
+    std::vector<std::uint64_t> obsoleted_ids_;  // backings reclaimed by compaction
 };
 
 }  // namespace lockstep::storage

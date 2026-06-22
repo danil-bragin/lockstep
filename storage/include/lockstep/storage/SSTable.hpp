@@ -79,6 +79,7 @@
 // output. All IO is core::IDisk; the CRC + bloom hashes are hand-rolled +
 // deterministic. A pure function of (seed, ops).
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -116,11 +117,23 @@ struct SstEntry {
 
 // Fixed framing constants — the on-disk contract.
 inline constexpr std::uint32_t kSstMagic = 0x4C535354u;   // 'LSST' (footer)
-inline constexpr std::uint32_t kManMagic = 0x4C4D414Eu;   // 'LMAN' (manifest rec)
+inline constexpr std::uint32_t kManMagic = 0x4C4D414Eu;   // 'LMAN' (manifest INSTALL rec)
+// Compaction (C3.4) extends the append-only manifest with two MORE record kinds,
+// each a distinct magic so a decoder dispatches on the leading word (the INSTALL
+// 48-byte layout is byte-UNCHANGED — backward compatible with step-3 manifests):
+//   * OBSOLETE — a previously-installed SSTable is now superseded by a compaction
+//     output and must NOT be loaded as live on recovery (its disk is reclaimable).
+//   * WAL-TRUNCATE — the committed history up to `seq` now lives durably in the
+//     SSTable set, so WAL records with seq <= this watermark need not be replayed
+//     (the WAL prefix below it is reclaimable). A monotonic high-water mark.
+inline constexpr std::uint32_t kManObsoleteMagic = 0x4D42534Fu;  // 'OSBM' obsolete
+inline constexpr std::uint32_t kManWalTruncMagic = 0x4D52544Cu;  // 'LTRM' wal-trunc
 inline constexpr std::size_t kSstFooterBytes = 48;        // see FOOTER layout
 inline constexpr std::size_t kBlockCrcBytes = 4;
 inline constexpr std::size_t kSstTargetBlockBytes = 256;  // small ⇒ many blocks
 inline constexpr std::size_t kManRecordBytes = 4 + 8 + 8 + 8 + 8 + 8 + 4;  // 48
+// OBSOLETE/WAL-TRUNCATE records: magic + entry_no + u64 payload + crc = 24 bytes.
+inline constexpr std::size_t kManAuxRecordBytes = 4 + 8 + 8 + 4;  // 24
 
 // ---------------------------------------------------------------------------
 // Bloom filter — hand-rolled, deterministic. Double-hashing (Kirsch-Mitzenmacher)
@@ -389,12 +402,28 @@ public:
         if (blk < 0) {
             return hit;
         }
-        // Scan from the candidate block forward. A key's versions are contiguous
-        // and key-ascending; a key with many versions may SPILL into the next
-        // block(s), whose first_key == key (so first_key <= key still holds). We
-        // scan blocks while first_key <= key, and the first block whose first_key
-        // > key cannot contain the key (keys are ascending) → stop.
-        for (std::size_t b = static_cast<std::size_t>(blk); b < blocks_.size(); ++b) {
+        // A key's versions are contiguous + ascending, but with MANY versions a key
+        // SPANS several blocks AND may START mid-block (its first version packed
+        // after a smaller key). seek_block lands on the LAST block whose first_key
+        // <= key — for a multi-block key that is the key's LAST block. We must scan
+        // EVERY block of the key's run, so BACK UP to the run's first block:
+        //   * over preceding blocks whose first_key == key (pure spill blocks), then
+        //   * ONE more predecessor (first_key < key): the key may START in it (its
+        //     first versions packed after a smaller key, spilling into block `lo`).
+        // Scanning a block that does not actually hold the key is harmless (the
+        // per-entry filter only matches the exact key). Without this a key whose
+        // OLDEST visible version (<= at) lives in an earlier block is read as absent
+        // — surfacing ∅ where a value is live (the compaction-GC multi-version case).
+        std::size_t lo = static_cast<std::size_t>(blk);
+        while (lo > 0 && index_[lo - 1].first_key == key) {
+            --lo;
+        }
+        if (lo > 0 && index_[lo - 1].first_key < key) {
+            --lo;  // the key may begin mid-block in this predecessor.
+        }
+        // Scan forward from `lo` while the block could still hold the key (its
+        // first_key <= key); the first block whose first_key > key cannot (ascending).
+        for (std::size_t b = lo; b < blocks_.size(); ++b) {
             if (index_[b].first_key > key) {
                 break;
             }
@@ -427,6 +456,25 @@ public:
                 acc.emplace_back(e.key, ScanCand{e.seq, e.value, e.tombstone});
             }
         }
+    }
+
+    // Append EVERY decoded entry of this table (key-asc/seq-asc) into `out` — the
+    // compaction merge input (C3.4). Pure, synchronous over the cached blocks.
+    void collect_entries(std::vector<SstEntry>& out) const {
+        for (const std::vector<SstEntry>& blk : blocks_) {
+            for (const SstEntry& e : blk) {
+                out.push_back(e);
+            }
+        }
+    }
+
+    // Total decoded version count across all blocks (the GC-space metric).
+    [[nodiscard]] std::size_t entry_count() const noexcept {
+        std::size_t n = 0;
+        for (const std::vector<SstEntry>& blk : blocks_) {
+            n += blk.size();
+        }
+        return n;
     }
 
 private:
@@ -473,6 +521,110 @@ private:
     std::vector<std::vector<SstEntry>> blocks_;  // decoded data blocks (parallel)
     BloomFilter bloom_;
 };
+
+// ---------------------------------------------------------------------------
+// COMPACTION MERGE + VERSION GC (C3.4 / V-GC). Pure, synchronous: given the
+// decoded entry runs of several SSTables (oldest→newest install order) and the
+// GC watermark (the oldest live snapshot Seq), produce ONE key-asc/seq-asc entry
+// run with dead versions dropped — ready to feed SSTableBuilder::build.
+//
+// K-WAY MERGE: every input run is key-asc/seq-asc; we concatenate all entries and
+// sort by (key asc, seq asc). A (key,seq) pair is GLOBALLY UNIQUE (Seq is the
+// monotonic commit id; the same version may appear in >1 SSTable after a flush+
+// replay, so we DEDUP identical (key,seq) keeping one copy).
+//
+// VERSION GC RULE (V-GC — the binding contract):
+//   watermark = the oldest live snapshot Seq (single node). For a key k with
+//   versions v1<v2<…<vn (by seq), a version vi is DROPPABLE iff there exists a
+//   newer version vj (j>i) with vj.seq <= watermark. Reason: every live snapshot
+//   reads as-of some seq >= watermark, so it sees vj (or newer) — never vi. The
+//   newest version with seq <= watermark is the OLDEST one any live snapshot can
+//   still observe; everything strictly older than it is dead and dropped. We keep
+//   that survivor AND every version with seq > watermark (a future/younger
+//   snapshot or the live tip may need them). NEVER drop a version still visible:
+//   if no version has seq <= watermark we keep them ALL (the watermark predates
+//   the key entirely).
+//   TOMBSTONE GC: a tombstone that becomes the OLDEST retained version of its key
+//   AND is at/below the watermark covers "absent for every live snapshot" — it
+//   can be dropped entirely (no older value to resurrect, nothing newer to need
+//   it as a delimiter). We only drop it when it is the survivor (the newest
+//   version <= watermark) AND it is a tombstone AND there is no retained version
+//   above it that is a value needing the delete boundary — i.e. it is the single
+//   surviving floor; then the key vanishes for snapshots < its next version.
+//   Conservative + correct: we KEEP a tombstone if any version with seq>watermark
+//   exists for the key (a mid-history snapshot between them must still read ∅).
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline std::vector<SstEntry> compact_merge(
+    const std::vector<std::vector<SstEntry>>& runs, Seq watermark) {
+    // (1) gather every entry.
+    std::vector<SstEntry> all;
+    for (const std::vector<SstEntry>& run : runs) {
+        for (const SstEntry& e : run) {
+            all.push_back(e);
+        }
+    }
+    // (2) sort by (key asc, seq asc). Deterministic comparator — no hashing.
+    std::sort(all.begin(), all.end(), [](const SstEntry& a, const SstEntry& b) {
+        if (a.key != b.key) {
+            return a.key < b.key;
+        }
+        return a.seq < b.seq;
+    });
+    // (3) dedup identical (key,seq) — a version flushed then WAL-replayed can
+    // appear twice; they are byte-identical, keep one.
+    std::vector<SstEntry> uniq;
+    for (SstEntry& e : all) {
+        if (!uniq.empty() && uniq.back().key == e.key && uniq.back().seq == e.seq) {
+            continue;
+        }
+        uniq.push_back(std::move(e));
+    }
+    // (4) per-key GC under the watermark. Walk each key's ascending versions.
+    std::vector<SstEntry> out;
+    std::size_t i = 0;
+    while (i < uniq.size()) {
+        std::size_t j = i;
+        while (j < uniq.size() && uniq[j].key == uniq[i].key) {
+            ++j;
+        }
+        // versions [i,j) for one key, seq-ascending. Find the survivor floor: the
+        // index of the NEWEST version with seq <= watermark (or -1 if none).
+        std::ptrdiff_t floor = -1;
+        for (std::size_t k = i; k < j; ++k) {
+            if (uniq[k].seq <= watermark) {
+                floor = static_cast<std::ptrdiff_t>(k);
+            } else {
+                break;  // ascending ⇒ the rest are > watermark
+            }
+        }
+        // Keep: the floor survivor (if any) + everything above the watermark.
+        // Everything strictly below the floor is dead (no live snapshot sees it).
+        const std::size_t keep_from =
+            (floor < 0) ? i : static_cast<std::size_t>(floor);
+        // TOMBSTONE GC: if the floor survivor is a tombstone AND there is NO
+        // retained version above it (the whole key is just this delete, fully
+        // below the watermark), the key is "absent for every live snapshot" — drop
+        // the tombstone entirely (it reclaims the key). Only safe when the floor
+        // is the LAST version (nothing newer that a snapshot between could read).
+        bool drop_lone_tombstone = false;
+        if (floor >= 0) {
+            const std::size_t fl = static_cast<std::size_t>(floor);
+            if (uniq[fl].tombstone && fl + 1 == j) {
+                drop_lone_tombstone = true;
+            }
+        }
+        if (!drop_lone_tombstone) {
+            for (std::size_t k = keep_from; k < j; ++k) {
+                out.push_back(uniq[k]);
+            }
+        } else {
+            // Drop the lone surviving tombstone (and the dead older versions
+            // already excluded). Nothing emitted for this key.
+        }
+        i = j;
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // SSTableLoader — the async loader. Reads + validates an SSTable image from an
@@ -643,16 +795,27 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Manifest record (decoded) + (de)serialise. The atomic-install log.
+// Manifest records (decoded) + (de)serialise. The append-only atomic-install +
+// compaction log. THREE record kinds share one entry_no sequence (1,2,3,…):
+//   * Install   — adds an SSTable to the live set (the step-3 48-byte format).
+//   * Obsolete  — removes a previously-installed SSTable (compaction superseded
+//     it). Its backing disk is reclaimable once this record is durable.
+//   * WalTrunc  — raises the WAL-truncation watermark: WAL records with seq <=
+//     `seq` are covered by the durable SSTable set and need not be replayed.
 // ---------------------------------------------------------------------------
+enum class ManifestKind : std::uint8_t { Install, Obsolete, WalTrunc };
+
 struct ManifestRecord {
-    std::uint64_t entry_no = 0;   // 1,2,3,… (Seq-contiguity)
-    std::uint64_t sstable_id = 0;
-    std::uint64_t sst_len = 0;
-    Seq min_seq = kNoSeq;
+    ManifestKind kind = ManifestKind::Install;
+    std::uint64_t entry_no = 0;   // 1,2,3,… (Seq-contiguity across ALL kinds)
+    std::uint64_t sstable_id = 0; // Install/Obsolete: the SSTable backing id
+    std::uint64_t sst_len = 0;    // Install: durable image length
+    Seq min_seq = kNoSeq;         // Install: covered seq range
     Seq max_seq = kNoSeq;
+    Seq wal_trunc_seq = kNoSeq;   // WalTrunc: the truncation watermark
 };
 
+// Encode an INSTALL record (the step-3 byte-exact 48-byte layout; UNCHANGED).
 [[nodiscard]] inline std::vector<std::byte> encode_manifest(const ManifestRecord& r) {
     std::vector<std::byte> buf;
     put_u32(buf, kManMagic);
@@ -666,40 +829,96 @@ struct ManifestRecord {
     return buf;
 }
 
+// Encode an OBSOLETE record: magic | entry_no | sstable_id | crc (24 bytes).
+[[nodiscard]] inline std::vector<std::byte> encode_manifest_obsolete(std::uint64_t entry_no,
+                                                                     std::uint64_t sstable_id) {
+    std::vector<std::byte> buf;
+    put_u32(buf, kManObsoleteMagic);
+    put_u64(buf, entry_no);
+    put_u64(buf, sstable_id);
+    const std::uint32_t crc = Crc32::compute(std::span<const std::byte>(buf.data(), buf.size()));
+    put_u32(buf, crc);
+    return buf;
+}
+
+// Encode a WAL-TRUNCATE record: magic | entry_no | wal_trunc_seq | crc (24 bytes).
+[[nodiscard]] inline std::vector<std::byte> encode_manifest_wal_trunc(std::uint64_t entry_no,
+                                                                      Seq wal_trunc_seq) {
+    std::vector<std::byte> buf;
+    put_u32(buf, kManWalTruncMagic);
+    put_u64(buf, entry_no);
+    put_u64(buf, wal_trunc_seq);
+    const std::uint32_t crc = Crc32::compute(std::span<const std::byte>(buf.data(), buf.size()));
+    put_u32(buf, crc);
+    return buf;
+}
+
 struct ManifestDecode {
     bool ok = false;
     ManifestRecord record;
     std::size_t consumed = 0;
 };
 
-// Decode ONE manifest record at image[pos..]. ok=false on short/torn/bad-magic/
-// CRC-fail — the recover loop treats it as the install-prefix boundary.
+// Decode ONE manifest record at image[pos..], dispatching on the leading magic.
+// ok=false on short/torn/bad-magic/CRC-fail — the recover loop treats it as the
+// install-prefix boundary (stop-at-first-corrupt + entry_no Seq-contiguity).
 [[nodiscard]] inline ManifestDecode decode_manifest(const std::vector<std::byte>& image,
                                                     std::size_t pos) {
     ManifestDecode d;
-    if (image.size() - pos < kManRecordBytes) {
+    const std::size_t avail = image.size() - pos;
+    if (avail < 4) {
         return d;
     }
     const std::byte* p = image.data() + pos;
-    if (get_u32(p) != kManMagic) {
+    const std::uint32_t magic = get_u32(p);
+    if (magic == kManMagic) {
+        if (avail < kManRecordBytes) {
+            return d;
+        }
+        const std::size_t body = kManRecordBytes - 4;
+        const std::uint32_t want = get_u32(p + body);
+        const std::uint32_t got = Crc32::compute(std::span<const std::byte>(p, body));
+        if (want != got) {
+            return d;
+        }
+        ManifestRecord r;
+        r.kind = ManifestKind::Install;
+        r.entry_no = get_u64(p + 4);
+        r.sstable_id = get_u64(p + 12);
+        r.sst_len = get_u64(p + 20);
+        r.min_seq = get_u64(p + 28);
+        r.max_seq = get_u64(p + 36);
+        d.ok = true;
+        d.record = r;
+        d.consumed = kManRecordBytes;
         return d;
     }
-    const std::size_t body = kManRecordBytes - 4;  // bytes before the crc
-    const std::uint32_t want = get_u32(p + body);
-    const std::uint32_t got = Crc32::compute(std::span<const std::byte>(p, body));
-    if (want != got) {
+    if (magic == kManObsoleteMagic || magic == kManWalTruncMagic) {
+        if (avail < kManAuxRecordBytes) {
+            return d;
+        }
+        const std::size_t body = kManAuxRecordBytes - 4;
+        const std::uint32_t want = get_u32(p + body);
+        const std::uint32_t got = Crc32::compute(std::span<const std::byte>(p, body));
+        if (want != got) {
+            return d;
+        }
+        ManifestRecord r;
+        r.entry_no = get_u64(p + 4);
+        const std::uint64_t payload = get_u64(p + 12);
+        if (magic == kManObsoleteMagic) {
+            r.kind = ManifestKind::Obsolete;
+            r.sstable_id = payload;
+        } else {
+            r.kind = ManifestKind::WalTrunc;
+            r.wal_trunc_seq = payload;
+        }
+        d.ok = true;
+        d.record = r;
+        d.consumed = kManAuxRecordBytes;
         return d;
     }
-    ManifestRecord r;
-    r.entry_no = get_u64(p + 4);
-    r.sstable_id = get_u64(p + 12);
-    r.sst_len = get_u64(p + 20);
-    r.min_seq = get_u64(p + 28);
-    r.max_seq = get_u64(p + 36);
-    d.ok = true;
-    d.record = r;
-    d.consumed = kManRecordBytes;
-    return d;
+    return d;  // unknown magic — corrupt/garbage, stop.
 }
 
 }  // namespace lockstep::storage
