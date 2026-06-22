@@ -32,3 +32,22 @@ endif()
 if(TARGET lockstep_providers_sim)
     target_link_libraries(lockstep_harness INTERFACE lockstep_providers_sim)
 endif()
+
+# --- Phase 2 batch 2 (C2.7): seed-burn farm RUNNER + one-command replay -------
+# The runner executable around the pure SeedBurn library
+# (include/lockstep/harness/SeedBurn.hpp). It sweeps a CONFIGURABLE seed range of
+# the honest KV system + §4 checkers under the full fault envelope (V-SEED2),
+# stores + surfaces any MUST-HOLD breach, and --seed replays one seed byte-
+# identically (V-SEED1). NOT a ctest target (kept fast at the modest default;
+# the gate's teeth are kv_seedburn_test). NON-provider code → forbidden-lint
+# scans it. Builds only when the runtime + sim providers are present.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
+    add_executable(lockstep_seedburn runner/seedburn_main.cpp)
+    target_link_libraries(lockstep_seedburn
+        PRIVATE
+            lockstep_warnings
+            lockstep_sanitizers
+            lockstep_harness
+            lockstep_runtime
+            lockstep_providers_sim)
+endif()

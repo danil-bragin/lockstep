@@ -373,16 +373,24 @@ private:
 
         Node& nd = nodes_[node_id];
         KvResult res;
-        Entry* e = find_entry(nd.store, fr.key);
         bool do_commit = false;
         std::string committed_value;
         std::uint64_t commit_seq = 0;
 
+        // INVARIANT (V-RKV1): NEVER hold an Entry* (a pointer into nd.store)
+        // across a co_await. A concurrent coroutine on the same node can
+        // apply_record→nd.store.insert and REALLOCATE the vector during a
+        // suspension, dangling the pointer. So we (a) await FIRST where a slow
+        // path needs it, then (b) fetch the Entry* fresh AFTER any await and use
+        // it only within the same synchronous span. (Backprop B<seedburn>: a
+        // seed-burn sweep + ASan caught a use-after-realloc here.)
         switch (fr.op_kind) {
             case OpKind::Read: {
                 if (buggify_->fire(BuggifyKind::ColdRead)) {
-                    co_await clock_->delay(1);  // cold-read slow path
+                    co_await clock_->delay(1);  // cold-read slow path (await 1st)
                 }
+                // Fetch AFTER the await — the store may have been reallocated.
+                const Entry* e = find_entry(nd.store, fr.key);
                 res.ok = true;
                 res.result = (e != nullptr && e->present) ? e->value : "";
                 break;
@@ -396,6 +404,9 @@ private:
                 break;
             }
             case OpKind::Cas: {
+                // No await before this read of the store → fetch fresh + use it
+                // synchronously (no Entry* survives a suspension).
+                const Entry* e = find_entry(nd.store, fr.key);
                 const std::string cur =
                     (e != nullptr && e->present) ? e->value : "";
                 if (cur == fr.cas_old) {

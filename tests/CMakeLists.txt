@@ -196,6 +196,34 @@ else()
     "kv_teeth_test not built (Phase 2 batch 2 §6 teeth gate pending).")
 endif()
 
+# --- Phase 2 batch 2 (C2.7 + C2.8): seed-burn farm + shrinking gate -----------
+# B2D self-test (specs/checker-framework.md §6.1, §7: V-SEED1/V-SEED2/V-SHRINK1).
+# Asserts (A) the seed-burn farm runs N seeds with the MUST-HOLD invariants
+# holding on the HONEST system (C-DUR=0, no INT-1/DUR-2 fabrication), tracking
+# the expected failover anomalies; (B) a KNOWN buggy-variant failure auto-shrinks
+# (delta-debugging) to a STRICTLY-SMALLER config that still triggers the SAME
+# violation class (violation PRESERVED), replaying byte-identically; (C) a seed
+# replays byte-identically (V-SEED1). Builds on the pure SeedBurn library
+# (harness/include/lockstep/harness/SeedBurn.hpp) + BuggyKvSystems. Needs harness
+# + sim providers + runtime. Builds only when all are present.
+if(TARGET lockstep_harness AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_kv_seedburn_test kv_seedburn_test.cpp)
+  target_include_directories(lockstep_kv_seedburn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_kv_seedburn_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_harness
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME kv_seedburn_test COMMAND lockstep_kv_seedburn_test)
+else()
+  message(WARNING
+    "lockstep_harness / runtime / providers_sim not all found; "
+    "kv_seedburn_test not built (Phase 2 batch 2 C2.7/C2.8 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never

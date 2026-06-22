@@ -68,6 +68,7 @@ KV-register correctness checkers (per key unless noted):
   to exercise the HARNESS, not build production replication. A deliberately-simple replicator (e.g. single-leader +
   crude failover, or quorum-less primary-backup) is fine; its job is to be a system the checkers + faults stress.
 - V-TOY1: under FULL fault envelope + seed-burn → C-INT, C-MONO, C-LIN, C-DUR hold (or a real bug found & reported reproducibly).
+- V-RKV1 (coroutine pointer-stability): ∀ server coroutine on the deterministic scheduler → ⊥ hold a pointer/reference INTO a node's `store` (or any vector that another coroutine on the same node can grow) ACROSS a `co_await`. A suspension lets a concurrent op `insert`/reallocate → dangling read. ! re-fetch the Entry AFTER any await; use it only within one synchronous span. (Backprop B-seedburn-uaf.)
 
 ## §6 Harness-has-teeth (the batch-2 GATE proper)
 - V-TEETH1: feed the checker set a DELIBERATELY-BROKEN KV system (e.g. drops a write on partition, serves a stale read, skips the cas compare) via `run_kv_sim_with` → checkers MUST flag it, with witness + replayable seed. A green run on a known-buggy system halts batch 2.
@@ -80,6 +81,8 @@ Toy KV system is non-consensus (spec §5) → inherently non-linearizable under 
 - TRACK + report reproducibly (⊥ fail the gate): expected failover anomalies — C-LIN non-linearizable, C-MONO read-your-writes, C-INT/INT-2 lost-ack. These are the documented non-consensus limit; real linearizability-under-failover is earned in Phase 4 (consensus).
 - BATCH-2 GATE PROPER = §6 harness-has-teeth (V-TEETH1 buggy-system flagged) + seed reproducibility (V-SEED) + mutation-of-harness (V-TEETH2). NOT honest-system-passes-everything.
 - Found-bug record: WAL torn-value fabrication FIXED (commit per-record CRC-32 + recover-to-prefix); honest sweep C-DUR 4→0, no fabrication. See [[backprop-wal-torn-fabrication]].
+- Found (C2.7 seed-burn + ASan, honest sweep): USE-AFTER-REALLOC in ReplicatedKvSystem::on_client_request — an `Entry*` into `nd.store` was held across the ColdRead-buggify `co_await clock_->delay(1)`; a concurrent same-node commit `apply_record→store.insert` reallocated the vector → dangling read (ASan container-overflow). FIXED: await first, then re-fetch the Entry after any suspension (no Entry* survives a `co_await`). New invariant V-RKV1. See [[backprop-seedburn-uaf]].
+- Found (C2.7 seed-burn, 3000-seed honest sweep): MUST-HOLD class is exactly INT-1 + **DUR-2** (storage-manufactured value) — both 0/3000 ✓. C-DUR/**DUR-1** ("rejected-write-surfaced") is NOT a sound honest must-hold: the toy workload tags values `c<client>_v<i>`, so one token can reach a key via BOTH a rejected cas (new-value) AND a legitimate path (lost-ack write, or a committing cas whose `cas_old` proves the register HELD it). DUR-1's provenance check sees only the rejected source → false-alarms (~1%/seed). ∴ DUR-1 is TRACKED, not asserted (seedburn::ViolationClass splits dur_fab2 vs dur_rejected). Real fix = globally-unique value tokens / version provenance, Phase 4. See [[backprop-dur1-token-reuse]].
 
 ## §7 Seed / replay / shrinking contract
 - V-SEED1: every run logs its seed; one-command replay reproduces byte-identically (extends Phase 1 infra).
