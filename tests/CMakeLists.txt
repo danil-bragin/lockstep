@@ -41,6 +41,21 @@ if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
       lockstep_providers_sim)
   add_test(NAME runtime_determinism COMMAND lockstep_runtime_determinism_test)
 
+  # --- Phase 1 determinism: SAME-TICK timer firing order (mutation backprop) ---
+  # Kills the surviving mutant at Scheduler.hpp:238 (the timer insertion-sort
+  # `b - 1` -> `b - 0`). Arms MULTIPLE timers DUE AT THE SAME virtual tick with
+  # the pending-timer vector holding them at SCRAMBLED indices (arm_seq order !=
+  # vector order), and asserts they FIRE in the documented (due, arm_seq) order.
+  # A `b - 0` no-op sort fires them in vector order instead -> this test FAILS,
+  # killing that mutant. Links the header-only runtime only (no PRNG needed).
+  add_executable(lockstep_scheduler_timer_order_test scheduler_timer_order_test.cpp)
+  target_link_libraries(lockstep_scheduler_timer_order_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime)
+  add_test(NAME scheduler_timer_order COMMAND lockstep_scheduler_timer_order_test)
+
   # --- Phase 1 ADVERSARIAL determinism gate (P1-VERIFY, independent author) ---
   # The FULL gate the brief P1-VERIFY calls for: the ping-pong gate (3 spec
   # assertions), a multi-seed sweep, a forced-bug byte-reproducibility check, and
@@ -382,6 +397,87 @@ else()
   message(WARNING
     "lockstep_storage / runtime / providers_sim not all found; "
     "storage_wisckey_test not built (Phase 3 step 6 pending).")
+endif()
+
+# --- Phase 4 Stage M: consensus verification machinery teeth gate ------------
+# P4-MACHINERY gate (specs/Consensus.tla; briefs/phase4.md Stage M). Proves the
+# consensus SEAM (consensus/ConsensusNode.hpp) + the conformance / linearizability
+# / cross-check HARNESS have TEETH — BEFORE either real Raft impl exists. Asserts
+# (A) each deliberately-WRONG ConsensusNode stub is FLAGGED by the conformance
+# checker mapping to the Consensus.tla invariant it breaks (ElectionSafety /
+# LogMatching / StateMachineSafety / LeaderAppendOnly), with witness + replayable
+# seed; (B) the no-op "always-follower" baseline does NOT false-positive the
+# safety checkers yet makes NO progress (vacuous safety ≠ correctness); (C) the
+# dual-impl cross-check agrees impl-vs-itself and catches a divergent pair; (D)
+# determinism — same seed ⇒ byte-identical ObservedRun (in-test + external diff).
+# Links the header-only consensus lib + runtime + sim PRNG/disk/network + harness
+# (the driver wires SimNetwork + SimDisk on the scheduler; reuses the harness
+# Verdict shape). Non-provider TU → forbidden-lint scans it. Inherits TIMEOUT 90.
+if(TARGET lockstep_consensus AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim AND TARGET lockstep_harness)
+  add_executable(lockstep_consensus_harness_test consensus_harness_test.cpp)
+  target_include_directories(lockstep_consensus_harness_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_consensus_harness_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus
+      lockstep_harness
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME consensus_harness_test COMMAND lockstep_consensus_harness_test)
+
+  # --- Phase 4 Stage I: DUAL independent Raft implementations (pre-wired) ------
+  # impl A and impl B are authored by TWO different agents against the same seam
+  # + verified spec; targets pre-registered here so neither agent edits this file.
+  # Each builds only if its source exists (half-landed batch still configures).
+  foreach(impl_test consensus_impl_a_test consensus_impl_b_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${impl_test}.cpp")
+      add_executable(lockstep_${impl_test} ${impl_test}.cpp)
+      target_include_directories(lockstep_${impl_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+      target_link_libraries(lockstep_${impl_test}
+        PRIVATE
+          lockstep_warnings
+          lockstep_sanitizers
+          lockstep_consensus
+          lockstep_harness
+          lockstep_runtime
+          lockstep_providers_sim)
+      add_test(NAME ${impl_test} COMMAND lockstep_${impl_test})
+    endif()
+  endforeach()
+
+  # --- Phase 4 Stage V: DUAL-IMPL CROSS-CHECK GATE (the Phase-4 gate) ----------
+  # P4-XCHECK gate (master-plan §6.5; briefs/phase4.md Stage V). Runs BOTH
+  # independently-built Raft impls (raft_a::RaftNodeA + raft_b::RaftNodeB, each
+  # already conformant) on the SAME seed + workload + fault schedule over a seed
+  # sweep under the full fault envelope and asserts: (1) AGREE — their committed
+  # logs never conflict at a shared index (one is a prefix of the other), via
+  # cross_check; (2) CONFORM — both impls individually pass all five conformance
+  # checkers (belt and suspenders); (3) PROGRESS — commits accumulate (agreement
+  # non-vacuous); (4) DETERMINISM — same seed ⇒ byte-identical output (in-test +
+  # external double-run diff under a stable marker). Builds only if its source
+  # exists. Non-provider TU → forbidden-lint scans it. Inherits TIMEOUT 90.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_crosscheck_test.cpp")
+    add_executable(lockstep_consensus_crosscheck_test consensus_crosscheck_test.cpp)
+    target_include_directories(lockstep_consensus_crosscheck_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_crosscheck_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_harness
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_crosscheck_test
+             COMMAND lockstep_consensus_crosscheck_test)
+  endif()
+else()
+  message(WARNING
+    "lockstep_consensus / runtime / providers_sim / harness not all found; "
+    "consensus_harness_test not built (Phase 4 Stage M pending).")
 endif()
 
 # --- Harness liveness invariant (orchestrator) -------------------------------

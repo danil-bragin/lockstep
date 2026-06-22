@@ -43,3 +43,12 @@ __pycache__/
 
 # macOS
 .DS_Store
+tools/tla/tla2tools.jar
+
+# TLC model-checker scratch (state queue / checkpoints) — never commit, can be GBs
+states/
+*.st
+states_*/
+
+# mutation-engine backups — never commit (a stray one = interrupted mutation)
+*.mutbak

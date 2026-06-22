@@ -41,9 +41,18 @@ IS_DARWIN=0
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Prefer Makefiles locally (ninja not installed); presets already pin generator.
-# Build parallelism.
-if have nproc; then JOBS="$(nproc)"; elif have sysctl; then JOBS="$(sysctl -n hw.ncpu)"; else JOBS=2; fi
+# ---- RESOURCE GUARDRAILS (backprop: a parallel-gate + 15GB-TLC-scratch +
+# runaway-test event froze the host). Keep one runaway from taking the machine
+# down. macOS has no cgroups and `ulimit -v` is a no-op there, so we use the
+# levers that DO work: no core dumps (a SIGSEGV core of a big proc can be GBs and
+# fill the disk), a bounded stack (deep recursion SIGSEGVs fast instead of
+# thrashing), and HALF-core build parallelism so even two concurrent gates don't
+# catastrophically oversubscribe. Override JOBS via env if you really mean it.
+ulimit -c 0 2>/dev/null || true          # no core dumps
+ulimit -s 16384 2>/dev/null || true      # 16 MB stack ceiling (recursion guard)
+if have nproc; then _NCPU="$(nproc)"; elif have sysctl; then _NCPU="$(sysctl -n hw.ncpu)"; else _NCPU=2; fi
+# half the cores, floor 2 — leaves headroom for a second concurrent build/agent.
+JOBS="${JOBS:-$(( _NCPU/2 > 2 ? _NCPU/2 : 2 ))}"
 
 # ---- dashboard accounting ---------------------------------------------------
 # Parallel arrays: STAGE_NAMES[i] -> STAGE_RESULTS[i] in {PASS,FAIL,SKIP,NOOP}.
