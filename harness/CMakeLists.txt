@@ -19,4 +19,16 @@ if(TARGET lockstep_core)
     target_link_libraries(lockstep_harness INTERFACE lockstep_core)
 endif()
 target_compile_features(lockstep_harness INTERFACE cxx_std_23)
-# // toy KV system + checker set + teeth fixture arrive in stage B/C
+
+# Stage B (toy replicated KV system + reusable run harness) lives in
+# include/lockstep/harness/kv/. It builds on the sim providers (SimNetwork +
+# SimDisk) and the deterministic runtime, so the harness lib links them when
+# present (concurrent-agent-tolerant guard, mirroring the root pattern). Headers
+# stay determinism-clean and lint-scanned (harness/ is NOT lint-exempt). The
+# checker set + teeth fixture (stage C) reuse run_kv_sim() from kv/KvSim.hpp.
+if(TARGET lockstep_runtime)
+    target_link_libraries(lockstep_harness INTERFACE lockstep_runtime)
+endif()
+if(TARGET lockstep_providers_sim)
+    target_link_libraries(lockstep_harness INTERFACE lockstep_providers_sim)
+endif()

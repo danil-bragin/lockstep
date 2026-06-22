@@ -113,6 +113,35 @@ else()
     "(Phase 2 batch 2 stage A pending).")
 endif()
 
+# --- Phase 2 batch 2 stage B: toy KV system + run harness self-test ----------
+# B2B self-test (specs/checker-framework.md §5; briefs/phase2-batch2.md stage B).
+# Drives the toy replicated KV register system under the FULL fault envelope via
+# run_kv_sim(seed,cfg) and asserts the HARNESS RUNS DETERMINISTICALLY + the
+# system is ALIVE (NOT deep correctness — that is stage C's checker set):
+#   (a) progress: some client ops ack under faults,
+#   (b) same-seed run twice => byte-identical History (in-test render diff),
+#   (c) the run terminates (inherits the directory-wide TIMEOUT 90 ceiling),
+#   (d) crash+restart is exercised (node lifecycle C2.3).
+# Needs harness + sim providers + runtime (run_kv_sim wires SimNetwork + SimDisk
+# on the scheduler). Builds only when all are present.
+if(TARGET lockstep_harness AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_kv_sim_test kv_sim_test.cpp)
+  target_include_directories(lockstep_kv_sim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_kv_sim_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_harness
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME kv_sim_test COMMAND lockstep_kv_sim_test)
+else()
+  message(WARNING
+    "lockstep_harness / runtime / providers_sim not all found; kv_sim_test not "
+    "built (Phase 2 batch 2 stage B pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
