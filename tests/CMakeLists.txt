@@ -480,6 +480,37 @@ else()
     "consensus_harness_test not built (Phase 4 Stage M pending).")
 endif()
 
+# --- Phase 5 Stage M: distributed-txn verification machinery teeth gate -------
+# P5-MACHINERY gate (specs/CommitOrdering.tla; briefs/phase5.md Stage M). Proves
+# the txn SEAM (txn/Transaction.hpp: the one-shot Transaction + the call-site-
+# visible D5 selector) + the strict-serializable ORACLE + the differential /
+# linearizability HARNESS + the per-D5-level CONSISTENCY CHECKERS have TEETH —
+# BEFORE the real distributed-txn impl exists. Asserts (A) each deliberately-
+# WRONG txn executor is FLAGGED by the checker mapping to the CommitOrdering.tla
+# invariant / D5 rule it breaks (OLLPSound / SerializedBySeqLog / ReadsMatch
+# SerialPrefix / D5ReadYourWrites), with witness + replayable seed; (B) the
+# HONEST executor passes all checkers + makes progress (no false positive) and
+# the no-progress baseline is vacuously safe but caught as making NO progress
+# (vacuous != correct); (C) determinism — same seed => byte-identical rendered
+# outcome (in-test + the external double-run diff under a stable marker). Links
+# ONLY the header-only txn lib (self-contained value-shaped seam + checkers; no
+# scheduler/sim needed at Stage M). Non-provider TU -> forbidden-lint scans it.
+# Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_txn)
+  add_executable(lockstep_txn_harness_test txn_harness_test.cpp)
+  target_include_directories(lockstep_txn_harness_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_txn_harness_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_txn)
+  add_test(NAME txn_harness_test COMMAND lockstep_txn_harness_test)
+else()
+  message(WARNING
+    "lockstep_txn target not found; txn_harness_test not built "
+    "(Phase 5 Stage M pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
