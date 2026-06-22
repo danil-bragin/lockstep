@@ -142,6 +142,33 @@ else()
     "built (Phase 2 batch 2 stage B pending).")
 endif()
 
+# --- Phase 2 batch 2 stage C: §4 checker set teeth + honest-system run --------
+# B2C-checkers self-test (specs/checker-framework.md §4; briefs/phase2-batch2.md
+# stage C). Author ≠ toy-system author (DECISION-D). Proves the §4 checker set
+# (C-INT / C-MONO / C-LIN / C-DUR) has TEETH: each checker FLAGS its canonical
+# hand-crafted bad History with a witness (V-CHK5 non-vacuous), and the honest
+# system PASSES all four across a seed sweep under the full fault envelope
+# (V-TOY1) — or a real bug is surfaced reproducibly (seed + witness). Needs
+# harness + sim providers + runtime (run_kv_sim_checked wires SimNetwork +
+# SimDisk on the scheduler). Builds only when all are present.
+if(TARGET lockstep_harness AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_kv_checkers_test kv_checkers_test.cpp)
+  target_include_directories(lockstep_kv_checkers_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_kv_checkers_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_harness
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME kv_checkers_test COMMAND lockstep_kv_checkers_test)
+else()
+  message(WARNING
+    "lockstep_harness / runtime / providers_sim not all found; "
+    "kv_checkers_test not built (Phase 2 batch 2 stage C pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
