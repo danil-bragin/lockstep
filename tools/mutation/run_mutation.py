@@ -120,6 +120,24 @@ SOURCE_EXTS = (".hpp", ".cpp", ".cc", ".h")
 # Build/test commands (reuse the existing presets; debug is fine and fast).
 DEFAULT_PRESET = "debug"
 
+# ISOLATED MUTATION BUILD DIRECTORY (the shared-build-tree-pollution fix).
+# -----------------------------------------------------------------------
+# Mutants MUST NOT be built or tested in the SHARED `build/<preset>` directories
+# that the merge gate (gate.sh: `compile+test (debug)`) and human developers use.
+# A mutation lives in a HEADER; after the source is restored an incremental
+# `cmake --build` sometimes does NOT rebuild the dependent target (an mtime /
+# dependency miss), leaving a STALE MUTANT-COMPILED test binary in build/debug.
+# A later normal `ctest` then runs that stale mutant binary and FAILS with a
+# mutation-induced assert — corrupting the gate signal (this misdiagnosed twice
+# as a Phase-1 regression). The cure: mutation gets its OWN build directory,
+# configured ONCE with debug-like settings, reused across mutants in the run.
+# After any mutation run, build/debug and every preset dir are byte-for-byte
+# UNTOUCHED. `build/mutation` is NOT a preset binaryDir (presets use
+# build/<presetName>: debug/release/asan/...), so it can never collide, and it is
+# already covered by the `build/` rule in .gitignore.
+MUTATION_BUILD_DIRNAME = "mutation"
+MUTATION_BUILD_SUBDIR = os.path.join("build", MUTATION_BUILD_DIRNAME)
+
 # Per-mutant timeout policy (env-overridable; documented above + in docs/mutation.md).
 TIMEOUT_FACTOR_DEFAULT = float(os.environ.get("LOCKSTEP_MUTATION_TIMEOUT_FACTOR", "8"))
 TIMEOUT_FLOOR_DEFAULT = float(os.environ.get("LOCKSTEP_MUTATION_TIMEOUT_FLOOR", "30"))
@@ -477,9 +495,92 @@ def restore_on_start(repo_root: str, roots: tuple) -> int:
     return restored
 
 
-def build_and_test(repo_root: str, preset: str, build_timeout: int,
+def mutation_build_dir(repo_root: str) -> str:
+    """Absolute path of the ISOLATED mutation build directory (build/mutation).
+    This is the ONLY build tree mutants touch — never build/<preset>."""
+    return os.path.join(repo_root, MUTATION_BUILD_SUBDIR)
+
+
+def _debug_cache_vars(repo_root: str, preset: str) -> dict:
+    """Read CMakePresets.json and resolve the named preset's effective
+    cacheVariables (walking `inherits`), so the isolated dir is configured with
+    the SAME debug-like flags the gate's `debug` preset uses (CMAKE_BUILD_TYPE,
+    C++ standard, export-compile-commands, etc.) — minus the binaryDir, which we
+    override to build/mutation. Falls back to a minimal Debug config if the
+    presets file can't be parsed (the goal is debug-like, not byte-identical)."""
+    fallback = {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "CMAKE_CXX_EXTENSIONS": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+    }
+    presets_path = os.path.join(repo_root, "CMakePresets.json")
+    try:
+        data = json.load(open(presets_path, "r", encoding="utf-8"))
+    except Exception:
+        return fallback
+    by_name = {p.get("name"): p for p in data.get("configurePresets", [])}
+    if preset not in by_name:
+        return fallback
+    # Resolve inheritance chain (child overrides parent).
+    chain = []
+    seen = set()
+    cur = preset
+    while cur and cur in by_name and cur not in seen:
+        seen.add(cur)
+        chain.append(by_name[cur])
+        inh = by_name[cur].get("inherits")
+        cur = inh if isinstance(inh, str) else (inh[0] if isinstance(inh, list) and inh else None)
+    merged: dict = {}
+    for p in reversed(chain):  # base first, child last (child wins)
+        for k, v in (p.get("cacheVariables") or {}).items():
+            merged[k] = v.get("value") if isinstance(v, dict) else v
+    return merged or fallback
+
+
+def configure_isolated_build_dir(repo_root: str, preset: str, build_timeout: int,
+                                 verbose: bool) -> str:
+    """Configure the ISOLATED mutation build directory ONCE, with the same
+    debug-like cache variables as the `preset` (default: debug), but with its
+    binaryDir overridden to build/mutation so it can NEVER touch the shared
+    build/<preset> dirs the gate + humans use. Returns the absolute build dir.
+
+    We do a plain `cmake -S <repo> -B build/mutation -D...` rather than
+    `cmake --preset` because the preset hard-codes binaryDir=build/<presetName>;
+    a `-D` override of binaryDir is not honoured by `--preset`. Mirroring the
+    cache vars gives debug-equivalent settings without the shared dir."""
+    build_dir = mutation_build_dir(repo_root)
+    os.makedirs(build_dir, exist_ok=True)
+    cache = _debug_cache_vars(repo_root, preset)
+    cmd = ["cmake", "-S", repo_root, "-B", build_dir]
+    for k, v in cache.items():
+        cmd.append(f"-D{k}={v}")
+    env = dict(os.environ)
+    env.pop("LOCKSTEP_SWEEP_SEEDS", None)
+    print(f"[mutation] configuring ISOLATED build dir {MUTATION_BUILD_SUBDIR} "
+          f"(debug-like, mirrors preset '{preset}'); build/{preset} and other "
+          f"preset dirs are NEVER touched.")
+    if verbose:
+        print("[mutation]   + " + " ".join(cmd))
+    ct, rc, out, err = run_proc_group(cmd, cwd=repo_root, timeout=build_timeout, env=env)
+    if ct or rc != 0:
+        tail = (err or out or "").strip().splitlines()
+        msg = tail[-1] if tail else "configure error"
+        raise RuntimeError(
+            f"failed to configure isolated mutation build dir {build_dir}: {msg}")
+    return build_dir
+
+
+def build_and_test(repo_root: str, build_dir: str, build_timeout: int,
                    test_timeout: int) -> tuple[bool, bool, str, bool]:
-    """Build the preset, then run ctest UNDER A BOUNDED PER-MUTANT TIMEOUT.
+    """Build the ISOLATED mutation build dir, then run ctest UNDER A BOUNDED
+    PER-MUTANT TIMEOUT.
+
+    `build_dir` is the ISOLATED mutation directory (build/mutation) — NEVER the
+    shared build/<preset>. It must already be configured (see
+    configure_isolated_build_dir). This is the shared-tree-pollution fix: every
+    mutant compile + ctest happens here, so build/debug is left untouched.
 
     Returns (built_ok, tests_passed, detail, timed_out).
 
@@ -492,7 +593,6 @@ def build_and_test(repo_root: str, preset: str, build_timeout: int,
     best-effort orphan sweep verifies nothing is left spinning. A test timeout is
     a KILL (timed_out=True): a mutant that breaks termination IS a detected defect.
     """
-    build_dir = os.path.join(repo_root, "build", preset)
     env = dict(os.environ)
     # Keep mutation runs fast: do NOT crank seed-sweep / fuzz sizes.
     env.pop("LOCKSTEP_SWEEP_SEEDS", None)
@@ -535,12 +635,12 @@ def build_and_test(repo_root: str, preset: str, build_timeout: int,
     return (True, False, failline or "ctest non-zero", False)
 
 
-def time_clean_suite(repo_root: str, preset: str, build_timeout: int) -> float:
-    """Time the CLEAN ctest suite ONCE (build first so the timing is test-only).
-    Returns the wall-clock seconds of the clean ctest run, or a conservative
-    fallback if the clean suite itself does not finish (which would be a real
-    problem independent of mutation)."""
-    build_dir = os.path.join(repo_root, "build", preset)
+def time_clean_suite(repo_root: str, build_dir: str, build_timeout: int) -> float:
+    """Time the CLEAN ctest suite ONCE in the ISOLATED build dir (build first so
+    the timing is test-only). `build_dir` is the isolated mutation directory —
+    NEVER build/<preset>. Returns the wall-clock seconds of the clean ctest run,
+    or a conservative fallback if the clean suite itself does not finish (which
+    would be a real problem independent of mutation)."""
     env = dict(os.environ)
     env.pop("LOCKSTEP_SWEEP_SEEDS", None)
     # Ensure the tree is built so we measure test time, not a cold build.
@@ -568,7 +668,7 @@ def derive_test_timeout(baseline_s: float, factor: float, floor_s: float) -> int
 # ---------------------------------------------------------------------------
 # Drive all selected mutants.
 # ---------------------------------------------------------------------------
-def evaluate(repo_root: str, preset: str, mutants: list, build_timeout: int,
+def evaluate(repo_root: str, build_dir: str, mutants: list, build_timeout: int,
              test_timeout: int, verbose: bool) -> list:
     verdicts = []
     n = len(mutants)
@@ -579,7 +679,7 @@ def evaluate(repo_root: str, preset: str, mutants: list, build_timeout: int,
             apply_mutant(repo_root, m)   # creates the crash-safe .mutbak first
             applied = True
             built, passed, detail, timed_out = build_and_test(
-                repo_root, preset, build_timeout, test_timeout
+                repo_root, build_dir, build_timeout, test_timeout
             )
         finally:
             # ALWAYS restore from the .mutbak (the crash-safe ground truth) and
@@ -819,6 +919,17 @@ def main(argv=None) -> int:
         # Honest: no viable mutants proves nothing. But don't block an empty tree
         # solely on this — fall through to threshold logic (0.0 vs threshold).
 
+    # ISOLATED BUILD DIR (shared-tree-pollution fix). Configure build/mutation
+    # ONCE, with debug-like settings mirroring the preset, BEFORE any mutant runs.
+    # Every mutant build + ctest below targets THIS dir; build/<preset> is never
+    # touched, so a stale mutant binary can never poison the gate's debug stage.
+    try:
+        build_dir = configure_isolated_build_dir(
+            repo_root, args.preset, args.build_timeout, args.verbose)
+    except RuntimeError as e:
+        print(f"[mutation] !! FATAL: {e}")
+        return 1
+
     # Derive the per-mutant TEST timeout from a baseline clean-suite timing, unless
     # explicitly overridden. This bounds every mutant's test step so a liveness-
     # breaking mutant can never spin the host (the bug this hardening prevents).
@@ -826,8 +937,9 @@ def main(argv=None) -> int:
         test_timeout = args.test_timeout
         print(f"[mutation] per-mutant test timeout: {test_timeout}s (explicit --test-timeout)")
     else:
-        print("[mutation] timing the CLEAN suite once to derive the per-mutant timeout ...")
-        baseline_s = time_clean_suite(repo_root, args.preset, args.build_timeout)
+        print("[mutation] timing the CLEAN suite once (in the isolated dir) to derive "
+              "the per-mutant timeout ...")
+        baseline_s = time_clean_suite(repo_root, build_dir, args.build_timeout)
         test_timeout = derive_test_timeout(baseline_s, args.timeout_factor, args.timeout_floor)
         print(f"[mutation] clean suite = {baseline_s:.1f}s -> per-mutant test timeout "
               f"= max({args.timeout_floor:.0f}, {baseline_s:.1f}*{args.timeout_factor:g}) "
@@ -836,7 +948,7 @@ def main(argv=None) -> int:
 
     t0 = time.time()
     verdicts = evaluate(
-        repo_root, args.preset, selected,
+        repo_root, build_dir, selected,
         args.build_timeout, test_timeout, args.verbose,
     )
     report.verdicts = verdicts

@@ -68,11 +68,14 @@ def part_a_planted_killed(repo_root: str, preset: str, verbose: bool) -> bool:
     if not candidates:
         candidates = mutants[:1]
 
-    build_dir = os.path.join(repo_root, "build", preset)
-    if not os.path.isdir(build_dir):
-        print(f"  [setup] configuring preset '{preset}' ...")
-        subprocess.run(["cmake", "--preset", preset], cwd=repo_root,
-                       capture_output=True, text=True, check=False)
+    # Use the ISOLATED mutation build dir (build/mutation), NOT the shared
+    # build/<preset>, so even the self-test never pollutes the gate's debug tree.
+    print(f"  [setup] configuring ISOLATED mutation build dir (mirrors '{preset}') ...")
+    try:
+        build_dir = rm.configure_isolated_build_dir(repo_root, preset, 600, verbose)
+    except RuntimeError as e:
+        print(f"  PART A SKIP: could not configure isolated build dir: {e}")
+        return True
 
     for m in candidates[:8]:
         print(f"  trying planted mutant: {m.mutant_id}  ({m.describe()})")
@@ -80,7 +83,7 @@ def part_a_planted_killed(repo_root: str, preset: str, verbose: bool) -> bool:
         try:
             rm.apply_mutant(repo_root, m)
             applied = True
-            built, passed, detail, _to = rm.build_and_test(repo_root, preset, 600, 600)
+            built, passed, detail, _to = rm.build_and_test(repo_root, build_dir, 600, 600)
         finally:
             if applied:
                 rm.restore_mutant(repo_root, m)
@@ -336,7 +339,7 @@ def part_c_timeout_killed(verbose: bool) -> bool:
                 print("  PART C FAIL: .mutbak backup was not created before mutation.")
                 return False
             built, passed, detail, timed_out = rm.build_and_test(
-                tmp, "debug", 120, per_mut_timeout)
+                tmp, build_dir, 120, per_mut_timeout)
         finally:
             if applied:
                 rm.restore_mutant(tmp, target)

@@ -17,7 +17,8 @@ For each mutant the runner:
 1. **Generates** a single-edit source change by applying the operator set below
    to the C++ sources under `core/` and `providers/sim/`.
 2. **Backs up** the file to `<file>.mutbak`, **applies** the one-line edit in
-   place, **rebuilds** the affected preset (`debug` by default), and **runs the
+   place, **rebuilds** in the **isolated mutation build directory**
+   (`build/mutation/` — see *Isolated build directory* below), and **runs the
    ctest suite under a bounded per-mutant timeout** (see *Liveness safety*). The
    original bytes are always restored **from the backup** afterward — even on
    exception, Ctrl-C, or an external SIGKILL of a child — and the backup is
@@ -60,6 +61,43 @@ operator at every safe site. Documented operators (code → meaning):
 Operators that produce a longer C++ token (`<<`, `>>`, `->`, `++`, `+=`, `&&` from
 `Type&&`, etc.) are skipped at generation time so we don't emit nonsense; the few
 that slip through simply fail to compile and are counted as **SKIPPED**.
+
+## Isolated build directory (the shared-tree-pollution fix)
+
+Mutation **never** builds or tests in the shared `build/<preset>` directories the
+merge gate (`gate.sh` stage `compile+test (debug)`) and human developers use. It
+configures and builds in its **own** directory, **`build/mutation/`**.
+
+**Why this is mandatory.** A mutation lives in a *header*. After the source is
+restored, an incremental `cmake --build` sometimes does **not** rebuild the
+dependent target — an mtime / dependency miss — leaving a **stale,
+mutant-compiled** test binary in `build/debug`. A later *normal*
+`cmake --build --preset debug` + `ctest` then runs that stale mutant binary and
+**fails with a mutation-induced assert** (e.g. `set_value on empty Promise`),
+corrupting the gate signal. This was misdiagnosed twice as a Phase-1 runtime
+regression. Isolating the build dir makes it **impossible**: after any mutation
+run, `build/debug` and every preset dir are **byte-for-byte untouched**.
+
+**How it works.**
+
+- `build/mutation` is **not** a preset `binaryDir` (presets use
+  `build/<presetName>`: `debug`, `release`, `asan`, …), so it can never collide
+  with a gate or developer build tree. It is already covered by the `build/`
+  rule in `.gitignore`.
+- The dir is configured **once at startup** (`configure_isolated_build_dir`),
+  then **reused across all mutants** in the run for speed — the first configure
+  is a one-time cost.
+- Configuration mirrors the `--preset` (default `debug`) **cacheVariables**
+  (`CMAKE_BUILD_TYPE=Debug`, C++ standard, export-compile-commands, …) read from
+  `CMakePresets.json`, but with the `binaryDir` overridden to `build/mutation`.
+  We use a plain `cmake -S . -B build/mutation -D…` rather than `cmake --preset`
+  because `--preset` hard-codes `binaryDir=build/<presetName>` and ignores a
+  `binaryDir` override — so the only way to keep debug-equivalent flags *and* an
+  isolated dir is to mirror the cache vars.
+- Every per-mutant `cmake --build` and `ctest` (and the baseline clean-suite
+  timing) targets **`build/mutation`** via `--test-dir` — never `build/<preset>`.
+- The `--selftest` likewise builds its real-tree Part A against `build/mutation`,
+  so even the teeth-test never pollutes the gate's debug tree.
 
 ## Determinism (cardinal rule: no system randomness)
 
@@ -202,7 +240,8 @@ python3 tools/mutation/run_mutation.py [options]
   --sample N             deterministic seeded sample of N mutants
   --seed S               sample seed (default fixed; no system randomness)
   --changed-only         only mutate sources changed vs HEAD
-  --preset P             cmake/ctest preset to rebuild per mutant (default: debug)
+  --preset P             preset whose cacheVariables the ISOLATED build/mutation dir
+                         mirrors (default: debug); mutants build there, NOT in build/<preset>
   --threshold F          min score percent (env LOCKSTEP_MUTATION_THRESHOLD)
   --test-timeout N       fixed per-mutant test timeout (s); overrides derivation
   --timeout-factor F     per-mutant timeout = max(floor, baseline*F) (env LOCKSTEP_MUTATION_TIMEOUT_FACTOR)
