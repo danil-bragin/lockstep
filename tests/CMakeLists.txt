@@ -41,6 +41,21 @@ if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
       lockstep_providers_sim)
   add_test(NAME runtime_determinism COMMAND lockstep_runtime_determinism_test)
 
+  # --- Phase 1 determinism: SAME-TICK timer firing order (mutation backprop) ---
+  # Kills the surviving mutant at Scheduler.hpp:238 (the timer insertion-sort
+  # `b - 1` -> `b - 0`). Arms MULTIPLE timers DUE AT THE SAME virtual tick with
+  # the pending-timer vector holding them at SCRAMBLED indices (arm_seq order !=
+  # vector order), and asserts they FIRE in the documented (due, arm_seq) order.
+  # A `b - 0` no-op sort fires them in vector order instead -> this test FAILS,
+  # killing that mutant. Links the header-only runtime only (no PRNG needed).
+  add_executable(lockstep_scheduler_timer_order_test scheduler_timer_order_test.cpp)
+  target_link_libraries(lockstep_scheduler_timer_order_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime)
+  add_test(NAME scheduler_timer_order COMMAND lockstep_scheduler_timer_order_test)
+
   # --- Phase 1 ADVERSARIAL determinism gate (P1-VERIFY, independent author) ---
   # The FULL gate the brief P1-VERIFY calls for: the ping-pong gate (3 spec
   # assertions), a multi-seed sweep, a forced-bug byte-reproducibility check, and

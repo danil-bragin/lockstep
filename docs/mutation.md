@@ -12,17 +12,21 @@ hollow 100%).
 
 ## What it does
 
-For each mutant the runner:
+Once per run the runner first builds a **shadow copy** of the repo source under
+`build/mutation-src/` (see *Shadow source tree* below) and configures the
+isolated build from it. Then, for each mutant, it:
 
 1. **Generates** a single-edit source change by applying the operator set below
    to the C++ sources under `core/` and `providers/sim/`.
-2. **Backs up** the file to `<file>.mutbak`, **applies** the one-line edit in
-   place, **rebuilds** in the **isolated mutation build directory**
-   (`build/mutation/` — see *Isolated build directory* below), and **runs the
-   ctest suite under a bounded per-mutant timeout** (see *Liveness safety*). The
-   original bytes are always restored **from the backup** afterward — even on
-   exception, Ctrl-C, or an external SIGKILL of a child — and the backup is
-   deleted on success.
+2. **Applies** the one-line edit **in the SHADOW tree** (never the real working
+   tree), **rebuilds** in the **isolated mutation build directory**
+   (`build/mutation/`, configured from the shadow — see *Isolated build
+   directory* below), and **runs the ctest suite under a bounded per-mutant
+   timeout** (see *Liveness safety*). The shadow file is restored afterward by
+   re-copying it from the **real source** (the ground truth) — even on exception,
+   Ctrl-C, or an external SIGKILL of a child. A crash-safe `<shadow-file>.mutbak`
+   is also written next to the shadow file as a belt-and-suspenders, but it can
+   only ever land under `build/` (gitignored), **never** in the real source tree.
 3. **Classifies** the mutant:
    - **KILLED** — build OK and ctest **FAILED** → a test caught the bug. Good.
      A build/test that **exceeds the per-mutant timeout** is **also KILLED**
@@ -62,11 +66,51 @@ Operators that produce a longer C++ token (`<<`, `>>`, `->`, `++`, `+=`, `&&` fr
 `Type&&`, etc.) are skipped at generation time so we don't emit nonsense; the few
 that slip through simply fail to compile and are counted as **SKIPPED**.
 
+## Shadow source tree (the live-tree-corruption fix — the PRIMARY safety)
+
+Mutation **never writes the real working tree.** Once per run the runner copies
+the repo's source into a **shadow tree** under **`build/mutation-src/`** and
+configures the build *from the shadow* (`cmake -S build/mutation-src -B
+build/mutation`). Every mutant's one-line edit is applied to a file **in the
+shadow**, built+tested in `build/mutation`, then restored by re-copying that file
+from the real source. The real `core/`, `providers/`, … files are **never** a
+build input and are **never** written.
+
+**Why this is mandatory.** The earlier design mutated source files **in place**
+(back up to `<file>.mutbak` → mutate → restore in a `finally`). When the process
+was **killed mid-mutant** (a host freeze did exactly this), the `finally` never
+ran: the **live working tree was left CORRUPTED** with a mutant in place, with
+only the `.mutbak` holding the original. That silently left two core mutants
+(Scheduler insertion-sort, SeededRandom range guard) that **nearly got
+committed.** The isolated build dir (below) fixed stale *binaries* but not
+in-place *source* corruption.
+
+**How the shadow makes corruption impossible.**
+
+- The shadow is **rebuilt fresh every run** (`shutil.rmtree` + `copytree`), so it
+  always mirrors the current real source byte-for-byte.
+- It excludes the heavy/recursive/non-source dirs — notably **`build`** (which
+  *contains* the shadow; excluding it avoids infinite recursion), `.git`, and the
+  TLC `states/` scratch — and any stray `*.mutbak`. Everything else (all source +
+  `CMakeLists.txt` + `CMakePresets.json` + `cmake/` modules) is copied so the
+  shadow configures exactly like the real tree.
+- An interruption (SIGKILL / host freeze) can **only ever leave junk under
+  `build/`**, which is gitignored and disposable — **never** a corrupted real
+  source file. `git status core/ providers/` shows **zero** modifications during
+  and after a run.
+- The `*.mutbak` + **restore-on-start** machinery (see *Liveness safety*) is
+  **kept as belt-and-suspenders** (and still heals any legacy in-place state in
+  the real tree), but the shadow tree is the primary mechanism that makes the live
+  tree untouchable.
+
+`build/mutation-src/` is covered by the `build/` rule in `.gitignore`.
+
 ## Isolated build directory (the shared-tree-pollution fix)
 
 Mutation **never** builds or tests in the shared `build/<preset>` directories the
 merge gate (`gate.sh` stage `compile+test (debug)`) and human developers use. It
-configures and builds in its **own** directory, **`build/mutation/`**.
+configures and builds in its **own** directory, **`build/mutation/`**, whose
+source (`-S`) is the **shadow tree** (`build/mutation-src/`), not the real repo.
 
 **Why this is mandatory.** A mutation lives in a *header*. After the source is
 restored, an incremental `cmake --build` sometimes does **not** rebuild the
@@ -90,14 +134,18 @@ run, `build/debug` and every preset dir are **byte-for-byte untouched**.
 - Configuration mirrors the `--preset` (default `debug`) **cacheVariables**
   (`CMAKE_BUILD_TYPE=Debug`, C++ standard, export-compile-commands, …) read from
   `CMakePresets.json`, but with the `binaryDir` overridden to `build/mutation`.
-  We use a plain `cmake -S . -B build/mutation -D…` rather than `cmake --preset`
-  because `--preset` hard-codes `binaryDir=build/<presetName>` and ignores a
-  `binaryDir` override — so the only way to keep debug-equivalent flags *and* an
-  isolated dir is to mirror the cache vars.
+  We use a plain `cmake -S build/mutation-src -B build/mutation -D…` (source =
+  the **shadow tree**) rather than `cmake --preset` because `--preset` hard-codes
+  `binaryDir=build/<presetName>` and ignores a `binaryDir` override — so the only
+  way to keep debug-equivalent flags *and* an isolated dir *and* a shadow source
+  is to mirror the cache vars. (A stale `build/mutation` cache pointing at a
+  different source dir is detected via `CMAKE_HOME_DIRECTORY` and wiped before
+  reconfigure.)
 - Every per-mutant `cmake --build` and `ctest` (and the baseline clean-suite
   timing) targets **`build/mutation`** via `--test-dir` — never `build/<preset>`.
-- The `--selftest` likewise builds its real-tree Part A against `build/mutation`,
-  so even the teeth-test never pollutes the gate's debug tree.
+- The `--selftest` likewise builds its Part A against the **shadow tree** +
+  `build/mutation`, so even the teeth-test never writes the real working tree nor
+  pollutes the gate's debug tree.
 
 ## Determinism (cardinal rule: no system randomness)
 
@@ -209,6 +257,43 @@ Every **SURVIVED** mutant is printed with `file:line`, operator, and
 `original -> mutated`, both in the human summary and in `--json` (`survivors[]`).
 A survivor means a real, mechanically-proven hole in the agent-written tests:
 fix the test (or accept + document the gap), then re-run.
+
+### Same-tick timer ordering — gap closed (`tests/scheduler_timer_order_test.cpp`)
+
+A mutation survived at `core/include/lockstep/core/Scheduler.hpp:238`, the timer
+insertion-sort that orders timers due at the **same virtual tick** by `arm_seq`.
+The Phase-1 determinism suite never armed **multiple timers due at the same tick**
+and pinned their fire order, so any bug in that ordering went undetected — the
+real adequacy hole. `tests/scheduler_timer_order_test.cpp` closes it: it arms
+several timers all due at one tick, in a non-trivial arm order, and asserts they
+**fire in ascending `arm_seq` order** (observable in the event trace). It KILLS
+every *observable* same-tick-ordering mutation of that line — `ROR >`→`<=`,
+`LCR &&`→`||`, `AOR -`→`+`, `NEG` — each of which corrupts the fire order or trips
+the scheduler's own assertions / the suite's liveness ceiling.
+
+### Documented EQUIVALENT mutant: `Scheduler.hpp:238 ABS '1'->'0'`
+
+The specific survivor the suite still reports — `due_now[b - 1]` → `due_now[b -
+0]` — is a **proven equivalent mutant** through the scheduler's public surface,
+and is therefore **un-killable by any test that does not edit `Scheduler.hpp`**:
+
+- The pending-timer vector `timers_` is **always arm-monotonic**: `delay()`
+  appends in arm order, and the firing erase preserves survivors' relative order.
+  So the index list the insertion-sort receives is **always already sorted by
+  `arm_seq`**. On already-sorted input the correct `b-1` and the no-op `b-0` are
+  **byte-for-byte identical** (the inner loop never needs to move anything).
+- Feeding the sort an **unsorted** list (the only input on which `b-1` and `b-0`
+  differ) is impossible without **also** violating the firing erase loop's
+  identical precondition (it erases `due_now[k-1]` descending, assuming ascending
+  indices). Verified empirically: white-box injecting **any** non-trivial
+  same-tick order corrupts the erase **even on correct code** (out-of-range erase
+  / `set_value on empty Promise`). The sort's gather-order invariant and the erase
+  loop's precondition are the **same** precondition.
+
+So this mutant guards a branch that is **dead-but-correct under every reachable
+state**. It is accepted and documented here as an equivalent mutant — not a test
+gap — and the mutation gate's threshold/baseline policy should treat it as such
+(it does not, by itself, fail a tree whose threshold is not ratcheted up).
 
 ## Non-vacuous proof (the teeth-test)
 

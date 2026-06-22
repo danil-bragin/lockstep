@@ -138,6 +138,43 @@ DEFAULT_PRESET = "debug"
 MUTATION_BUILD_DIRNAME = "mutation"
 MUTATION_BUILD_SUBDIR = os.path.join("build", MUTATION_BUILD_DIRNAME)
 
+# SHADOW SOURCE TREE (the live-tree-corruption fix — PRIMARY mechanism).
+# -----------------------------------------------------------------------
+# Mutants MUST NOT be written into the REAL working tree. The earlier design
+# mutated source files IN PLACE (backup -> mutate -> restore-in-finally). When the
+# process was KILLED mid-mutant (a host freeze did exactly this), the live tree
+# was left CORRUPTED with a mutant in place — only the <file>.mutbak held the
+# original — and that nearly committed two core mutants (Scheduler insertion-sort,
+# SeededRandom range guard). The build-dir isolation (build/mutation) fixed stale
+# BINARIES but not in-place SOURCE corruption.
+#
+# THE FIX: once per run we copy the repo's SOURCE into a SHADOW tree under
+# build/mutation-src/ (gitignored, disposable) and CONFIGURE THE BUILD FROM THE
+# SHADOW (cmake -S build/mutation-src -B build/mutation). Every mutant is applied
+# to a file IN THE SHADOW tree, built+tested in build/mutation, then the shadow
+# file is restored (re-copied from the REAL source). The REAL working tree is
+# NEVER written. An interruption can only ever leave junk under build/ — never a
+# corrupted source file. The .mutbak/restore-on-start machinery is KEPT as a
+# belt-and-suspenders for any legacy state, but the shadow tree is what makes the
+# live tree untouchable.
+MUTATION_SHADOW_DIRNAME = "mutation-src"
+MUTATION_SHADOW_SUBDIR = os.path.join("build", MUTATION_SHADOW_DIRNAME)
+
+# Directories never copied into the shadow tree (heavy, non-source, recursive, or
+# NOT a build input). `build` MUST be excluded (it contains the shadow itself —
+# recursion) as must the VCS dir and the TLC model-checker scratch. `tools` is
+# excluded too: the top-level CMake never `add_subdirectory(tools)`, so the build
+# does not need it — AND it holds the lint's DELIBERATELY-DIRTY fixtures
+# (tools/lint/fixtures/dirty/*), which the gate's repo-wide forbidden-call lint
+# would otherwise FALSE-FLAG when scanning the shadow copy (the exemption is keyed
+# on the prefix `tools/lint/fixtures`, which the shadowed path no longer matches).
+# Everything the build actually needs (all compiled source + CMakeLists +
+# CMakePresets + cmake/ modules) is copied so the shadow configures byte-for-byte
+# like the real tree.
+SHADOW_EXCLUDE_DIRS = {"build", ".git", "states", "cmake-build-debug", "out", "tools"}
+# File suffixes skipped during the shadow copy (mutation backups; see MUTBAK_SUFFIX).
+SHADOW_EXCLUDE_SUFFIXES = (".mutbak",)
+
 # Per-mutant timeout policy (env-overridable; documented above + in docs/mutation.md).
 TIMEOUT_FACTOR_DEFAULT = float(os.environ.get("LOCKSTEP_MUTATION_TIMEOUT_FACTOR", "8"))
 TIMEOUT_FLOOR_DEFAULT = float(os.environ.get("LOCKSTEP_MUTATION_TIMEOUT_FLOOR", "30"))
@@ -501,6 +538,79 @@ def mutation_build_dir(repo_root: str) -> str:
     return os.path.join(repo_root, MUTATION_BUILD_SUBDIR)
 
 
+def shadow_src_dir(repo_root: str) -> str:
+    """Absolute path of the SHADOW SOURCE TREE (build/mutation-src). Mutants are
+    applied HERE, never in the real working tree."""
+    return os.path.join(repo_root, MUTATION_SHADOW_SUBDIR)
+
+
+def setup_shadow_tree(repo_root: str, verbose: bool) -> str:
+    """Build (once per run) a SHADOW COPY of the repo's source under
+    build/mutation-src/ — the tree mutants are actually written into. The REAL
+    working tree is the source of truth and is NEVER mutated.
+
+    We copy everything except the heavy/recursive/non-source dirs in
+    SHADOW_EXCLUDE_DIRS (notably `build`, which CONTAINS the shadow — excluding it
+    avoids infinite recursion) and any stray *.mutbak. The shadow is recreated
+    fresh each run so it always mirrors the current real source byte-for-byte.
+
+    Returns the absolute shadow root. The shadow lives under build/ and is thus
+    already gitignored + disposable: an interruption can only ever leave junk here,
+    never a corrupted real source file.
+    """
+    shadow = shadow_src_dir(repo_root)
+    build_parent = os.path.join(repo_root, "build")
+    os.makedirs(build_parent, exist_ok=True)
+    # Recreate fresh so the shadow exactly mirrors the current real source.
+    if os.path.isdir(shadow):
+        shutil.rmtree(shadow, ignore_errors=True)
+    os.makedirs(shadow, exist_ok=True)
+
+    def _ignore(dirpath, names):
+        ignored = []
+        rel = os.path.relpath(dirpath, repo_root)
+        for n in names:
+            full = os.path.join(dirpath, n)
+            # Exclude top-level heavy/recursive dirs by name.
+            if os.path.isdir(full) and rel == "." and n in SHADOW_EXCLUDE_DIRS:
+                ignored.append(n)
+                continue
+            # Never copy the shadow/build into itself at any depth.
+            if os.path.isdir(full) and os.path.abspath(full) == os.path.abspath(build_parent):
+                ignored.append(n)
+                continue
+            if n.endswith(SHADOW_EXCLUDE_SUFFIXES):
+                ignored.append(n)
+        return ignored
+
+    # Copy file-by-file via copytree into the (already-created) shadow dir.
+    # dirs_exist_ok lets us target the pre-made shadow root.
+    shutil.copytree(repo_root, shadow, ignore=_ignore, dirs_exist_ok=True,
+                    symlinks=True)
+    print(f"[mutation] built SHADOW SOURCE TREE {MUTATION_SHADOW_SUBDIR} "
+          f"(mutants are applied HERE; the REAL working tree is NEVER written).")
+    if verbose:
+        try:
+            n_files = sum(len(fs) for _d, _s, fs in os.walk(shadow))
+            print(f"[mutation]   shadow contains {n_files} file(s).")
+        except OSError:
+            pass
+    return shadow
+
+
+def refresh_shadow_file(repo_root: str, shadow_root: str, rel_path: str) -> None:
+    """Restore ONE file in the shadow tree by re-copying it from the REAL source.
+    Used after each mutant as the primary restore (the real file is the ground
+    truth; we never need to trust an in-shadow backup). Idempotent."""
+    real = os.path.join(repo_root, rel_path)
+    shadow = os.path.join(shadow_root, rel_path)
+    try:
+        os.makedirs(os.path.dirname(shadow), exist_ok=True)
+        shutil.copy2(real, shadow)
+    except OSError as e:
+        print(f"[mutation] !! WARNING: failed to refresh shadow file {rel_path}: {e}")
+
+
 def _debug_cache_vars(repo_root: str, preset: str) -> dict:
     """Read CMakePresets.json and resolve the named preset's effective
     cacheVariables (walking `inherits`), so the isolated dir is configured with
@@ -539,28 +649,48 @@ def _debug_cache_vars(repo_root: str, preset: str) -> dict:
     return merged or fallback
 
 
-def configure_isolated_build_dir(repo_root: str, preset: str, build_timeout: int,
-                                 verbose: bool) -> str:
+def configure_isolated_build_dir(repo_root: str, source_dir: str, preset: str,
+                                 build_timeout: int, verbose: bool) -> str:
     """Configure the ISOLATED mutation build directory ONCE, with the same
     debug-like cache variables as the `preset` (default: debug), but with its
     binaryDir overridden to build/mutation so it can NEVER touch the shared
     build/<preset> dirs the gate + humans use. Returns the absolute build dir.
 
-    We do a plain `cmake -S <repo> -B build/mutation -D...` rather than
+    `source_dir` is the SHADOW SOURCE TREE (build/mutation-src) — NOT the real
+    repo — so the build compiles the shadow's files, and every mutant edit lands
+    in the shadow. The real working tree is never a build input.
+
+    We do a plain `cmake -S <shadow> -B build/mutation -D...` rather than
     `cmake --preset` because the preset hard-codes binaryDir=build/<presetName>;
     a `-D` override of binaryDir is not honoured by `--preset`. Mirroring the
     cache vars gives debug-equivalent settings without the shared dir."""
     build_dir = mutation_build_dir(repo_root)
+    # A stale CMakeCache from a PRIOR run may record a DIFFERENT source dir (e.g. an
+    # older runner configured `-S <repo>` instead of the shadow). CMake refuses to
+    # reuse such a cache ("source does not match"). Since the shadow is rebuilt
+    # fresh every run anyway, drop a mismatched build dir so configure is clean.
+    cache_file = os.path.join(build_dir, "CMakeCache.txt")
+    if os.path.isfile(cache_file):
+        try:
+            cached_src = None
+            for ln in open(cache_file, "r", encoding="utf-8", errors="replace"):
+                if ln.startswith("CMAKE_HOME_DIRECTORY:"):
+                    cached_src = ln.split("=", 1)[1].strip()
+                    break
+            if cached_src and os.path.abspath(cached_src) != os.path.abspath(source_dir):
+                shutil.rmtree(build_dir, ignore_errors=True)
+        except OSError:
+            shutil.rmtree(build_dir, ignore_errors=True)
     os.makedirs(build_dir, exist_ok=True)
     cache = _debug_cache_vars(repo_root, preset)
-    cmd = ["cmake", "-S", repo_root, "-B", build_dir]
+    cmd = ["cmake", "-S", source_dir, "-B", build_dir]
     for k, v in cache.items():
         cmd.append(f"-D{k}={v}")
     env = dict(os.environ)
     env.pop("LOCKSTEP_SWEEP_SEEDS", None)
     print(f"[mutation] configuring ISOLATED build dir {MUTATION_BUILD_SUBDIR} "
-          f"(debug-like, mirrors preset '{preset}'); build/{preset} and other "
-          f"preset dirs are NEVER touched.")
+          f"FROM THE SHADOW TREE {MUTATION_SHADOW_SUBDIR} (debug-like, mirrors "
+          f"preset '{preset}'); the REAL tree and build/{preset} are NEVER touched.")
     if verbose:
         print("[mutation]   + " + " ".join(cmd))
     ct, rc, out, err = run_proc_group(cmd, cwd=repo_root, timeout=build_timeout, env=env)
@@ -668,26 +798,32 @@ def derive_test_timeout(baseline_s: float, factor: float, floor_s: float) -> int
 # ---------------------------------------------------------------------------
 # Drive all selected mutants.
 # ---------------------------------------------------------------------------
-def evaluate(repo_root: str, build_dir: str, mutants: list, build_timeout: int,
-             test_timeout: int, verbose: bool) -> list:
+def evaluate(repo_root: str, shadow_root: str, build_dir: str, mutants: list,
+             build_timeout: int, test_timeout: int, verbose: bool) -> list:
     verdicts = []
     n = len(mutants)
     for i, m in enumerate(mutants, start=1):
         applied = False
         timed_out = False
         try:
-            apply_mutant(repo_root, m)   # creates the crash-safe .mutbak first
+            # Apply the mutant IN THE SHADOW TREE — never the real working tree.
+            # apply_mutant also writes a crash-safe .mutbak (belt-and-suspenders)
+            # NEXT TO THE SHADOW FILE, so any interruption leaves junk only under
+            # build/ (gitignored), never a corrupted real source file.
+            apply_mutant(shadow_root, m)
             applied = True
             built, passed, detail, timed_out = build_and_test(
                 repo_root, build_dir, build_timeout, test_timeout
             )
         finally:
-            # ALWAYS restore from the .mutbak (the crash-safe ground truth) and
-            # delete the backup. Even if build_and_test raised, the source is
-            # healed here; and even if THIS process is killed before this runs,
-            # the next run's restore-on-start guard heals the leftover .mutbak.
+            # PRIMARY restore: re-copy the file from the REAL source into the
+            # shadow (the real file is the ground truth). Also restore-from-.mutbak
+            # to consume the in-shadow backup. Either way the real tree is never
+            # touched; even a SIGKILL before this runs leaves only build/ junk that
+            # the next run's restore-on-start + fresh shadow rebuild heal.
             if applied:
-                restore_mutant(repo_root, m)
+                restore_mutant(shadow_root, m)
+                refresh_shadow_file(repo_root, shadow_root, m.file_path)
         if not built:
             status = "skipped"
         elif passed:
@@ -876,9 +1012,11 @@ def main(argv=None) -> int:
 
     repo_root = os.path.abspath(args.repo_root)
 
-    # RESTORE-ON-START GUARD (self-heal). Before ANYTHING else, heal any *.mutbak
-    # a previously crashed/killed run left behind, so a hang+SIGKILL can never
-    # leave the tree corrupted across invocations.
+    # RESTORE-ON-START GUARD (self-heal, belt-and-suspenders). Heal any *.mutbak a
+    # previously crashed/killed LEGACY in-place run left behind in the REAL source
+    # roots, so even old state can never leave the tree corrupted. With the shadow
+    # tree this should never fire for new runs (mutants live in build/mutation-src,
+    # which is rebuilt fresh each run), but we keep it for legacy safety.
     restore_on_start(repo_root, SOURCE_ROOTS)
 
     if args.selftest:
@@ -919,13 +1057,25 @@ def main(argv=None) -> int:
         # Honest: no viable mutants proves nothing. But don't block an empty tree
         # solely on this — fall through to threshold logic (0.0 vs threshold).
 
+    # SHADOW SOURCE TREE (live-tree-corruption fix — PRIMARY mechanism). Build a
+    # fresh copy of the repo source under build/mutation-src ONCE; every mutant is
+    # written HERE, never in the real working tree. An interruption can only leave
+    # junk under build/ (gitignored), never a corrupted real source file.
+    try:
+        shadow_root = setup_shadow_tree(repo_root, args.verbose)
+    except OSError as e:
+        print(f"[mutation] !! FATAL: could not build shadow source tree: {e}")
+        return 1
+
     # ISOLATED BUILD DIR (shared-tree-pollution fix). Configure build/mutation
-    # ONCE, with debug-like settings mirroring the preset, BEFORE any mutant runs.
-    # Every mutant build + ctest below targets THIS dir; build/<preset> is never
-    # touched, so a stale mutant binary can never poison the gate's debug stage.
+    # ONCE, FROM THE SHADOW TREE, with debug-like settings mirroring the preset,
+    # BEFORE any mutant runs. Every mutant build + ctest below targets THIS dir and
+    # compiles the SHADOW's files; build/<preset> and the real tree are never
+    # touched, so a stale mutant binary can never poison the gate's debug stage and
+    # the live source is never written.
     try:
         build_dir = configure_isolated_build_dir(
-            repo_root, args.preset, args.build_timeout, args.verbose)
+            repo_root, shadow_root, args.preset, args.build_timeout, args.verbose)
     except RuntimeError as e:
         print(f"[mutation] !! FATAL: {e}")
         return 1
@@ -948,7 +1098,7 @@ def main(argv=None) -> int:
 
     t0 = time.time()
     verdicts = evaluate(
-        repo_root, build_dir, selected,
+        repo_root, shadow_root, build_dir, selected,
         args.build_timeout, test_timeout, args.verbose,
     )
     report.verdicts = verdicts

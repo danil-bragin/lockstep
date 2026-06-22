@@ -68,25 +68,31 @@ def part_a_planted_killed(repo_root: str, preset: str, verbose: bool) -> bool:
     if not candidates:
         candidates = mutants[:1]
 
-    # Use the ISOLATED mutation build dir (build/mutation), NOT the shared
-    # build/<preset>, so even the self-test never pollutes the gate's debug tree.
-    print(f"  [setup] configuring ISOLATED mutation build dir (mirrors '{preset}') ...")
+    # Use the SHADOW SOURCE TREE (build/mutation-src) + the ISOLATED mutation build
+    # dir (build/mutation), NOT the real tree or the shared build/<preset>, so even
+    # the self-test never WRITES the real working tree nor pollutes the gate's debug
+    # tree. The planted mutant is applied in the SHADOW and built from it.
+    print(f"  [setup] building SHADOW source tree + configuring ISOLATED build dir "
+          f"(mirrors '{preset}') ...")
     try:
-        build_dir = rm.configure_isolated_build_dir(repo_root, preset, 600, verbose)
-    except RuntimeError as e:
-        print(f"  PART A SKIP: could not configure isolated build dir: {e}")
+        shadow_root = rm.setup_shadow_tree(repo_root, verbose)
+        build_dir = rm.configure_isolated_build_dir(repo_root, shadow_root, preset, 600, verbose)
+    except (RuntimeError, OSError) as e:
+        print(f"  PART A SKIP: could not set up shadow tree / isolated build dir: {e}")
         return True
 
     for m in candidates[:8]:
         print(f"  trying planted mutant: {m.mutant_id}  ({m.describe()})")
         applied = False
         try:
-            rm.apply_mutant(repo_root, m)
+            # Mutate the SHADOW file, never the real one.
+            rm.apply_mutant(shadow_root, m)
             applied = True
             built, passed, detail, _to = rm.build_and_test(repo_root, build_dir, 600, 600)
         finally:
             if applied:
-                rm.restore_mutant(repo_root, m)
+                rm.restore_mutant(shadow_root, m)
+                rm.refresh_shadow_file(repo_root, shadow_root, m.file_path)
         if not built:
             print(f"    -> did not compile (SKIP): {detail}; trying next")
             continue
