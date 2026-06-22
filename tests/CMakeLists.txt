@@ -224,6 +224,166 @@ else()
     "kv_seedburn_test not built (Phase 2 batch 2 C2.7/C2.8 pending).")
 endif()
 
+# --- Phase 3 step 1: storage differential harness self-test ------------------
+# P3-MACHINERY self-test (specs/storage-engine.md §4/§5 step 1). Proves the
+# storage VERIFICATION MACHINERY before any real engine: the Engine interface
+# seam + trivial Oracle + differential harness. Asserts (a) Oracle-vs-Oracle is an
+# always-match baseline across a seed sweep (the comparator compares), (b) TEETH —
+# deliberately-WRONG engines (off-by-one snapshot bound; a delete that doesn't
+# delete) are FLAGGED with a replayable witness (a harness that passes a known-
+# wrong engine is itself the bug), and (c) the harness is a pure fn of seed
+# (same seed ⇒ byte-identical witness). Links the header-only storage lib + the
+# runtime + sim PRNG (the harness drives the seeded op stream on the scheduler).
+# Non-provider code → forbidden-lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_diff_test storage_diff_test.cpp)
+  target_include_directories(lockstep_storage_diff_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_diff_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_diff_test COMMAND lockstep_storage_diff_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_diff_test not built (Phase 3 step 1 pending).")
+endif()
+
+# --- Phase 3 step 2: real storage engine (WAL + memtable + MVCC + recovery) ---
+# P3-ENGINE-CORE gate (specs/storage-engine.md §2/§4; §5 step 2). The FIRST real
+# Lockstep engine (storage/WalEngine.hpp). Asserts (A) DIFFERENTIAL no-faults —
+# WalEngine vs Oracle over a seed sweep, 0 mismatch (the core gate); (B) CRASH-
+# CONSISTENCY under the full fault envelope — crash() at seeded points, recover()
+# to a valid oracle PREFIX, 0 fabrication (V-PREFIX/V-NOTORN); (B') durable-
+# survives on an honest disk (V-DUR); (C) MVCC under concurrent writers — a
+# snapshot stays stable (V-SNAP); (D) determinism — same seed ⇒ byte-identical
+# recovered reads + on-disk durable image fingerprint (V-DET). Links the header-
+# only storage lib + runtime + sim PRNG + SimDisk. Non-provider TU → forbidden-
+# lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_engine_test storage_engine_test.cpp)
+  target_include_directories(lockstep_storage_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_engine_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_engine_test COMMAND lockstep_storage_engine_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_engine_test not built (Phase 3 step 2 pending).")
+endif()
+
+# --- Phase 3 step 4: SSTable layer (flush + manifest + bloom + scan) ----------
+# P3-SSTABLE gate (specs/storage-engine.md §2/§3/§6; §5 step 4). The memtable
+# flushes to immutable on-disk SSTables (per-block CRC + sparse index + bloom +
+# CRC'd footer), atomically installed via a CRC'd Seq-contiguous MANIFEST; reads
+# span memtable + SSTables (newest→oldest); scan() merges them at a snapshot.
+# Asserts (A) DIFFERENTIAL WITH FLUSHES — WalEngine(LSM) vs Oracle over a seed
+# sweep, get+scan, 0 mismatch (the core gate, with many forced flushes); (B)
+# METAMORPHIC — a forced flush changes no visible get/scan value (flush ⊥ change
+# reads); (C) CRASH-DURING-FLUSH — crash incl. mid-flush under the full fault
+# envelope, recover from the manifest's committed SSTable set + WAL prefix to a
+# valid oracle PREFIX, 0 fabrication, no half-SSTable surviving (V-PREFIX/
+# V-NOTORN, atomic install); (D) BLOOM no false negative (a present key is never
+# skipped); (E) determinism — same seed ⇒ byte-identical recovered reads + WAL +
+# SSTable on-disk fingerprint (V-DET). Links the header-only storage lib +
+# runtime + sim PRNG + SimDisk. Non-provider TU → forbidden-lint scans it.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_sstable_test storage_sstable_test.cpp)
+  target_include_directories(lockstep_storage_sstable_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_sstable_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_sstable_test COMMAND lockstep_storage_sstable_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_sstable_test not built (Phase 3 step 4 pending).")
+endif()
+
+# --- Phase 3 step 5: compaction + version GC + WAL truncation -----------------
+# P3-COMPACTION gate (specs/storage-engine.md §2 V-GC/V-PREFIX/V-NOTORN; §3/§6;
+# §5 step 5). Size-tiered compaction k-way-merges the live SSTable set into ONE,
+# dropping versions no live snapshot can see (GC under a watermark), then
+# truncates the WAL prefix the merged set durably covers — all atomic via the
+# append-only, CRC'd, entry_no-contiguous MANIFEST (INSTALL/OBSOLETE/WAL-TRUNCATE
+# records). Asserts (A) DIFFERENTIAL WITH COMPACTION — WalEngine(LSM+compaction)
+# vs Oracle over a seed sweep, get+scan, 0 mismatch (many flushes+compactions);
+# (B) METAMORPHIC — a forced compaction changes no visible get/scan value
+# (compaction ⊥ change reads); (C) GC-SAFETY (V-GC) — a held live snapshot still
+# sees its versions after a watermark-bounded compaction AND dead versions are
+# reclaimed (space drops); (D) CRASH-DURING-COMPACTION — crash incl. mid-
+# compaction under the full fault envelope, recover from the folded manifest live
+# set + WAL prefix to a valid oracle PREFIX, 0 fabrication, no half-/mixed-SSTable
+# loss (V-PREFIX/V-NOTORN, atomic install+obsolete); (E) determinism — same seed
+# ⇒ byte-identical recovered reads + WAL + SSTable on-disk fingerprint (V-DET).
+# Links the header-only storage lib + runtime + sim PRNG + SimDisk. Non-provider
+# TU → forbidden-lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_compaction_test storage_compaction_test.cpp)
+  target_include_directories(lockstep_storage_compaction_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_compaction_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_compaction_test COMMAND lockstep_storage_compaction_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_compaction_test not built (Phase 3 step 5 pending).")
+endif()
+
+# --- Phase 3 step 6: WiscKey large-value separation ---------------------------
+# P3-WISCKEY gate (specs/storage-engine.md §1/§2/§3/§6 V-NOTORN/V-PREFIX/V-GC;
+# master-plan D4). A value over a size threshold is written ONCE to an append-only
+# VALUE LOG (CRC'd records); the LSM stores only a small {gen,offset,len,crc}
+# pointer. Small values stay inline. Asserts (A) DIFFERENTIAL WITH LARGE VALUES —
+# WalEngine(LSM+WiscKey) vs an INLINE Oracle over a seed sweep on a mixed small/
+# large workload, get+scan, 0 mismatch (the value is identical inline or
+# separated); (B) WRITE-AMP — a compaction of large values writes FAR fewer
+# SSTable bytes than rewriting them inline would (the WiscKey point); (C) CRASH-
+# AROUND-VLOG — crash incl. around the vlog append / between vlog and WAL under the
+# full fault envelope (torn + lying-fsync on WAL + vlog), recover to a valid oracle
+# PREFIX, 0 fabrication, no pointer resolving to a torn/fabricated value
+# (V-NOTORN); (D) determinism — same seed ⇒ byte-identical recovered reads + WAL +
+# SSTable + VLOG on-disk fingerprint (V-DET). Links the header-only storage lib +
+# runtime + sim PRNG + SimDisk. Non-provider TU → forbidden-lint scans it.
+if(TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_storage_wisckey_test storage_wisckey_test.cpp)
+  target_include_directories(lockstep_storage_wisckey_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_wisckey_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_wisckey_test COMMAND lockstep_storage_wisckey_test)
+else()
+  message(WARNING
+    "lockstep_storage / runtime / providers_sim not all found; "
+    "storage_wisckey_test not built (Phase 3 step 6 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
