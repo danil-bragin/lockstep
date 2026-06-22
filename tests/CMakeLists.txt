@@ -432,6 +432,33 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
       add_test(NAME ${impl_test} COMMAND lockstep_${impl_test})
     endif()
   endforeach()
+
+  # --- Phase 4 Stage V: DUAL-IMPL CROSS-CHECK GATE (the Phase-4 gate) ----------
+  # P4-XCHECK gate (master-plan §6.5; briefs/phase4.md Stage V). Runs BOTH
+  # independently-built Raft impls (raft_a::RaftNodeA + raft_b::RaftNodeB, each
+  # already conformant) on the SAME seed + workload + fault schedule over a seed
+  # sweep under the full fault envelope and asserts: (1) AGREE — their committed
+  # logs never conflict at a shared index (one is a prefix of the other), via
+  # cross_check; (2) CONFORM — both impls individually pass all five conformance
+  # checkers (belt and suspenders); (3) PROGRESS — commits accumulate (agreement
+  # non-vacuous); (4) DETERMINISM — same seed ⇒ byte-identical output (in-test +
+  # external double-run diff under a stable marker). Builds only if its source
+  # exists. Non-provider TU → forbidden-lint scans it. Inherits TIMEOUT 90.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_crosscheck_test.cpp")
+    add_executable(lockstep_consensus_crosscheck_test consensus_crosscheck_test.cpp)
+    target_include_directories(lockstep_consensus_crosscheck_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_crosscheck_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_harness
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_crosscheck_test
+             COMMAND lockstep_consensus_crosscheck_test)
+  endif()
 else()
   message(WARNING
     "lockstep_consensus / runtime / providers_sim / harness not all found; "
