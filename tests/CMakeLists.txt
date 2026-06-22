@@ -412,6 +412,26 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME consensus_harness_test COMMAND lockstep_consensus_harness_test)
+
+  # --- Phase 4 Stage I: DUAL independent Raft implementations (pre-wired) ------
+  # impl A and impl B are authored by TWO different agents against the same seam
+  # + verified spec; targets pre-registered here so neither agent edits this file.
+  # Each builds only if its source exists (half-landed batch still configures).
+  foreach(impl_test consensus_impl_a_test consensus_impl_b_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${impl_test}.cpp")
+      add_executable(lockstep_${impl_test} ${impl_test}.cpp)
+      target_include_directories(lockstep_${impl_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+      target_link_libraries(lockstep_${impl_test}
+        PRIVATE
+          lockstep_warnings
+          lockstep_sanitizers
+          lockstep_consensus
+          lockstep_harness
+          lockstep_runtime
+          lockstep_providers_sim)
+      add_test(NAME ${impl_test} COMMAND lockstep_${impl_test})
+    endif()
+  endforeach()
 else()
   message(WARNING
     "lockstep_consensus / runtime / providers_sim / harness not all found; "
