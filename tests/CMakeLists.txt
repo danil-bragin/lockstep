@@ -540,6 +540,57 @@ if(TARGET lockstep_txn AND TARGET lockstep_storage AND TARGET lockstep_runtime
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME txn_impl_test COMMAND lockstep_txn_impl_test)
+
+  # --- Phase 5 Stage I: the SECOND, INDEPENDENT txn executor (impl B) ----------
+  # P5-IMPL-B gate (specs/CommitOrdering.tla; briefs/phase5.md; master-plan §6.5).
+  # The DUAL independent transaction executor (txn/IndependentExecutor.hpp): built
+  # FROM THE SPEC, NOT from impl A — a pure value model (history-scan
+  # ValueAfterPrefix; NO MVCC engine, NO scheduler, NO coroutines) so the two impls
+  # do not share a blind spot. Asserts the SAME deliverable as impl A's gate over a
+  # seed sweep (<=64 in-gate, LOCKSTEP_TXN_SEEDS override): the Stage-M DiffHarness
+  # + ALL 8 checkers, 0 violations (differential-vs-oracle, strict-serializable,
+  # each D5 level EXACTLY its contract, OLLP sound + bounded retry, ExactlyOnce) +
+  # PROGRESS + DETERMINISM. Links the txn lib only (the value model needs no engine).
+  # Non-provider TU -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/txn_impl_b_test.cpp")
+    add_executable(lockstep_txn_impl_b_test txn_impl_b_test.cpp)
+    target_include_directories(lockstep_txn_impl_b_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_txn_impl_b_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME txn_impl_b_test COMMAND lockstep_txn_impl_b_test)
+  endif()
+
+  # --- Phase 5 Stage V: DUAL-IMPL CROSS-CHECK GATE (the §6.5 gate) -------------
+  # P5-XCHECK gate (master-plan §6.5; briefs/phase5.md). Runs BOTH independently-
+  # built txn executors (DeterministicExecutor impl A + IndependentExecutor impl B)
+  # on the SAME seed + workload + ExecConfig over a seed sweep and asserts: (1)
+  # CROSS-CHECK — A and B produce the SAME committed effects (per txn: status,
+  # writes, result, seq/version, strict-read values); a divergence at a committed
+  # effect = at least one is wrong (reported with seed + witnessing txn); (2)
+  # CONFORM — both impls individually match the strict-serializable oracle + pass
+  # the 8-checker battery; (3) PROGRESS — commits accumulate (agreement non-
+  # vacuous); (4) DETERMINISM — same seed => byte-identical rendered outcome for
+  # each impl. Links the txn lib + the real storage engine (impl A drives it) +
+  # runtime + sim. Non-provider TU -> forbidden-lint scans it. Inherits TIMEOUT.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/txn_crosscheck_test.cpp")
+    add_executable(lockstep_txn_crosscheck_test txn_crosscheck_test.cpp)
+    target_include_directories(lockstep_txn_crosscheck_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_txn_crosscheck_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME txn_crosscheck_test COMMAND lockstep_txn_crosscheck_test)
+  endif()
 else()
   message(WARNING
     "lockstep_txn / storage / runtime / providers_sim not all found; "
