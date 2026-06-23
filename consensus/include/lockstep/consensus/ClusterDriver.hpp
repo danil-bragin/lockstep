@@ -92,6 +92,16 @@ struct ClusterConfig {
     std::uint64_t partition_episodes = 2;
     std::uint64_t crash_episodes = 2;
     bool full_envelope = true;  // false ⇒ pristine bus + honest disk (calm baseline)
+
+    // C4.2 MEMBERSHIP CHANGE (Membership.tla). `n_nodes` is the UNIVERSE of all
+    // servers that may ever participate (== Server in the spec). `init_config_size`
+    // is how many of them the cluster STARTS with (configs[1] = {0 .. size-1}); the
+    // remaining ids are add/remove candidates. EQUAL to n_nodes (the default) ⇒
+    // fixed membership (init_config = the whole universe), byte-identical to the
+    // pre-membership driver. `membership_changes` single-server add/remove episodes
+    // are driven mid-run by the leader (commit-before-next-paced) when > 0.
+    std::uint64_t init_config_size = 0;   // 0 ⇒ = n_nodes (fixed membership)
+    std::uint64_t membership_changes = 0;  // single-server changes to drive (0 = none)
 };
 
 namespace detail {
@@ -138,6 +148,10 @@ inline void snapshot(ClusterRunState* st) {
             ns.physical_log_size = st->nodes[i]->physical_log_size();
             ns.snapshots_taken = st->nodes[i]->snapshots_taken();
             ns.snapshots_installed = st->nodes[i]->snapshots_installed();
+            // C4.2 membership measurement (introspection; not a safety observable).
+            ns.config = st->nodes[i]->current_config();
+            ns.config_index = st->nodes[i]->config_index();
+            ns.config_committed_index = st->nodes[i]->config_committed_index();
         } else {
             // A crashed node serves nothing; record an empty/idle snapshot so the
             // checkers skip it (ElectionSafety/LogMatching only read live nodes).
@@ -341,6 +355,98 @@ inline Task fault_driver(ClusterRunState* st, const ClusterConfig* cfg) {
     co_return;
 }
 
+// C4.2 MEMBERSHIP DRIVER (Membership.tla). Drives a bounded sequence of SINGLE-
+// server add/remove changes through the believed leader, COMMIT-BEFORE-NEXT paced:
+// each change is proposed only once the previous one is Settled (config_committed
+// caught up to config_index on the leader). Bounded episodes + a per-episode
+// virtual-time budget ⇒ terminates. The leader's propose_config_change enforces
+// the single-server rule + Settled gate; the driver just picks targets. The first
+// change ADDS the first non-init server; later changes alternate remove/add of a
+// non-leader server so the config keeps moving (each step delta 1).
+inline Task membership_driver(ClusterRunState* st, const ClusterConfig* cfg) {
+    if (cfg->membership_changes == 0) {
+        co_return;
+    }
+    const std::uint64_t universe = cfg->n_nodes;
+    const std::uint64_t init_n =
+        (cfg->init_config_size == 0 || cfg->init_config_size > universe)
+            ? universe
+            : cfg->init_config_size;
+    // The candidate to add first = the first server OUTSIDE the init config.
+    std::uint64_t add_target = init_n < universe ? init_n : universe - 1;
+    bool last_was_add = false;
+    std::uint64_t done = 0;
+
+    for (std::uint64_t ep = 0; ep < cfg->membership_changes; ++ep) {
+        // Let the cluster run + (re)elect before each change.
+        std::uint64_t li = UINT64_MAX;
+        {
+            Task t = await_leader(st, cfg, cfg->election_timeout_max * 4, &li);
+            co_await std::move(t);
+        }
+        if (li == UINT64_MAX) {
+            // No leader this window (a fault is in flight) — wait + retry next ep.
+            co_await st->clock.delay(cfg->election_timeout_max);
+            snapshot(st);
+            continue;
+        }
+        ConsensusNode* leader = st->nodes[li].get();
+        // Decide the single-server change: alternate ADD (the candidate) then REMOVE
+        // (a non-leader member of the current config), keeping delta == 1 each step.
+        bool add;
+        std::uint64_t target;
+        if (!last_was_add) {
+            add = true;
+            target = add_target;
+        } else {
+            add = false;
+            // Remove a member that is NOT the leader and NOT the just-added one we
+            // want to keep churning — pick the lowest such id in the current config.
+            const std::vector<std::uint64_t> curc = leader->current_config();
+            target = UINT64_MAX;
+            for (std::uint64_t id : curc) {
+                if (id != leader->id() && id != add_target) {
+                    target = id;
+                    break;
+                }
+            }
+            if (target == UINT64_MAX) {
+                // Nothing safe to remove this round; try an add of the candidate
+                // instead (if absent) so the sweep still exercises a change.
+                add = true;
+                target = add_target;
+            }
+        }
+        const bool proposed = leader->propose_config_change(target, add);
+        snapshot(st);
+        if (proposed) {
+            last_was_add = add;
+            ++done;
+        }
+        // commit-before-next: wait (bounded) until the leader reports the change
+        // Settled (config_committed_index caught up to config_index), snapshotting.
+        Tick waited = 0;
+        const Tick stride = cfg->heartbeat_interval * 2 > 0
+                                ? cfg->heartbeat_interval * 2
+                                : 1;
+        const Tick budget = cfg->election_timeout_max * 8 + cfg->request_deadline;
+        while (waited < budget) {
+            co_await st->clock.delay(stride);
+            waited += stride;
+            snapshot(st);
+            const std::uint64_t cur = believed_leader(st);
+            if (cur != UINT64_MAX) {
+                ConsensusNode* l = st->nodes[cur].get();
+                if (l->config_committed_index() == l->config_index()) {
+                    break;  // Settled — the next change may start
+                }
+            }
+        }
+    }
+    (void)done;
+    co_return;
+}
+
 // Reconstruct the FINAL committed log: the longest committed prefix any node ever
 // witnessed, each slot's (term,value) the first committed entry seen there. (The
 // safety checkers prove this is consistent; this is the cross-check payload.)
@@ -388,12 +494,22 @@ inline Tick compute_deadline(const ClusterConfig* cfg) {
     // The final settle coroutine advances settle_ticks * 4.
     const Tick settle = cfg->settle_ticks * 4;
 
-    // The chains run CONCURRENTLY (client + fault + settle on one scheduler); the
-    // horizon is the longest of them, plus a generous settle margin so any in-
-    // flight election/replication that started near the end still completes.
+    // C4.2: worst-case membership chain. Each change waits for a leader
+    // (election_timeout_max*4) then for the change to Settle
+    // (election_timeout_max*8 + request_deadline). Pure fn of cfg.
+    const Tick per_change = cfg->election_timeout_max * 12 + cfg->request_deadline;
+    const Tick membership_chain =
+        static_cast<Tick>(cfg->membership_changes) * per_change;
+
+    // The chains run CONCURRENTLY (client + fault + membership + settle on one
+    // scheduler); the horizon is the longest of them, plus a generous settle margin
+    // so any in-flight election/replication that started near the end still completes.
     Tick horizon = client_chain;
     if (fault_chain > horizon) {
         horizon = fault_chain;
+    }
+    if (membership_chain > horizon) {
+        horizon = membership_chain;
     }
     if (settle > horizon) {
         horizon = settle;
@@ -443,10 +559,20 @@ inline std::uint64_t compute_step_cap(const ClusterConfig* cfg) {
         st->bus.set_faults(cfg.net_faults);
     }
 
-    // The cluster membership view (all node ids 0..N-1, sorted).
+    // The cluster membership view (all node ids 0..N-1, sorted) — the UNIVERSE of
+    // servers (== Server). For C4.2 the cluster STARTS in init_config (the first
+    // `init_config_size` ids); the rest are add/remove candidates.
     std::vector<std::uint64_t> cluster;
     for (std::uint64_t i = 0; i < cfg.n_nodes; ++i) {
         cluster.push_back(i);
+    }
+    std::vector<std::uint64_t> init_config;
+    const std::uint64_t init_n =
+        (cfg.init_config_size == 0 || cfg.init_config_size > cfg.n_nodes)
+            ? cfg.n_nodes
+            : cfg.init_config_size;
+    for (std::uint64_t i = 0; i < init_n; ++i) {
+        init_config.push_back(i);
     }
 
     // Build N nodes behind the seam factory: one SimDisk + one INetwork handle
@@ -474,6 +600,12 @@ inline std::uint64_t compute_step_cap(const ClusterConfig* cfg) {
         NodeConfig nc;
         nc.self_id = i;
         nc.cluster = cluster;
+        // C4.2: init_config == cluster ⇒ fixed membership (empty also means that in
+        // the impls, but pass it explicitly so the membership sweep starts in the
+        // subset). When init_n == n_nodes this is the whole universe (no change).
+        if (init_n < cfg.n_nodes) {
+            nc.init_config = init_config;
+        }
         nc.election_timeout_min = cfg.election_timeout_min;
         nc.election_timeout_max = cfg.election_timeout_max;
         nc.heartbeat_interval = cfg.heartbeat_interval;
@@ -494,6 +626,10 @@ inline std::uint64_t compute_step_cap(const ClusterConfig* cfg) {
         st->sched.spawn(detail::client_driver(st, &cfg, c));
     }
     st->sched.spawn(detail::fault_driver(st, &cfg));
+
+    // C4.2: drive single-server membership changes mid-run (no-op when
+    // membership_changes == 0 — the coroutine returns immediately).
+    st->sched.spawn(detail::membership_driver(st, &cfg));
 
     // A final settle coroutine: after the workload + faults, advance time so any
     // in-flight election/replication completes, snapshotting throughout.

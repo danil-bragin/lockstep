@@ -210,6 +210,13 @@ enum class MsgType : std::uint8_t {
     // it needs were compacted away, so AppendEntries cannot catch it up).
     InstallSnapshot = 5,
     InstallSnapshotResp = 6,
+    // C4.2 MEMBERSHIP (Membership.tla). A dedicated RPC pair carries the config
+    // chain rollout, kept OFF the value-log replication path so the value log
+    // observable is untouched (the five base-Raft checkers stay byte-identical when
+    // no change is proposed). ConfigChange ships ONE new chain config (its chain
+    // index + the member set) from the leader; ConfigChangeResp acks adoption.
+    ConfigChange = 7,
+    ConfigChangeResp = 8,
 };
 
 struct RaftMsg {
@@ -221,6 +228,15 @@ struct RaftMsg {
     // RequestVote
     Index last_log_index = 0;
     Term last_log_term = 0;
+    // C4.2 Membership: the candidate's config-chain index (cfgIdx[c]). A voter
+    // refuses a candidate whose cfgIdx is BEHIND its own (the config-log up-to-date
+    // rule, Membership.tla RequestVote). Always carried on RequestVote.
+    std::uint64_t cfg_index = 0;
+
+    // C4.2 ConfigChange / ConfigChangeResp: the chain index of the proposed config
+    // and its member set (sorted ids). ConfigChangeResp echoes the index it adopted.
+    std::uint64_t config_chain_index = 0;
+    std::vector<std::uint64_t> config_members;
 
     // RequestVoteResp / AppendEntriesResp / InstallSnapshotResp
     bool granted = false;  // vote granted
@@ -254,6 +270,7 @@ struct RaftMsg {
         case MsgType::RequestVote:
             wire::put_u64(body, m.last_log_index);
             wire::put_u64(body, m.last_log_term);
+            wire::put_u64(body, m.cfg_index);  // C4.2 config-log up-to-date check
             break;
         case MsgType::RequestVoteResp:
             wire::put_u8(body, m.granted ? 1u : 0u);
@@ -282,6 +299,16 @@ struct RaftMsg {
             break;
         case MsgType::InstallSnapshotResp:
             wire::put_u64(body, m.match_index);  // follower's new logical length
+            break;
+        case MsgType::ConfigChange:
+            wire::put_u64(body, m.config_chain_index);
+            wire::put_u32(body, static_cast<std::uint32_t>(m.config_members.size()));
+            for (std::uint64_t id : m.config_members) {
+                wire::put_u64(body, id);
+            }
+            break;
+        case MsgType::ConfigChangeResp:
+            wire::put_u64(body, m.config_chain_index);  // chain index acked
             break;
     }
 
@@ -326,6 +353,7 @@ struct RaftMsg {
         case MsgType::RequestVote:
             out.last_log_index = r.u64();
             out.last_log_term = r.u64();
+            out.cfg_index = r.u64();  // C4.2 config-log up-to-date check
             break;
         case MsgType::RequestVoteResp:
             out.granted = (r.u8() != 0);
@@ -372,6 +400,22 @@ struct RaftMsg {
         case MsgType::InstallSnapshotResp:
             out.match_index = r.u64();
             break;
+        case MsgType::ConfigChange: {
+            out.config_chain_index = r.u64();
+            const std::uint32_t count = r.u32();
+            if (!r.ok() || count > len) {
+                return false;
+            }
+            out.config_members.clear();
+            out.config_members.reserve(count);
+            for (std::uint32_t k = 0; k < count; ++k) {
+                out.config_members.push_back(r.u64());
+            }
+            break;
+        }
+        case MsgType::ConfigChangeResp:
+            out.config_chain_index = r.u64();
+            break;
         default:
             return false;
     }
@@ -392,6 +436,13 @@ enum class RecKind : std::uint8_t {
     // state and sets the base, so the durable prefix it covers is compacted
     // (recovery replays snapshot + retained suffix, never the discarded prefix).
     Snapshot = 4,
+    // C4.2 MEMBERSHIP (Membership.tla): one config-chain entry. Configs live in the
+    // log (Raft §4.1), so they are durable: a CONFIG record carries the chain index
+    // + the member set. On replay, CONFIG records rebuild the config chain and the
+    // node's adopted cfgIdx (= the highest chain index it durably stored), so a
+    // restarted node honors the config it had adopted (a removed server stays
+    // removed; an added one stays added) — never regressing membership across crash.
+    Config = 5,
 };
 
 [[nodiscard]] inline std::vector<std::byte> rec_meta(Term term,
@@ -472,6 +523,29 @@ enum class RecKind : std::uint8_t {
     return out;
 }
 
+// C4.2 CONFIG durable record: chain index + member set. Replayed to rebuild the
+// config chain + the node's adopted cfgIdx.
+[[nodiscard]] inline std::vector<std::byte> rec_config(
+    std::uint64_t chain_index, const std::vector<std::uint64_t>& members) {
+    std::vector<std::uint8_t> body;
+    wire::put_u8(body, static_cast<std::uint8_t>(RecKind::Config));
+    wire::put_u64(body, chain_index);
+    wire::put_u32(body, static_cast<std::uint32_t>(members.size()));
+    for (std::uint64_t id : members) {
+        wire::put_u64(body, id);
+    }
+    const std::uint32_t crc = wire::crc32(body.data(), body.size());
+    std::vector<std::uint8_t> frame;
+    wire::put_u32(frame, crc);
+    wire::put_u32(frame, static_cast<std::uint32_t>(body.size()));
+    frame.insert(frame.end(), body.begin(), body.end());
+    std::vector<std::byte> out(frame.size());
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        out[i] = static_cast<std::byte>(frame[i]);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // RaftNodeA — the implementation.
 // ---------------------------------------------------------------------------
@@ -491,9 +565,19 @@ public:
                 peers_.push_back(id);
             }
         }
-        quorum_ = cfg.cluster.size() / 2 + 1;
         next_index_.assign(cfg.cluster.size(), 0);
         match_index_.assign(cfg.cluster.size(), 0);
+        // C4.2 MEMBERSHIP: seed the config chain with configs[1] = init_config
+        // (Membership.tla InitConfig). EMPTY init_config ⇒ the full cluster (fixed
+        // membership; byte-identical to the pre-membership build). The chain + the
+        // adopted cfg index are reset on recovery from the durable CONFIG records.
+        std::vector<std::uint64_t> init = cfg.init_config.empty() ? cfg.cluster
+                                                                  : cfg.init_config;
+        cfg_chain_.clear();
+        cfg_chain_.push_back(init);
+        cfg_idx_ = 0;
+        cfg_committed_idx_ = 0;
+        cfg_adopted_.assign(cfg.cluster.size(), 0);
     }
 
     RaftNodeA(const RaftNodeA&) = delete;
@@ -591,6 +675,14 @@ public:
         for (auto& v : match_index_) {
             v = 0;
         }
+        // C4.2: drop the in-memory config chain to the init config; recovery rebuilds
+        // the adopted chain from the durable CONFIG records (recover-to-prefix).
+        cfg_chain_ = init_config_chain();
+        cfg_idx_ = 0;
+        cfg_committed_idx_ = 0;
+        for (auto& v : cfg_adopted_) {
+            v = 0;
+        }
         // Power loss drops the non-durable write pipeline: any record appended but
         // not yet synced is lost (matches SimDisk::crash() — recover-to-prefix).
         write_queue_.clear();
@@ -632,6 +724,74 @@ public:
     }
     [[nodiscard]] std::uint64_t snapshots_installed() const noexcept override {
         return snapshots_installed_;
+    }
+
+    // ---- C4.2 MEMBERSHIP CHANGE (Membership.tla) -------------------------
+
+    // ProposeConfigChange(s): a CURRENT-term Leader, while its config is SETTLED
+    // (previous change committed — commit-before-next), proposes a SINGLE-server
+    // change. Returns true iff admissible + proposed.
+    [[nodiscard]] bool propose_config_change(std::uint64_t server,
+                                             bool add) override {
+        if (!running_ || role_ != Role::Leader) {
+            return false;
+        }
+        // commit-before-next: the chain must be SETTLED — the previous change fully
+        // propagated (cfg_committed_idx_ == cfg_idx_ == head). Without this, two
+        // single-server changes compose into a net 2-server jump whose old/new
+        // majorities can be DISJOINT (Ongaro §4.2.3 / Membership.tla Settled).
+        if (cfg_idx_ != cfg_chain_.size() - 1 || cfg_committed_idx_ != cfg_idx_) {
+            return false;
+        }
+        const std::vector<std::uint64_t>& cur = cfg_chain_[cfg_idx_];
+        const bool present = in_config(cur, server);
+        if (add == present) {
+            return false;  // add an existing / remove an absent member ⇒ no-op
+        }
+        if (add && !in_config(cfg_.cluster, server)) {
+            return false;  // can only add a server from the universe (Server set)
+        }
+        if (!add && server == self_) {
+            return false;  // leader stays a member (no self-removal; spec s \in newC)
+        }
+        // Build the new config (delta == 1 by construction: one add or one remove).
+        std::vector<std::uint64_t> nc;
+        if (add) {
+            nc = cur;
+            nc.push_back(server);
+        } else {
+            for (std::uint64_t id : cur) {
+                if (id != server) {
+                    nc.push_back(id);
+                }
+            }
+        }
+        if (nc.empty()) {
+            return false;  // never empty the cluster
+        }
+        sort_ids(nc);
+        // Append the new config to the chain; the leader adopts it IMMEDIATELY
+        // (Raft: a leader uses C_new as soon as it is appended to its log). Other
+        // servers catch up via the ConfigChange RPC — THIS is the straddle window.
+        cfg_chain_.push_back(nc);
+        cfg_idx_ = cfg_chain_.size() - 1;
+        persist_config(cfg_idx_, nc);
+        // Replicate to the UNION of old+new config members (a removed server is not
+        // told; an added server learns it joined). The leader counts adoptions from
+        // the NEW config to learn when the change is committed (commit-before-next).
+        broadcast_config_change();
+        return true;
+    }
+
+    [[nodiscard]] std::vector<std::uint64_t> current_config() const override {
+        return cfg_chain_.empty() ? std::vector<std::uint64_t>{}
+                                  : cfg_chain_[cfg_idx_];
+    }
+    [[nodiscard]] std::uint64_t config_index() const noexcept override {
+        return cfg_idx_;
+    }
+    [[nodiscard]] std::uint64_t config_committed_index() const noexcept override {
+        return cfg_committed_idx_;
     }
 
 private:
@@ -683,6 +843,13 @@ private:
             if (self->role_ == Role::Leader) {
                 if (now >= self->heartbeat_deadline_) {
                     self->broadcast_append(/*heartbeat=*/true);
+                    // C4.2: keep pushing the config rollout until it commits (a
+                    // dropped/partitioned ConfigChange is retried on each heartbeat,
+                    // so the change makes progress under faults). No-op once
+                    // committed (Settled) — only re-sent while the chain is in flight.
+                    if (self->cfg_committed_idx_ < self->cfg_idx_) {
+                        self->broadcast_config_change();
+                    }
                     self->heartbeat_deadline_ = now + self->cfg_.heartbeat_interval;
                 }
             } else {
@@ -730,6 +897,12 @@ private:
             case MsgType::InstallSnapshotResp:
                 handle_install_snapshot_resp(m);
                 break;
+            case MsgType::ConfigChange:
+                handle_config_change(m);
+                break;
+            case MsgType::ConfigChangeResp:
+                handle_config_change_resp(m);
+                break;
         }
     }
 
@@ -754,6 +927,14 @@ private:
         if (!running_) {
             return;
         }
+        // C4.2 Membership Timeout(s) guard: only a server that is a MEMBER of its own
+        // current config stands for election. A server removed by a change (no longer
+        // in the config it has adopted) does NOT start an election — it cannot
+        // disrupt the cluster (Membership.tla Timeout: s \in Cfg(s)).
+        if (!in_current_config(self_)) {
+            arm_election_deadline();
+            return;
+        }
         // state[s] ∈ {Follower, Candidate} (a Leader does not time out into a new
         // election here — it heartbeats). Bump term, become Candidate, self-vote.
         ++current_term_;
@@ -768,8 +949,8 @@ private:
         persist_meta();
         arm_election_deadline();
 
-        // A single-node cluster is its own quorum.
-        if (votes_granted_.size() >= quorum_) {
+        // A single-node config is its own quorum (quorum over the CURRENT config).
+        if (config_votes() >= quorum()) {
             become_leader();
             return;
         }
@@ -780,6 +961,7 @@ private:
         base.source = self_;
         base.last_log_index = llen();
         base.last_log_term = last_log_term();
+        base.cfg_index = cfg_idx_;  // C4.2 config-log up-to-date rule
         for (std::uint64_t d : peers_) {
             RaftMsg m = base;
             m.dest = d;
@@ -809,9 +991,15 @@ private:
             (m.last_log_term > last_log_term()) ||
             (m.last_log_term == last_log_term() &&
              m.last_log_index >= llen());
+        // C4.2 Membership RequestVote: the CONFIG-LOG up-to-date rule. A voter refuses
+        // a candidate whose config-chain index is BEHIND its own (cfgIdx[c] >=
+        // cfgIdx[v]). This is ESSENTIAL: it stops a server stranded on a stale,
+        // superseded config (e.g. a removed server that never learned it was removed)
+        // from collecting a quorum under the old config and electing a SECOND leader.
+        const bool cand_cfg_up_to_date = (m.cfg_index >= cfg_idx_);
         const bool can_vote =
             (voted_for_ == kNil || voted_for_ == m.source);
-        const bool grant = can_vote && cand_up_to_date;
+        const bool grant = can_vote && cand_up_to_date && cand_cfg_up_to_date;
 
         if (grant && voted_for_ != m.source) {
             voted_for_ = m.source;
@@ -844,7 +1032,9 @@ private:
             }
         }
         votes_granted_.push_back(m.source);
-        if (votes_granted_.size() >= quorum_) {
+        // BecomeLeader(s): quorum over the CURRENT config (Membership.tla). A vote
+        // from a non-member (e.g. a server only the OLD config knew) does not count.
+        if (config_votes() >= quorum()) {
             become_leader();
         }
     }
@@ -860,8 +1050,24 @@ private:
             match_index_[i] = 0;
         }
         match_index_[self_idx()] = last;
+        // C4.2: reset per-peer config-adoption tracking; the leader knows only its
+        // own adoption. A leader re-confirms the head config is committed by
+        // re-collecting adoptions (it re-broadcasts ConfigChange below while the
+        // chain is in flight). cfg_committed_idx_ is recomputed from acks; if the
+        // head was already committed before this term it is re-proven harmlessly.
+        cfg_adopted_.assign(cfg_.cluster.size(), 0);
+        // A new leader must NOT assume its head config is cluster-committed: it could
+        // have adopted the head locally while a quorum had not. Treat the head as
+        // UNSETTLED (committed = the previous index) and re-prove it via adoptions
+        // before allowing the next change — preserving commit-before-next across an
+        // election that lands mid-rollout (Membership.tla Settled re-checked).
+        cfg_committed_idx_ = (cfg_idx_ > 0) ? cfg_idx_ - 1 : 0;
         heartbeat_deadline_ = clock_->now();  // beat immediately
         broadcast_append(/*heartbeat=*/true);
+        if (cfg_committed_idx_ < cfg_idx_) {
+            broadcast_config_change();
+        }
+        maybe_commit_config();  // single-config chains re-settle immediately
     }
 
     // ===================================================================
@@ -1124,6 +1330,123 @@ private:
         replicate_to(m.source, /*heartbeat=*/false);
     }
 
+    // ===================================================================
+    // C4.2 MEMBERSHIP CHANGE rollout (Membership.tla AdoptConfig + the commit-
+    // before-next gate). A leader ships ConfigChange (chain index + members) to the
+    // union of old+new config; a follower ADOPTS any chain config strictly ahead of
+    // its own (cfgIdx only ever moves FORWARD — Membership.tla AdoptConfig) and acks
+    // the index it now sits at. The leader marks the change COMMITTED once a quorum
+    // of the NEW config has adopted it; only then may the chain accept the next
+    // change (Settled). cfgIdx + the chain are DURABLE (configs live in the log).
+    // ===================================================================
+
+    // The leader re-broadcasts its head config to every other server in the universe
+    // that might still be a member of old or new (a removed server is excluded so it
+    // never learns it was removed — it ages out via the config-log up-to-date rule).
+    void broadcast_config_change() {
+        if (role_ != Role::Leader || cfg_chain_.empty()) {
+            return;
+        }
+        const std::vector<std::uint64_t>& head = cfg_chain_[cfg_idx_];
+        const std::vector<std::uint64_t>& prev =
+            cfg_idx_ > 0 ? cfg_chain_[cfg_idx_ - 1] : head;
+        for (std::uint64_t d : peers_) {
+            // Tell members of the new config OR the immediately-previous one (so a
+            // server being removed transitions, and a server being added joins).
+            if (in_config(head, d) || in_config(prev, d)) {
+                send_config_change_to(d);
+            }
+        }
+    }
+
+    void send_config_change_to(std::uint64_t dest) {
+        RaftMsg m;
+        m.type = MsgType::ConfigChange;
+        m.term = current_term_;
+        m.source = self_;
+        m.dest = dest;
+        m.config_chain_index = cfg_idx_;
+        m.config_members = cfg_chain_[cfg_idx_];
+        send_to(dest, m);
+    }
+
+    // Follower handles a ConfigChange: ADOPT the config if it is strictly ahead of
+    // ours (forward-only). We extend our chain to match (filling the head). Then ack
+    // the index we now hold. A stale-term sender is ignored (it is not the leader).
+    void handle_config_change(const RaftMsg& m) {
+        if (m.term < current_term_) {
+            return;  // stale leader — ignore (it will step down)
+        }
+        // A current-term ConfigChange means the sender is the term's leader.
+        role_ = Role::Follower;
+        leader_hint_ = m.source;
+        arm_election_deadline();
+
+        const std::uint64_t idx = m.config_chain_index;
+        if (idx > cfg_idx_) {
+            // Forward-only adopt. Grow the chain to length idx+1 with this head
+            // config at position idx (the focused chain is global + totally ordered,
+            // so we only ever need the head we are catching up to).
+            if (idx >= cfg_chain_.size()) {
+                cfg_chain_.resize(idx + 1);
+            }
+            cfg_chain_[idx] = m.config_members;
+            cfg_idx_ = idx;
+            persist_config(cfg_idx_, cfg_chain_[cfg_idx_]);
+        }
+
+        RaftMsg resp;
+        resp.type = MsgType::ConfigChangeResp;
+        resp.term = current_term_;
+        resp.source = self_;
+        resp.dest = m.source;
+        resp.config_chain_index = cfg_idx_;  // the index we now sit at
+        send_to(m.source, resp);
+    }
+
+    // Leader handles a ConfigChangeResp: record the responder's adopted index; once
+    // a QUORUM of the NEW (head) config has adopted the head, the change is
+    // COMMITTED (Settled) — the chain may then accept the next single-server change.
+    void handle_config_change_resp(const RaftMsg& m) {
+        if (role_ != Role::Leader || m.term != current_term_) {
+            return;
+        }
+        const std::size_t di = idx_of(m.source);
+        if (m.config_chain_index > cfg_adopted_[di]) {
+            cfg_adopted_[di] = m.config_chain_index;
+        }
+        maybe_commit_config();
+    }
+
+    // Commit-before-next: the head config is committed when a quorum of the head
+    // config's members have adopted the head chain index (the leader counts itself).
+    void maybe_commit_config() {
+        if (role_ != Role::Leader || cfg_chain_.empty()) {
+            return;
+        }
+        const std::uint64_t head = static_cast<std::uint64_t>(cfg_chain_.size() - 1);
+        if (cfg_committed_idx_ >= head) {
+            return;
+        }
+        const std::vector<std::uint64_t>& hc = cfg_chain_[head];
+        std::size_t adopted = 0;
+        for (std::size_t i = 0; i < cfg_.cluster.size(); ++i) {
+            if (!in_config(hc, cfg_.cluster[i])) {
+                continue;
+            }
+            if (cfg_.cluster[i] == self_) {
+                if (cfg_idx_ >= head) {
+                    ++adopted;  // the leader has adopted the head
+                }
+            } else if (cfg_adopted_[i] >= head) {
+                ++adopted;
+            }
+        }
+        if (adopted * 2 > hc.size()) {
+            cfg_committed_idx_ = head;
+        }
+    }
+
     // Leader handles an AppendEntriesResp: advance/back off nextIndex + matchIndex.
     void handle_append_entries_resp(const RaftMsg& m) {
         if (role_ != Role::Leader || m.term != current_term_) {
@@ -1166,15 +1489,20 @@ private:
             if (term_at(n) != current_term_) {
                 continue;
             }
+            // C4.2 Membership: count agreement over the CURRENT config only (a
+            // server outside the config does not contribute to its commit quorum).
             std::size_t agree = 0;
             for (std::size_t i = 0; i < match_index_.size(); ++i) {
+                if (!in_current_config(cfg_.cluster[i])) {
+                    continue;
+                }
                 if (i == self_idx()) {
                     ++agree;  // leader stores it (its own log)
                 } else if (match_index_[i] >= n) {
                     ++agree;
                 }
             }
-            if (agree >= quorum_) {
+            if (agree >= quorum()) {
                 commit_index_ = n;
                 break;  // n is the highest committable index
             }
@@ -1257,6 +1585,12 @@ private:
     }
     void persist_snapshot() {
         enqueue_durable(rec_snapshot(snap_base_, snap_state_));
+    }
+    // C4.2: persist one config-chain entry (chain index + members) so the adopted
+    // config survives a crash (Membership.tla: configs live in the durable log).
+    void persist_config(std::uint64_t chain_index,
+                        const std::vector<std::uint64_t>& members) {
+        enqueue_durable(rec_config(chain_index, members));
     }
 
     // Append a framed record to the in-order FIFO write queue and request a
@@ -1342,6 +1676,14 @@ private:
         std::vector<LogEntry> rec_log;     // retained suffix (abs idx rec_base+1 ..)
         Index rec_base = 0;                // snapshot.lastIncludedIndex
         std::vector<LogEntry> rec_state;   // snapshot.state (folded prefix)
+        // C4.2 MEMBERSHIP: rebuild the config chain + adopted cfgIdx from CONFIG
+        // records. The chain starts at the init config (configs[1]); each CONFIG
+        // record extends/sets a chain index. The highest index seen is the adopted
+        // cfgIdx (forward-only). cfg_committed is re-learned via replication, not
+        // persisted (like commitIndex).
+        std::vector<std::vector<std::uint64_t>> rec_chain = self->init_config_chain();
+        std::uint64_t rec_cfg_idx = 0;
+        bool rec_have_cfg = false;
         bool any = false;
 
         for (;;) {
@@ -1455,6 +1797,31 @@ private:
                 rec_base = lii;
                 rec_state = std::move(st);
                 rec_log = std::move(kept);
+            } else if (kind == RecKind::Config) {
+                // C4.2: a CONFIG record sets a chain index to a member set. Forward-
+                // only (the chain never regresses); the highest index is the adopted
+                // cfgIdx. A regressing / wildly-large index is a torn tail → stop.
+                const std::uint64_t cidx = r.u64();
+                const std::uint32_t mcount = r.u32();
+                if (!r.ok() || mcount > len) {
+                    break;
+                }
+                std::vector<std::uint64_t> members;
+                members.reserve(mcount);
+                for (std::uint32_t k = 0; k < mcount; ++k) {
+                    members.push_back(r.u64());
+                }
+                if (!r.ok() || cidx == 0 || cidx > rec_chain.size()) {
+                    break;  // index 0 is the immutable init config; a gap = torn tail
+                }
+                if (cidx >= rec_chain.size()) {
+                    rec_chain.resize(cidx + 1);
+                }
+                rec_chain[cidx] = std::move(members);
+                if (cidx > rec_cfg_idx) {
+                    rec_cfg_idx = cidx;
+                }
+                rec_have_cfg = true;
             } else {
                 break;  // unknown record kind → stop
             }
@@ -1480,6 +1847,14 @@ private:
             self->applied_index_ = rec_base;
             self->log_view_.clear();
         }
+        // C4.2: restore the adopted config chain + cfgIdx (forward-only). If no
+        // CONFIG record survived, the node sits at the init config (index 0). The
+        // committed index is conservatively re-learned (a leader re-confirms; a
+        // follower trusts the leader's rollout), so reset it here.
+        self->cfg_chain_ = std::move(rec_chain);
+        self->cfg_idx_ = rec_have_cfg ? rec_cfg_idx : 0;
+        self->cfg_committed_idx_ = self->cfg_idx_;  // adopted ⇒ locally settled
+        self->cfg_adopted_.assign(self->cfg_.cluster.size(), 0);
         // Recovery done: arm the election deadline and open the gates so the timer
         // loop + dispatch may now act on the (recovered) durable state.
         self->arm_election_deadline();
@@ -1582,6 +1957,63 @@ private:
         return 0;
     }
 
+    // ---- C4.2 MEMBERSHIP helpers (Membership.tla) ------------------------
+
+    static void sort_ids(std::vector<std::uint64_t>& v) {
+        // Deterministic insertion sort (no std::sort: keep output a pure fn of input
+        // with a stable, allocation-free order; the sets are tiny).
+        for (std::size_t i = 1; i < v.size(); ++i) {
+            std::uint64_t x = v[i];
+            std::size_t j = i;
+            while (j > 0 && v[j - 1] > x) {
+                v[j] = v[j - 1];
+                --j;
+            }
+            v[j] = x;
+        }
+    }
+
+    [[nodiscard]] static bool in_config(const std::vector<std::uint64_t>& c,
+                                        std::uint64_t id) noexcept {
+        for (std::uint64_t m : c) {
+            if (m == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Membership.tla Cfg(s) membership: is `id` in the config this server uses now?
+    [[nodiscard]] bool in_current_config(std::uint64_t id) const noexcept {
+        return !cfg_chain_.empty() && in_config(cfg_chain_[cfg_idx_], id);
+    }
+
+    // Quorum size over the CURRENT config (Membership.tla Quorum(Cfg(s))).
+    [[nodiscard]] std::size_t quorum() const noexcept {
+        const std::size_t n = cfg_chain_.empty() ? cfg_.cluster.size()
+                                                 : cfg_chain_[cfg_idx_].size();
+        return n / 2 + 1;
+    }
+
+    // Count granted votes that come from CURRENT-config members (a vote from a
+    // non-member does not count toward the config quorum).
+    [[nodiscard]] std::size_t config_votes() const noexcept {
+        std::size_t c = 0;
+        for (std::uint64_t v : votes_granted_) {
+            if (in_current_config(v)) {
+                ++c;
+            }
+        }
+        return c;
+    }
+
+    // The chain seeded with configs[1] = init_config (used to reset on recovery).
+    [[nodiscard]] std::vector<std::vector<std::uint64_t>> init_config_chain() const {
+        std::vector<std::uint64_t> init =
+            cfg_.init_config.empty() ? cfg_.cluster : cfg_.init_config;
+        return {init};
+    }
+
     // ---- injected boundary handles + config ------------------------------
     core::IScheduler* sched_;
     IClock* clock_;
@@ -1591,7 +2023,6 @@ private:
     NodeConfig cfg_;
     std::uint64_t self_;
     std::vector<std::uint64_t> peers_;
-    std::size_t quorum_ = 1;
 
     // ---- raft state (in-memory; the spec's per-server variables) ----------
     Role role_ = Role::Follower;
@@ -1623,6 +2054,20 @@ private:
     // ---- leader replication bookkeeping (dense by cluster index) ----------
     std::vector<Index> next_index_;
     std::vector<Index> match_index_;
+
+    // ---- C4.2 MEMBERSHIP CHANGE state (Membership.tla) --------------------
+    // cfg_chain_ is the GLOBAL config chain (configs[1], configs[2], ...): a
+    // totally-ordered sequence where adjacent configs differ by <= 1 server.
+    // cfg_chain_[0] = the init config; cfg_idx_ = the latest index this node has
+    // ADOPTED (Membership.tla cfgIdx[s], forward-only). cfg_committed_idx_ = the
+    // highest index known committed cluster-wide (commit-before-next: a leader may
+    // only propose the next change once cfg_committed_idx_ == cfg_idx_ == head).
+    // cfg_adopted_ (leader-only, by cluster index) tracks each peer's adopted index
+    // so the leader learns when the head config has reached a quorum of itself.
+    std::vector<std::vector<std::uint64_t>> cfg_chain_;
+    std::uint64_t cfg_idx_ = 0;
+    std::uint64_t cfg_committed_idx_ = 0;
+    std::vector<std::uint64_t> cfg_adopted_;
 
     // ---- timing + lifecycle ----------------------------------------------
     Tick election_deadline_ = 0;

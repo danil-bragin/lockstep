@@ -503,6 +503,29 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
     add_test(NAME consensus_snapshot_test
              COMMAND lockstep_consensus_snapshot_test)
   endif()
+
+  # --- Phase 4 C4.2: single-server MEMBERSHIP CHANGE conformance gate --------
+  # Proves both impls implement add/remove ONE server at a time conformant to
+  # specs/Membership.tla (ElectionSafety/ConfigChangeSafety across the change,
+  # QuorumOverlap, single-server chain, config-log up-to-date voting, commit-
+  # before-next) WITHOUT regressing base Consensus/Snapshot conformance. TEETH: a
+  # 2-server jump breaks overlap (mirrors specs/Membership2.cfg). Non-provider TU
+  # -> forbidden-lint scans it. Inherits TIMEOUT 90.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_membership_test.cpp")
+    add_executable(lockstep_consensus_membership_test consensus_membership_test.cpp)
+    target_include_directories(lockstep_consensus_membership_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_membership_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_harness
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_membership_test
+             COMMAND lockstep_consensus_membership_test)
+  endif()
 else()
   message(WARNING
     "lockstep_consensus / runtime / providers_sim / harness not all found; "
