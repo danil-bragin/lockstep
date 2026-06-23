@@ -103,7 +103,7 @@ constexpr std::int64_t kStart = 1000;
 struct Xfer {
     std::string a;
     std::string b;
-    std::int64_t amount;
+    std::int64_t amount = 0;
 };
 
 struct Workload {

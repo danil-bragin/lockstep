@@ -98,7 +98,7 @@ constexpr std::uint64_t kClientEp = 2;
 struct WorkSubmit {
     std::string a;
     std::string b;
-    std::int64_t amount;
+    std::int64_t amount = 0;
 };
 
 // Build a deterministic workload from a seed: a fixed set of accounts seeded to a

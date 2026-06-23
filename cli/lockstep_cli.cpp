@@ -353,7 +353,6 @@ lockstep::core::Task run_script(q::Connection& conn, const std::vector<Command>*
 // lines. Deterministic: a pure transform of the byte stream.
 [[nodiscard]] std::vector<std::string> tokens_from_stdin() {
     std::vector<std::string> toks;
-    std::string line;
     int ch = 0;
     std::string cur;
     bool comment = false;
