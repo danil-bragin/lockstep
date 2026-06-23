@@ -20,12 +20,14 @@
 //       DISK (not memory — there is none). We assert the recovered log values + terms
 //       MATCH what was appended before, and read them back over the real admin socket.
 //
-// CONTRACT FLAG (N=1 commit): RaftNodeA advances commit_index ONLY on a peer
-// AppendEntries ack; a peerless 1-node cluster has no acks, so commit_index stays 0
-// even though the spec permits a quorum-of-1 self-commit. consensus/ stays UNCHANGED
-// per the brief, so this is FLAGGED (printed), not "fixed". The durability proof is
-// therefore over the DURABLE LOG (which IS persisted + recovered), not commit_index.
-// S5b-2 (>=2 nodes) commits via real peer acks; the gap is specific to N=1.
+// N=1 SELF-COMMIT (fixed): the consensus core now advances commit_index for a
+// peerless 1-node cluster — the lone leader self-commits its own appended entry the
+// instant it is durable (advance_commit_index() is re-evaluated after the leader's own
+// append; it self-counts and quorum()==1). This deployment is exactly what surfaced the
+// original gap (RaftNodeA only advanced commit_index on a peer AppendEntries ack, which
+// never arrives with no peers). The fix is gated on quorum()==1, so it is a strict no-op
+// for N>=2 (where commitment stays ack-driven). We now ASSERT commit_index advances to
+// the durable log length here, in addition to the durable-LOG recovery payload.
 //
 // Everything is driven by ONE in-process ProdReactor per incarnation (the node + the
 // admin client share it — the S4b in-process model; multi-PROCESS is S5b-2). BOUNDED
@@ -247,12 +249,17 @@ int main() {
                     values_ok ? "PASS" : "FAIL");
         all = all && log_over_socket && values_ok;
 
-        // FLAG (N=1 commit gap): commit_index does NOT advance for a peerless cluster
-        // (no AppendEntries acks). Reported, not asserted — see the header's CONTRACT
-        // FLAG. The durable LOG, not commit_index, is the recovery payload.
-        std::printf("    [FLAG] N=1 commit_index=%llu (does NOT advance without peer "
-                    "acks; consensus/ UNCHANGED — durability proven over the LOG)\n",
-                    static_cast<unsigned long long>(node->commit_index()));
+        // N=1 SELF-COMMIT (fixed): the lone leader self-commits its own entries with no
+        // peer ack, so commit_index advances to the durable log length. ASSERTED here —
+        // the exact deployment that surfaced the original gap now commits.
+        const std::uint64_t ci = node->commit_index();
+        const bool commit_ok = ci == static_cast<std::uint64_t>(values.size());
+        std::printf("%s consensus/N=1-self-commit (commit_index=%llu want=%llu; lone "
+                    "leader self-commits, no peer ack)\n",
+                    commit_ok ? "PASS" : "FAIL",
+                    static_cast<unsigned long long>(ci),
+                    static_cast<unsigned long long>(values.size()));
+        all = all && commit_ok;
 
         // Snapshot the durable log + term DIRECTLY from the node (the oracle to
         // cross-check the post-restart recovery against).

@@ -608,6 +608,18 @@ public:
         r.accepted = true;
         r.term = current_term_;
         r.index = idx;
+        // SINGLE-MEMBER CONFIG SELF-COMMIT. Commitment is normally driven from
+        // handle_append_entries_resp (a peer ack). With NO peers in the current config
+        // (quorum() == 1 ⇔ config size 1) no ack EVER arrives, so commit_index_ would
+        // never advance past 0. Re-evaluate here so the lone leader self-commits its own
+        // entry the instant it is durable (the leader self-counts in advance_commit_index;
+        // agree == 1 >= quorum() == 1). GATED on quorum() == 1 so this branch is provably
+        // UNREACHABLE — a strict no-op, byte-identical — for any config with >= 2 members
+        // (where commitment stays ack-driven, exactly as before).
+        if (quorum() == 1) {
+            advance_commit_index();
+            apply_and_maybe_snapshot();
+        }
         // Kick replication promptly so the entry can commit within the deadline.
         broadcast_append(/*heartbeat=*/false);
         return r;

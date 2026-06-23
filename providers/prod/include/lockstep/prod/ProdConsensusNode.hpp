@@ -50,21 +50,19 @@
 // transport is ProdNetwork's existing 4-byte-LE length framing (no new wire code).
 //
 // ----------------------------------------------------------------------------
-// CONTRACT FLAG (N=1 commit — a CONSENSUS design gap, NOT a prod-assembly bug;
-// consensus/ stays UNCHANGED per the brief). RaftNodeA advances commit_index ONLY in
-// handle_append_response (a peer ack drives AdvanceCommitIndex). For an N=1 (peerless)
-// cluster there are no peers to ack, so commit_index NEVER advances past 0 even
+// N=1 SELF-COMMIT (FIXED). Previously RaftNodeA advanced commit_index ONLY in
+// handle_append_entries_resp (a peer ack drives AdvanceCommitIndex), so an N=1
+// (peerless) cluster — no peers to ack — never advanced commit_index past 0, even
 // though the spec's AdvanceCommitIndex permits a leader to self-commit (a quorum of 1
 // = the leader itself, with log[N].term == currentTerm). The sim ClusterDriver only
-// ever runs N=3/N=5 (ClusterConfig.n_nodes default 3 == spec Server), so the N=1
-// self-commit path was never exercised by the impl. THE DURABILITY PROOF is therefore
-// stated over the DURABLE LOG (every appended entry is persisted to consensus.wal by
-// RaftNodeA's FIFO persist worker + recovered from it on restart — that IS exercised
-// and IS the real ProdDisk durability), NOT over commit_index. To make a 1-node
-// cluster self-commit, RaftNodeA would need advance_commit_index() called after a
-// leader's own local append (or in its heartbeat tick) — a CONSENSUS change, FLAGGED
-// here, deliberately NOT made. S5b-2 (>=2 nodes) commits via real peer acks, so this
-// gap is specific to the degenerate 1-node case.
+// ever ran N=3/N=5, so this degenerate path was never exercised — until this prod
+// 1-node deployment surfaced it. THE FIX (consensus/, both impls A and B): the lone
+// leader re-evaluates advance_commit_index() right after its own local append, and a
+// lone candidate self-elects on its own vote — BOTH gated on quorum()==1, so they are a
+// strict no-op for N>=2 (verified byte-identical at N=3 + TLC Consensus1.cfg confirms
+// the spec invariants hold at N=1). commit_index now advances for a 1-node cluster; the
+// durable LOG (persisted to consensus.wal + recovered on restart) remains the separate
+// durability payload. S5b-2 (>=2 nodes) commits via real peer acks, unchanged.
 //
 // ----------------------------------------------------------------------------
 // LINUX-ONLY (epoll + sockets): compiled only under __linux__ (ProdReactor /

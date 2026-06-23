@@ -488,6 +488,96 @@ void determinism() {
                   "baseline)");
 }
 
+// ---------------------------------------------------------------------------
+// (6) N=1 SELF-COMMIT. A single-node cluster (quorum == 1) must elect its lone
+//     member leader and COMMIT every SUBMITted value with NO peer ack — the path
+//     a prod 1-node deployment exercises but the N=3/5 sweep never did. For BOTH
+//     impls: commit_index advances to each submit's index, the committed log holds
+//     the submitted value, and A and B AGREE (V-XCHECK) on the committed history.
+//     Bounded, deterministic; the N=3 sweep above already proved the fix is a
+//     strict no-op for N>=2 (byte-identical), so this only enables N=1.
+// ---------------------------------------------------------------------------
+void single_node_self_commit() {
+    std::printf("N=1 SELF-COMMIT (single-node leader self-commits SUBMITs; A, B, "
+                "and A==B):\n");
+    const ConsensusNodeFactory fa = make_raft_a_factory();
+    const ConsensusNodeFactory fb = RaftNodeB::factory();
+    ClusterConfig cfg;
+    cfg.n_nodes = 1;                // ONE node: quorum() == 1, no peers ever ack
+    cfg.n_clients = 1;             // single sequential client ⇒ forced history
+    cfg.submits_per_client = 6;
+    cfg.full_envelope = false;     // pristine bus + honest disk (no peers anyway)
+    cfg.partition_episodes = 0;    // a 1-node cluster cannot partition
+    cfg.crash_episodes = 0;
+
+    const std::uint64_t seed = 0xC305'0001ULL;
+    const ObservedRun run_a = run_cluster(seed, fa, cfg);
+    const ObservedRun run_b = run_cluster(seed, fb, cfg);
+
+    auto report = [](const char* who, const ObservedRun& run) -> std::size_t {
+        std::size_t committed = count_committed(run);
+        std::printf("  %s: submits=%zu committed=%zu committed_log_len=%zu vals=[%s]\n",
+                    who, run.submits.size(), committed, run.committed_log.size(),
+                    render_values(run.committed_log).c_str());
+        return committed;
+    };
+    const std::size_t ca = report("A", run_a);
+    const std::size_t cb = report("B", run_b);
+
+    // Every SUBMIT must commit (a lone leader, no faults — nothing can block it).
+    check(ca == cfg.submits_per_client,
+          "impl A N=1: EVERY submitted value commits (lone-leader self-commit)");
+    check(cb == cfg.submits_per_client,
+          "impl B N=1: EVERY submitted value commits (lone-leader self-commit)");
+    check(run_a.committed_log.size() == cfg.submits_per_client,
+          "impl A N=1: committed log length == #submits (commit_index advanced)");
+    check(run_b.committed_log.size() == cfg.submits_per_client,
+          "impl B N=1: committed log length == #submits (commit_index advanced)");
+
+    // The committed log holds the submitted values in submit order (forced history).
+    bool a_values_ok = true, b_values_ok = true;
+    for (std::size_t i = 0; i < run_a.committed_log.size(); ++i) {
+        if (client_key(run_a.committed_log[i].value) != "c0_v" + std::to_string(i)) {
+            a_values_ok = false;
+        }
+    }
+    for (std::size_t i = 0; i < run_b.committed_log.size(); ++i) {
+        if (client_key(run_b.committed_log[i].value) != "c0_v" + std::to_string(i)) {
+            b_values_ok = false;
+        }
+    }
+    check(a_values_ok, "impl A N=1: committed log holds the SUBMITTED values in order");
+    check(b_values_ok, "impl B N=1: committed log holds the SUBMITTED values in order");
+
+    // Both impls individually conform at N=1 (all five checkers hold).
+    const std::vector<NamedVerdict> va = run_all_conformance(run_a);
+    const std::vector<NamedVerdict> vb = run_all_conformance(run_b);
+    bool conform_a = true, conform_b = true;
+    for (std::size_t i = 0; i < 5; ++i) {
+        if (!va[i].verdict.ok) { conform_a = false; }
+        if (!vb[i].verdict.ok) { conform_b = false; }
+    }
+    check(conform_a, "impl A N=1: all five conformance checkers hold");
+    check(conform_b, "impl B N=1: all five conformance checkers hold");
+
+    // A == B agree at N=1 (V-XCHECK per-client relative order; also byte-identical
+    // committed value sequence since it is a forced single-client history).
+    const std::string w = crosscheck_agree(run_a, run_b, cfg.n_clients);
+    check(w.empty(), "N=1: A and B AGREE on the committed history (V-XCHECK)");
+    const std::vector<std::string> ka = committed_keys(run_a);
+    const std::vector<std::string> kb = committed_keys(run_b);
+    check(ka == kb,
+          "N=1: A and B commit the IDENTICAL value sequence (forced history)");
+
+    // DETERMINISM at N=1: same seed ⇒ byte-identical committed value sequence.
+    const ObservedRun run_a2 = run_cluster(seed, fa, cfg);
+    const ObservedRun run_b2 = run_cluster(seed, fb, cfg);
+    check(render_values(run_a.committed_log) == render_values(run_a2.committed_log),
+          "N=1: impl A is deterministic (same seed ⇒ byte-identical committed log)");
+    check(render_values(run_b.committed_log) == render_values(run_b2.committed_log),
+          "N=1: impl B is deterministic (same seed ⇒ byte-identical committed log)");
+}
+
 }  // namespace
 
 int main() {
@@ -496,6 +586,7 @@ int main() {
 
     crosscheck_and_conform_sweep();
     forced_history_agree();
+    single_node_self_commit();
     determinism();
 
     // Emit the cross-check fingerprint under a stable marker so the gate's external

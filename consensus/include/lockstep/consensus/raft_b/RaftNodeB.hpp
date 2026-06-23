@@ -633,6 +633,18 @@ public:
         r.accepted = true;
         r.term = current_term_;
         r.index = idx;
+        // SINGLE-MEMBER CONFIG SELF-COMMIT. Commitment is normally driven from
+        // handle_append_entries_resp (a peer ack). With NO peers in the current config
+        // (quorum() == 1 ⇔ config size 1) no ack EVER arrives, so commit_index_ would
+        // never advance past 0. Re-evaluate here so the lone leader self-commits its own
+        // entry the instant it is durable (the leader self-counts in advance_commit_index;
+        // agree == 1 >= quorum() == 1). GATED on quorum() == 1 so this branch is provably
+        // UNREACHABLE — a strict no-op, byte-identical — for any config with >= 2 members
+        // (where commitment stays ack-driven, exactly as before).
+        if (quorum() == 1) {
+            advance_commit_index();
+            apply_and_maybe_snapshot();
+        }
         // Push the new entry out promptly (replication also runs on heartbeats).
         broadcast_append_entries();
         return r;
@@ -1005,6 +1017,17 @@ private:
         // reply: a self-vote at this term is durable before we solicit others).
         persist_term_vote();
         sync_now();
+        // A single-member config is its own quorum: with the self-vote already
+        // counted, votes_count() == 1 >= quorum() == 1, so the lone candidate becomes
+        // leader immediately — no RequestVote response will ever arrive to elect it.
+        // GATED on quorum() == 1 so for any config with >= 2 members this branch is
+        // provably UNREACHABLE: a strict no-op, election stays response-driven and the
+        // broadcast→arm ordering below is byte-identical to before.
+        if (quorum() == 1) {
+            arm_election_deadline();
+            become_leader();
+            return;
+        }
         broadcast_request_vote();
         arm_election_deadline();
     }

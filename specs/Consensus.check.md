@@ -51,6 +51,34 @@ Finished in 09s.
   added once `Cardinality(messages) = MaxMsgs` and no term/log growth remains), not a
   protocol stall. Deadlock checking was left ENABLED.
 
+## N=1 self-commit confirmation (specs/Consensus1.cfg)
+
+`AdvanceCommitIndex(s)` is a standalone, always-enabled action: `commitIndex` advances the
+instant a Quorum stores a current-term entry — and for a single server the Quorum is the lone
+leader itself. So the spec ALREADY permits a 1-node leader to self-commit with no peer ack.
+`specs/Consensus1.cfg` is the 3-server `.cfg` with `Server = {s1}` (everything else identical),
+confirming the four safety invariants still hold when the cluster is a single server. This is
+the spec-side proof that the C++ N=1 self-commit fix (call `advance_commit_index()` after the
+lone leader's own append; a lone candidate self-elects on its own vote) is safe.
+
+```
+scripts/tlc.sh -config specs/Consensus1.cfg specs/Consensus.tla   (TLC_WORKERS=2 TLC_XMX=4g)
+
+Model checking completed. No error has been found.
+154 states generated, 79 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 9.
+```
+
+- All four safety properties hold at N=1: **ElectionSafety, LogMatching, StateMachineSafety,
+  LeaderAppendOnly.** The reachable graph shows `Timeout → BecomeLeader → ClientRequest⁺ →
+  AdvanceCommitIndex` taking `commitIndex[s1]` from 0 to `Len(log[s1])` with `messages = {}`
+  throughout — the lone leader commits its own log with NO peer exchange.
+- `CHECK_DEADLOCK FALSE` for this config ONLY: a single peerless node legitimately QUIESCES
+  once it has self-committed up to the `MaxTerm`/`MaxLogLen` bounds (no peer traffic can
+  generate a successor). That terminal state is expected, not a protocol stall; the 3-server
+  config keeps deadlock checking ENABLED (its perpetual message churn never terminates within
+  the bound). Both runs reproduce identically (`0 states left on queue` = exhaustive).
+
 ## Modeling decisions
 
 - **`messages` is a set** (monotonically growing); re-delivery is idempotent. To keep the
