@@ -38,6 +38,7 @@ add_subdirectory(query)
 add_subdirectory(harness)
 add_subdirectory(consensus)
 add_subdirectory(bench)
+add_subdirectory(cli)
 
 if(BUILD_TESTING)
   add_subdirectory(tests)

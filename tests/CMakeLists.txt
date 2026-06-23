@@ -597,6 +597,94 @@ else()
     "txn_impl_test not built (Phase 5 Stage I pending).")
 endif()
 
+# --- Phase 6 Stage F: developer-facing client + query surface CONFORMANCE -----
+# P6-SURFACE gate (lockstep-phase-specs-all.md Phase 6 C6.1/C6.2; master-plan
+# D1/D3/D5; briefs/phase6.md V-DET-USER / V-D5-SAFE / V-CONFORM). The CLIENT
+# SURFACE (query/Database.hpp + query/Query.hpp): a typed Database that lets a
+# user AUTHOR + submit ONE-SHOT txn functions over the verified txn::Executor
+# seam (deterministic_factory) with a PURE deterministic handle (TxnContext: no
+# clock/rng/IO — V-DET-USER, compile-enforced), plus a typed, composable, NON-SQL
+# read surface (get/scan/range) over storage::Engine MVCC at a CALL-SITE-VISIBLE
+# D5 level (Query<L> — V-D5-SAFE). Authors example one-shot txns (a bank-transfer
+# workload) + reads at each D5 level THROUGH THE SURFACE over a seed sweep (<=64
+# in-gate, LOCKSTEP_QUERY_SEEDS override) and asserts (A) results == the strict-
+# serializable oracle + all 8 checkers, 0 violations on the default path; (B) each
+# D5 level honors EXACTLY its contract (the matching txn D5 checker); (C) user txn
+# bodies are pure (compile-enforced); (D) determinism (same seed => byte-
+# identical); (E) TEETH — a Strict read served STALE is caught. Links the header-
+# only query lib (which pulls txn + storage + runtime + sim). Non-provider TU ->
+# forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
+   AND TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_query_surface_test query_surface_test.cpp)
+  target_include_directories(lockstep_query_surface_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_query_surface_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME query_surface_test COMMAND lockstep_query_surface_test)
+
+  # --- Phase 6 Stage B (C6.3): the CLIENT<->SERVER WIRE PROTOCOL gate ---------
+  # Drives a ClientStub <-> Server exchange over SimNetwork across a seed sweep
+  # (LOCKSTEP_PROTOCOL_SEEDS override, <=64 in-gate) and asserts: (A) round-trip
+  # correctness — a Submit/Query through the wire equals the same op done DIRECTLY
+  # on the Server's Database surface (and thus the oracle); (B) EXACTLY-ONCE under
+  # net faults (dup/reorder/drop) — a re-delivered Submit applies no duplicate txn
+  # effect; (C) a TORN/corrupt frame is rejected at decode, never mis-decoded;
+  # (D) determinism — same seed => byte-identical. Links the header-only query lib
+  # (which pulls txn + storage + runtime + sim). Non-provider TU -> forbidden-lint
+  # scans it. Inherits the dir-wide TIMEOUT.
+  add_executable(lockstep_query_protocol_test query_protocol_test.cpp)
+  target_include_directories(lockstep_query_protocol_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_query_protocol_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME query_protocol_test COMMAND lockstep_query_protocol_test)
+
+  # --- Phase 6 Stage B (C6.6): the END-TO-END CONFORMANCE GATE ----------------
+  # Exercises the FULL developer surface stack — the C6.4 reference Driver
+  # (Connection) -> wire ClientStub -> SimNetwork -> wire Server -> Database ->
+  # txn deterministic executor -> WalEngine MVCC — over a seed sweep under net
+  # faults, and asserts: (A) end-to-end balances == the strict-serializable oracle
+  # on the default path (clean AND under dup/reorder/drop); (B) EXACTLY-ONCE end
+  # to end (a re-delivered Submit applies no duplicate effect); (C) each D5 level
+  # driven through the driver honors EXACTLY its contract (the matching txn D5
+  # checker, reusing txn/Oracle.hpp + txn/Checkers.hpp unchanged); (D) determinism
+  # (same seed => byte-identical trace + balances); (E) TEETH — a stale Strict read
+  # is caught. LOCKSTEP_CONFORMANCE_SEEDS override (<=64 in-gate). Non-provider TU
+  # -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+  add_executable(lockstep_query_conformance_test query_conformance_test.cpp)
+  target_include_directories(lockstep_query_conformance_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_query_conformance_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME query_conformance_test COMMAND lockstep_query_conformance_test)
+else()
+  message(WARNING
+    "lockstep_query / txn / storage / runtime / providers_sim not all found; "
+    "query_surface_test not built (Phase 6 Stage F pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
