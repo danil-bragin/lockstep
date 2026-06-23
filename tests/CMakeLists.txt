@@ -830,6 +830,35 @@ else()
     "query_surface_test not built (Phase 6 Stage F pending).")
 endif()
 
+# --- Phase 7 S2: PROD provider conformance + record-replay --------------------
+# P7-S2 gate (briefs/phase7.md S2; V-PROD-CONTRACT + V-PROD-REPLAY). Runs the
+# REUSABLE S1 universal suite (conformance::universal::*) VERBATIM against the
+# PROD providers (prod::ProdRandom — full tier-A; prod::ProdClock — now()-monotonic
+# only, delay/timers deferred to S4), proves sim==prod PRNG byte-identity for
+# several seeds, and proves the record-replay TRACE round-trips byte-identical.
+# tests/ is on the include path so "provider_conformance/..." resolves. Links the
+# header-only runtime + sim + prod providers. Non-provider TU -> forbidden-lint
+# scans it (no <chrono>/<random>/<thread> here; real time/entropy stays in
+# providers/prod/). Inherits the dir-wide TIMEOUT.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim
+   AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_provider_test prod_provider_test.cpp)
+  target_include_directories(lockstep_prod_provider_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_provider_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_provider_test COMMAND lockstep_prod_provider_test)
+else()
+  message(WARNING
+    "lockstep_runtime / providers_sim / providers_prod not all found; "
+    "prod_provider_test not built (Phase 7 S2 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
