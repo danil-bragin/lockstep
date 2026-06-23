@@ -1,38 +1,45 @@
 # =============================================================================
 # Lockstep CI -- gate-as-code: the FULL universal merge gate (master-plan §8).
 #
-# This workflow IS the gate. It runs on ubuntu-latest with the LLVM/clang
-# toolchain, which (unlike the macOS / Apple-clang dev host) provides ALL of:
-# ASan, TSan, UBSan, MSan, clang-tidy, and scan-build. Every stage below runs
-# FOR REAL here. The local mirror is scripts/gate.sh (which honestly SKIPs the
-# three host-limited stages on macOS).
+# This workflow IS the gate, and it MIRRORS scripts/gate.sh / scripts/gate-linux.sh
+# (the local source of truth) so CI green == local gate green. Ubuntu + LLVM/clang
+# provides what the macOS / Apple-clang dev host cannot: ASan, TSan, UBSan, MSan,
+# clang-tidy, scan-build. Two stages need the project's Linux dev IMAGE rather than
+# bare apt clang, and they say so below:
+#   * MSan         -- real MSan needs an MSan-INSTRUMENTED libc++ (else stdlib
+#                     false-positives). The Docker image builds it once
+#                     (tools/docker/Dockerfile -> $LOCKSTEP_MSAN_LIBCXX); the msan
+#                     job runs inside that image. The heavy libc++ layer is cached
+#                     via the GitHub Actions cache so it is built ~once, not per run.
 #
 # REQUIRED STATUS CHECKS -- the gate cannot be bypassed.
-#   Every job below is intended to be configured as a REQUIRED status check on
+#   Configure gate-summary (the single fan-in job) as a REQUIRED status check on
 #   the protected default branch (Settings -> Branches -> Branch protection ->
-#   "Require status checks to pass before merging"), so that NO PR merges unless
-#   the whole §8 battery is green. Per cardinal rule 2, "the verification
-#   battery is the gate"; per spec C0.5 it is "encoded directly in CI so it
-#   cannot be bypassed." Add each job name (compile, lint, clang-tidy,
-#   scan-build, sanitizers (asan|tsan|ubsan|msan), sim-battery,
-#   spec-conformance, linearizability, mutation, gate-summary) to the required
-#   list when enabling branch protection.
+#   "Require status checks to pass before merging"). It fails if ANY upstream stage
+#   failed or was skipped, so no PR merges unless the whole §8 battery is green.
+#   Per cardinal rule 2, "the verification battery is the gate"; per spec C0.5 it is
+#   "encoded directly in CI so it cannot be bypassed."
 #
 # ORDERED STAGES (master-plan §8), expressed via `needs:` dependencies:
 #   compile (debug+release)
 #     -> lint (forbidden-call) + clang-tidy + scan-build (static analysis)
-#       -> sanitizers: ASan, TSan, UBSan, MSan   (matrix; build + ctest)
-#         -> deterministic simulation battery     [Phase 0 no-op hook]
-#           -> conforms-to-formal-spec             [Phase 0 no-op hook]
-#             -> applicable linearizability checks [Phase 0 no-op hook]
-#               -> mutation score not regressed
+#       -> sanitizers: ASan, TSan, UBSan (plain clang)  +  MSan (instrumented libc++)
+#         -> deterministic simulation battery   [covered by ctest; explicit hook]
+#           -> conforms-to-formal-spec           [REAL: TLC over every spec]
+#             -> applicable linearizability checks [covered by ctest; explicit hook]
+#               -> mutation score not regressed   [mirrors gate.sh policy]
 #
-# Phase 0 reality: the sim-battery / spec-conformance / linearizability stages
-# have nothing to run yet, so each is an explicit, clearly-commented no-op hook
-# that echoes a banner and succeeds -- wired now, real in Phase >= 2.
+# Phase-6 reality vs the Phase-0 placeholders:
+#   * conforms-to-formal-spec is now REAL: it model-checks all 6 specs in TLC and
+#     asserts the Membership2 "teeth" cfg (2-server jump) VIOLATES QuorumOverlap.
+#   * the deterministic-simulation battery and linearizability checks run AS PART OF
+#     ctest (seed-sweep, cross-check, conformance, and end-to-end fault-storm tests
+#     execute in the compile + sanitizer stages above), so the dedicated stages here
+#     stay explicit hooks that document where that coverage lives rather than
+#     re-running it. They go real-standalone if/when a separate Jepsen-style checker
+#     is added.
 #
-# CMake presets used (defined by A1 in CMakePresets.json):
-#   debug release asan tsan ubsan msan
+# CMake presets used (defined in CMakePresets.json): debug release asan tsan ubsan msan
 # =============================================================================
 name: ci
 
@@ -51,15 +58,15 @@ permissions:
   contents: read
 
 env:
-  # Pin the LLVM/clang toolchain everywhere so MSan/TSan instrumentation and the
-  # static-analysis tools all come from the same, consistent toolchain.
+  # Pin the LLVM/clang toolchain everywhere so the sanitizer instrumentation and
+  # the static-analysis tools all come from one consistent toolchain.
   CC: clang
   CXX: clang++
-  LOCKSTEP_MUTATION_THRESHOLD: "100.0"
 
 jobs:
   # ===========================================================================
-  # STAGE 1 -- COMPILE (debug + release build matrix)
+  # STAGE 1 -- COMPILE (debug + release build matrix). ctest here also exercises
+  # the deterministic-simulation / cross-check / conformance / end-to-end tests.
   # ===========================================================================
   compile:
     name: compile (${{ matrix.preset }})
@@ -79,7 +86,7 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test (ctest)
-        run: ctest --preset ${{ matrix.preset }}
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
 
   # ===========================================================================
   # STAGE 2 -- LINT + STATIC ANALYSIS
@@ -132,7 +139,7 @@ jobs:
         run: scan-build --status-bugs cmake --build --preset debug
 
   # ===========================================================================
-  # STAGE 3 -- SANITIZERS (ASan / TSan / UBSan / MSan), separate matrix jobs.
+  # STAGE 3a -- SANITIZERS on plain clang: ASan / TSan / UBSan.
   #   Each: configure -> build -> ctest under the sanitizer preset.
   # ===========================================================================
   sanitizers:
@@ -142,10 +149,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [asan, tsan, ubsan, msan]
+        preset: [asan, tsan, ubsan]
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain (llvm/clang has MSan; Apple clang does not)
+      - name: Install toolchain + sanitizer runtimes
         run: |
           sudo apt-get update
           sudo apt-get install -y clang clang-tools cmake ninja-build
@@ -154,37 +161,96 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test (ctest under sanitizer)
-        run: ctest --preset ${{ matrix.preset }}
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
 
   # ===========================================================================
-  # STAGE 4 -- DETERMINISTIC SIMULATION BATTERY   [Phase 0 no-op hook]
-  #   Real in Phase >= 2 (sim harness + fault storms + seed-burn, spec C2.*).
+  # STAGE 3b -- MSan, inside the Linux dev IMAGE (MSan-instrumented libc++).
+  #   Plain apt clang would false-positive in stdlib internals; the image builds
+  #   libc++/libc++abi/libunwind with -fsanitize=memory once. The heavy build is
+  #   cached as a Docker layer via the GH Actions cache, so it is paid ~once.
+  #   This is exactly the MSan stage scripts/gate-linux.sh runs.
+  # ===========================================================================
+  msan:
+    name: sanitizer (msan, instrumented libc++)
+    runs-on: ubuntu-latest
+    needs: [lint, clang-tidy, scan-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the Linux dev image (instrumented libc++, layer-cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: tools/docker
+          file: tools/docker/Dockerfile
+          tags: lockstep-dev:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: ctest under REAL MSan (instrumented libc++ from $LOCKSTEP_MSAN_LIBCXX)
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work --memory=8g --cpus=2 \
+            lockstep-dev:latest bash -lc '
+              set -euo pipefail
+              rm -rf build/msan
+              cmake --preset msan
+              cmake --build --preset msan
+              ctest --preset msan --output-on-failure'
+
+  # ===========================================================================
+  # STAGE 4 -- DETERMINISTIC SIMULATION BATTERY.
+  #   The sim harness, seed-sweep, fault-storm and end-to-end tests run as part of
+  #   ctest in STAGE 1/3 above (they are registered ctest targets). This explicit
+  #   hook documents that coverage; it goes standalone only if the battery is ever
+  #   split out of ctest.
   # ===========================================================================
   sim-battery:
     name: deterministic simulation battery
     runs-on: ubuntu-latest
-    needs: sanitizers
+    needs: [sanitizers, msan]
     steps:
       - uses: actions/checkout@v4
-      - name: Sim battery (placeholder hook)
-        run: "echo 'Phase 0: no-op hook (wired for Phase >=2)'"
+      - name: Sim battery (runs within ctest; see compile + sanitizer stages)
+        run: "echo 'sim battery executes inside ctest (seed-sweep / fault-storm / e2e targets)'"
 
   # ===========================================================================
-  # STAGE 5 -- CONFORMS-TO-FORMAL-SPEC            [Phase 0 no-op hook]
-  #   Real in Phase >= 4/5 (TLA+ model-checked in TLC; specs/ exists, empty now).
+  # STAGE 5 -- CONFORMS-TO-FORMAL-SPEC (REAL: model-check every spec in TLC).
+  #   Bounded runner (scripts/tlc.sh: capped heap, /tmp metadir, bounded workers).
+  #   Positive specs must hold; the Membership2 "teeth" cfg (2-server jump) MUST
+  #   violate QuorumOverlap -- a negative control proving the checker has teeth.
   # ===========================================================================
   spec-conformance:
-    name: conforms-to-formal-spec
+    name: conforms-to-formal-spec (TLC)
     runs-on: ubuntu-latest
     needs: sim-battery
+    env:
+      TLC_WORKERS: "2"
+      TLC_XMX: "5g"
     steps:
       - uses: actions/checkout@v4
-      - name: Spec conformance (placeholder hook)
-        run: "echo 'Phase 0: no-op hook (wired for Phase >=2)'"
+      - name: Install JRE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jre-headless
+      - name: Model-check every spec (invariants must hold)
+        run: |
+          set -e
+          for s in CommitOrdering Consensus Membership Sequencer Snapshot; do
+            echo "==================== TLC: $s ===================="
+            bash scripts/tlc.sh -config "specs/$s.cfg" "specs/$s.tla"
+          done
+      - name: Teeth -- Membership2 (2-server jump) MUST violate QuorumOverlap
+        run: |
+          if bash scripts/tlc.sh -config specs/Membership2.cfg specs/Membership.tla; then
+            echo "TEETH FAIL: Membership2 (2-server jump) should violate QuorumOverlap, but TLC reported no error."
+            exit 1
+          fi
+          echo "TEETH OK: Membership2 violated QuorumOverlap as expected (negative control holds)."
 
   # ===========================================================================
-  # STAGE 6 -- APPLICABLE LINEARIZABILITY CHECKS  [Phase 0 no-op hook]
-  #   Real in Phase >= 4/5 (Elle/Jepsen-style, one checker per D5 level).
+  # STAGE 6 -- APPLICABLE LINEARIZABILITY CHECKS.
+  #   The strict-serializable oracle + the D5-level checkers + the cross-impl
+  #   linearization checks run as ctest targets (txn / consensus / end-to-end
+  #   conformance tests). This explicit hook documents that coverage.
   # ===========================================================================
   linearizability:
     name: linearizability checks
@@ -192,12 +258,16 @@ jobs:
     needs: spec-conformance
     steps:
       - uses: actions/checkout@v4
-      - name: Linearizability (placeholder hook)
-        run: "echo 'Phase 0: no-op hook (wired for Phase >=2)'"
+      - name: Linearizability (runs within ctest; oracle + D5 checkers + cross-check)
+        run: "echo 'linearizability / strict-serializable checks execute inside ctest'"
 
   # ===========================================================================
   # STAGE 7 -- MUTATION SCORE NOT REGRESSED (adequacy meta-gate, §6.7).
-  #   Runs end-to-end now; fails the gate on any regression below threshold.
+  #   Mirrors scripts/gate.sh EXACTLY: invoke the runner with NO --threshold, so it
+  #   uses its default policy (report survivors + fail on regression vs the recorded
+  #   baseline) rather than a fixed percentage. A fixed 100% threshold is wrong here:
+  #   there is a PROVEN-EQUIVALENT mutant (Scheduler.hpp insertion-sort guard) that
+  #   no test can kill, so 100% is unreachable and would red the gate forever.
   # ===========================================================================
   mutation:
     name: mutation score not regressed
@@ -205,17 +275,21 @@ jobs:
     needs: linearizability
     steps:
       - uses: actions/checkout@v4
+      - name: Install toolchain (mutation rebuilds the suite in a shadow tree)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tools cmake ninja-build
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Mutation runner (threshold-gated)
-        run: python3 tools/mutation/run_mutation.py --threshold "${LOCKSTEP_MUTATION_THRESHOLD}"
+      - name: Mutation runner (same invocation as scripts/gate.sh)
+        run: python3 tools/mutation/run_mutation.py
 
   # ===========================================================================
-  # GATE SUMMARY -- single fan-in check. Make THIS a required status check (in
-  # addition to / instead of each leaf) so the whole ordered battery must be
-  # green before merge. Fails if any upstream job failed or was skipped.
+  # GATE SUMMARY -- single fan-in check. Make THIS the required status check, so
+  # the whole ordered battery must be green before merge. Fails if ANY upstream
+  # job failed or was skipped.
   # ===========================================================================
   gate-summary:
     name: gate-summary
@@ -227,6 +301,7 @@ jobs:
       - clang-tidy
       - scan-build
       - sanitizers
+      - msan
       - sim-battery
       - spec-conformance
       - linearizability
@@ -239,6 +314,7 @@ jobs:
           echo "clang-tidy=${{ needs.clang-tidy.result }}"
           echo "scan-build=${{ needs.scan-build.result }}"
           echo "sanitizers=${{ needs.sanitizers.result }}"
+          echo "msan=${{ needs.msan.result }}"
           echo "sim-battery=${{ needs.sim-battery.result }}"
           echo "spec-conformance=${{ needs.spec-conformance.result }}"
           echo "linearizability=${{ needs.linearizability.result }}"
@@ -248,6 +324,7 @@ jobs:
             || [ "${{ needs.clang-tidy.result }}" != "success" ] \
             || [ "${{ needs.scan-build.result }}" != "success" ] \
             || [ "${{ needs.sanitizers.result }}" != "success" ] \
+            || [ "${{ needs.msan.result }}" != "success" ] \
             || [ "${{ needs.sim-battery.result }}" != "success" ] \
             || [ "${{ needs.spec-conformance.result }}" != "success" ] \
             || [ "${{ needs.linearizability.result }}" != "success" ] \
