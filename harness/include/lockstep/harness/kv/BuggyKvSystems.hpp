@@ -326,10 +326,9 @@ private:
             std::string key;
             std::string value;
             std::uint32_t seq = 0;
-            const std::size_t start = pos;
             if (!get_str(durable, pos, key) || !get_str(durable, pos, value) ||
                 !get_u32(durable, pos, seq)) {
-                pos = start;  // short/torn tail → apply only the valid prefix.
+                // short/torn tail → stop; only the valid prefix was applied.
                 break;
             }
             commit_in_memory(key, value, seq);

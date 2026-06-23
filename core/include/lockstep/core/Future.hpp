@@ -220,8 +220,12 @@ public:
         // Future::has_error()/error() on the original future; here we return the
         // value (default-constructed-from-optional on the error path).
         T await_resume() {
-            if (state->result().value.has_value()) {
-                return std::move(*state->result().value);
+            // Bind the optional ONCE: state->result() yields a fresh reference
+            // per call, so checking has_value() on one call and dereferencing on
+            // another defeats the optional checker. One alias = one object.
+            auto& value = state->result().value;
+            if (value.has_value()) {
+                return std::move(*value);
             }
             return T{};
         }

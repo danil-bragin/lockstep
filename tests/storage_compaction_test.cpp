@@ -88,6 +88,16 @@ using lockstep::storage::SstEntry;
 using lockstep::storage::Value;
 using lockstep::storage::WalEngine;
 
+// printf-friendly view of an optional<Value> (Value == std::string). The
+// explicit if-guard makes the not-engaged case unmistakable to the optional
+// checker (a `o.has_value() ? o->c_str() : "nil"` ternary it cannot model).
+const char* opt_cstr(const std::optional<Value>& o) {
+    if (o.has_value()) {
+        return o->c_str();
+    }
+    return "nil";
+}
+
 int g_failures = 0;
 
 #define CHECK(cond, ...)                                                              \
@@ -470,8 +480,7 @@ void test_gc_safety_end_to_end() {
                              static_cast<unsigned long long>(seed),
                              live_probes[i].first.c_str(),
                              static_cast<unsigned long long>(tip),
-                             live_before[i].has_value() ? live_before[i]->c_str() : "nil",
-                             live_after[i].has_value() ? live_after[i]->c_str() : "nil");
+                             opt_cstr(live_before[i]), opt_cstr(live_after[i]));
                 break;
             }
         }
@@ -574,7 +583,7 @@ void test_gc_live_snapshot_preserved() {
                              static_cast<unsigned long long>(seed),
                              probes[i].first.c_str(),
                              static_cast<unsigned long long>(held),
-                             got[i].has_value() ? got[i]->c_str() : "nil");
+                             opt_cstr(got[i]));
                 break;
             }
         }
@@ -771,8 +780,7 @@ void test_crash_during_compaction() {
                              static_cast<unsigned long long>(crash_step),
                              static_cast<unsigned long long>(tip), k.c_str(),
                              static_cast<unsigned long long>(at),
-                             want.has_value() ? want->c_str() : "nil",
-                             got.has_value() ? got->c_str() : "nil");
+                             opt_cstr(want), opt_cstr(got));
                 break;
             }
         }

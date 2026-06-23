@@ -187,10 +187,14 @@ private:
             bool snapshot_prefix_set = false;
 
             for (const Read& r : t.declared_reads) {
-                Seq read_prefix = serial_prefix;  // default: own serialization pt
+                // Default = the own serialization prefix; the StrictSerializable
+                // case keeps it. Every other arm overrides it. This init is the
+                // value read for strict reads (not a dead store).
+                Seq read_prefix = serial_prefix;
                 switch (r.level) {
                     case Level::StrictSerializable:
-                        read_prefix = serial_prefix;
+                        // strict read serves at the own serialization prefix
+                        // (the default above) — no override needed.
                         break;
                     case Level::Snapshot: {
                         // All Snapshot reads share ONE prefix. A non-kNoSeq request
