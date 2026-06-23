@@ -12,15 +12,21 @@
 // values small and origin-relative (a Tick is "opaque ticks since an unspecified
 // origin" per IClock.hpp — we pick construction time as that origin).
 //
-// DELAY IS DEFERRED TO S4. A correct prod delay() needs the prod REACTOR (epoll
-// event loop) to wake the coroutine when wall-time passes the deadline WITHOUT a
-// busy-wait or a rogue background thread (a threaded timer here would (a) violate
-// the single-threaded determinism model the Scheduler assumes and (b) be a hack
-// the brief explicitly forbids). So delay() returns an immediately-completing
-// Future carrying ErrorCode::Unavailable with a clear "deferred to S4" detail,
-// and we expose the minimal registration surface (pending_timers()) the S4
-// reactor will drain. The universal `clock/delay-*` and `timers-fire-in-order`
-// checks are therefore DEFERRED to S4 for prod; only `now-monotonic` runs now.
+// DELAY IS WIRED TO THE REACTOR (S4a). A correct prod delay() needs the prod
+// REACTOR (epoll event loop) to wake the coroutine when wall-time passes the
+// deadline WITHOUT a busy-wait or a rogue background thread (a threaded timer here
+// would (a) violate the single-threaded determinism model the Scheduler assumes
+// and (b) be a hack the brief forbids). S4a resolves the S2 deferral: a ProdClock
+// constructed WITH an ITimerRegistrar* (the ProdReactor implements it) forwards
+// delay(d) to reactor->arm_timer(d), returning a Future<void> the reactor's loop
+// completes when real time passes the deadline. A ProdClock constructed WITHOUT a
+// registrar (the now()-only S2 path) keeps the documented Unavailable stub so the
+// macOS / no-reactor build still compiles and the now()-monotonic check still runs.
+//
+// ITimerRegistrar is the narrow seam between ProdClock (core IClock impl) and
+// ProdReactor (the epoll loop) — it lives HERE in prod, NOT in core, so the core
+// IClock interface is untouched (no core change). ProdReactor::delay() is the
+// implementation; ProdClock just forwards to it.
 //
 // providers/prod/ is the lint-exempt boundary zone: std::chrono::steady_clock is
 // permitted HERE (and only here).
@@ -34,8 +40,21 @@
 
 namespace lockstep::prod {
 
+// The narrow seam ProdClock uses to arm a real timer on the reactor. ProdReactor
+// implements it (arm_timer == ProdReactor::delay). It lives in prod, NOT in core,
+// so wiring delay() to the reactor needs NO change to the core IClock interface.
+class ITimerRegistrar {
+public:
+    virtual ~ITimerRegistrar() = default;
+    // Arm a real timer `d` ticks (ns) ahead of the reactor's now() and return a
+    // Future<void> the reactor's loop completes once real time passes the deadline.
+    // d <= 0 is permitted and completes promptly (next loop turn), never hangs.
+    [[nodiscard]] virtual core::Future<void> arm_timer(core::Duration d) = 0;
+};
+
 // Production clock. now() is real monotonic wall-elapsed time in ticks (ns);
-// delay() is a documented S4-deferred stub (see header note).
+// delay() forwards to a bound reactor (ITimerRegistrar) when present, else the
+// documented S2 Unavailable stub (see header note).
 class ProdClock final : public core::IClock {
 public:
     // The Tick unit for this clock: 1 tick == 1 nanosecond of steady_clock
@@ -43,7 +62,13 @@ public:
     static constexpr core::Tick kTicksPerSecond = 1'000'000'000;
 
     // Origin = construction instant. now() reports nanoseconds since this origin.
+    // No reactor bound: delay() is the now()-only S2 stub (Unavailable).
     ProdClock() noexcept : origin_(std::chrono::steady_clock::now()) {}
+
+    // S4a: bind a reactor (ITimerRegistrar) so delay() arms a real epoll timer.
+    // Explicit single-arg ctor (no implicit conversion from a registrar pointer).
+    explicit ProdClock(ITimerRegistrar* reactor) noexcept
+        : origin_(std::chrono::steady_clock::now()), reactor_(reactor) {}
 
     // Real monotonic time as a Tick (ns since origin). steady_clock guarantees the
     // underlying count never decreases, so successive now() calls are monotonic
@@ -62,16 +87,22 @@ public:
         return t;
     }
 
-    // DEFERRED TO S4 (prod reactor). Returns an already-complete Future carrying
-    // Unavailable; it does NOT block, spawn a thread, or busy-wait. The S4 reactor
-    // will replace this with a real epoll-driven timer that drains pending_timers().
+    // S4a: forward to the bound reactor's real epoll timer when present. With no
+    // reactor (the S2 now()-only path) keep the documented Unavailable stub: it
+    // does NOT block, spawn a thread, or busy-wait. The reactor path does not
+    // block here either — arm_timer() only ENQUEUES a timer; the reactor's run()
+    // loop is what later fires it (single-threaded, epoll-driven).
     [[nodiscard]] core::Future<void> delay(core::Duration d) override {
-        // Record the request so the S4 reactor (or a test) can see what was armed.
+        // Record the request so a test / recorder can see what was armed.
         pending_.push_back(d);
+        if (reactor_ != nullptr) {
+            return reactor_->arm_timer(d);
+        }
         core::Promise<void> p;
         core::Future<void> f = p.get_future();
         p.set_error(core::Error{core::ErrorCode::Unavailable,
-                                "ProdClock::delay deferred to S4 (epoll reactor)"});
+                                "ProdClock::delay needs a reactor (bind via "
+                                "ProdClock(ITimerRegistrar*) — S4a)"});
         return f;
     }
 
@@ -83,8 +114,9 @@ public:
 
 private:
     std::chrono::steady_clock::time_point origin_;
+    ITimerRegistrar* reactor_ = nullptr;     // bound reactor (S4a); null = S2 stub
     mutable core::Tick last_ = 0;            // last observed now() (monotonic clamp)
-    std::vector<core::Duration> pending_{};  // S4 reactor input (armed delays)
+    std::vector<core::Duration> pending_{};  // armed-delay log (test/recorder view)
 };
 
 } // namespace lockstep::prod

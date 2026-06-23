@@ -891,6 +891,38 @@ else()
     "prod_disk_test not built (Phase 7 S3 pending).")
 endif()
 
+# --- Phase 7 S4a: PROD REACTOR (epoll event loop + real timers) [LINUX ONLY] --
+# P7-S4a gate (briefs/phase7.md S4; the loop + real timers, NO sockets yet). The
+# prod REACTOR (providers/prod/ProdReactor.hpp) is a real epoll-driven event loop
+# implementing the SAME two core surfaces the sim Scheduler does (core::IScheduler
+# + core::detail::SchedulerSink), so the verified async core (Future/Promise/Task)
+# runs on it UNCHANGED. delay() is wired to it via prod::ITimerRegistrar, resolving
+# the S2 deferral. Asserts the deferred S1 clock checks now pass on prod, ADAPTED
+# from sim's exact-virtual-d to a real-elapsed tolerance: (a) timers-fire-in-time-
+# order (universal — the nearer deadline fires first); (b) delay completes after
+# >= d REAL elapsed (the prod analogue of sim's exact-d advance; the exact-d
+# assertion is sim-specific virtual time, NOT universal); (c) delay(<=0) completes
+# promptly without hanging; (d) the core actually runs on the reactor — a coroutine
+# co_awaits ProdClock::delay() a couple times + a Promise resolved by another
+# scheduled task, driven by ProdReactor::run() to quiescence, completes in real-time
+# order. epoll is LINUX-ONLY: this target is added ONLY on Linux (if(UNIX AND NOT
+# APPLE)) so the macOS host build stays green (the reactor target simply absent).
+# Bounded: real timers are a few ms; run() drives to quiescence. Non-provider TU ->
+# forbidden-lint scans it (NO <chrono>/<thread>/<sys/epoll.h> here; all real time +
+# epoll stay inside providers/prod/ProdReactor.hpp). Inherits the dir-wide TIMEOUT.
+if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_reactor_test prod_reactor_test.cpp)
+  target_include_directories(lockstep_prod_reactor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_reactor_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME prod_reactor_test COMMAND lockstep_prod_reactor_test)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
