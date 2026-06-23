@@ -1020,6 +1020,30 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_consensus AND TARGET lockstep_runtime
   add_test(NAME prod_consensus_test COMMAND lockstep_prod_consensus_test)
 endif()
 
+# --- Phase 7 S5b-2: REAL MULTI-PROCESS Raft CLUSTER smoke [LINUX ONLY] --------
+# P7-S5b-2 gate (briefs/phase7.md S5; THE distributed milestone). Orchestrates a REAL
+# 3-process lockstepd cluster over loopback TCP via tests/prod_cluster_smoke.sh and
+# asserts: (1) exactly ONE leader emerges (others followers); (2) client SUBMITs (via
+# the lockstep_admin leader-find client) REPLICATE + COMMIT on ALL 3 nodes with their
+# committed logs AGREEING (same values, same order); (3) a killed follower RESTARTED on
+# the SAME data dir REJOINS and its committed log CATCHES UP (recovery from ProdDisk +
+# replication). PROCESS-CLEANUP GUARANTEE: the script traps EXIT/INT/TERM to SIGKILL
+# every child on every path, and each lockstepd self-deadlines (--run-seconds), so no
+# orphan can outlive the test. BOUNDED: every wait has an absolute deadline; the ctest
+# has its own TIMEOUT (a hard wall guard) below. Built ONLY on Linux (needs the
+# lockstepd + lockstep_admin Linux targets); the macOS host stays green (test absent).
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
+  add_test(
+    NAME prod_cluster_smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_cluster_smoke.sh)
+  # A generous ceiling that still kills any true hang fast (the script's own internal
+  # deadlines are well under this; sanitizer/CI jitter is absorbed).
+  set_tests_properties(prod_cluster_smoke PROPERTIES TIMEOUT 120)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never

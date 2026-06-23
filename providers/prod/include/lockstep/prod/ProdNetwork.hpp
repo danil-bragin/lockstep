@@ -208,6 +208,21 @@ public:
     // for accept. Idempotent on id. Returns false on a socket setup failure.
     bool add_node(std::uint64_t id);
 
+    // S5b-2 (multi-PROCESS): register a node LISTENING on a FIXED loopback port. In a
+    // single process the bus mints ephemeral ports (peers learn them in-process), but
+    // ACROSS processes a peer must know the listen port a priori — so a real cluster
+    // binds each node to a fixed, agreed port. `port` must be > 0. Otherwise identical
+    // to add_node (idempotent on id; non-blocking listen; armed for accept). Returns
+    // false if the bind/listen fails (e.g. the port is already taken — fail fast, do
+    // NOT spin trying alternates).
+    bool add_node_on_port(std::uint64_t id, std::uint16_t port);
+
+    // S5b-2: record a PEER's known (id -> fixed loopback port) WITHOUT binding a listen
+    // socket here. A node's outbound send() to that peer dials 127.0.0.1:port via this
+    // address-map entry (the peer LISTENS in its OWN process). Used to teach this
+    // process where its peers live. Idempotent / overwrites the recorded port.
+    void add_peer(std::uint64_t id, std::uint16_t port) { record_port(id, port); }
+
     // Per-node INetwork handle. The node must already be add_node()'d.
     [[nodiscard]] ProdNetwork* node(std::uint64_t id);
 
@@ -689,7 +704,15 @@ inline ProdNetworkBus::ProdNetworkBus(ProdReactor& reactor) noexcept
     : reactor_(&reactor) {}
 inline ProdNetworkBus::~ProdNetworkBus() = default;
 
+// Shared bind+listen helper for add_node / add_node_on_port. `want_port`==0 binds an
+// EPHEMERAL port (single-process); a non-zero `want_port` binds that FIXED port (the
+// cross-process cluster, where peers must know the listen port a priori). Records the
+// actual bound port in the address map + arms the node for accept. Idempotent on id.
 inline bool ProdNetworkBus::add_node(std::uint64_t id) {
+    return add_node_on_port(id, 0);
+}
+
+inline bool ProdNetworkBus::add_node_on_port(std::uint64_t id, std::uint16_t want_port) {
     for (const auto& n : nodes_) {
         if (n && n->local().id == id) {
             return true; // idempotent
@@ -708,17 +731,17 @@ inline bool ProdNetworkBus::add_node(std::uint64_t id) {
     }
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = 0; // ephemeral
+    addr.sin_port = ::htons(want_port); // 0 == ephemeral; >0 == fixed (cross-process)
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        ::close(fd);
+        ::close(fd); // fixed port already taken: fail fast (the caller does NOT spin)
         return false;
     }
     if (::listen(fd, 16) != 0) {
         ::close(fd);
         return false;
     }
-    // Read back the ephemeral port we were assigned.
+    // Read back the actual bound port (== want_port when fixed, else the ephemeral one).
     sockaddr_in bound{};
     socklen_t blen = sizeof(bound);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &blen) != 0) {

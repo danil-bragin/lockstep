@@ -255,9 +255,31 @@ public:
     // `cluster` lists ALL consensus member ids (1-node: just {self_id}); S5b-2 lists
     // every peer and the bus add_node's each. `seed` feeds ProdRandom (election
     // jitter / backoff). The node is built but NOT started — call start().
+    // Real-time Raft timing knobs (ns ticks). The defaults are the 1-node (S5b-1)
+    // window — SHORT, so a lone node wins its own election promptly. S5b-2 (>=2 real
+    // processes over real TCP) passes a WIDER window: the election timeout must exceed
+    // a few heartbeat intervals + real cross-process connect/RTT latency, or followers
+    // time out before the leader's heartbeat lands and the cluster never stabilizes on
+    // ONE leader. A randomized [min,max] spread breaks symmetric split votes.
+    struct Timing {
+        core::Tick election_min = kElectionMinNs;
+        core::Tick election_max = kElectionMaxNs;
+        core::Tick heartbeat = kHeartbeatNs;
+        core::Tick request_deadline = kRequestDeadlineNs;
+    };
+
+    // 1-node convenience ctor (S5b-1 call sites): default timing.
     ProdConsensusNode(ProdReactor& reactor, ProdNetworkBus& bus, std::uint64_t self_id,
                       std::uint64_t admin_id, const std::string& data_dir,
                       std::uint64_t seed, std::vector<std::uint64_t> cluster)
+        : ProdConsensusNode(reactor, bus, self_id, admin_id, data_dir, seed,
+                            std::move(cluster), Timing{}) {}
+
+    // Full ctor with explicit timing (S5b-2 multi-process call site).
+    ProdConsensusNode(ProdReactor& reactor, ProdNetworkBus& bus, std::uint64_t self_id,
+                      std::uint64_t admin_id, const std::string& data_dir,
+                      std::uint64_t seed, std::vector<std::uint64_t> cluster,
+                      Timing timing)
         : reactor_(&reactor),
           self_id_(self_id),
           admin_id_(admin_id),
@@ -277,14 +299,10 @@ public:
         consensus::NodeConfig nc;
         nc.self_id = self_id;
         nc.cluster = std::move(cluster);
-        // 1-node real-time timing: a SHORT election timeout (ns ticks) so the lone
-        // node wins its own election (no peers to vote) promptly; a heartbeat shorter
-        // still. Real time, so these are nanoseconds, sized generously below the
-        // wall-guard so the node is Leader well before any test deadline.
-        nc.election_timeout_min = kElectionMinNs;
-        nc.election_timeout_max = kElectionMaxNs;
-        nc.heartbeat_interval = kHeartbeatNs;
-        nc.request_deadline = kRequestDeadlineNs;
+        nc.election_timeout_min = timing.election_min;
+        nc.election_timeout_max = timing.election_max;
+        nc.heartbeat_interval = timing.heartbeat;
+        nc.request_deadline = timing.request_deadline;
 
         const consensus::ConsensusNodeFactory factory =
             consensus::raft_a::make_raft_a_factory();

@@ -75,6 +75,23 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_runtime
         lockstep_providers_sim
         lockstep_providers_prod)
+
+    # --- Phase 7 S5b-2: lockstep_admin — the CLUSTER ADMIN CLIENT [LINUX ONLY] -
+    # The leader-find client for the multi-PROCESS cluster: dials a node's admin port
+    # over REAL TCP, SUBMITs (retrying the next host on NotLeader until the leader
+    # accepts) / reads STATUS (role/term/commit_index/committed-log digest). Speaks the
+    # admin wire via the PROVIDER surface (ProdNetwork) so it touches no raw syscall —
+    # forbidden-lint scans it. BOUNDED by an absolute reactor deadline so an unreachable
+    # node can never hang. Built ONLY on Linux so the macOS host stays green.
+    add_executable(lockstep_admin lockstep_admin.cpp)
+    target_link_libraries(lockstep_admin
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_runtime
+        lockstep_providers_sim
+        lockstep_providers_prod)
   endif()
 
 else()
