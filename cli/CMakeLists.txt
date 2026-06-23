@@ -68,6 +68,7 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       PRIVATE
         lockstep_warnings
         lockstep_sanitizers
+        lockstep_consensus
         lockstep_query
         lockstep_txn
         lockstep_storage

@@ -988,6 +988,38 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_query AND TARGET lockstep_txn
   add_test(NAME prod_server_test COMMAND lockstep_prod_server_test)
 endif()
 
+# --- Phase 7 S5b-1: REAL Raft CONSENSUS node on PROD providers [LINUX ONLY] ---
+# P7-S5b-1 gate (briefs/phase7.md S5; the 1-node consensus precursor to multi-PROCESS
+# Raft, which is S5b-2). Assembles a REAL Raft ConsensusNode (impl A via
+# make_raft_a_factory) on the PROD providers (ProdReactor epoll loop + the reactor's
+# ONE shared ProdClock + ProdRandom(seed) + ProdNetwork real TCP + ProdDisk over the
+# data dir) as a 1-node cluster, drives client SUBMITs over a minimal admin protocol
+# on a real socket, observes COMMIT (1-node leader, quorum=1), then PROVES durable
+# crash/restart recovery: a FRESH reactor/bus/node over the SAME data_dir rebuilds the
+# committed log FROM the real ProdDisk file (consensus.wal) — the durability proof
+# S5a flagged (its query store was in-memory; here the consensus LOG is on ProdDisk).
+# Links the consensus lib (RaftNodeA + ConsensusNode) + the prod providers (reactor/
+# network/disk/clock/random). epoll/sockets LINUX-ONLY -> built ONLY on Linux
+# (if(UNIX AND NOT APPLE)) so the macOS host stays green (target absent). NOT in the
+# providers/ lint-exempt zone: forbidden-lint scans it (NO raw syscall here — only
+# the provider + consensus surfaces). BOUNDED: an absolute reactor deadline ABOVE the
+# 1-node election window so the node reaches Leader yet can NEVER hang.
+if(UNIX AND NOT APPLE AND TARGET lockstep_consensus AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_consensus_test prod_consensus_test.cpp)
+  target_include_directories(lockstep_prod_consensus_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_consensus_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_consensus_test COMMAND lockstep_prod_consensus_test)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never

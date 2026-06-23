@@ -1,44 +1,53 @@
-// lockstepd.cpp — Phase 7 S5a. THE SINGLE-NODE PROD SERVER DAEMON (precursor to the
-// full lockstepd; multi-node Raft is S5b). A thin main(): parse a tiny config
-// (listen node id, data dir, seed, optional run-duration), assemble a
-// prod::ProdServerNode on the PROD providers (ProdReactor epoll loop + the reactor's
-// ONE shared ProdClock + ProdRandom(seed) + ProdDisk(data dir) + ProdNetwork), spawn
-// the wire::Server's serve coroutine, and run the reactor's BOUNDED loop. Keep it
-// thin — config parse + assemble + run; ALL the real plumbing lives in
-// providers/prod/ProdServerNode.hpp.
+// lockstepd.cpp — Phase 7 S5b-1. THE PROD SERVER DAEMON running a REAL Raft
+// ConsensusNode. A thin main(): parse a tiny config (node id, data dir, seed,
+// optional run-duration), assemble a prod::ProdConsensusNode on the PROD providers
+// (ProdReactor epoll loop + the reactor's ONE shared ProdClock + ProdRandom(seed) +
+// ProdNetwork with cluster addressing + ProdDisk over the data dir) as a 1-NODE
+// cluster, construct the node via make_raft_a_factory() (impl A), start() it (arms
+// the election/heartbeat timers on the reactor's real clock, spawns the admin
+// serve-loop), and run the reactor's BOUNDED loop. The consensus LOG is durable on
+// the ProdDisk; a restart rebuilds it from those bytes.
+//
+// Multi-PROCESS Raft (3 nodes, election, replication) is S5b-2 — this is the 1-node
+// consensus precursor. The ProdNetwork cluster addressing (id -> loopback port via
+// add_node / port_of) is built NOW so S5b-2 just add_node's each peer + lists them
+// in the cluster vector; this main() is otherwise unchanged.
 //
 // LINUX-ONLY (epoll/sockets). cli/CMakeLists.txt guards the target with
 // if(UNIX AND NOT APPLE); the macOS host never builds it and stays green.
 //
 // This TU is NOT in the providers/ lint-exempt zone: the forbidden-call lint scans
-// it. It touches NO raw socket/epoll/clock syscall of its own — only the provider
-// surfaces (ProdServerNode) + plain argv parsing. The run loop is BOUNDED by an
-// absolute reactor deadline (a hard wall guard) OR an explicit run-seconds, so it
-// can never serve forever in a constrained / CI context.
+// it. It touches NO raw socket/epoll/clock/file syscall of its own — only the
+// provider surfaces (ProdConsensusNode) + plain argv parsing. The run loop is BOUNDED
+// by an absolute reactor deadline (a hard wall guard), so a 1-node election timer
+// can never spin forever in a constrained / CI context.
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
+#include <lockstep/prod/ProdConsensusNode.hpp>
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
-#include <lockstep/prod/ProdServerNode.hpp>
+
+#include <lockstep/consensus/ConsensusNode.hpp>
 
 namespace {
 
 namespace prod = lockstep::prod;
 namespace core = lockstep::core;
+namespace consensus = lockstep::consensus;
 
 struct Args {
     std::uint64_t node_id = 1;
     std::uint64_t seed = 0;
     std::string data_dir = ".";
-    // Bounded run: serve at most this many real seconds, then exit cleanly. 0 means
-    // "until the reactor quiesces" (a single-node node with a live listen socket does
-    // not quiesce, so a 0 here would block — we default to a small positive bound so
-    // a no-arg run terminates; pass --run-seconds N to extend).
+    // Bounded run: serve at most this many real seconds, then exit cleanly. A 1-node
+    // node with a live listen socket does not quiesce, so a small positive bound
+    // ensures a no-arg run terminates; pass --run-seconds N to extend.
     std::uint64_t run_seconds = 2;
 };
 
@@ -70,57 +79,69 @@ Args parse_args(int argc, char** argv) {
     return a;
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     const Args args = parse_args(argc, argv);
 
-    // --- assemble on the prod providers (the ProdServerNode does the wiring) ---
+    // --- assemble on the prod providers (ProdConsensusNode does the wiring) ----
     prod::ProdReactor reactor;
     if (!reactor.valid()) {
         std::fprintf(stderr, "lockstepd: failed to create epoll reactor\n");
         return 1;
     }
+
+    // The admin listen endpoint id is the consensus node id + a fixed offset, so it
+    // never collides with a (future) peer id; the admin client dials this endpoint.
+    const std::uint64_t admin_id = args.node_id + 1'000'000;
+
+    // ProdNetwork cluster addressing: bind a listen socket (-> ephemeral loopback
+    // port recorded in the bus's id->port map) for the consensus node AND its admin
+    // endpoint. S5b-2 add_node's each PEER here too; the map then routes peer RPC.
     prod::ProdNetworkBus bus(reactor);
-    if (!bus.add_node(args.node_id)) {
-        std::fprintf(stderr, "lockstepd: failed to bind listen socket for node %llu\n",
+    if (!bus.add_node(args.node_id) || !bus.add_node(admin_id)) {
+        std::fprintf(stderr, "lockstepd: failed to bind listen sockets for node %llu\n",
                      static_cast<unsigned long long>(args.node_id));
         return 1;
     }
 
-    prod::ProdServerConfig cfg;
-    cfg.node_id = args.node_id;
-    cfg.seed = args.seed;
-    cfg.data_dir = args.data_dir;
-    prod::ProdServerNode node(reactor, bus, cfg);
+    // 1-node cluster: the cluster view is just this node (quorum=1). S5b-2 passes the
+    // full peer list here (and add_node's each above).
+    prod::ProdConsensusNode node(reactor, bus, args.node_id, admin_id, args.data_dir,
+                                 args.seed,
+                                 std::vector<std::uint64_t>{args.node_id});
     if (!node.valid()) {
-        std::fprintf(stderr, "lockstepd: failed to assemble server node\n");
+        std::fprintf(stderr, "lockstepd: failed to assemble consensus node\n");
         return 1;
     }
 
     const core::Endpoint ep = node.endpoint();
-    std::printf("lockstepd: node %llu listening on 127.0.0.1 (ephemeral port), "
-                "data-dir=%s seed=%llu disk=%s\n",
-                static_cast<unsigned long long>(ep.id), cfg.data_dir.c_str(),
-                static_cast<unsigned long long>(cfg.seed),
+    const core::Endpoint aep = node.admin_endpoint();
+    std::printf("lockstepd: consensus node %llu listening (consensus ep=%llu admin "
+                "ep=%llu) data-dir=%s seed=%llu disk=%s\n",
+                static_cast<unsigned long long>(ep.id),
+                static_cast<unsigned long long>(ep.id),
+                static_cast<unsigned long long>(aep.id), args.data_dir.c_str(),
+                static_cast<unsigned long long>(args.seed),
                 node.disk_valid() ? "ok" : "UNAVAILABLE");
 
-    // --- spawn the server serve-loop + run the BOUNDED reactor loop -----------
-    // A generous bounded recv budget (the single node serves many requests before
-    // quiescing; NEVER an unbounded loop). The reactor run is BOUNDED by an absolute
-    // now()-deadline (run_seconds), a hard wall guard so the daemon always terminates
-    // in a constrained context.
-    constexpr int kServeBudget = 1 << 20;
-    node.start(kServeBudget);
+    // --- start the node + admin serve-loop, run the BOUNDED reactor loop ------
+    // A generous bounded admin recv budget (NEVER an unbounded loop). The reactor run
+    // is BOUNDED by an absolute now()-deadline (run_seconds), a hard wall guard so the
+    // daemon always terminates in a constrained context (a 1-node election timer fires
+    // perpetually, so without the deadline the loop would never return).
+    constexpr int kAdminBudget = 1 << 20;
+    node.start(kAdminBudget);
 
     const core::Tick deadline_ns =
         reactor.now() + static_cast<core::Tick>(args.run_seconds) * 1'000'000'000;
     node.run_with_deadline(deadline_ns);
 
-    std::printf("lockstepd: node %llu shutting down — applied=%llu rejected=%llu tip=%llu\n",
+    std::printf("lockstepd: consensus node %llu shutting down — role=%s term=%llu "
+                "commit_index=%llu\n",
                 static_cast<unsigned long long>(ep.id),
-                static_cast<unsigned long long>(node.applied_submits()),
-                static_cast<unsigned long long>(node.rejected()),
-                static_cast<unsigned long long>(node.tip()));
+                consensus::role_name(node.role()),
+                static_cast<unsigned long long>(node.term()),
+                static_cast<unsigned long long>(node.commit_index()));
     return 0;
 }
