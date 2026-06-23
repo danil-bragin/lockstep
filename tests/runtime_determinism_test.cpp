@@ -165,6 +165,42 @@ int main() {
         return 1;
     }
 
+    // (5) SeededRandom value contract — pins the documented edge guarantees so
+    //     they can't silently drift (each line below kills a real mutant):
+    //       * uniform(0) is the invalid-range guard: returns 0, never UB.
+    //       * uniform(1) has a single valid output, 0.
+    //       * uniform(bound) stays in [0, bound) for every drawn value.
+    //       * uniform_range(lo, hi) stays in [lo, hi].
+    {
+        SeededRandom rng(0xD15EA5EULL);
+        if (rng.uniform(0) != 0) { // invalid range -> documented 0 (kills ABS 0->1)
+            std::fprintf(stderr, "RNG FAIL: uniform(0) != 0\n");
+            return 1;
+        }
+        for (int i = 0; i < 64; ++i) {
+            if (rng.uniform(1) != 0) {
+                std::fprintf(stderr, "RNG FAIL: uniform(1) != 0\n");
+                return 1;
+            }
+        }
+        for (int i = 0; i < 4096; ++i) {
+            std::uint64_t bound = 1 + rng.uniform(1000);
+            std::uint64_t v = rng.uniform(bound);
+            if (v >= bound) {
+                std::fprintf(stderr, "RNG FAIL: uniform(%llu)=%llu out of range\n",
+                             static_cast<unsigned long long>(bound),
+                             static_cast<unsigned long long>(v));
+                return 1;
+            }
+            std::int64_t rv = rng.uniform_range(-7, 7);
+            if (rv < -7 || rv > 7) {
+                std::fprintf(stderr, "RNG FAIL: uniform_range(-7,7)=%lld out of range\n",
+                             static_cast<long long>(rv));
+                return 1;
+            }
+        }
+    }
+
     std::printf("runtime determinism self-test OK\n");
     std::printf("  seed=%llu exchanges=%d final_vtime=%lld token=%lld trace_bytes=%zu\n",
                 static_cast<unsigned long long>(kSeed), kExchanges,
