@@ -629,6 +629,30 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME query_surface_test COMMAND lockstep_query_surface_test)
+
+  # --- Phase 6 Stage B (C6.3): the CLIENT<->SERVER WIRE PROTOCOL gate ---------
+  # Drives a ClientStub <-> Server exchange over SimNetwork across a seed sweep
+  # (LOCKSTEP_PROTOCOL_SEEDS override, <=64 in-gate) and asserts: (A) round-trip
+  # correctness — a Submit/Query through the wire equals the same op done DIRECTLY
+  # on the Server's Database surface (and thus the oracle); (B) EXACTLY-ONCE under
+  # net faults (dup/reorder/drop) — a re-delivered Submit applies no duplicate txn
+  # effect; (C) a TORN/corrupt frame is rejected at decode, never mis-decoded;
+  # (D) determinism — same seed => byte-identical. Links the header-only query lib
+  # (which pulls txn + storage + runtime + sim). Non-provider TU -> forbidden-lint
+  # scans it. Inherits the dir-wide TIMEOUT.
+  add_executable(lockstep_query_protocol_test query_protocol_test.cpp)
+  target_include_directories(lockstep_query_protocol_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_query_protocol_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME query_protocol_test COMMAND lockstep_query_protocol_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "
