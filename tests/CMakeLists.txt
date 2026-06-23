@@ -107,6 +107,35 @@ if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
   endforeach()
 endif()
 
+# --- Phase 7 S1: reusable boundary-provider CONTRACT CONFORMANCE suite --------
+# P7-S1 gate (briefs/phase7.md S1; V-PROD-CONTRACT). The REUSABLE conformance
+# harness any IClock/IRandom/IDisk/INetwork impl MUST pass: the UNIVERSAL contract
+# tier (conformance::universal::*) parameterized over provider FACTORIES, run here
+# against the SIM providers (validates the harness — sim already conforms) and
+# the foundation every PROD provider in S2–S4 plugs into by swapping the factory.
+# Cleanly separates (A) universal contract from (B) sim-only fault behaviours
+# (torn/lying/drop/partition stay tier B, NOT in the universal suite). Asserts the
+# universal suite PASSES vs sim + is a pure fn of seed (run twice, byte-identical
+# Report). tests/ is on the include path so "provider_conformance/..." resolves.
+# Links the header-only runtime + sim providers. Non-provider TU → forbidden-lint
+# scans it; all time virtual, all randomness SeededRandom. Inherits TIMEOUT.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_provider_conformance_test provider_conformance_test.cpp)
+  target_include_directories(lockstep_provider_conformance_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_provider_conformance_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME provider_conformance_test COMMAND lockstep_provider_conformance_test)
+else()
+  message(WARNING
+    "lockstep_runtime / providers_sim not found; provider_conformance_test not "
+    "built (Phase 7 S1 pending).")
+endif()
+
 # --- Phase 2 batch 2 stage A: checker framework + history recorder self-test --
 # B2A FOUNDATION self-test (specs/checker-framework.md §2/§3; briefs/
 # phase2-batch2.md BRIEF B2A). Builds a synthetic history via HistoryRecorder,
