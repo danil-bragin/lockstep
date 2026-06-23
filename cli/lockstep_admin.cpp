@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -373,6 +374,207 @@ int cmd_bench(const BenchArgs& ba, const std::vector<std::uint16_t>& hosts) {
     return read_ok ? 0 : 1;
 }
 
+// ============================================================================
+// PIPELINED / CONCURRENT BENCH (S8.1) — OPEN-LOOP load to find the REAL ceiling.
+// ============================================================================
+// The S7 `bench` verb is CLOSED-LOOP (concurrency 1: send->recv->send...), so its
+// throughput is 1/latency by construction — it measures latency, not the throughput
+// ceiling. `pbench` keeps K requests IN FLIGHT on ONE persistent connection (a sliding
+// WINDOW: fire K submits without waiting, then for each reply fire one more), and/or
+// drives C such connections concurrently on ONE client reactor. Real throughput is the
+// total ACCEPTED ops over the wall time of the loop (NOT 1/latency).
+//
+// WHY THIS REVEALS THE BOTTLENECK: pipelining removes the per-request client<->server
+// ROUND-TRIP stall. If throughput RISES with depth, the round-trip (network / commit
+// RTT) was the limit. If it stays FLAT, the server's per-op serial work (reactor CPU,
+// or fdatasync if accept blocked on sync) is the limit. The admin serve-loop processes
+// frames from one connection SERIALLY (recv->handle->send), but the connection BUFFERS
+// queued inbound frames (FIFO), so K pipelined submits ARE accepted without K round
+// trips. submit->ACCEPT does NOT block on fdatasync (the persist worker syncs in the
+// background), so pbench measures the ACCEPT ceiling = reactor/CPU + append + the serve
+// loop's per-frame cost.
+//
+// BOUNDED: finite total N, finite window K, an absolute wall deadline; never a spin.
+
+struct PipeArgs {
+    std::uint64_t count = 2000;        // total submits across all connections (FINITE)
+    std::uint64_t value_bytes = 16;
+    std::uint64_t inflight = 16;       // window depth K per connection (>=1)
+    std::uint64_t conns = 1;           // concurrent client connections C (>=1)
+};
+
+// Per-connection pipeline state (heap-stable; the coroutine holds a raw pointer to it).
+struct PipeConn {
+    Client* client = nullptr;          // owns reactor/bus (shared reactor via the driver)
+    std::uint64_t to_send = 0;         // submits still to fire on THIS connection
+    std::uint64_t base_seq = 0;        // first value seq for this conn (distinct values)
+    std::uint64_t next_seq = 0;        // next value seq to fire
+    std::uint64_t value_bytes = 16;
+    std::uint64_t window = 1;          // K
+    std::uint64_t accepted = 0;        // replies that were SubmitOk
+    std::uint64_t replied = 0;         // total replies seen
+    bool fault = false;                // a not-accepted / decode failure stops the conn
+    bool done = false;
+};
+
+// The pipelined driver for ONE connection: keep `window` submits outstanding. Fire the
+// first window, then on EACH reply fire the next (sliding window) until `to_send` are all
+// fired AND all replies are in. send() and recv() are independent coroutines awaited in
+// lockstep order (the connection delivers in send order, the serve loop replies in that
+// order, so the j-th recv corresponds to the j-th send). BOUNDED by `to_send`.
+//
+// EARLY STOP on a NotLeader/garbage reply: if leadership is lost mid-run we STOP firing
+// new submits and DRAIN the already-outstanding replies, then finish. This keeps the
+// measured throughput honest (it covers the STABLE-leader window, not a long tail of
+// doomed NotLeader submits that would dilute the denominator) and bounds the run.
+core::Task pipe_run(PipeConn* st) {
+    core::INetwork* net = st->client->net();
+    const core::Endpoint admin = st->client->admin_ep();
+    std::uint64_t outstanding = 0;
+    bool stop_sending = false;
+    // Prime the window.
+    while (outstanding < st->window && st->next_seq < st->base_seq + st->to_send) {
+        const std::string v = make_value(st->next_seq++, st->value_bytes);
+        const std::vector<std::byte> req = prod::encode_submit(v);
+        co_await net->send(admin, {req.data(), req.size()});
+        ++outstanding;
+    }
+    // Drain + refill: one recv per outstanding, fire a replacement if any remain and we
+    // have not hit a fault. Loop while ANY reply is still outstanding (covers the early-
+    // stop drain) — bounded by the total ever sent.
+    while (outstanding > 0) {
+        core::Message rep = co_await net->recv();
+        --outstanding;
+        ++st->replied;
+        prod::admin_detail::Reader r{rep.payload.data(), rep.payload.size(), 0, true};
+        const auto kind = static_cast<prod::AdminKind>(r.u8());
+        if (kind == prod::AdminKind::SubmitOk) {
+            ++st->accepted;
+        } else {
+            st->fault = true;       // NotLeader / garbage: leadership lost — stop firing.
+            stop_sending = true;
+        }
+        if (!stop_sending && st->next_seq < st->base_seq + st->to_send) {
+            const std::string v = make_value(st->next_seq++, st->value_bytes);
+            const std::vector<std::byte> req = prod::encode_submit(v);
+            co_await net->send(admin, {req.data(), req.size()});
+            ++outstanding;
+        }
+    }
+    st->done = true;
+    co_return;
+}
+
+// One persistent client connection per concurrent stream, ALL on ONE shared reactor (so
+// C connections are driven concurrently by the single client reactor — true in-flight
+// concurrency at the client). Returns the process exit code; prints a PBENCH line.
+int cmd_pbench(const PipeArgs& pa, const std::vector<std::uint16_t>& hosts) {
+    const std::uint16_t leader_port = find_leader_port(hosts);
+    if (leader_port == 0) {
+        std::printf("PBENCH error=no_leader\n");
+        std::fflush(stdout);
+        return 1;
+    }
+    const std::uint64_t conns = pa.conns == 0 ? 1 : pa.conns;
+    const std::uint64_t window = pa.inflight == 0 ? 1 : pa.inflight;
+
+    // Split the total count across the C connections (the LAST takes the remainder).
+    std::vector<std::unique_ptr<Client>> clients;
+    std::vector<std::unique_ptr<PipeConn>> states;
+    clients.reserve(conns);
+    states.reserve(conns);
+    for (std::uint64_t ci = 0; ci < conns; ++ci) {
+        auto cl = std::make_unique<Client>(leader_port);
+        if (!cl->ok) {
+            std::printf("PBENCH error=client_init\n");
+            std::fflush(stdout);
+            return 1;
+        }
+        clients.push_back(std::move(cl));
+    }
+
+    // Each Client owns its own reactor (epoll fd + bus). To drive C connections
+    // concurrently we ROUND-ROBIN pump every reactor a short slice so all C have
+    // outstanding work at once (a finite, deadline-bounded loop — never a spin). With
+    // C=1 this is a single connection at window depth K (pure pipelining).
+    const std::uint64_t per = pa.count / conns;
+    const std::uint64_t rem = pa.count % conns;
+    std::uint64_t seq = 0;
+    for (std::uint64_t ci = 0; ci < conns; ++ci) {
+        auto st = std::make_unique<PipeConn>();
+        st->client = clients[ci].get();
+        st->value_bytes = pa.value_bytes;
+        st->window = window;
+        st->to_send = per + (ci + 1 == conns ? rem : 0);
+        st->base_seq = seq;
+        st->next_seq = seq;
+        seq += st->to_send;
+        clients[ci]->reactor.spawn(pipe_run(st.get()));
+        states.push_back(std::move(st));
+    }
+
+    // Bound the whole load: a generous absolute wall (scaled by count); if it elapses we
+    // stop (a stall is a finding, not a hang). We measure elapsed time from the MAX now()
+    // across all reactors — a reactor that finishes early stops being pumped (its clock
+    // freezes), so the per-reactor clock is NOT a safe global wall. The max over all live
+    // reactors always advances while ANY connection is pumped, so the guard never wedges.
+    auto max_now = [&]() -> core::Tick {
+        core::Tick m = 0;
+        for (std::uint64_t ci = 0; ci < conns; ++ci) {
+            const core::Tick n = clients[ci]->reactor.now();
+            if (n > m) {
+                m = n;
+            }
+        }
+        return m;
+    };
+    const core::Tick t0 = max_now();
+    const core::Tick wall_ns = t0 +
+                               static_cast<core::Tick>(pa.count) * 2'000'000 + // ~2ms/op cap
+                               5'000'000'000;                                  // +5s floor
+    bool all_done = false;
+    while (!all_done && max_now() < wall_ns) {
+        all_done = true;
+        for (std::uint64_t ci = 0; ci < conns; ++ci) {
+            if (!states[ci]->done) {
+                all_done = false;
+                // Pump THIS reactor one short slice so every connection progresses.
+                clients[ci]->reactor.run_until([&] { return states[ci]->done; },
+                                               clients[ci]->reactor.now() + 1'000'000);
+            }
+        }
+    }
+    const core::Tick t1 = max_now();
+    const double elapsed_ms = static_cast<double>(t1 - t0) / 1'000'000.0;
+
+    std::uint64_t accepted = 0;
+    std::uint64_t replied = 0;
+    bool any_fault = false;
+    bool any_unfinished = false;
+    for (std::uint64_t ci = 0; ci < conns; ++ci) {
+        accepted += states[ci]->accepted;
+        replied += states[ci]->replied;
+        any_fault = any_fault || states[ci]->fault;
+        any_unfinished = any_unfinished || !states[ci]->done;
+    }
+    const double tput = elapsed_ms > 0.0
+                            ? static_cast<double>(accepted) / (elapsed_ms / 1000.0)
+                            : 0.0;
+
+    std::printf(
+        "PBENCH count=%llu inflight=%llu conns=%llu value_bytes=%llu elapsed_ms=%.3f "
+        "accept_tput=%.1f accepted=%llu replied=%llu fault=%d unfinished=%d\n",
+        static_cast<unsigned long long>(pa.count),
+        static_cast<unsigned long long>(window),
+        static_cast<unsigned long long>(conns),
+        static_cast<unsigned long long>(pa.value_bytes), elapsed_ms, tput,
+        static_cast<unsigned long long>(accepted),
+        static_cast<unsigned long long>(replied), any_fault ? 1 : 0,
+        any_unfinished ? 1 : 0);
+    std::fflush(stdout);
+    return (any_unfinished || accepted == 0) ? 1 : 0;
+}
+
 void print_status(std::uint16_t port, bool ok, const prod::AdminStatus& st) {
     std::printf("STATUS port=%u ok=%d role=%u term=%llu commit=%llu log=", port,
                 ok ? 1 : 0, static_cast<unsigned>(st.role),
@@ -434,7 +636,9 @@ int main(int argc, char** argv) {
             "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
             "       lockstep_admin submit VALUE --host PORT [--host PORT ...]\n"
             "       lockstep_admin bench --count N [--value-bytes B] "
-            "[--commit-samples S] --host PORT [--host PORT ...]\n");
+            "[--commit-samples S] --host PORT [--host PORT ...]\n"
+            "       lockstep_admin pbench --count N [--inflight K] [--conns C] "
+            "[--value-bytes B] --host PORT [--host PORT ...]\n");
         return 2;
     }
 
@@ -442,6 +646,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> hosts;
     std::string value;
     BenchArgs ba;
+    PipeArgs pa;
     int i = 2;
 
     if (verb == "submit") {
@@ -469,8 +674,18 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--commit-samples") == 0 && i + 1 < argc) {
             ba.commit_samples = parse_u64_opt(argv[i + 1], ba.commit_samples);
             ++i;
+        } else if (std::strcmp(argv[i], "--inflight") == 0 && i + 1 < argc) {
+            pa.inflight = parse_u64_opt(argv[i + 1], pa.inflight);
+            ++i;
+        } else if (std::strcmp(argv[i], "--conns") == 0 && i + 1 < argc) {
+            pa.conns = parse_u64_opt(argv[i + 1], pa.conns);
+            ++i;
         }
     }
+    // pbench shares --count + --value-bytes with bench (the --count/--value-bytes flags
+    // land in ba; copy them across so pbench honors them).
+    pa.count = ba.count;
+    pa.value_bytes = ba.value_bytes;
 
     if (hosts.empty()) {
         std::fprintf(stderr, "lockstep_admin: no --host PORT given\n");
@@ -485,6 +700,9 @@ int main(int argc, char** argv) {
     }
     if (verb == "bench") {
         return cmd_bench(ba, hosts);
+    }
+    if (verb == "pbench") {
+        return cmd_pbench(pa, hosts);
     }
     std::fprintf(stderr, "lockstep_admin: unknown verb '%s'\n", verb.c_str());
     return 2;
