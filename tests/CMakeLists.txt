@@ -1044,6 +1044,40 @@ if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
   set_tests_properties(prod_cluster_smoke PROPERTIES TIMEOUT 120)
 endif()
 
+# --- Phase 7 S6: JEPSEN-STYLE PROD-CLUSTER CAPSTONE (V-PROD-CLUSTER) [LINUX] ---
+# P7-S6 gate (briefs/phase7.md S6 — THE capstone). Drives the REAL multi-process
+# lockstepd cluster (5 nodes) under a FAULT STORM — process CRASH/RESTART (SIGKILL +
+# restart on the same data dir, recover from ProdDisk) plus a NETWORK PARTITION
+# (NET_ADMIN-FREE: SIGSTOP freezes a node so peers see it unresponsive == partitioned;
+# SIGCONT heals) — across several SEEDED scenarios, while a concurrent client workload
+# submits a stream of DISTINCT values. Records the client-observed history (each
+# submit's accept/term/index + periodic per-node STATUS snapshots) and CHECKS the
+# SAFETY properties the sim fault-storm proved, judged over the REAL committed Raft
+# log: (A) NO SPLIT-BRAIN — committed logs are prefix-compatible at every snapshot,
+# converge after heal; (B) ACK DURABILITY / EXACTLY-ONCE — every ACKed submit appears
+# exactly once in the final committed log; (C) LEADER UNIQUENESS — per-node term
+# monotonicity + no divergent same-index commits; (D) PROGRESS — non-trivial commits
+# under faults; (E) V-XCHECK — per-client program-order preserved on the final log.
+# These ARE the linearizability/strict-serializability properties for a Raft total-
+# order store (the commit index is the linearization point). TEETH: the checker is run
+# on a FABRICATED bad history and must FAIL. PROCESS-CLEANUP: the script traps
+# EXIT/INT/TERM to SIGCONT-then-SIGKILL every tracked child (a SIGSTOPed node is
+# CONTinued before kill so none is left stopped/zombie); each lockstepd self-deadlines
+# (--run-seconds). BOUNDED: scenarios/rounds/submits/waits all capped. Built ONLY on
+# Linux (needs lockstepd + lockstep_admin); the macOS host stays green (test absent).
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
+  add_test(
+    NAME prod_jepsen
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_jepsen.sh)
+  # A generous ceiling that still kills any true hang fast. The script's own internal
+  # absolute deadlines + each daemon's --run-seconds are well under this; the outer
+  # fork-parent wall-guard (brief's `to()`) is an additional backstop in-gate.
+  set_tests_properties(prod_jepsen PROPERTIES TIMEOUT 300)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
