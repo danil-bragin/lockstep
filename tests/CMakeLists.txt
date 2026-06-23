@@ -671,6 +671,42 @@ if(TARGET lockstep_txn AND TARGET lockstep_storage AND TARGET lockstep_runtime
         lockstep_providers_sim)
     add_test(NAME txn_crosscheck_test COMMAND lockstep_txn_crosscheck_test)
   endif()
+
+  # --- Phase 5/6: END-TO-END distributed-txn FAULT-STORM gate ------------------
+  # P5-E2E gate (specs/CommitOrdering.tla + Consensus.tla + Sequencer.tla;
+  # master-plan D1/D2/D5/§6.5). Closes the last verification debt: the Phase-5 txn
+  # layer was verified over the seqLog ABSTRACTION + a real MVCC store, but NOT
+  # end-to-end through the REAL Phase-4 consensus + Phase-3 storage under a
+  # crash/partition fault storm. This wires the WHOLE stack: a REAL cluster of
+  # consensus nodes (raft_a) ORDERS a seeded stream of one-shot txn submissions
+  # UNDER the full fault envelope (partition/heal keeping quorum, crash/restart, net
+  # reorder/drop/dup, SimDisk latency) on the deterministic scheduler; the COMMITTED
+  # CONSENSUS LOG (the agreed total order, surviving crash/restart) feeds the
+  # Phase-5 DeterministicExecutor over the REAL WalEngine MVCC store. Asserts, over
+  # a seed sweep (<=32 in-gate, LOCKSTEP_E2E_SEEDS override; every run TERMINATES via
+  # the run_until step-backstop -> progress_stalled==0): the committed history is
+  # STRICT-SERIALIZABLE == the txn Oracle on the consensus order, EXACTLY-ONCE,
+  # DURABLE across crash (cold recovery from the committed order reproduces it),
+  # PROGRESS (non-vacuous), DETERMINISM (byte-identical), and TEETH (executing in
+  # arrival order instead of the consensus order is caught). Links the txn lib + the
+  # real consensus lib + storage + runtime + sim. Non-provider TU -> forbidden-lint
+  # scans it. Inherits the dir-wide TIMEOUT 90.
+  if(TARGET lockstep_consensus AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/txn_end_to_end_test.cpp")
+    add_executable(lockstep_txn_end_to_end_test txn_end_to_end_test.cpp)
+    target_include_directories(lockstep_txn_end_to_end_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_txn_end_to_end_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_txn
+        lockstep_consensus
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME txn_end_to_end_test COMMAND lockstep_txn_end_to_end_test)
+  endif()
 else()
   message(WARNING
     "lockstep_txn / storage / runtime / providers_sim not all found; "
