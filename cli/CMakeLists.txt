@@ -51,6 +51,31 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
     set_tests_properties(cli_determinism PROPERTIES TIMEOUT 90)
   endif()
 
+  # --- Phase 7 S5a: lockstepd — the single-node PROD server daemon [LINUX ONLY] -
+  # The precursor to the full lockstepd (multi-node Raft is S5b). A thin main()
+  # that parses a tiny config (--node-id / --seed / --data-dir / --run-seconds),
+  # assembles a prod::ProdServerNode on the PROD providers (ProdReactor epoll loop +
+  # the reactor's ONE shared ProdClock + ProdRandom + ProdDisk + ProdNetwork), spawns
+  # the UNCHANGED wire::Server's serve coroutine, and runs the reactor's BOUNDED loop
+  # (absolute now()-deadline wall guard). epoll/sockets are LINUX-ONLY -> built ONLY
+  # on Linux (if(UNIX AND NOT APPLE)) so the macOS host stays green (target absent).
+  # NOT in the providers/ lint-exempt zone: forbidden-lint scans it (no raw syscall
+  # here — only the provider surfaces). Links the query lib (wire::Server) + the prod
+  # providers (which pull the reactor/network/disk/clock/random).
+  if(UNIX AND NOT APPLE AND TARGET lockstep_providers_prod)
+    add_executable(lockstepd lockstepd.cpp)
+    target_link_libraries(lockstepd
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_query
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim
+        lockstep_providers_prod)
+  endif()
+
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "

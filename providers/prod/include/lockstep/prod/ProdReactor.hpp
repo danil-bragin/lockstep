@@ -84,7 +84,15 @@ public:
     // source (ProdClock::now() in ns ticks) used for timer deadlines and vtime().
     // epoll_create1 gives us an empty epoll set NOW; S4b registers socket fds into
     // it. EPOLL_CLOEXEC so a future fork()/exec() does not leak the descriptor.
-    ProdReactor() noexcept : epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)) {}
+    //
+    // CLOCK IDENTITY (S5a resolution of the S4a flag): the reactor's OWN clock_ is
+    // bound to the reactor as its ITimerRegistrar, so clock_.delay() arms a real
+    // reactor timer. clock() hands that SAME ProdClock instance out by reference, so
+    // the whole stack (e.g. wire::ClientStub's IClock&) shares ONE clock identity
+    // with the reactor's vtime()/now()/timer-deadline source — no second ProdClock
+    // with a divergent origin. now()/vtime()/arm_timer() all read the same origin.
+    ProdReactor() noexcept
+        : clock_(this), epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)) {}
 
     ProdReactor(const ProdReactor&) = delete;
     ProdReactor& operator=(const ProdReactor&) = delete;
@@ -110,6 +118,12 @@ public:
     // unusable; surface it rather than spinning.
     [[nodiscard]] bool valid() const noexcept { return epoll_fd_ >= 0; }
     [[nodiscard]] int epoll_fd() const noexcept { return epoll_fd_; }
+
+    // The reactor's OWN ProdClock, by reference (S5a clock-identity resolution). The
+    // stack co_awaits delay() through this SAME instance, so its now()/vtime() origin
+    // is identical to the reactor's timer/deadline source — one clock, no divergence.
+    // It is already bound to the reactor (delay() arms a real reactor timer).
+    [[nodiscard]] ProdClock& clock() noexcept { return clock_; }
 
     // ---- core::IScheduler ------------------------------------------------
 

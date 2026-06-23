@@ -952,6 +952,42 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_
   add_test(NAME prod_network_test COMMAND lockstep_prod_network_test)
 endif()
 
+# --- Phase 7 S5a: SINGLE-NODE PROD SERVER (real TCP round-trip) [LINUX ONLY] --
+# P7-S5a gate (briefs/phase7.md S5; the precursor to lockstepd, multi-node Raft is
+# S5b). Stands up a prod::ProdServerNode (ProdNetwork real TCP -> wire::Server ->
+# Database -> txn deterministic executor -> MVCC store) on the PROD providers driven
+# by the S4a ProdReactor, and a REAL wire client (wire::ClientStub / query::Connection
+# over a ProdNetwork client endpoint) connecting over LOOPBACK: it submits a txn,
+# reads the value back, and asserts it MATCHES (and a second DISTINCT submit applies
+# EXACTLY once — applied_submits() advances by one; reads do not apply). Proves the
+# sim-proven client-facing stack runs on real sockets with ZERO change to core/sim/
+# query/txn/storage. Everything driven by ONE in-process reactor; BOUNDED with an
+# ABSOLUTE reactor deadline so a lost connection can NEVER hang. epoll/sockets are
+# LINUX-ONLY -> target added ONLY on Linux (if(UNIX AND NOT APPLE)) so the macOS host
+# stays green (the target simply absent). Non-provider TU -> forbidden-lint scans it
+# (NO socket/epoll/clock syscall here; all real plumbing stays inside providers/prod/;
+# the client surface is the UNCHANGED wire::ClientStub / Connection). Links the query
+# lib (wire::Server/ClientStub + Connection) + the prod providers (reactor/network/
+# disk/clock/random). Inherits the dir-wide TIMEOUT.
+if(UNIX AND NOT APPLE AND TARGET lockstep_query AND TARGET lockstep_txn
+   AND TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_server_test prod_server_test.cpp)
+  target_include_directories(lockstep_prod_server_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_server_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_server_test COMMAND lockstep_prod_server_test)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
