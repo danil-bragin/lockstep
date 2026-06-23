@@ -480,6 +480,34 @@ else()
     "consensus_harness_test not built (Phase 4 Stage M pending).")
 endif()
 
+# --- Phase 4 C4.4: the multi-shard SEQUENCER conformance gate ----------------
+# C4.4 gate (specs/Sequencer.tla, model-checked clean + committed). Proves the
+# real multi-shard sequencer (consensus/sequencer/Sequencer.hpp) — the
+# deterministic CROSS-shard merge that combines N per-shard committed consensus
+# logs into ONE global total order (Calvin epoch batching) — conforms to the
+# spec's four safety invariants on a seed sweep (<=64 in-gate): (a)
+# GlobalOrderDeterministic (same shard logs => byte-identical global order, run
+# twice); (b) PerShardOrderPreserved; (c) ExactlyOnceGlobal (each sealed input
+# entry once, none fabricated); (d) EpochMonotone. Plus TEETH — a deliberately-
+# wrong (reversed-idx / by-arrival) merge is CAUGHT by the determinism /
+# per-shard-order assertion. Links ONLY the header-only consensus lib (the
+# sequencer is a pure value function; no scheduler/sim needed). Non-provider TU
+# -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+if(TARGET lockstep_consensus)
+  add_executable(lockstep_sequencer_test sequencer_test.cpp)
+  target_include_directories(lockstep_sequencer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sequencer_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus)
+  add_test(NAME sequencer_test COMMAND lockstep_sequencer_test)
+else()
+  message(WARNING
+    "lockstep_consensus target not found; sequencer_test not built "
+    "(Phase 4 C4.4 pending).")
+endif()
+
 # --- Phase 5 Stage M: distributed-txn verification machinery teeth gate -------
 # P5-MACHINERY gate (specs/CommitOrdering.tla; briefs/phase5.md Stage M). Proves
 # the txn SEAM (txn/Transaction.hpp: the one-shot Transaction + the call-site-
