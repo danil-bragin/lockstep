@@ -205,6 +205,18 @@ enum class MsgType : std::uint8_t {
     RequestVoteResp = 2,
     AppendEntries = 3,
     AppendEntriesResp = 4,
+    // C4.3 InstallSnapshot: leader ships its snapshot to a follower whose
+    // nextIndex has fallen at/below the leader's discarded prefix (the entries
+    // it needs were compacted away, so AppendEntries cannot catch it up).
+    InstallSnapshot = 5,
+    InstallSnapshotResp = 6,
+    // C4.2 MEMBERSHIP (Membership.tla). A dedicated RPC pair carries the config
+    // chain rollout, kept OFF the value-log replication path so the value log
+    // observable is untouched (the five base-Raft checkers stay byte-identical when
+    // no change is proposed). ConfigChange ships ONE new chain config (its chain
+    // index + the member set) from the leader; ConfigChangeResp acks adoption.
+    ConfigChange = 7,
+    ConfigChangeResp = 8,
 };
 
 struct RaftMsg {
@@ -216,8 +228,17 @@ struct RaftMsg {
     // RequestVote
     Index last_log_index = 0;
     Term last_log_term = 0;
+    // C4.2 Membership: the candidate's config-chain index (cfgIdx[c]). A voter
+    // refuses a candidate whose cfgIdx is BEHIND its own (the config-log up-to-date
+    // rule, Membership.tla RequestVote). Always carried on RequestVote.
+    std::uint64_t cfg_index = 0;
 
-    // RequestVoteResp / AppendEntriesResp
+    // C4.2 ConfigChange / ConfigChangeResp: the chain index of the proposed config
+    // and its member set (sorted ids). ConfigChangeResp echoes the index it adopted.
+    std::uint64_t config_chain_index = 0;
+    std::vector<std::uint64_t> config_members;
+
+    // RequestVoteResp / AppendEntriesResp / InstallSnapshotResp
     bool granted = false;  // vote granted
     bool success = false;  // append accepted
     Index match_index = 0;
@@ -227,6 +248,12 @@ struct RaftMsg {
     Term prev_log_term = 0;
     Index leader_commit = 0;
     std::vector<LogEntry> entries;
+
+    // InstallSnapshot (Snapshot.tla InstallSnapshot(s,d)): lastIncludedIndex +
+    // the snapshot.state (our state machine = the folded committed entries, so
+    // the state is exactly the committed prefix entry list through the base).
+    Index last_included_index = 0;
+    std::vector<LogEntry> snap_state;
 };
 
 // ---------------------------------------------------------------------------
@@ -243,6 +270,7 @@ struct RaftMsg {
         case MsgType::RequestVote:
             wire::put_u64(body, m.last_log_index);
             wire::put_u64(body, m.last_log_term);
+            wire::put_u64(body, m.cfg_index);  // C4.2 config-log up-to-date check
             break;
         case MsgType::RequestVoteResp:
             wire::put_u8(body, m.granted ? 1u : 0u);
@@ -260,6 +288,27 @@ struct RaftMsg {
         case MsgType::AppendEntriesResp:
             wire::put_u8(body, m.success ? 1u : 0u);
             wire::put_u64(body, m.match_index);
+            break;
+        case MsgType::InstallSnapshot:
+            wire::put_u64(body, m.last_included_index);
+            wire::put_u32(body, static_cast<std::uint32_t>(m.snap_state.size()));
+            for (const LogEntry& e : m.snap_state) {
+                wire::put_u64(body, e.term);
+                wire::put_str(body, e.value);
+            }
+            break;
+        case MsgType::InstallSnapshotResp:
+            wire::put_u64(body, m.match_index);  // follower's new logical length
+            break;
+        case MsgType::ConfigChange:
+            wire::put_u64(body, m.config_chain_index);
+            wire::put_u32(body, static_cast<std::uint32_t>(m.config_members.size()));
+            for (std::uint64_t id : m.config_members) {
+                wire::put_u64(body, id);
+            }
+            break;
+        case MsgType::ConfigChangeResp:
+            wire::put_u64(body, m.config_chain_index);  // chain index acked
             break;
     }
 
@@ -304,6 +353,7 @@ struct RaftMsg {
         case MsgType::RequestVote:
             out.last_log_index = r.u64();
             out.last_log_term = r.u64();
+            out.cfg_index = r.u64();  // C4.2 config-log up-to-date check
             break;
         case MsgType::RequestVoteResp:
             out.granted = (r.u8() != 0);
@@ -331,6 +381,41 @@ struct RaftMsg {
             out.success = (r.u8() != 0);
             out.match_index = r.u64();
             break;
+        case MsgType::InstallSnapshot: {
+            out.last_included_index = r.u64();
+            const std::uint32_t count = r.u32();
+            if (!r.ok() || count > len) {
+                return false;
+            }
+            out.snap_state.clear();
+            out.snap_state.reserve(count);
+            for (std::uint32_t k = 0; k < count; ++k) {
+                LogEntry e;
+                e.term = r.u64();
+                e.value = r.str();
+                out.snap_state.push_back(std::move(e));
+            }
+            break;
+        }
+        case MsgType::InstallSnapshotResp:
+            out.match_index = r.u64();
+            break;
+        case MsgType::ConfigChange: {
+            out.config_chain_index = r.u64();
+            const std::uint32_t count = r.u32();
+            if (!r.ok() || count > len) {
+                return false;
+            }
+            out.config_members.clear();
+            out.config_members.reserve(count);
+            for (std::uint32_t k = 0; k < count; ++k) {
+                out.config_members.push_back(r.u64());
+            }
+            break;
+        }
+        case MsgType::ConfigChangeResp:
+            out.config_chain_index = r.u64();
+            break;
         default:
             return false;
     }
@@ -345,6 +430,19 @@ enum class RecKind : std::uint8_t {
     Meta = 1,   // currentTerm, votedFor (UINT64_MAX = Nil)
     Entry = 2,  // index, term, value (an appended log entry)
     Trunc = 3,  // new_len (truncate the log to this length)
+    // C4.3 Snapshot.tla TakeSnapshot/InstallSnapshot: lastIncludedIndex + the
+    // folded snapshot.state (our state machine = the committed prefix entry
+    // list). On replay a SNAPSHOT record RESETS the reconstructed log to its
+    // state and sets the base, so the durable prefix it covers is compacted
+    // (recovery replays snapshot + retained suffix, never the discarded prefix).
+    Snapshot = 4,
+    // C4.2 MEMBERSHIP (Membership.tla): one config-chain entry. Configs live in the
+    // log (Raft §4.1), so they are durable: a CONFIG record carries the chain index
+    // + the member set. On replay, CONFIG records rebuild the config chain and the
+    // node's adopted cfgIdx (= the highest chain index it durably stored), so a
+    // restarted node honors the config it had adopted (a removed server stays
+    // removed; an added one stays added) — never regressing membership across crash.
+    Config = 5,
 };
 
 [[nodiscard]] inline std::vector<std::byte> rec_meta(Term term,
@@ -400,6 +498,54 @@ enum class RecKind : std::uint8_t {
     return out;
 }
 
+// SNAPSHOT durable record: lastIncludedIndex + the folded state (the committed
+// prefix entry list). On replay it resets the reconstructed (base, state) — the
+// durable compaction point.
+[[nodiscard]] inline std::vector<std::byte> rec_snapshot(
+    Index last_included_index, const std::vector<LogEntry>& state) {
+    std::vector<std::uint8_t> body;
+    wire::put_u8(body, static_cast<std::uint8_t>(RecKind::Snapshot));
+    wire::put_u64(body, last_included_index);
+    wire::put_u32(body, static_cast<std::uint32_t>(state.size()));
+    for (const LogEntry& e : state) {
+        wire::put_u64(body, e.term);
+        wire::put_str(body, e.value);
+    }
+    const std::uint32_t crc = wire::crc32(body.data(), body.size());
+    std::vector<std::uint8_t> frame;
+    wire::put_u32(frame, crc);
+    wire::put_u32(frame, static_cast<std::uint32_t>(body.size()));
+    frame.insert(frame.end(), body.begin(), body.end());
+    std::vector<std::byte> out(frame.size());
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        out[i] = static_cast<std::byte>(frame[i]);
+    }
+    return out;
+}
+
+// C4.2 CONFIG durable record: chain index + member set. Replayed to rebuild the
+// config chain + the node's adopted cfgIdx.
+[[nodiscard]] inline std::vector<std::byte> rec_config(
+    std::uint64_t chain_index, const std::vector<std::uint64_t>& members) {
+    std::vector<std::uint8_t> body;
+    wire::put_u8(body, static_cast<std::uint8_t>(RecKind::Config));
+    wire::put_u64(body, chain_index);
+    wire::put_u32(body, static_cast<std::uint32_t>(members.size()));
+    for (std::uint64_t id : members) {
+        wire::put_u64(body, id);
+    }
+    const std::uint32_t crc = wire::crc32(body.data(), body.size());
+    std::vector<std::uint8_t> frame;
+    wire::put_u32(frame, crc);
+    wire::put_u32(frame, static_cast<std::uint32_t>(body.size()));
+    frame.insert(frame.end(), body.begin(), body.end());
+    std::vector<std::byte> out(frame.size());
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        out[i] = static_cast<std::byte>(frame[i]);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // RaftNodeA — the implementation.
 // ---------------------------------------------------------------------------
@@ -419,9 +565,19 @@ public:
                 peers_.push_back(id);
             }
         }
-        quorum_ = cfg.cluster.size() / 2 + 1;
         next_index_.assign(cfg.cluster.size(), 0);
         match_index_.assign(cfg.cluster.size(), 0);
+        // C4.2 MEMBERSHIP: seed the config chain with configs[1] = init_config
+        // (Membership.tla InitConfig). EMPTY init_config ⇒ the full cluster (fixed
+        // membership; byte-identical to the pre-membership build). The chain + the
+        // adopted cfg index are reset on recovery from the durable CONFIG records.
+        std::vector<std::uint64_t> init = cfg.init_config.empty() ? cfg.cluster
+                                                                  : cfg.init_config;
+        cfg_chain_.clear();
+        cfg_chain_.push_back(init);
+        cfg_idx_ = 0;
+        cfg_committed_idx_ = 0;
+        cfg_adopted_.assign(cfg.cluster.size(), 0);
     }
 
     RaftNodeA(const RaftNodeA&) = delete;
@@ -445,8 +601,8 @@ public:
         LogEntry e;
         e.term = current_term_;
         e.value = value;
-        log_.push_back(e);
-        const Index idx = static_cast<Index>(log_.size());
+        append_entry(e);
+        const Index idx = llen();
         match_index_[self_idx()] = idx;  // leader trivially stores its own entry
         persist_entry(idx, e);
         r.accepted = true;
@@ -464,7 +620,12 @@ public:
         return current_term_;
     }
     [[nodiscard]] std::span<const LogEntry> log() const noexcept override {
-        return {log_.data(), log_.size()};
+        // Observable = the FULL logical log (snapshot prefix + retained suffix),
+        // so compaction is invisible to the conformance harness (Snapshot.tla
+        // ReconstructUpTo). The view is rebuilt here and is valid until the next
+        // mutation — the harness COPIES it per step (V-RKV1).
+        rebuild_log_view();
+        return {log_view_.data(), log_view_.size()};
     }
     [[nodiscard]] Index commit_index() const noexcept override {
         return commit_index_;
@@ -501,6 +662,10 @@ public:
         current_term_ = 0;
         voted_for_ = kNil;
         log_.clear();
+        snap_base_ = 0;
+        snap_state_.clear();
+        applied_index_ = 0;
+        log_view_.clear();
         commit_index_ = 0;
         votes_granted_.clear();
         leader_hint_ = kNoLeader;
@@ -508,6 +673,14 @@ public:
             v = 0;
         }
         for (auto& v : match_index_) {
+            v = 0;
+        }
+        // C4.2: drop the in-memory config chain to the init config; recovery rebuilds
+        // the adopted chain from the durable CONFIG records (recover-to-prefix).
+        cfg_chain_ = init_config_chain();
+        cfg_idx_ = 0;
+        cfg_committed_idx_ = 0;
+        for (auto& v : cfg_adopted_) {
             v = 0;
         }
         // Power loss drops the non-durable write pipeline: any record appended but
@@ -526,6 +699,10 @@ public:
         ++gen_;
         role_ = Role::Follower;
         commit_index_ = 0;
+        snap_base_ = 0;
+        snap_state_.clear();
+        applied_index_ = 0;
+        log_view_.clear();
         votes_granted_.clear();
         leader_hint_ = kNoLeader;
         recover_from_disk();  // arms the election deadline when recovery completes
@@ -534,6 +711,88 @@ public:
     }
 
     [[nodiscard]] std::uint64_t id() const noexcept override { return self_; }
+
+    // C4.3 snapshot introspection (measurement only; not safety-observable).
+    [[nodiscard]] Index snapshot_index() const noexcept override {
+        return snap_base_;
+    }
+    [[nodiscard]] std::size_t physical_log_size() const noexcept override {
+        return log_.size();
+    }
+    [[nodiscard]] std::uint64_t snapshots_taken() const noexcept override {
+        return snapshots_taken_;
+    }
+    [[nodiscard]] std::uint64_t snapshots_installed() const noexcept override {
+        return snapshots_installed_;
+    }
+
+    // ---- C4.2 MEMBERSHIP CHANGE (Membership.tla) -------------------------
+
+    // ProposeConfigChange(s): a CURRENT-term Leader, while its config is SETTLED
+    // (previous change committed — commit-before-next), proposes a SINGLE-server
+    // change. Returns true iff admissible + proposed.
+    [[nodiscard]] bool propose_config_change(std::uint64_t server,
+                                             bool add) override {
+        if (!running_ || role_ != Role::Leader) {
+            return false;
+        }
+        // commit-before-next: the chain must be SETTLED — the previous change fully
+        // propagated (cfg_committed_idx_ == cfg_idx_ == head). Without this, two
+        // single-server changes compose into a net 2-server jump whose old/new
+        // majorities can be DISJOINT (Ongaro §4.2.3 / Membership.tla Settled).
+        if (cfg_idx_ != cfg_chain_.size() - 1 || cfg_committed_idx_ != cfg_idx_) {
+            return false;
+        }
+        const std::vector<std::uint64_t>& cur = cfg_chain_[cfg_idx_];
+        const bool present = in_config(cur, server);
+        if (add == present) {
+            return false;  // add an existing / remove an absent member ⇒ no-op
+        }
+        if (add && !in_config(cfg_.cluster, server)) {
+            return false;  // can only add a server from the universe (Server set)
+        }
+        if (!add && server == self_) {
+            return false;  // leader stays a member (no self-removal; spec s \in newC)
+        }
+        // Build the new config (delta == 1 by construction: one add or one remove).
+        std::vector<std::uint64_t> nc;
+        if (add) {
+            nc = cur;
+            nc.push_back(server);
+        } else {
+            for (std::uint64_t id : cur) {
+                if (id != server) {
+                    nc.push_back(id);
+                }
+            }
+        }
+        if (nc.empty()) {
+            return false;  // never empty the cluster
+        }
+        sort_ids(nc);
+        // Append the new config to the chain; the leader adopts it IMMEDIATELY
+        // (Raft: a leader uses C_new as soon as it is appended to its log). Other
+        // servers catch up via the ConfigChange RPC — THIS is the straddle window.
+        cfg_chain_.push_back(nc);
+        cfg_idx_ = cfg_chain_.size() - 1;
+        persist_config(cfg_idx_, nc);
+        // Replicate to the UNION of old+new config members (a removed server is not
+        // told; an added server learns it joined). The leader counts adoptions from
+        // the NEW config to learn when the change is committed (commit-before-next).
+        broadcast_config_change();
+        return true;
+    }
+
+    [[nodiscard]] std::vector<std::uint64_t> current_config() const override {
+        return cfg_chain_.empty() ? std::vector<std::uint64_t>{}
+                                  : cfg_chain_[cfg_idx_];
+    }
+    [[nodiscard]] std::uint64_t config_index() const noexcept override {
+        return cfg_idx_;
+    }
+    [[nodiscard]] std::uint64_t config_committed_index() const noexcept override {
+        return cfg_committed_idx_;
+    }
 
 private:
     static constexpr std::uint64_t kNil = UINT64_MAX;       // votedFor = Nil
@@ -584,6 +843,13 @@ private:
             if (self->role_ == Role::Leader) {
                 if (now >= self->heartbeat_deadline_) {
                     self->broadcast_append(/*heartbeat=*/true);
+                    // C4.2: keep pushing the config rollout until it commits (a
+                    // dropped/partitioned ConfigChange is retried on each heartbeat,
+                    // so the change makes progress under faults). No-op once
+                    // committed (Settled) — only re-sent while the chain is in flight.
+                    if (self->cfg_committed_idx_ < self->cfg_idx_) {
+                        self->broadcast_config_change();
+                    }
                     self->heartbeat_deadline_ = now + self->cfg_.heartbeat_interval;
                 }
             } else {
@@ -625,6 +891,18 @@ private:
             case MsgType::AppendEntriesResp:
                 handle_append_entries_resp(m);
                 break;
+            case MsgType::InstallSnapshot:
+                handle_install_snapshot(m);
+                break;
+            case MsgType::InstallSnapshotResp:
+                handle_install_snapshot_resp(m);
+                break;
+            case MsgType::ConfigChange:
+                handle_config_change(m);
+                break;
+            case MsgType::ConfigChangeResp:
+                handle_config_change_resp(m);
+                break;
         }
     }
 
@@ -649,6 +927,14 @@ private:
         if (!running_) {
             return;
         }
+        // C4.2 Membership Timeout(s) guard: only a server that is a MEMBER of its own
+        // current config stands for election. A server removed by a change (no longer
+        // in the config it has adopted) does NOT start an election — it cannot
+        // disrupt the cluster (Membership.tla Timeout: s \in Cfg(s)).
+        if (!in_current_config(self_)) {
+            arm_election_deadline();
+            return;
+        }
         // state[s] ∈ {Follower, Candidate} (a Leader does not time out into a new
         // election here — it heartbeats). Bump term, become Candidate, self-vote.
         ++current_term_;
@@ -663,8 +949,8 @@ private:
         persist_meta();
         arm_election_deadline();
 
-        // A single-node cluster is its own quorum.
-        if (votes_granted_.size() >= quorum_) {
+        // A single-node config is its own quorum (quorum over the CURRENT config).
+        if (config_votes() >= quorum()) {
             become_leader();
             return;
         }
@@ -673,8 +959,9 @@ private:
         base.type = MsgType::RequestVote;
         base.term = current_term_;
         base.source = self_;
-        base.last_log_index = static_cast<Index>(log_.size());
+        base.last_log_index = llen();
         base.last_log_term = last_log_term();
+        base.cfg_index = cfg_idx_;  // C4.2 config-log up-to-date rule
         for (std::uint64_t d : peers_) {
             RaftMsg m = base;
             m.dest = d;
@@ -703,10 +990,16 @@ private:
         const bool cand_up_to_date =
             (m.last_log_term > last_log_term()) ||
             (m.last_log_term == last_log_term() &&
-             m.last_log_index >= static_cast<Index>(log_.size()));
+             m.last_log_index >= llen());
+        // C4.2 Membership RequestVote: the CONFIG-LOG up-to-date rule. A voter refuses
+        // a candidate whose config-chain index is BEHIND its own (cfgIdx[c] >=
+        // cfgIdx[v]). This is ESSENTIAL: it stops a server stranded on a stale,
+        // superseded config (e.g. a removed server that never learned it was removed)
+        // from collecting a quorum under the old config and electing a SECOND leader.
+        const bool cand_cfg_up_to_date = (m.cfg_index >= cfg_idx_);
         const bool can_vote =
             (voted_for_ == kNil || voted_for_ == m.source);
-        const bool grant = can_vote && cand_up_to_date;
+        const bool grant = can_vote && cand_up_to_date && cand_cfg_up_to_date;
 
         if (grant && voted_for_ != m.source) {
             voted_for_ = m.source;
@@ -739,7 +1032,9 @@ private:
             }
         }
         votes_granted_.push_back(m.source);
-        if (votes_granted_.size() >= quorum_) {
+        // BecomeLeader(s): quorum over the CURRENT config (Membership.tla). A vote
+        // from a non-member (e.g. a server only the OLD config knew) does not count.
+        if (config_votes() >= quorum()) {
             become_leader();
         }
     }
@@ -749,14 +1044,30 @@ private:
     void become_leader() {
         role_ = Role::Leader;
         leader_hint_ = self_;
-        const Index last = static_cast<Index>(log_.size());
+        const Index last = llen();
         for (std::size_t i = 0; i < next_index_.size(); ++i) {
             next_index_[i] = last + 1;  // optimistic: assume followers match
             match_index_[i] = 0;
         }
         match_index_[self_idx()] = last;
+        // C4.2: reset per-peer config-adoption tracking; the leader knows only its
+        // own adoption. A leader re-confirms the head config is committed by
+        // re-collecting adoptions (it re-broadcasts ConfigChange below while the
+        // chain is in flight). cfg_committed_idx_ is recomputed from acks; if the
+        // head was already committed before this term it is re-proven harmlessly.
+        cfg_adopted_.assign(cfg_.cluster.size(), 0);
+        // A new leader must NOT assume its head config is cluster-committed: it could
+        // have adopted the head locally while a quorum had not. Treat the head as
+        // UNSETTLED (committed = the previous index) and re-prove it via adoptions
+        // before allowing the next change — preserving commit-before-next across an
+        // election that lands mid-rollout (Membership.tla Settled re-checked).
+        cfg_committed_idx_ = (cfg_idx_ > 0) ? cfg_idx_ - 1 : 0;
         heartbeat_deadline_ = clock_->now();  // beat immediately
         broadcast_append(/*heartbeat=*/true);
+        if (cfg_committed_idx_ < cfg_idx_) {
+            broadcast_config_change();
+        }
+        maybe_commit_config();  // single-config chains re-settle immediately
     }
 
     // ===================================================================
@@ -780,10 +1091,19 @@ private:
             ni = 1;
         }
         const Index prev_index = ni - 1;
-        const Term prev_term =
-            (prev_index >= 1 && prev_index <= log_.size())
-                ? log_[static_cast<std::size_t>(prev_index) - 1].term
-                : 0;
+
+        // C4.3 InstallSnapshot(s,d): the entries the follower needs (prevLogIndex
+        // and below) were DISCARDED by our compaction (prev_index < snap_base_), so
+        // AppendEntries cannot carry the prevLog term — ship the snapshot instead.
+        // (Snapshot.tla InstallSnapshot guard: nextIndex at/below the leader's
+        // lastIncludedIndex.) prev_index == snap_base_ is fine: term_at(snap_base_)
+        // is still reconstructable from snap_state_, so a normal AppendEntries works.
+        if (prev_index < snap_base_) {
+            send_install_snapshot(dest);
+            return;
+        }
+
+        const Term prev_term = term_at(prev_index);
 
         RaftMsg m;
         m.type = MsgType::AppendEntries;
@@ -797,10 +1117,21 @@ private:
         // still ship the suffix (it is idempotent on the follower); shipping it
         // makes progress even if a heartbeat is the only traffic.
         (void)heartbeat;
-        for (std::size_t k = static_cast<std::size_t>(prev_index); k < log_.size();
-             ++k) {
-            m.entries.push_back(log_[k]);
+        for (Index abs = prev_index + 1; abs <= llen(); ++abs) {
+            m.entries.push_back(entry_at(abs));
         }
+        send_to(dest, m);
+    }
+
+    // Ship our snapshot to a lagging follower (Snapshot.tla InstallSnapshot(s,d)).
+    void send_install_snapshot(std::uint64_t dest) {
+        RaftMsg m;
+        m.type = MsgType::InstallSnapshot;
+        m.term = current_term_;
+        m.source = self_;
+        m.dest = dest;
+        m.last_included_index = snap_base_;
+        m.snap_state = snap_state_;  // the folded committed prefix (= state machine)
         send_to(dest, m);
     }
 
@@ -831,12 +1162,18 @@ private:
         leader_hint_ = m.source;
         arm_election_deadline();
 
-        // logOk: prevLogIndex == 0, OR in-range with matching term.
+        // logOk: prevLogIndex == 0, OR in-range with a matching term. Absolute-index
+        // aware (Snapshot.tla: the retained log is a contiguous suffix above
+        // logBase). prevLogIndex inside our snapshotted prefix (< snap_base_) is NOT
+        // auto-accepted: term_at reconstructs the term from snap_state_ for
+        // prevLogIndex >= 1, so the SAME term-match guard applies uniformly — a
+        // leader whose prevLog conflicts with our (committed, snapshotted) prefix is
+        // correctly rejected, never allowed to truncate a committed entry. We never
+        // weaken the conflict guard at/below the snapshot point.
         const bool log_ok =
             (m.prev_log_index == 0) ||
-            (m.prev_log_index <= log_.size() &&
-             log_[static_cast<std::size_t>(m.prev_log_index) - 1].term ==
-                 m.prev_log_term);
+            (m.prev_log_index <= llen() &&
+             term_at(m.prev_log_index) == m.prev_log_term);
 
         if (!log_ok) {
             RaftMsg resp;
@@ -851,15 +1188,19 @@ private:
         }
 
         // Raft conflict rule: find the FIRST incoming entry (1-based k) whose term
-        // conflicts with our existing log at index prevLogIndex+k. Truncate only
-        // there; keep matching/subsumed entries (idempotent redelivery).
+        // conflicts with our existing log at ABSOLUTE index prevLogIndex+k. Entries
+        // at/below snap_base_ are already snapshotted (committed) — never re-examine
+        // or truncate them (the prefix is safe; truncation only ever happens above
+        // the snapshot point, mirroring the spec).
         bool mutated = false;
         std::size_t first_conflict = 0;  // 1-based k, 0 = none
         for (std::size_t k = 1; k <= m.entries.size(); ++k) {
             const Index at = m.prev_log_index + k;
-            if (at <= log_.size()) {
-                if (log_[static_cast<std::size_t>(at) - 1].term !=
-                    m.entries[k - 1].term) {
+            if (at <= snap_base_) {
+                continue;  // inside the snapshotted prefix — committed, no conflict
+            }
+            if (at <= llen()) {
+                if (term_at(at) != m.entries[k - 1].term) {
                     first_conflict = k;
                     break;
                 }
@@ -869,30 +1210,30 @@ private:
         }
 
         if (first_conflict != 0) {
-            // Conflict: truncate at the first conflicting index, then append the
-            // incoming suffix from there. Truncation happens while we are a
-            // Follower (we set role above) — LeaderAppendOnly preserved.
+            // Conflict: truncate at the first conflicting absolute index, then
+            // append the incoming suffix from there. Truncation happens while we
+            // are a Follower (we set role above) — LeaderAppendOnly preserved.
             const Index keep = m.prev_log_index + first_conflict - 1;
-            if (log_.size() > static_cast<std::size_t>(keep)) {
-                log_.resize(static_cast<std::size_t>(keep));
+            if (llen() > keep) {
+                truncate_to(keep);
                 persist_trunc(keep);
                 mutated = true;
             }
             for (std::size_t k = first_conflict; k <= m.entries.size(); ++k) {
-                log_.push_back(m.entries[k - 1]);
-                persist_entry(static_cast<Index>(log_.size()), m.entries[k - 1]);
+                append_entry(m.entries[k - 1]);
+                persist_entry(llen(), m.entries[k - 1]);
                 mutated = true;
             }
         } else {
             // No conflict: append only the genuinely-new tail (idempotent if the
             // incoming entries are fully subsumed by what we already hold).
             const Index incoming_last = m.prev_log_index + m.entries.size();
-            if (incoming_last > log_.size()) {
+            if (incoming_last > llen()) {
                 const std::size_t start =
-                    log_.size() - static_cast<std::size_t>(m.prev_log_index);
+                    static_cast<std::size_t>(llen() - m.prev_log_index);
                 for (std::size_t k = start; k < m.entries.size(); ++k) {
-                    log_.push_back(m.entries[k]);
-                    persist_entry(static_cast<Index>(log_.size()), m.entries[k]);
+                    append_entry(m.entries[k]);
+                    persist_entry(llen(), m.entries[k]);
                     mutated = true;
                 }
             }
@@ -907,6 +1248,9 @@ private:
         if (adopt > commit_index_) {
             commit_index_ = adopt;
         }
+        // Apply newly-committed entries to the state machine, then maybe compact
+        // (Snapshot.tla Apply + TakeSnapshot).
+        apply_and_maybe_snapshot();
 
         RaftMsg resp;
         resp.type = MsgType::AppendEntriesResp;
@@ -916,6 +1260,191 @@ private:
         resp.success = true;
         resp.match_index = last_new;
         send_to(m.source, resp);
+    }
+
+    // ===================================================================
+    // C4.3 HandleInstallSnapshot (Snapshot.tla InstallSnapshot(s,d)): a lagging
+    // follower whose needed entries were discarded by the leader ADOPTS the
+    // leader's snapshot WHOLESALE — applied state := snapshot.state, applied/log
+    // base := lastIncludedIndex — then keeps the retained suffix the leader ships
+    // via subsequent AppendEntries. We never regress: an install that does not
+    // advance our snapshot point is ignored (idempotent / stale redelivery).
+    // ===================================================================
+    void handle_install_snapshot(const RaftMsg& m) {
+        // Stale-term: reject at our term (sender steps down).
+        if (m.term < current_term_) {
+            return;
+        }
+        role_ = Role::Follower;
+        leader_hint_ = m.source;
+        arm_election_deadline();
+
+        // Only adopt a snapshot that is strictly ahead of what we already hold;
+        // never discard an un-applied/uncommitted suffix we genuinely have that is
+        // already past the snapshot point.
+        if (m.last_included_index > snap_base_ &&
+            m.last_included_index > commit_index_) {
+            // Adopt the snapshot wholesale: state := snapshot.state, base := lii.
+            snap_state_ = m.snap_state;          // the folded committed prefix
+            snap_base_ = m.last_included_index;
+            applied_index_ = m.last_included_index;
+            if (commit_index_ < m.last_included_index) {
+                commit_index_ = m.last_included_index;
+            }
+            // The retained suffix is reset; the leader fills it via AppendEntries.
+            log_.clear();
+            log_view_.clear();
+            ++snapshots_installed_;
+            // Durable: persist the snapshot so recovery starts from it (compacted).
+            persist_snapshot();
+        }
+
+        RaftMsg resp;
+        resp.type = MsgType::InstallSnapshotResp;
+        resp.term = current_term_;
+        resp.source = self_;
+        resp.dest = m.source;
+        // Report a match point AT LEAST m.last_included_index: the follower now holds
+        // the committed prefix through the leader's snapshot point (it just adopted
+        // it, or already had it committed). If we already held the prefix but our own
+        // snap_base_ is lower (caught up via AppendEntries, never self-snapshotted),
+        // reporting the stale low snap_base_ would make the leader re-ship the
+        // snapshot forever (zero-virtual-time InstallSnapshot livelock). Snapshot.tla
+        // InstallSnapshot(s,d): after install commitIndex[d] >= base.
+        resp.match_index = snap_base_ > m.last_included_index ? snap_base_
+                                                              : m.last_included_index;
+        send_to(m.source, resp);
+    }
+
+    void handle_install_snapshot_resp(const RaftMsg& m) {
+        if (role_ != Role::Leader || m.term != current_term_) {
+            return;
+        }
+        const std::size_t di = idx_of(m.source);
+        if (m.match_index > match_index_[di]) {
+            match_index_[di] = m.match_index;
+        }
+        // After install, the follower holds [1..match_index]; continue replication
+        // from the entry right after the snapshot point.
+        next_index_[di] = m.match_index + 1;
+        replicate_to(m.source, /*heartbeat=*/false);
+    }
+
+    // ===================================================================
+    // C4.2 MEMBERSHIP CHANGE rollout (Membership.tla AdoptConfig + the commit-
+    // before-next gate). A leader ships ConfigChange (chain index + members) to the
+    // union of old+new config; a follower ADOPTS any chain config strictly ahead of
+    // its own (cfgIdx only ever moves FORWARD — Membership.tla AdoptConfig) and acks
+    // the index it now sits at. The leader marks the change COMMITTED once a quorum
+    // of the NEW config has adopted it; only then may the chain accept the next
+    // change (Settled). cfgIdx + the chain are DURABLE (configs live in the log).
+    // ===================================================================
+
+    // The leader re-broadcasts its head config to every other server in the universe
+    // that might still be a member of old or new (a removed server is excluded so it
+    // never learns it was removed — it ages out via the config-log up-to-date rule).
+    void broadcast_config_change() {
+        if (role_ != Role::Leader || cfg_chain_.empty()) {
+            return;
+        }
+        const std::vector<std::uint64_t>& head = cfg_chain_[cfg_idx_];
+        const std::vector<std::uint64_t>& prev =
+            cfg_idx_ > 0 ? cfg_chain_[cfg_idx_ - 1] : head;
+        for (std::uint64_t d : peers_) {
+            // Tell members of the new config OR the immediately-previous one (so a
+            // server being removed transitions, and a server being added joins).
+            if (in_config(head, d) || in_config(prev, d)) {
+                send_config_change_to(d);
+            }
+        }
+    }
+
+    void send_config_change_to(std::uint64_t dest) {
+        RaftMsg m;
+        m.type = MsgType::ConfigChange;
+        m.term = current_term_;
+        m.source = self_;
+        m.dest = dest;
+        m.config_chain_index = cfg_idx_;
+        m.config_members = cfg_chain_[cfg_idx_];
+        send_to(dest, m);
+    }
+
+    // Follower handles a ConfigChange: ADOPT the config if it is strictly ahead of
+    // ours (forward-only). We extend our chain to match (filling the head). Then ack
+    // the index we now hold. A stale-term sender is ignored (it is not the leader).
+    void handle_config_change(const RaftMsg& m) {
+        if (m.term < current_term_) {
+            return;  // stale leader — ignore (it will step down)
+        }
+        // A current-term ConfigChange means the sender is the term's leader.
+        role_ = Role::Follower;
+        leader_hint_ = m.source;
+        arm_election_deadline();
+
+        const std::uint64_t idx = m.config_chain_index;
+        if (idx > cfg_idx_) {
+            // Forward-only adopt. Grow the chain to length idx+1 with this head
+            // config at position idx (the focused chain is global + totally ordered,
+            // so we only ever need the head we are catching up to).
+            if (idx >= cfg_chain_.size()) {
+                cfg_chain_.resize(idx + 1);
+            }
+            cfg_chain_[idx] = m.config_members;
+            cfg_idx_ = idx;
+            persist_config(cfg_idx_, cfg_chain_[cfg_idx_]);
+        }
+
+        RaftMsg resp;
+        resp.type = MsgType::ConfigChangeResp;
+        resp.term = current_term_;
+        resp.source = self_;
+        resp.dest = m.source;
+        resp.config_chain_index = cfg_idx_;  // the index we now sit at
+        send_to(m.source, resp);
+    }
+
+    // Leader handles a ConfigChangeResp: record the responder's adopted index; once
+    // a QUORUM of the NEW (head) config has adopted the head, the change is
+    // COMMITTED (Settled) — the chain may then accept the next single-server change.
+    void handle_config_change_resp(const RaftMsg& m) {
+        if (role_ != Role::Leader || m.term != current_term_) {
+            return;
+        }
+        const std::size_t di = idx_of(m.source);
+        if (m.config_chain_index > cfg_adopted_[di]) {
+            cfg_adopted_[di] = m.config_chain_index;
+        }
+        maybe_commit_config();
+    }
+
+    // Commit-before-next: the head config is committed when a quorum of the head
+    // config's members have adopted the head chain index (the leader counts itself).
+    void maybe_commit_config() {
+        if (role_ != Role::Leader || cfg_chain_.empty()) {
+            return;
+        }
+        const std::uint64_t head = static_cast<std::uint64_t>(cfg_chain_.size() - 1);
+        if (cfg_committed_idx_ >= head) {
+            return;
+        }
+        const std::vector<std::uint64_t>& hc = cfg_chain_[head];
+        std::size_t adopted = 0;
+        for (std::size_t i = 0; i < cfg_.cluster.size(); ++i) {
+            if (!in_config(hc, cfg_.cluster[i])) {
+                continue;
+            }
+            if (cfg_.cluster[i] == self_) {
+                if (cfg_idx_ >= head) {
+                    ++adopted;  // the leader has adopted the head
+                }
+            } else if (cfg_adopted_[i] >= head) {
+                ++adopted;
+            }
+        }
+        if (adopted * 2 > hc.size()) {
+            cfg_committed_idx_ = head;
+        }
     }
 
     // Leader handles an AppendEntriesResp: advance/back off nextIndex + matchIndex.
@@ -931,8 +1460,13 @@ private:
             }
             next_index_[di] = match_index_[di] + 1;
             advance_commit_index();
+            // Apply newly-committed entries on the leader, then maybe compact.
+            apply_and_maybe_snapshot();
         } else {
             // prevLog mismatch: back off nextIndex and retry (decrement, floor 1).
+            // Floor the backoff at snap_base_+1 so we never chase a nextIndex into
+            // our discarded prefix in a loop; replicate_to switches to
+            // InstallSnapshot once nextIndex-1 falls below the follower's base.
             if (next_index_[di] > 1) {
                 --next_index_[di];
             }
@@ -949,25 +1483,78 @@ private:
         if (role_ != Role::Leader) {
             return;
         }
-        for (Index n = static_cast<Index>(log_.size()); n > commit_index_; --n) {
+        for (Index n = llen(); n > commit_index_; --n) {
             // Current-term entry only — never commit an older-term entry by
             // replication count alone (StateMachineSafety).
-            if (log_[static_cast<std::size_t>(n) - 1].term != current_term_) {
+            if (term_at(n) != current_term_) {
                 continue;
             }
+            // C4.2 Membership: count agreement over the CURRENT config only (a
+            // server outside the config does not contribute to its commit quorum).
             std::size_t agree = 0;
             for (std::size_t i = 0; i < match_index_.size(); ++i) {
+                if (!in_current_config(cfg_.cluster[i])) {
+                    continue;
+                }
                 if (i == self_idx()) {
                     ++agree;  // leader stores it (its own log)
                 } else if (match_index_[i] >= n) {
                     ++agree;
                 }
             }
-            if (agree >= quorum_) {
+            if (agree >= quorum()) {
                 commit_index_ = n;
                 break;  // n is the highest committable index
             }
         }
+    }
+
+    // ===================================================================
+    // C4.3 Apply + TakeSnapshot (Snapshot.tla Apply(s) / TakeSnapshot(s)).
+    // Apply(s): fold every committed-but-unapplied entry into the state machine
+    // (our state machine = the committed entry LIST, so "fold e" = append e to
+    // snap_state_'s logical continuation). We track applied_index_; the retained
+    // suffix holds [snap_base_+1 .. llen()] so applied entries above the base are
+    // still in log_. TakeSnapshot(s): once the retained suffix grows past the
+    // threshold AND there is a fresh applied prefix to fold (applied_index_ >
+    // snap_base_), capture snap_state_ := entries[1..applied_index_] (folding the
+    // about-to-be-discarded prefix into the snapshot — the CRITICAL safety: never
+    // discard an entry not yet folded) and DISCARD log_[1..applied_index_].
+    // ===================================================================
+    void apply_and_maybe_snapshot() {
+        // Apply: advance applied_index_ up to commit_index_ (entries are already in
+        // snap_state_/log_; "applying" here just records how far the state machine
+        // has consumed — snap_state_ already equals the committed prefix by
+        // construction, so the fold is implicit in the retained representation).
+        if (commit_index_ > applied_index_) {
+            applied_index_ = commit_index_;
+        }
+        // TakeSnapshot guard: only fold/discard an APPLIED prefix, and only once the
+        // retained suffix is large enough to be worth compacting.
+        if (applied_index_ > snap_base_ &&
+            log_.size() > kSnapshotThreshold) {
+            take_snapshot();
+        }
+    }
+
+    void take_snapshot() {
+        const Index i = applied_index_;  // snapshot through the applied index
+        if (i <= snap_base_) {
+            return;  // nothing fresh to fold (defensive)
+        }
+        // snapshot.state := fold[1..i] = snap_state_ ++ retained[snap_base_+1..i].
+        // (snap_state_ already holds [1..snap_base_]; append the applied middle.)
+        const std::size_t take =
+            static_cast<std::size_t>(i - snap_base_);
+        snap_state_.insert(snap_state_.end(), log_.begin(),
+                           log_.begin() + static_cast<std::ptrdiff_t>(take));
+        // DISCARD the log prefix <= i (Snapshot.tla: SubSeq(log, i-base+1, Len)).
+        log_.erase(log_.begin(), log_.begin() + static_cast<std::ptrdiff_t>(take));
+        snap_base_ = i;
+        log_view_.clear();
+        ++snapshots_taken_;
+        // Persist the snapshot so recovery starts from it (durable compaction).
+        persist_snapshot();
     }
 
     // ===================================================================
@@ -995,6 +1582,15 @@ private:
     }
     void persist_trunc(Index new_len) {
         enqueue_durable(rec_trunc(new_len));
+    }
+    void persist_snapshot() {
+        enqueue_durable(rec_snapshot(snap_base_, snap_state_));
+    }
+    // C4.2: persist one config-chain entry (chain index + members) so the adopted
+    // config survives a crash (Membership.tla: configs live in the durable log).
+    void persist_config(std::uint64_t chain_index,
+                        const std::vector<std::uint64_t>& members) {
+        enqueue_durable(rec_config(chain_index, members));
     }
 
     // Append a framed record to the in-order FIFO write queue and request a
@@ -1077,7 +1673,17 @@ private:
         std::uint64_t off = 0;
         Term rec_term = self->current_term_;
         std::uint64_t rec_vote = self->voted_for_;
-        std::vector<LogEntry> rec_log;
+        std::vector<LogEntry> rec_log;     // retained suffix (abs idx rec_base+1 ..)
+        Index rec_base = 0;                // snapshot.lastIncludedIndex
+        std::vector<LogEntry> rec_state;   // snapshot.state (folded prefix)
+        // C4.2 MEMBERSHIP: rebuild the config chain + adopted cfgIdx from CONFIG
+        // records. The chain starts at the init config (configs[1]); each CONFIG
+        // record extends/sets a chain index. The highest index seen is the adopted
+        // cfgIdx (forward-only). cfg_committed is re-learned via replication, not
+        // persisted (like commitIndex).
+        std::vector<std::vector<std::uint64_t>> rec_chain = self->init_config_chain();
+        std::uint64_t rec_cfg_idx = 0;
+        bool rec_have_cfg = false;
         bool any = false;
 
         for (;;) {
@@ -1135,18 +1741,87 @@ private:
                 // and keep only the contiguous durable prefix (recover-to-prefix,
                 // the Phase-2/3 lesson). This is what keeps two nodes from holding
                 // a different value at the same (index,term) after crash/restart.
-                if (index != static_cast<Index>(rec_log.size()) + 1) {
+                // Contiguity is checked over the ABSOLUTE logical length (snapshot
+                // base + retained suffix) so a post-snapshot ENTRY continues right
+                // after the snapshot point.
+                if (index != rec_base + static_cast<Index>(rec_log.size()) + 1) {
                     break;  // non-contiguous ENTRY: prefix ends before it
                 }
                 rec_log.push_back(e);
             } else if (kind == RecKind::Trunc) {
                 const Index new_len = r.u64();
-                // A TRUNC may only shorten the contiguous prefix we have so far. A
-                // TRUNC naming a length we never reached is a torn/non-prefix tail.
-                if (new_len > static_cast<Index>(rec_log.size())) {
+                // A TRUNC may only shorten the contiguous suffix we have so far, and
+                // never below the snapshot base (a committed/snapshotted prefix is
+                // never truncated). One naming a length we never reached / below the
+                // base is a torn/non-prefix tail.
+                if (new_len > rec_base + static_cast<Index>(rec_log.size()) ||
+                    new_len < rec_base) {
                     break;
                 }
-                rec_log.resize(static_cast<std::size_t>(new_len));
+                rec_log.resize(static_cast<std::size_t>(new_len - rec_base));
+            } else if (kind == RecKind::Snapshot) {
+                // SNAPSHOT record: set (base, state). Compacts the durable prefix.
+                // CRITICAL: the stream order is "ENTRY... then SNAPSHOT", so by the
+                // time we read SNAPSHOT(base=i) the replay may ALREADY hold suffix
+                // entries at absolute indices > i (they were appended before the
+                // snapshot was taken). Those MUST be retained (they are above the
+                // snapshot point — Snapshot.tla keeps SubSeq(log, i-base+1, Len)).
+                // Only DROP the suffix entries at/below the new base; keep the rest.
+                // (Dropping the whole suffix here lost a committed entry — backprop.)
+                const Index lii = r.u64();
+                const std::uint32_t count = r.u32();
+                if (!r.ok() || count > len) {
+                    break;
+                }
+                std::vector<LogEntry> st;
+                st.reserve(count);
+                for (std::uint32_t k = 0; k < count; ++k) {
+                    LogEntry e;
+                    e.term = r.u64();
+                    e.value = r.str();
+                    st.push_back(std::move(e));
+                }
+                if (!r.ok() || lii < rec_base ||
+                    static_cast<Index>(st.size()) != lii) {
+                    break;  // malformed / regressing snapshot → stop at prefix
+                }
+                // Retain suffix entries above the new base (abs index > lii). The
+                // current suffix covers abs [rec_base+1 .. rec_base+rec_log.size()].
+                const Index cur_abs_end = rec_base + static_cast<Index>(rec_log.size());
+                std::vector<LogEntry> kept;
+                if (cur_abs_end > lii) {
+                    const std::size_t drop = static_cast<std::size_t>(lii - rec_base);
+                    kept.assign(rec_log.begin() + static_cast<std::ptrdiff_t>(drop),
+                                rec_log.end());
+                }
+                rec_base = lii;
+                rec_state = std::move(st);
+                rec_log = std::move(kept);
+            } else if (kind == RecKind::Config) {
+                // C4.2: a CONFIG record sets a chain index to a member set. Forward-
+                // only (the chain never regresses); the highest index is the adopted
+                // cfgIdx. A regressing / wildly-large index is a torn tail → stop.
+                const std::uint64_t cidx = r.u64();
+                const std::uint32_t mcount = r.u32();
+                if (!r.ok() || mcount > len) {
+                    break;
+                }
+                std::vector<std::uint64_t> members;
+                members.reserve(mcount);
+                for (std::uint32_t k = 0; k < mcount; ++k) {
+                    members.push_back(r.u64());
+                }
+                if (!r.ok() || cidx == 0 || cidx > rec_chain.size()) {
+                    break;  // index 0 is the immutable init config; a gap = torn tail
+                }
+                if (cidx >= rec_chain.size()) {
+                    rec_chain.resize(cidx + 1);
+                }
+                rec_chain[cidx] = std::move(members);
+                if (cidx > rec_cfg_idx) {
+                    rec_cfg_idx = cidx;
+                }
+                rec_have_cfg = true;
             } else {
                 break;  // unknown record kind → stop
             }
@@ -1163,8 +1838,23 @@ private:
         if (any) {
             self->current_term_ = rec_term;
             self->voted_for_ = rec_vote;
+            self->snap_base_ = rec_base;
+            self->snap_state_ = std::move(rec_state);
             self->log_ = std::move(rec_log);
+            // The snapshotted prefix is applied by definition; recovery restores
+            // appliedIndex to the snapshot point (commitIndex is re-learned via
+            // replication / leaderCommit, never persisted).
+            self->applied_index_ = rec_base;
+            self->log_view_.clear();
         }
+        // C4.2: restore the adopted config chain + cfgIdx (forward-only). If no
+        // CONFIG record survived, the node sits at the init config (index 0). The
+        // committed index is conservatively re-learned (a leader re-confirms; a
+        // follower trusts the leader's rollout), so reset it here.
+        self->cfg_chain_ = std::move(rec_chain);
+        self->cfg_idx_ = rec_have_cfg ? rec_cfg_idx : 0;
+        self->cfg_committed_idx_ = self->cfg_idx_;  // adopted ⇒ locally settled
+        self->cfg_adopted_.assign(self->cfg_.cluster.size(), 0);
         // Recovery done: arm the election deadline and open the gates so the timer
         // loop + dispatch may now act on the (recovered) durable state.
         self->arm_election_deadline();
@@ -1176,8 +1866,64 @@ private:
     // Helpers
     // ===================================================================
 
+    // ===================================================================
+    // Compacted-log accessors. The consensus core reasons in ABSOLUTE 1-based
+    // logical indices; these translate to the retained suffix / snapshot. An
+    // absolute index <= snap_base_ has been compacted into snap_state_ (the spec
+    // never re-reads a discarded entry by index in the hot path — prevLog checks
+    // only ever land at or after the snapshot point because nextIndex below the
+    // base triggers InstallSnapshot instead).
+    // ===================================================================
+
+    // Logical log length (Snapshot.tla logBase + Len(log)).
+    [[nodiscard]] Index llen() const noexcept {
+        return snap_base_ + static_cast<Index>(log_.size());
+    }
+
+    // Term at absolute 1-based index i (0 if out of range / index 0). Reads the
+    // snapshot prefix for i <= snap_base_, else the retained suffix.
+    [[nodiscard]] Term term_at(Index i) const noexcept {
+        if (i == 0 || i > llen()) {
+            return 0;
+        }
+        if (i <= snap_base_) {
+            return snap_state_[static_cast<std::size_t>(i) - 1].term;
+        }
+        return log_[static_cast<std::size_t>(i - snap_base_) - 1].term;
+    }
+
+    // Entry at absolute 1-based index i (must be in range).
+    [[nodiscard]] const LogEntry& entry_at(Index i) const noexcept {
+        if (i <= snap_base_) {
+            return snap_state_[static_cast<std::size_t>(i) - 1];
+        }
+        return log_[static_cast<std::size_t>(i - snap_base_) - 1];
+    }
+
+    // Append an entry at the tail (absolute index llen()+1).
+    void append_entry(const LogEntry& e) { log_.push_back(e); }
+
+    // Truncate the logical log to absolute length new_len (new_len >= snap_base_;
+    // we never truncate into the snapshotted/applied prefix — Follower truncation
+    // only ever happens at/after the snapshot point, like the spec).
+    void truncate_to(Index new_len) {
+        if (new_len < snap_base_) {
+            new_len = snap_base_;  // never erase a committed/applied prefix
+        }
+        log_.resize(static_cast<std::size_t>(new_len - snap_base_));
+    }
+
+    // Rebuild the full logical-log view (snap_state_ ++ log_) for the observable
+    // log(). Pure function of current state; invisible to compaction.
+    void rebuild_log_view() const {
+        log_view_.clear();
+        log_view_.reserve(snap_state_.size() + log_.size());
+        log_view_.insert(log_view_.end(), snap_state_.begin(), snap_state_.end());
+        log_view_.insert(log_view_.end(), log_.begin(), log_.end());
+    }
+
     [[nodiscard]] Term last_log_term() const noexcept {
-        return log_.empty() ? 0 : log_.back().term;
+        return llen() == 0 ? 0 : term_at(llen());
     }
 
     void arm_election_deadline() {
@@ -1211,6 +1957,63 @@ private:
         return 0;
     }
 
+    // ---- C4.2 MEMBERSHIP helpers (Membership.tla) ------------------------
+
+    static void sort_ids(std::vector<std::uint64_t>& v) {
+        // Deterministic insertion sort (no std::sort: keep output a pure fn of input
+        // with a stable, allocation-free order; the sets are tiny).
+        for (std::size_t i = 1; i < v.size(); ++i) {
+            std::uint64_t x = v[i];
+            std::size_t j = i;
+            while (j > 0 && v[j - 1] > x) {
+                v[j] = v[j - 1];
+                --j;
+            }
+            v[j] = x;
+        }
+    }
+
+    [[nodiscard]] static bool in_config(const std::vector<std::uint64_t>& c,
+                                        std::uint64_t id) noexcept {
+        for (std::uint64_t m : c) {
+            if (m == id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Membership.tla Cfg(s) membership: is `id` in the config this server uses now?
+    [[nodiscard]] bool in_current_config(std::uint64_t id) const noexcept {
+        return !cfg_chain_.empty() && in_config(cfg_chain_[cfg_idx_], id);
+    }
+
+    // Quorum size over the CURRENT config (Membership.tla Quorum(Cfg(s))).
+    [[nodiscard]] std::size_t quorum() const noexcept {
+        const std::size_t n = cfg_chain_.empty() ? cfg_.cluster.size()
+                                                 : cfg_chain_[cfg_idx_].size();
+        return n / 2 + 1;
+    }
+
+    // Count granted votes that come from CURRENT-config members (a vote from a
+    // non-member does not count toward the config quorum).
+    [[nodiscard]] std::size_t config_votes() const noexcept {
+        std::size_t c = 0;
+        for (std::uint64_t v : votes_granted_) {
+            if (in_current_config(v)) {
+                ++c;
+            }
+        }
+        return c;
+    }
+
+    // The chain seeded with configs[1] = init_config (used to reset on recovery).
+    [[nodiscard]] std::vector<std::vector<std::uint64_t>> init_config_chain() const {
+        std::vector<std::uint64_t> init =
+            cfg_.init_config.empty() ? cfg_.cluster : cfg_.init_config;
+        return {init};
+    }
+
     // ---- injected boundary handles + config ------------------------------
     core::IScheduler* sched_;
     IClock* clock_;
@@ -1220,19 +2023,51 @@ private:
     NodeConfig cfg_;
     std::uint64_t self_;
     std::vector<std::uint64_t> peers_;
-    std::size_t quorum_ = 1;
 
     // ---- raft state (in-memory; the spec's per-server variables) ----------
     Role role_ = Role::Follower;
     Term current_term_ = 0;
     std::uint64_t voted_for_ = kNil;   // votedFor (kNil = Nil)
-    std::vector<LogEntry> log_;        // log[s]
+    // log_ is the PHYSICALLY-RETAINED SUFFIX above the snapshot point (Snapshot.tla
+    // `log[s]`): log_[k] is absolute logical index snap_base_+k+1. The discarded
+    // prefix [1..snap_base_] lives folded into snap_state_ (= our state machine's
+    // applied state, which for a replicated log IS the committed-prefix entry list).
+    std::vector<LogEntry> log_;        // retained suffix (abs idx snap_base_+1 ..)
+    Index snap_base_ = 0;              // snapshot.lastIncludedIndex (= logBase[s])
+    std::vector<LogEntry> snap_state_; // snapshot.state: folded entries [1..base]
+    Index applied_index_ = 0;          // Snapshot.tla appliedIndex[s]
+    // log_view_ is the FULL logical log reconstructed from (snap_state_ ++ log_),
+    // returned by log() so the observable surface is UNCHANGED by compaction
+    // (Snapshot.tla ReconstructUpTo: snapshot.state then the retained suffix).
+    mutable std::vector<LogEntry> log_view_;
     Index commit_index_ = 0;           // commitIndex[s]
     std::vector<std::uint64_t> votes_granted_;  // votesGranted[s] (a set)
+
+    // C4.3 compaction trigger: snapshot once the retained suffix exceeds this many
+    // entries AND there is a fresh applied prefix to fold + discard. Kept small so
+    // the in-gate workload actually triggers compaction on some nodes.
+    static constexpr std::size_t kSnapshotThreshold = 8;
+    // Measurement counters (introspection only; NOT persisted, reset on crash).
+    std::uint64_t snapshots_taken_ = 0;
+    std::uint64_t snapshots_installed_ = 0;
 
     // ---- leader replication bookkeeping (dense by cluster index) ----------
     std::vector<Index> next_index_;
     std::vector<Index> match_index_;
+
+    // ---- C4.2 MEMBERSHIP CHANGE state (Membership.tla) --------------------
+    // cfg_chain_ is the GLOBAL config chain (configs[1], configs[2], ...): a
+    // totally-ordered sequence where adjacent configs differ by <= 1 server.
+    // cfg_chain_[0] = the init config; cfg_idx_ = the latest index this node has
+    // ADOPTED (Membership.tla cfgIdx[s], forward-only). cfg_committed_idx_ = the
+    // highest index known committed cluster-wide (commit-before-next: a leader may
+    // only propose the next change once cfg_committed_idx_ == cfg_idx_ == head).
+    // cfg_adopted_ (leader-only, by cluster index) tracks each peer's adopted index
+    // so the leader learns when the head config has reached a quorum of itself.
+    std::vector<std::vector<std::uint64_t>> cfg_chain_;
+    std::uint64_t cfg_idx_ = 0;
+    std::uint64_t cfg_committed_idx_ = 0;
+    std::vector<std::uint64_t> cfg_adopted_;
 
     // ---- timing + lifecycle ----------------------------------------------
     Tick election_deadline_ = 0;

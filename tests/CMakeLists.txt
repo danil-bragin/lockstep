@@ -474,10 +474,90 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
     add_test(NAME consensus_crosscheck_test
              COMMAND lockstep_consensus_crosscheck_test)
   endif()
+
+  # --- Phase 4 C4.3: LOG SNAPSHOTTING / COMPACTION gate (the snapshot gate) ----
+  # P4-SNAPSHOT gate (specs/Snapshot.tla, model-checked clean + committed). Drives
+  # BOTH independently-built Raft impls (raft_a + raft_b) under a snapshot-heavy
+  # fault storm (≫threshold submits + crash/restart so a node must be caught up by
+  # InstallSnapshot) and asserts conformance to Snapshot.tla WITHOUT regressing
+  # Consensus.tla: (a) StateMachineSafety (no committed entry lost/diverged after
+  # compaction); (b) RecoveredEqualsFull (a node caught up via InstallSnapshot has
+  # the same committed state); (c) compaction actually fires + bounds the in-memory
+  # log (measured); (d) determinism byte-identical; (e) the five checkers still 0
+  # violations on both impls; (f) the A-vs-B cross-check still agrees. TEETH: a
+  # deliberately-wrong compaction (empty/dropped snapshot state) is CAUGHT. Builds
+  # only if its source exists. Non-provider TU → forbidden-lint scans it. Inherits
+  # TIMEOUT 90.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_snapshot_test.cpp")
+    add_executable(lockstep_consensus_snapshot_test consensus_snapshot_test.cpp)
+    target_include_directories(lockstep_consensus_snapshot_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_snapshot_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_harness
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_snapshot_test
+             COMMAND lockstep_consensus_snapshot_test)
+  endif()
+
+  # --- Phase 4 C4.2: single-server MEMBERSHIP CHANGE conformance gate --------
+  # Proves both impls implement add/remove ONE server at a time conformant to
+  # specs/Membership.tla (ElectionSafety/ConfigChangeSafety across the change,
+  # QuorumOverlap, single-server chain, config-log up-to-date voting, commit-
+  # before-next) WITHOUT regressing base Consensus/Snapshot conformance. TEETH: a
+  # 2-server jump breaks overlap (mirrors specs/Membership2.cfg). Non-provider TU
+  # -> forbidden-lint scans it. Inherits TIMEOUT 90.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_membership_test.cpp")
+    add_executable(lockstep_consensus_membership_test consensus_membership_test.cpp)
+    target_include_directories(lockstep_consensus_membership_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_membership_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_harness
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_membership_test
+             COMMAND lockstep_consensus_membership_test)
+  endif()
 else()
   message(WARNING
     "lockstep_consensus / runtime / providers_sim / harness not all found; "
     "consensus_harness_test not built (Phase 4 Stage M pending).")
+endif()
+
+# --- Phase 4 C4.4: the multi-shard SEQUENCER conformance gate ----------------
+# C4.4 gate (specs/Sequencer.tla, model-checked clean + committed). Proves the
+# real multi-shard sequencer (consensus/sequencer/Sequencer.hpp) — the
+# deterministic CROSS-shard merge that combines N per-shard committed consensus
+# logs into ONE global total order (Calvin epoch batching) — conforms to the
+# spec's four safety invariants on a seed sweep (<=64 in-gate): (a)
+# GlobalOrderDeterministic (same shard logs => byte-identical global order, run
+# twice); (b) PerShardOrderPreserved; (c) ExactlyOnceGlobal (each sealed input
+# entry once, none fabricated); (d) EpochMonotone. Plus TEETH — a deliberately-
+# wrong (reversed-idx / by-arrival) merge is CAUGHT by the determinism /
+# per-shard-order assertion. Links ONLY the header-only consensus lib (the
+# sequencer is a pure value function; no scheduler/sim needed). Non-provider TU
+# -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+if(TARGET lockstep_consensus)
+  add_executable(lockstep_sequencer_test sequencer_test.cpp)
+  target_include_directories(lockstep_sequencer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sequencer_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus)
+  add_test(NAME sequencer_test COMMAND lockstep_sequencer_test)
+else()
+  message(WARNING
+    "lockstep_consensus target not found; sequencer_test not built "
+    "(Phase 4 C4.4 pending).")
 endif()
 
 # --- Phase 5 Stage M: distributed-txn verification machinery teeth gate -------
@@ -590,6 +670,42 @@ if(TARGET lockstep_txn AND TARGET lockstep_storage AND TARGET lockstep_runtime
         lockstep_runtime
         lockstep_providers_sim)
     add_test(NAME txn_crosscheck_test COMMAND lockstep_txn_crosscheck_test)
+  endif()
+
+  # --- Phase 5/6: END-TO-END distributed-txn FAULT-STORM gate ------------------
+  # P5-E2E gate (specs/CommitOrdering.tla + Consensus.tla + Sequencer.tla;
+  # master-plan D1/D2/D5/§6.5). Closes the last verification debt: the Phase-5 txn
+  # layer was verified over the seqLog ABSTRACTION + a real MVCC store, but NOT
+  # end-to-end through the REAL Phase-4 consensus + Phase-3 storage under a
+  # crash/partition fault storm. This wires the WHOLE stack: a REAL cluster of
+  # consensus nodes (raft_a) ORDERS a seeded stream of one-shot txn submissions
+  # UNDER the full fault envelope (partition/heal keeping quorum, crash/restart, net
+  # reorder/drop/dup, SimDisk latency) on the deterministic scheduler; the COMMITTED
+  # CONSENSUS LOG (the agreed total order, surviving crash/restart) feeds the
+  # Phase-5 DeterministicExecutor over the REAL WalEngine MVCC store. Asserts, over
+  # a seed sweep (<=32 in-gate, LOCKSTEP_E2E_SEEDS override; every run TERMINATES via
+  # the run_until step-backstop -> progress_stalled==0): the committed history is
+  # STRICT-SERIALIZABLE == the txn Oracle on the consensus order, EXACTLY-ONCE,
+  # DURABLE across crash (cold recovery from the committed order reproduces it),
+  # PROGRESS (non-vacuous), DETERMINISM (byte-identical), and TEETH (executing in
+  # arrival order instead of the consensus order is caught). Links the txn lib + the
+  # real consensus lib + storage + runtime + sim. Non-provider TU -> forbidden-lint
+  # scans it. Inherits the dir-wide TIMEOUT 90.
+  if(TARGET lockstep_consensus AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/txn_end_to_end_test.cpp")
+    add_executable(lockstep_txn_end_to_end_test txn_end_to_end_test.cpp)
+    target_include_directories(lockstep_txn_end_to_end_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_txn_end_to_end_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_txn
+        lockstep_consensus
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME txn_end_to_end_test COMMAND lockstep_txn_end_to_end_test)
   endif()
 else()
   message(WARNING

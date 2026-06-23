@@ -31,6 +31,25 @@ struct NodeSnapshot {
     Term term = 0;
     Index commit_index = 0;
     std::vector<LogEntry> log;  // deep copy: log[i] is spec index (i+1)
+
+    // C4.3 snapshot MEASUREMENT (introspection only; NOT a safety observable —
+    // the five conformance checkers never read these). Captures how far this node
+    // has compacted and how bounded its physical (in-memory) log is, so the
+    // snapshot conformance test can prove compaction + InstallSnapshot fired and
+    // that the retained log stays bounded while the logical log keeps growing.
+    Index snapshot_index = 0;         // absolute index discarded up to (0 = none)
+    std::size_t physical_log_size = 0;  // entries physically retained in memory
+    std::uint64_t snapshots_taken = 0;
+    std::uint64_t snapshots_installed = 0;
+
+    // C4.2 MEMBERSHIP MEASUREMENT (introspection only; the five base-Raft checkers
+    // never read these). The config this node believes it is in, the chain index it
+    // has adopted (cfgIdx), and the index it knows committed (Settled when ==
+    // config_index). Lets the membership test assert quorum-overlap, that a removed
+    // server dropped out of its own config, and that the change committed.
+    std::vector<std::uint64_t> config;   // current_config() (sorted member ids)
+    std::uint64_t config_index = 0;      // cfgIdx[s]
+    std::uint64_t config_committed_index = 0;
 };
 
 // All N nodes snapshotted at one observed step (one virtual-time instant).
@@ -69,6 +88,15 @@ struct ObservedRun {
     // cross-check (CrossCheck.hpp) compares this between two implementations.
     // Filled by the driver after the run.
     std::vector<LogEntry> committed_log;
+
+    // DEFENSE-IN-DEPTH (root-cause-independent). True iff the driver's bounded
+    // step backstop tripped during run_until: forward progress STALLED at one
+    // virtual time (a zero-virtual-time message storm — e.g. a snapshot-install
+    // ping-pong that never advances the clock). A correct run NEVER trips this;
+    // it being true means the run was cut short before its virtual-time deadline
+    // and a test MUST fail loudly (not hang the host). Deterministic: the cap is a
+    // pure fn of cfg, so a storm trips identically across replays.
+    bool progress_stalled = false;
 };
 
 }  // namespace lockstep::consensus

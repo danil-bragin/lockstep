@@ -216,6 +216,71 @@ public:
 
     // This node's id (== its INetwork Endpoint id). Stable for the node's life.
     [[nodiscard]] virtual std::uint64_t id() const noexcept = 0;
+
+    // ---- C4.2 MEMBERSHIP CHANGE (single-server) — additive, default no-op ----
+    // Mirrors specs/Membership.tla. A node implementing dynamic membership tracks a
+    // CONFIG CHAIN (the global, totally-ordered sequence of configs, each adjacent
+    // pair differing by <= 1 server) and the config index it has adopted (cfgIdx).
+    // Quorum is computed over the CURRENT config (the config this server believes it
+    // is in), NOT a fixed cluster. These default to the FIXED-membership behavior so
+    // a node that does not implement membership change (teeth stubs / the baseline)
+    // is unaffected, and so the five base-Raft conformance checkers are byte-
+    // identical when no change is ever proposed (membership is purely additive).
+
+    // ProposeConfigChange(s) (Membership.tla): the CURRENT-term LEADER, while its
+    // config is STABLE (the previous change committed — commit-before-next) and the
+    // delta is a SINGLE server (add==true ⇒ add `server`; add==false ⇒ remove it),
+    // appends ONE new config to the chain and begins replicating it. Returns true
+    // iff the change was ADMISSIBLE and proposed (leader, settled, delta<=1, the new
+    // config is non-empty and keeps the leader a member). A non-leader / unsettled /
+    // non-single-server request returns false (REFUSED — the single-server rule).
+    [[nodiscard]] virtual bool propose_config_change(std::uint64_t server, bool add) {
+        (void)server;
+        (void)add;
+        return false;
+    }
+
+    // The config this server currently believes it is in (Membership.tla Cfg(s) =
+    // configs[cfgIdx[s]]) — sorted node ids. Default: empty (fixed-membership node).
+    [[nodiscard]] virtual std::vector<std::uint64_t> current_config() const {
+        return {};
+    }
+
+    // cfgIdx[s] (Membership.tla): the chain index of the latest config this server
+    // has adopted (0 = the initial config configs[1]). Monotonic non-decreasing.
+    [[nodiscard]] virtual std::uint64_t config_index() const noexcept { return 0; }
+
+    // The chain index known COMMITTED (the previous change fully propagated). When
+    // this equals config_index() the chain is SETTLED and a new change may start
+    // (commit-before-next). Default 0.
+    [[nodiscard]] virtual std::uint64_t config_committed_index() const noexcept {
+        return 0;
+    }
+
+    // ---- C4.3 snapshot introspection (OPTIONAL; default no-op) -------------
+    // These are NOT part of the safety-observable surface (the five conformance
+    // checkers read only role/term/log/commit_index above). They exist so the
+    // snapshot conformance test can MEASURE compaction (the log prefix actually
+    // discarded) and detect that a lagging follower was caught up by
+    // InstallSnapshot, WITHOUT changing observable behavior. A node that does not
+    // implement snapshotting (teeth stubs, the always-follower baseline) keeps the
+    // defaults — zero, i.e. "never compacted", which is honest for it.
+
+    // snapshot.lastIncludedIndex: the absolute index through which this node has
+    // snapshotted + DISCARDED its in-memory log prefix (0 = no snapshot yet).
+    [[nodiscard]] virtual Index snapshot_index() const noexcept { return 0; }
+
+    // The number of entries PHYSICALLY retained in memory (the compacted suffix).
+    // With snapshotting this is bounded; without it, it equals the full log length.
+    [[nodiscard]] virtual std::size_t physical_log_size() const noexcept { return 0; }
+
+    // Monotone counters: how many times this node took a snapshot / adopted a
+    // leader's snapshot via InstallSnapshot. Prove compaction + catch-up actually
+    // fired (the test asserts these are non-zero across the sweep — non-vacuous).
+    [[nodiscard]] virtual std::uint64_t snapshots_taken() const noexcept { return 0; }
+    [[nodiscard]] virtual std::uint64_t snapshots_installed() const noexcept {
+        return 0;
+    }
 };
 
 // ----------------------------------------------------------------------------
@@ -244,6 +309,15 @@ struct NodeDeps {
 struct NodeConfig {
     std::uint64_t self_id = 0;
     std::vector<std::uint64_t> cluster;  // ALL node ids (sorted; includes self_id)
+
+    // C4.2 MEMBERSHIP: the INITIAL config configs[1] of the Membership.tla chain —
+    // the set of node ids the cluster STARTS with (a subset of `cluster`, the
+    // universe of all servers that may EVER participate, == Server in the spec). A
+    // single-server change later adds/removes one of `cluster`'s ids to/from this.
+    // EMPTY ⇒ init_config = cluster (fixed membership; backward-compatible: every
+    // existing test leaves this empty, so quorum is over the full cluster exactly as
+    // before and behavior is byte-identical).
+    std::vector<std::uint64_t> init_config;
 
     core::Tick election_timeout_min = 15;  // randomized election timeout window
     core::Tick election_timeout_max = 30;
