@@ -3,7 +3,7 @@
 // request, awaits ONE reply, prints the decoded result, and exits — BOUNDED by an
 // absolute reactor deadline so a dead/unreachable node can NEVER hang the client.
 //
-// Two verbs:
+// Three verbs:
 //   status --host PORT [--host PORT ...]
 //       Query each given admin port's role/term/commit_index/committed-log digest and
 //       print one machine-parseable line per node:
@@ -18,6 +18,23 @@
 //       accepted=1 means the leader appended it at <index>; accepted=0 means no host in
 //       the list accepted within the per-host deadline (caller retries later).
 //
+//   bench --count N [--value-bytes B] [--commit-samples S] --host PORT [--host PORT ...]
+//       Phase 7 S7 PERFORMANCE BASELINE driver. Over ONE persistent client reactor +
+//       ONE persistent connection to the leader's admin port (found via the same
+//       leader-find retry as submit), drive a CLOSED-LOOP write load: submit N distinct
+//       values back-to-back (one in flight at a time — the admin serve-loop is a single
+//       recv->send round-trip), measuring the SERVER submit path (NOT process-spawn
+//       overhead — the reactor/connection are reused for all N). Reports:
+//         BENCH count=<N> value_bytes=<B> elapsed_ms=<T> submit_tput=<ops/s>
+//               submit_p50_us=<..> submit_p99_us=<..>
+//               commit_samples=<S> commit_p50_us=<..> commit_p99_us=<..>
+//               read_check=<ok|MISMATCH> committed_seen=<C>
+//       submit_* = submit->ACCEPT latency (leader appends + replies). commit_* = a
+//       SAMPLE of submit->COMMIT latency (poll STATUS until commit_index covers the
+//       value's index) measured on S of the submissions — approximate (poll-bounded,
+//       so it OVER-counts commit latency by up to one poll interval; stated as a
+//       baseline caveat). read_check confirms the committed log contains the submitted
+//       values in order (a correctness check under load, not a read benchmark).
 // The client speaks the admin wire via the PROVIDER surface (ProdNetwork over the
 // ProdReactor), so THIS TU does no raw socket/epoll syscall — exactly like lockstepd.
 // It mints its OWN client endpoint (a ProdNetwork node on an ephemeral port) and
@@ -28,6 +45,8 @@
 // the provider + admin-protocol surfaces). Every coroutine is a FREE FUNCTION over
 // stable pointers (no [&] capture Task — avoids stack-use-after-scope).
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -157,6 +176,203 @@ bool do_submit(std::uint16_t port, const std::string& value, SubmitOutcome& out)
     return done && out.replied;
 }
 
+// ============================================================================
+// PERF BASELINE (S7) — closed-loop bench over ONE persistent client + connection.
+// ============================================================================
+// We REUSE the one `Client` reactor/bus for ALL submits + status polls of a run, so
+// the measured time is the SERVER path (connect once, then submit->accept round-trips),
+// NOT per-call reactor/process construction. Each round-trip co_awaits send()+recv()
+// once (the admin serve-loop's single recv->send), so exactly ONE request is in flight
+// — a closed loop of concurrency 1 (a baseline, not a saturation test).
+
+// One submit round-trip on an EXISTING client reactor/connection. Returns true if a
+// reply decoded; fills `out`. Bounded by an absolute deadline (never a spin).
+bool bench_submit(Client& c, const std::string& value, SubmitOutcome& out) {
+    bool done = false;
+    out = SubmitOutcome{};
+    c.reactor.spawn(submit_rpc(c.net(), c.admin_ep(), value, &out, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && out.replied;
+}
+
+// One status round-trip on an EXISTING client reactor/connection.
+bool bench_status(Client& c, prod::AdminStatus& out) {
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(status_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// p-th percentile (p in [0,100]) of a latency sample (ns). Caller need not pre-sort;
+// we sort a copy. Empty sample -> 0. Nearest-rank (no interpolation) — fine for a
+// baseline. Returned in MICROSECONDS.
+double percentile_us(std::vector<core::Tick> samples, double p) {
+    if (samples.empty()) {
+        return 0.0;
+    }
+    std::sort(samples.begin(), samples.end());
+    const long rank =
+        std::lround((p / 100.0) * static_cast<double>(samples.size() - 1));
+    std::size_t idx = rank < 0 ? 0 : static_cast<std::size_t>(rank);
+    if (idx >= samples.size()) {
+        idx = samples.size() - 1;
+    }
+    return static_cast<double>(samples[idx]) / 1000.0;
+}
+
+struct BenchArgs {
+    std::uint64_t count = 1000;
+    std::uint64_t value_bytes = 16;
+    std::uint64_t commit_samples = 64;  // # of submissions whose submit->commit we time
+};
+
+// Find which host is the LEADER right now (leader-find): submit a probe value; whichever
+// host ACCEPTS is the leader. Returns its port (and consumes the probe — it commits like
+// any value). 0 if none accepted within the retry budget.
+std::uint16_t find_leader_port(const std::vector<std::uint16_t>& hosts) {
+    for (int attempt = 0; attempt < 40; ++attempt) {  // ~ bounded retries
+        for (std::uint16_t port : hosts) {
+            Client c(port);
+            if (!c.ok) {
+                continue;
+            }
+            SubmitOutcome so;
+            if (bench_submit(c, "bench-leader-probe", so) && so.accepted) {
+                return port;
+            }
+        }
+    }
+    return 0;
+}
+
+// Build a distinct value of ~value_bytes bytes carrying the sequence number, so the
+// read-check can confirm order. "bench-<seq>-<padding>" padded to value_bytes.
+std::string make_value(std::uint64_t seq, std::uint64_t value_bytes) {
+    std::string v = "bench-" + std::to_string(seq) + "-";
+    if (v.size() < value_bytes) {
+        v.append(value_bytes - v.size(), 'x');
+    }
+    return v;
+}
+
+// The closed-loop perf run against the LEADER port. Returns the process exit code.
+int cmd_bench(const BenchArgs& ba, const std::vector<std::uint16_t>& hosts) {
+    const std::uint16_t leader_port = find_leader_port(hosts);
+    if (leader_port == 0) {
+        std::printf("BENCH error=no_leader\n");
+        std::fflush(stdout);
+        return 1;
+    }
+
+    // ONE persistent client/connection for the whole measured load.
+    Client c(leader_port);
+    if (!c.ok) {
+        std::printf("BENCH error=client_init\n");
+        std::fflush(stdout);
+        return 1;
+    }
+
+    std::vector<core::Tick> submit_lat;      // submit->accept (ns), per submission
+    std::vector<core::Tick> commit_lat;      // submit->commit (ns), a sample
+    submit_lat.reserve(ba.count);
+    commit_lat.reserve(ba.commit_samples);
+
+    // Sample stride for commit-latency: spread the S samples across the N submissions.
+    const std::uint64_t stride =
+        ba.commit_samples == 0 ? 0 : (ba.count / (ba.commit_samples + 1) + 1);
+
+    std::uint64_t accepted = 0;
+    std::uint64_t last_index = 0;
+
+    const core::Tick t0 = c.reactor.now();
+    for (std::uint64_t i = 0; i < ba.count; ++i) {
+        const std::string value = make_value(i, ba.value_bytes);
+        const core::Tick s0 = c.reactor.now();
+        SubmitOutcome so;
+        if (!bench_submit(c, value, so) || !so.accepted) {
+            // Lost leadership / no reply: stop the measured run (baseline is the
+            // steady leader path; a mid-run election would skew it).
+            std::printf("BENCH warn=submit_not_accepted_at=%llu\n",
+                        static_cast<unsigned long long>(i));
+            break;
+        }
+        const core::Tick s1 = c.reactor.now();
+        submit_lat.push_back(s1 - s0);
+        ++accepted;
+        last_index = so.index;
+
+        // Sampled submit->commit latency: poll STATUS until commit_index covers this
+        // value's index. Poll-bounded (over-counts by up to one poll turn) — a baseline.
+        if (stride != 0 && commit_lat.size() < ba.commit_samples && (i % stride) == 0) {
+            const core::Tick wait_until = c.reactor.now() + kReqWallNs;
+            bool committed = false;
+            while (c.reactor.now() < wait_until) {
+                prod::AdminStatus st;
+                if (bench_status(c, st) && st.commit_index >= so.index) {
+                    committed = true;
+                    break;
+                }
+            }
+            if (committed) {
+                commit_lat.push_back(c.reactor.now() - s0);
+            }
+        }
+    }
+    const core::Tick t1 = c.reactor.now();
+    const double elapsed_ms = static_cast<double>(t1 - t0) / 1'000'000.0;
+    const double tput = elapsed_ms > 0.0
+                            ? static_cast<double>(accepted) / (elapsed_ms / 1000.0)
+                            : 0.0;
+
+    // READ CHECK under load: confirm the leader's committed log contains the submitted
+    // values in order (correctness check, not a read benchmark). We wait briefly for
+    // commit_index to cover the last accepted index, then verify the prefix.
+    bool read_ok = false;
+    std::uint64_t committed_seen = 0;
+    {
+        const core::Tick wait_until = c.reactor.now() + kReqWallNs;
+        prod::AdminStatus st;
+        while (c.reactor.now() < wait_until) {
+            if (bench_status(c, st) && st.commit_index >= last_index) {
+                break;
+            }
+        }
+        if (bench_status(c, st)) {
+            committed_seen = st.commit_index;
+            // Verify our `accepted` values appear IN ORDER as the committed-log slice
+            // ending at last_index (the run may NOT start at index 1: a re-run against a
+            // persistent daemon appends ABOVE prior values, and the leader-find probe
+            // sits below us). Our i-th value landed at log index (last_index-accepted+1+i),
+            // i.e. committed[] (1-based) slot (last_index-accepted+i) 0-based. So check the
+            // contiguous suffix [last_index-accepted, last_index).
+            if (accepted > 0 && last_index >= accepted &&
+                st.committed.size() >= last_index) {
+                read_ok = true;
+                const std::uint64_t base = last_index - accepted;  // 0-based start slot
+                for (std::uint64_t i = 0; read_ok && i < accepted; ++i) {
+                    if (st.committed[base + i] != make_value(i, ba.value_bytes)) {
+                        read_ok = false;
+                    }
+                }
+            }
+        }
+    }
+
+    std::printf(
+        "BENCH count=%llu value_bytes=%llu elapsed_ms=%.3f submit_tput=%.1f "
+        "submit_p50_us=%.2f submit_p99_us=%.2f commit_samples=%zu commit_p50_us=%.2f "
+        "commit_p99_us=%.2f read_check=%s committed_seen=%llu\n",
+        static_cast<unsigned long long>(accepted),
+        static_cast<unsigned long long>(ba.value_bytes), elapsed_ms, tput,
+        percentile_us(submit_lat, 50.0), percentile_us(submit_lat, 99.0),
+        commit_lat.size(), percentile_us(commit_lat, 50.0),
+        percentile_us(commit_lat, 99.0), read_ok ? "ok" : "MISMATCH",
+        static_cast<unsigned long long>(committed_seen));
+    std::fflush(stdout);
+    return read_ok ? 0 : 1;
+}
+
 void print_status(std::uint16_t port, bool ok, const prod::AdminStatus& st) {
     std::printf("STATUS port=%u ok=%d role=%u term=%llu commit=%llu log=", port,
                 ok ? 1 : 0, static_cast<unsigned>(st.role),
@@ -202,17 +418,30 @@ int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts
 
 }  // namespace
 
+std::uint64_t parse_u64_opt(const char* s, std::uint64_t fallback) {
+    if (s == nullptr || s[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    return (end != nullptr && *end == '\0') ? static_cast<std::uint64_t>(v) : fallback;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr,
-                     "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
-                     "       lockstep_admin submit VALUE --host PORT [--host PORT ...]\n");
+        std::fprintf(
+            stderr,
+            "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
+            "       lockstep_admin submit VALUE --host PORT [--host PORT ...]\n"
+            "       lockstep_admin bench --count N [--value-bytes B] "
+            "[--commit-samples S] --host PORT [--host PORT ...]\n");
         return 2;
     }
 
     const std::string verb = argv[1];
     std::vector<std::uint16_t> hosts;
     std::string value;
+    BenchArgs ba;
     int i = 2;
 
     if (verb == "submit") {
@@ -224,12 +453,21 @@ int main(int argc, char** argv) {
         i = 3;
     }
 
-    for (; i + 1 < argc + 1 && i < argc; ++i) {
+    for (; i < argc; ++i) {
         if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
             const std::uint16_t p = parse_port(argv[i + 1]);
             if (p != 0) {
                 hosts.push_back(p);
             }
+            ++i;
+        } else if (std::strcmp(argv[i], "--count") == 0 && i + 1 < argc) {
+            ba.count = parse_u64_opt(argv[i + 1], ba.count);
+            ++i;
+        } else if (std::strcmp(argv[i], "--value-bytes") == 0 && i + 1 < argc) {
+            ba.value_bytes = parse_u64_opt(argv[i + 1], ba.value_bytes);
+            ++i;
+        } else if (std::strcmp(argv[i], "--commit-samples") == 0 && i + 1 < argc) {
+            ba.commit_samples = parse_u64_opt(argv[i + 1], ba.commit_samples);
             ++i;
         }
     }
@@ -244,6 +482,9 @@ int main(int argc, char** argv) {
     }
     if (verb == "submit") {
         return cmd_submit(value, hosts);
+    }
+    if (verb == "bench") {
+        return cmd_bench(ba, hosts);
     }
     std::fprintf(stderr, "lockstep_admin: unknown verb '%s'\n", verb.c_str());
     return 2;
