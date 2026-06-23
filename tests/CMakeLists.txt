@@ -107,6 +107,35 @@ if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
   endforeach()
 endif()
 
+# --- Phase 7 S1: reusable boundary-provider CONTRACT CONFORMANCE suite --------
+# P7-S1 gate (briefs/phase7.md S1; V-PROD-CONTRACT). The REUSABLE conformance
+# harness any IClock/IRandom/IDisk/INetwork impl MUST pass: the UNIVERSAL contract
+# tier (conformance::universal::*) parameterized over provider FACTORIES, run here
+# against the SIM providers (validates the harness — sim already conforms) and
+# the foundation every PROD provider in S2–S4 plugs into by swapping the factory.
+# Cleanly separates (A) universal contract from (B) sim-only fault behaviours
+# (torn/lying/drop/partition stay tier B, NOT in the universal suite). Asserts the
+# universal suite PASSES vs sim + is a pure fn of seed (run twice, byte-identical
+# Report). tests/ is on the include path so "provider_conformance/..." resolves.
+# Links the header-only runtime + sim providers. Non-provider TU → forbidden-lint
+# scans it; all time virtual, all randomness SeededRandom. Inherits TIMEOUT.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_provider_conformance_test provider_conformance_test.cpp)
+  target_include_directories(lockstep_provider_conformance_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_provider_conformance_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME provider_conformance_test COMMAND lockstep_provider_conformance_test)
+else()
+  message(WARNING
+    "lockstep_runtime / providers_sim not found; provider_conformance_test not "
+    "built (Phase 7 S1 pending).")
+endif()
+
 # --- Phase 2 batch 2 stage A: checker framework + history recorder self-test --
 # B2A FOUNDATION self-test (specs/checker-framework.md §2/§3; briefs/
 # phase2-batch2.md BRIEF B2A). Builds a synthetic history via HistoryRecorder,
@@ -799,6 +828,254 @@ else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "
     "query_surface_test not built (Phase 6 Stage F pending).")
+endif()
+
+# --- Phase 7 S2: PROD provider conformance + record-replay --------------------
+# P7-S2 gate (briefs/phase7.md S2; V-PROD-CONTRACT + V-PROD-REPLAY). Runs the
+# REUSABLE S1 universal suite (conformance::universal::*) VERBATIM against the
+# PROD providers (prod::ProdRandom — full tier-A; prod::ProdClock — now()-monotonic
+# only, delay/timers deferred to S4), proves sim==prod PRNG byte-identity for
+# several seeds, and proves the record-replay TRACE round-trips byte-identical.
+# tests/ is on the include path so "provider_conformance/..." resolves. Links the
+# header-only runtime + sim + prod providers. Non-provider TU -> forbidden-lint
+# scans it (no <chrono>/<random>/<thread> here; real time/entropy stays in
+# providers/prod/). Inherits the dir-wide TIMEOUT.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim
+   AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_provider_test prod_provider_test.cpp)
+  target_include_directories(lockstep_prod_provider_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_provider_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_provider_test COMMAND lockstep_prod_provider_test)
+else()
+  message(WARNING
+    "lockstep_runtime / providers_sim / providers_prod not all found; "
+    "prod_provider_test not built (Phase 7 S2 pending).")
+endif()
+
+# --- Phase 7 S3: PROD Disk conformance + crash-injection + disk record-replay -
+# P7-S3 gate (briefs/phase7.md S3; V-PROD-CONTRACT + V-PROD-REPLAY). Runs the
+# REUSABLE S1 universal IDisk suite (conformance::universal::check_disk_contract)
+# VERBATIM against the PROD file-backed disk (prod::ProdDisk) via a ProdDiskFactory
+# with the SAME member shape as the S1 SimDiskFactory; a CRASH-INJECTION durability
+# test over a REAL temp file (synced survives close+reopen byte-identical; nothing
+# synced lost — no lying fsync; un-synced tail may be absent); and a disk
+# RECORD->REPLAY byte-identity proof. tests/ is on the include path so
+# "provider_conformance/..." resolves. Links the header-only runtime + sim + prod
+# providers. Non-provider TU -> forbidden-lint scans it (NO <chrono>/<random>/
+# <thread>, NO raw file IO here; all real disk IO stays in providers/prod/). The
+# test owns a UNIQUE mkdtemp scratch dir and cleans up after itself. Inherits the
+# dir-wide TIMEOUT.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim
+   AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_disk_test prod_disk_test.cpp)
+  target_include_directories(lockstep_prod_disk_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_disk_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_disk_test COMMAND lockstep_prod_disk_test)
+else()
+  message(WARNING
+    "lockstep_runtime / providers_sim / providers_prod not all found; "
+    "prod_disk_test not built (Phase 7 S3 pending).")
+endif()
+
+# --- Phase 7 S4a: PROD REACTOR (epoll event loop + real timers) [LINUX ONLY] --
+# P7-S4a gate (briefs/phase7.md S4; the loop + real timers, NO sockets yet). The
+# prod REACTOR (providers/prod/ProdReactor.hpp) is a real epoll-driven event loop
+# implementing the SAME two core surfaces the sim Scheduler does (core::IScheduler
+# + core::detail::SchedulerSink), so the verified async core (Future/Promise/Task)
+# runs on it UNCHANGED. delay() is wired to it via prod::ITimerRegistrar, resolving
+# the S2 deferral. Asserts the deferred S1 clock checks now pass on prod, ADAPTED
+# from sim's exact-virtual-d to a real-elapsed tolerance: (a) timers-fire-in-time-
+# order (universal — the nearer deadline fires first); (b) delay completes after
+# >= d REAL elapsed (the prod analogue of sim's exact-d advance; the exact-d
+# assertion is sim-specific virtual time, NOT universal); (c) delay(<=0) completes
+# promptly without hanging; (d) the core actually runs on the reactor — a coroutine
+# co_awaits ProdClock::delay() a couple times + a Promise resolved by another
+# scheduled task, driven by ProdReactor::run() to quiescence, completes in real-time
+# order. epoll is LINUX-ONLY: this target is added ONLY on Linux (if(UNIX AND NOT
+# APPLE)) so the macOS host build stays green (the reactor target simply absent).
+# Bounded: real timers are a few ms; run() drives to quiescence. Non-provider TU ->
+# forbidden-lint scans it (NO <chrono>/<thread>/<sys/epoll.h> here; all real time +
+# epoll stay inside providers/prod/ProdReactor.hpp). Inherits the dir-wide TIMEOUT.
+if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_reactor_test prod_reactor_test.cpp)
+  target_include_directories(lockstep_prod_reactor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_reactor_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME prod_reactor_test COMMAND lockstep_prod_reactor_test)
+endif()
+
+# --- Phase 7 S4b: PROD NETWORK (real TCP on the epoll reactor) [LINUX ONLY] ---
+# P7-S4b gate (briefs/phase7.md S4; real sockets on the S4a reactor). The prod
+# INetwork provider (providers/prod/ProdNetwork.hpp) moves bytes over real TCP on
+# loopback, registered on the S4a ProdReactor's epoll loop (add_fd/remove_fd), so
+# the verified async core runs UNCHANGED. Asserts: (1) the tier-A INetwork universal
+# checks pass on prod with TWO nodes on loopback (local stable; send accepted; recv
+# from+payload correct; per-link delivery in SEND ORDER — a TCP guarantee resolving
+# the S1 per-link-order flag); (2) an integration test exchanges messages, DROPS a
+# connection, RECONNECTS, and messages flow again with no corruption; (3) a network
+# RECORD -> REPLAY round-trip reproduces identical recv observations. epoll +
+# sockets are LINUX-ONLY: this target is added ONLY on Linux (if(UNIX AND NOT
+# APPLE)) so the macOS host build stays green (the target simply absent). Bounded:
+# small message counts + an absolute reactor deadline guard so a lost frame / half-
+# open socket can NEVER hang the loop. Non-provider TU -> forbidden-lint scans it
+# (NO socket/epoll syscall here; all real network plumbing stays inside
+# providers/prod/). Inherits the dir-wide TIMEOUT.
+if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_network_test prod_network_test.cpp)
+  target_include_directories(lockstep_prod_network_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_network_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME prod_network_test COMMAND lockstep_prod_network_test)
+endif()
+
+# --- Phase 7 S5a: SINGLE-NODE PROD SERVER (real TCP round-trip) [LINUX ONLY] --
+# P7-S5a gate (briefs/phase7.md S5; the precursor to lockstepd, multi-node Raft is
+# S5b). Stands up a prod::ProdServerNode (ProdNetwork real TCP -> wire::Server ->
+# Database -> txn deterministic executor -> MVCC store) on the PROD providers driven
+# by the S4a ProdReactor, and a REAL wire client (wire::ClientStub / query::Connection
+# over a ProdNetwork client endpoint) connecting over LOOPBACK: it submits a txn,
+# reads the value back, and asserts it MATCHES (and a second DISTINCT submit applies
+# EXACTLY once — applied_submits() advances by one; reads do not apply). Proves the
+# sim-proven client-facing stack runs on real sockets with ZERO change to core/sim/
+# query/txn/storage. Everything driven by ONE in-process reactor; BOUNDED with an
+# ABSOLUTE reactor deadline so a lost connection can NEVER hang. epoll/sockets are
+# LINUX-ONLY -> target added ONLY on Linux (if(UNIX AND NOT APPLE)) so the macOS host
+# stays green (the target simply absent). Non-provider TU -> forbidden-lint scans it
+# (NO socket/epoll/clock syscall here; all real plumbing stays inside providers/prod/;
+# the client surface is the UNCHANGED wire::ClientStub / Connection). Links the query
+# lib (wire::Server/ClientStub + Connection) + the prod providers (reactor/network/
+# disk/clock/random). Inherits the dir-wide TIMEOUT.
+if(UNIX AND NOT APPLE AND TARGET lockstep_query AND TARGET lockstep_txn
+   AND TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_server_test prod_server_test.cpp)
+  target_include_directories(lockstep_prod_server_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_server_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_server_test COMMAND lockstep_prod_server_test)
+endif()
+
+# --- Phase 7 S5b-1: REAL Raft CONSENSUS node on PROD providers [LINUX ONLY] ---
+# P7-S5b-1 gate (briefs/phase7.md S5; the 1-node consensus precursor to multi-PROCESS
+# Raft, which is S5b-2). Assembles a REAL Raft ConsensusNode (impl A via
+# make_raft_a_factory) on the PROD providers (ProdReactor epoll loop + the reactor's
+# ONE shared ProdClock + ProdRandom(seed) + ProdNetwork real TCP + ProdDisk over the
+# data dir) as a 1-node cluster, drives client SUBMITs over a minimal admin protocol
+# on a real socket, observes COMMIT (1-node leader, quorum=1), then PROVES durable
+# crash/restart recovery: a FRESH reactor/bus/node over the SAME data_dir rebuilds the
+# committed log FROM the real ProdDisk file (consensus.wal) — the durability proof
+# S5a flagged (its query store was in-memory; here the consensus LOG is on ProdDisk).
+# Links the consensus lib (RaftNodeA + ConsensusNode) + the prod providers (reactor/
+# network/disk/clock/random). epoll/sockets LINUX-ONLY -> built ONLY on Linux
+# (if(UNIX AND NOT APPLE)) so the macOS host stays green (target absent). NOT in the
+# providers/ lint-exempt zone: forbidden-lint scans it (NO raw syscall here — only
+# the provider + consensus surfaces). BOUNDED: an absolute reactor deadline ABOVE the
+# 1-node election window so the node reaches Leader yet can NEVER hang.
+if(UNIX AND NOT APPLE AND TARGET lockstep_consensus AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_consensus_test prod_consensus_test.cpp)
+  target_include_directories(lockstep_prod_consensus_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_consensus_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_consensus_test COMMAND lockstep_prod_consensus_test)
+endif()
+
+# --- Phase 7 S5b-2: REAL MULTI-PROCESS Raft CLUSTER smoke [LINUX ONLY] --------
+# P7-S5b-2 gate (briefs/phase7.md S5; THE distributed milestone). Orchestrates a REAL
+# 3-process lockstepd cluster over loopback TCP via tests/prod_cluster_smoke.sh and
+# asserts: (1) exactly ONE leader emerges (others followers); (2) client SUBMITs (via
+# the lockstep_admin leader-find client) REPLICATE + COMMIT on ALL 3 nodes with their
+# committed logs AGREEING (same values, same order); (3) a killed follower RESTARTED on
+# the SAME data dir REJOINS and its committed log CATCHES UP (recovery from ProdDisk +
+# replication). PROCESS-CLEANUP GUARANTEE: the script traps EXIT/INT/TERM to SIGKILL
+# every child on every path, and each lockstepd self-deadlines (--run-seconds), so no
+# orphan can outlive the test. BOUNDED: every wait has an absolute deadline; the ctest
+# has its own TIMEOUT (a hard wall guard) below. Built ONLY on Linux (needs the
+# lockstepd + lockstep_admin Linux targets); the macOS host stays green (test absent).
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
+  add_test(
+    NAME prod_cluster_smoke
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_cluster_smoke.sh)
+  # A generous ceiling that still kills any true hang fast (the script's own internal
+  # deadlines are well under this; sanitizer/CI jitter is absorbed).
+  set_tests_properties(prod_cluster_smoke PROPERTIES TIMEOUT 120)
+endif()
+
+# --- Phase 7 S6: JEPSEN-STYLE PROD-CLUSTER CAPSTONE (V-PROD-CLUSTER) [LINUX] ---
+# P7-S6 gate (briefs/phase7.md S6 — THE capstone). Drives the REAL multi-process
+# lockstepd cluster (5 nodes) under a FAULT STORM — process CRASH/RESTART (SIGKILL +
+# restart on the same data dir, recover from ProdDisk) plus a NETWORK PARTITION
+# (NET_ADMIN-FREE: SIGSTOP freezes a node so peers see it unresponsive == partitioned;
+# SIGCONT heals) — across several SEEDED scenarios, while a concurrent client workload
+# submits a stream of DISTINCT values. Records the client-observed history (each
+# submit's accept/term/index + periodic per-node STATUS snapshots) and CHECKS the
+# SAFETY properties the sim fault-storm proved, judged over the REAL committed Raft
+# log: (A) NO SPLIT-BRAIN — committed logs are prefix-compatible at every snapshot,
+# converge after heal; (B) ACK DURABILITY / EXACTLY-ONCE — every ACKed submit appears
+# exactly once in the final committed log; (C) LEADER UNIQUENESS — per-node term
+# monotonicity + no divergent same-index commits; (D) PROGRESS — non-trivial commits
+# under faults; (E) V-XCHECK — per-client program-order preserved on the final log.
+# These ARE the linearizability/strict-serializability properties for a Raft total-
+# order store (the commit index is the linearization point). TEETH: the checker is run
+# on a FABRICATED bad history and must FAIL. PROCESS-CLEANUP: the script traps
+# EXIT/INT/TERM to SIGCONT-then-SIGKILL every tracked child (a SIGSTOPed node is
+# CONTinued before kill so none is left stopped/zombie); each lockstepd self-deadlines
+# (--run-seconds). BOUNDED: scenarios/rounds/submits/waits all capped. Built ONLY on
+# Linux (needs lockstepd + lockstep_admin); the macOS host stays green (test absent).
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
+  add_test(
+    NAME prod_jepsen
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_jepsen.sh)
+  # A generous ceiling that still kills any true hang fast. The script's own internal
+  # absolute deadlines + each daemon's --run-seconds are well under this; the outer
+  # fork-parent wall-guard (brief's `to()`) is an additional backstop in-gate.
+  set_tests_properties(prod_jepsen PROPERTIES TIMEOUT 300)
 endif()
 
 # --- Harness liveness invariant (orchestrator) -------------------------------

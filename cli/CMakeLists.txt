@@ -51,6 +51,49 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
     set_tests_properties(cli_determinism PROPERTIES TIMEOUT 90)
   endif()
 
+  # --- Phase 7 S5a: lockstepd — the single-node PROD server daemon [LINUX ONLY] -
+  # The precursor to the full lockstepd (multi-node Raft is S5b). A thin main()
+  # that parses a tiny config (--node-id / --seed / --data-dir / --run-seconds),
+  # assembles a prod::ProdServerNode on the PROD providers (ProdReactor epoll loop +
+  # the reactor's ONE shared ProdClock + ProdRandom + ProdDisk + ProdNetwork), spawns
+  # the UNCHANGED wire::Server's serve coroutine, and runs the reactor's BOUNDED loop
+  # (absolute now()-deadline wall guard). epoll/sockets are LINUX-ONLY -> built ONLY
+  # on Linux (if(UNIX AND NOT APPLE)) so the macOS host stays green (target absent).
+  # NOT in the providers/ lint-exempt zone: forbidden-lint scans it (no raw syscall
+  # here — only the provider surfaces). Links the query lib (wire::Server) + the prod
+  # providers (which pull the reactor/network/disk/clock/random).
+  if(UNIX AND NOT APPLE AND TARGET lockstep_providers_prod)
+    add_executable(lockstepd lockstepd.cpp)
+    target_link_libraries(lockstepd
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_query
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim
+        lockstep_providers_prod)
+
+    # --- Phase 7 S5b-2: lockstep_admin — the CLUSTER ADMIN CLIENT [LINUX ONLY] -
+    # The leader-find client for the multi-PROCESS cluster: dials a node's admin port
+    # over REAL TCP, SUBMITs (retrying the next host on NotLeader until the leader
+    # accepts) / reads STATUS (role/term/commit_index/committed-log digest). Speaks the
+    # admin wire via the PROVIDER surface (ProdNetwork) so it touches no raw syscall —
+    # forbidden-lint scans it. BOUNDED by an absolute reactor deadline so an unreachable
+    # node can never hang. Built ONLY on Linux so the macOS host stays green.
+    add_executable(lockstep_admin lockstep_admin.cpp)
+    target_link_libraries(lockstep_admin
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_runtime
+        lockstep_providers_sim
+        lockstep_providers_prod)
+  endif()
+
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "
