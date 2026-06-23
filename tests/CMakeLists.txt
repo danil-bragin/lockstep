@@ -653,6 +653,32 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME query_protocol_test COMMAND lockstep_query_protocol_test)
+
+  # --- Phase 6 Stage B (C6.6): the END-TO-END CONFORMANCE GATE ----------------
+  # Exercises the FULL developer surface stack — the C6.4 reference Driver
+  # (Connection) -> wire ClientStub -> SimNetwork -> wire Server -> Database ->
+  # txn deterministic executor -> WalEngine MVCC — over a seed sweep under net
+  # faults, and asserts: (A) end-to-end balances == the strict-serializable oracle
+  # on the default path (clean AND under dup/reorder/drop); (B) EXACTLY-ONCE end
+  # to end (a re-delivered Submit applies no duplicate effect); (C) each D5 level
+  # driven through the driver honors EXACTLY its contract (the matching txn D5
+  # checker, reusing txn/Oracle.hpp + txn/Checkers.hpp unchanged); (D) determinism
+  # (same seed => byte-identical trace + balances); (E) TEETH — a stale Strict read
+  # is caught. LOCKSTEP_CONFORMANCE_SEEDS override (<=64 in-gate). Non-provider TU
+  # -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+  add_executable(lockstep_query_conformance_test query_conformance_test.cpp)
+  target_include_directories(lockstep_query_conformance_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_query_conformance_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME query_conformance_test COMMAND lockstep_query_conformance_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "
