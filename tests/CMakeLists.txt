@@ -923,6 +923,35 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_
   add_test(NAME prod_reactor_test COMMAND lockstep_prod_reactor_test)
 endif()
 
+# --- Phase 7 S4b: PROD NETWORK (real TCP on the epoll reactor) [LINUX ONLY] ---
+# P7-S4b gate (briefs/phase7.md S4; real sockets on the S4a reactor). The prod
+# INetwork provider (providers/prod/ProdNetwork.hpp) moves bytes over real TCP on
+# loopback, registered on the S4a ProdReactor's epoll loop (add_fd/remove_fd), so
+# the verified async core runs UNCHANGED. Asserts: (1) the tier-A INetwork universal
+# checks pass on prod with TWO nodes on loopback (local stable; send accepted; recv
+# from+payload correct; per-link delivery in SEND ORDER — a TCP guarantee resolving
+# the S1 per-link-order flag); (2) an integration test exchanges messages, DROPS a
+# connection, RECONNECTS, and messages flow again with no corruption; (3) a network
+# RECORD -> REPLAY round-trip reproduces identical recv observations. epoll +
+# sockets are LINUX-ONLY: this target is added ONLY on Linux (if(UNIX AND NOT
+# APPLE)) so the macOS host build stays green (the target simply absent). Bounded:
+# small message counts + an absolute reactor deadline guard so a lost frame / half-
+# open socket can NEVER hang the loop. Non-provider TU -> forbidden-lint scans it
+# (NO socket/epoll syscall here; all real network plumbing stays inside
+# providers/prod/). Inherits the dir-wide TIMEOUT.
+if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_network_test prod_network_test.cpp)
+  target_include_directories(lockstep_prod_network_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_network_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME prod_network_test COMMAND lockstep_prod_network_test)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never

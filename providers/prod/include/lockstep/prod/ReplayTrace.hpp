@@ -58,7 +58,10 @@
 #include <lockstep/core/Future.hpp>
 #include <lockstep/core/IClock.hpp>
 #include <lockstep/core/IDisk.hpp>
+#include <lockstep/core/INetwork.hpp>
 #include <lockstep/core/IRandom.hpp>
+#include <lockstep/core/IScheduler.hpp>
+#include <lockstep/core/Task.hpp>
 
 namespace lockstep::prod {
 
@@ -405,6 +408,129 @@ private:
 
     core::Scheduler* sched_;
     std::vector<ReadObs> reads_{};
+    std::size_t cursor_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// NETWORK record-replay (S4). On prod the RECV STREAM is the nondeterministic
+// boundary INPUT (which message arrives next, from whom, with what bytes — TCP
+// timing the core cannot reproduce). send() is deterministic given the inputs, so
+// the RECV log is exactly what an offline replay needs. Trace record:
+//
+//     network recv <from-id> <hexbytes>
+//
+// from-id = the sender Endpoint id (decimal); hexbytes = the payload, lower-hex,
+// no separators (empty payload -> empty blob). Append-only; mixes cleanly with the
+// Random/Clock/Disk records (each replay consumer filters by its own kind).
+// ---------------------------------------------------------------------------
+
+// RecordingNetwork — wraps any INetwork (a ProdNetwork in prod) and logs each
+// recv'd Message (from + bytes) into the shared trace, IN DELIVERY ORDER. send() is
+// forwarded untouched (logged-only is unnecessary — send is deterministic given the
+// inputs; only the recv stream is the nondeterministic boundary input we must
+// reproduce). Because a prod recv() completes ASYNCHRONOUSLY on the reactor (not
+// inline like a disk read), the wrapper spawns a tiny forwarder coroutine that
+// awaits the inner recv, COPIES the delivered bytes out (the Message span is valid
+// only during that callback — V-RKV1), logs them, and fulfils the outer promise.
+class RecordingNetwork final : public core::INetwork {
+public:
+    RecordingNetwork(core::INetwork& inner, core::IScheduler& sched,
+                     core::detail::SchedulerSink& sink, ReplayTrace& trace) noexcept
+        : inner_(&inner), sched_(&sched), sink_(&sink), trace_(&trace) {}
+
+    [[nodiscard]] core::Endpoint local() const noexcept override {
+        return inner_->local();
+    }
+
+    [[nodiscard]] core::Future<core::Error>
+    send(core::Endpoint to, std::span<const std::byte> payload) override {
+        return inner_->send(to, payload);
+    }
+
+    [[nodiscard]] core::Future<core::Message> recv() override {
+        core::Promise<core::Message> out = core::make_promise<core::Message>(sink_);
+        core::Future<core::Message> f = out.get_future();
+        sched_->spawn(forward(inner_, trace_, &retained_, std::move(out)));
+        return f;
+    }
+
+private:
+    // Await the inner recv, copy the bytes into a stable buffer, log the
+    // observation, then fulfil the outer promise with a span over that buffer.
+    static core::Task forward(core::INetwork* inner, ReplayTrace* trace,
+                              std::vector<std::vector<std::byte>>* retained,
+                              core::Promise<core::Message> out) {
+        core::Message m = co_await inner->recv();
+        std::vector<std::byte> bytes(m.payload.begin(), m.payload.end());
+        trace->append(TraceRecord{
+            TraceKind::Network, "recv",
+            {static_cast<std::int64_t>(m.from.id)},
+            bytes_to_hex(std::span<const std::byte>(bytes.data(), bytes.size()))});
+        retained->push_back(std::move(bytes));
+        std::span<const std::byte> view(retained->back().data(), retained->back().size());
+        out.set_value(core::Message{m.from, view});
+        co_return;
+    }
+
+    core::INetwork* inner_;
+    core::IScheduler* sched_;
+    core::detail::SchedulerSink* sink_;
+    ReplayTrace* trace_;
+    std::vector<std::vector<std::byte>> retained_{}; // stable spans for forwarded msgs
+};
+
+// ReplayNetwork — reproduces the recorded RECV observations offline (sim-usable,
+// pure: no sockets). It consumes the Network recv records IN ORDER and, for each
+// recv(), returns the recorded (from, bytes) as an already-ready Message. send() is
+// replay-inert (deterministic given inputs; nothing to reproduce) — it just returns
+// an ok already-ready Future. This is what makes a prod network incident replayable.
+class ReplayNetwork final : public core::INetwork {
+public:
+    ReplayNetwork(const ReplayTrace& trace, core::detail::SchedulerSink& sink,
+                  core::Endpoint self) noexcept
+        : sink_(&sink), self_(self) {
+        for (const TraceRecord& r : trace.records()) {
+            if (r.kind == TraceKind::Network && r.op == "recv") {
+                recvs_.push_back(RecvObs{r.args.empty() ? 0 : r.args[0],
+                                         hex_to_bytes(r.blob)});
+            }
+        }
+    }
+
+    [[nodiscard]] core::Endpoint local() const noexcept override { return self_; }
+
+    [[nodiscard]] core::Future<core::Error>
+    send(core::Endpoint /*to*/, std::span<const std::byte> /*payload*/) override {
+        core::Promise<core::Error> p = core::make_promise<core::Error>(sink_);
+        core::Future<core::Error> f = p.get_future();
+        p.set_value(core::Error{}); // replay-inert: send is deterministic
+        return f;
+    }
+
+    [[nodiscard]] core::Future<core::Message> recv() override {
+        core::Promise<core::Message> p = core::make_promise<core::Message>(sink_);
+        core::Future<core::Message> f = p.get_future();
+        if (cursor_ >= recvs_.size()) {
+            p.set_error(core::Error{core::ErrorCode::NotFound, "replay recv exhausted"});
+            return f;
+        }
+        const RecvObs& obs = recvs_[cursor_++];
+        retained_.push_back(obs.bytes);
+        std::span<const std::byte> view(retained_.back().data(), retained_.back().size());
+        p.set_value(core::Message{core::Endpoint{static_cast<std::uint64_t>(obs.from)}, view});
+        return f;
+    }
+
+private:
+    struct RecvObs {
+        std::int64_t from = 0;
+        std::vector<std::byte> bytes{};
+    };
+
+    core::detail::SchedulerSink* sink_;
+    core::Endpoint self_;
+    std::vector<RecvObs> recvs_{};
+    std::vector<std::vector<std::byte>> retained_{};
     std::size_t cursor_ = 0;
 };
 

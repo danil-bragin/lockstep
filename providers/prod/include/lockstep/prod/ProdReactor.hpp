@@ -50,11 +50,12 @@
 
 #ifdef __linux__
 
-#include <sys/epoll.h> // epoll_create1, epoll_wait — ALLOWED only under providers/
+#include <sys/epoll.h> // epoll_create1, epoll_wait, epoll_ctl — ALLOWED only under providers/
 #include <unistd.h>    // close
 
 #include <cstdint>
 #include <coroutine>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -148,11 +149,13 @@ public:
                 item.handle.resume(); // the ONE and ONLY resume site (L1)
                 continue;
             }
-            // Ready queue empty. Quiesce if no timers pend.
-            if (timers_.empty()) {
+            // Ready queue empty. Quiesce if nothing can ever wake us (no timers AND
+            // no registered fds). A node with a listen socket registered does NOT
+            // quiesce here — it uses run_until / run_with_deadline instead.
+            if (timers_.empty() && handlers_.empty()) {
                 break;
             }
-            wait_and_fire_timers();
+            wait_and_dispatch(/*deadline_ns=*/0);
         }
         trace(core::TraceAction::RunEnd, {});
     }
@@ -160,6 +163,139 @@ public:
     // Request the loop stop at the next turn (for a long-lived server loop, S5).
     // Idempotent; safe to call from a scheduled continuation. Tests do not use it.
     void stop() noexcept { stop_ = true; }
+
+    // ---- fd registration (S4b — sockets plug into the SAME epoll set) ----
+    //
+    // The S4a design note's promise made real: a socket fd is registered with
+    // EPOLL_CTL_ADD + an entry in an fd->handler table; the ONE epoll_wait loop in
+    // run() then dispatches a ready fd to its handler (which SCHEDULES continuations
+    // via the SchedulerSink, never resumes inline) AND fires due timers, as two
+    // additive branches. The timer path is UNCHANGED — timers still use the
+    // epoll_wait TIMEOUT argument; fds just make epoll_wait ALSO return on IO.
+    //
+    // `events` is an EPOLLIN/EPOLLOUT mask (EPOLLET is NOT used — level-triggered so
+    // a half-drained socket re-wakes; simplest correct model). `on_ready` is invoked
+    // with the events that fired for that fd. Single-threaded: the handler runs on
+    // the reactor thread, inside run(), between timer turns.
+
+    using FdHandler = std::function<void(std::uint32_t /*revents*/)>;
+
+    // Register `fd` on the epoll set with interest `events`. Returns false if
+    // epoll_ctl fails (e.g. fd already registered — use mod_fd then). The handler
+    // table is a sorted-by-fd vector: deterministic iteration, no unordered map.
+    bool add_fd(int fd, std::uint32_t events, FdHandler on_ready) {
+        if (fd < 0 || epoll_fd_ < 0) {
+            return false;
+        }
+        epoll_event ev{};
+        ev.events = events;
+        ev.data.fd = fd;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) != 0) {
+            return false;
+        }
+        insert_handler(fd, events, std::move(on_ready));
+        trace(core::TraceAction::Schedule,
+              std::string("fd_add fd=") + std::to_string(fd) +
+                  " ev=" + std::to_string(events));
+        return true;
+    }
+
+    // Change the interest mask for an already-registered fd (e.g. arm/disarm
+    // EPOLLOUT as the write buffer fills/drains). Keeps the same handler.
+    bool mod_fd(int fd, std::uint32_t events) {
+        if (fd < 0 || epoll_fd_ < 0) {
+            return false;
+        }
+        epoll_event ev{};
+        ev.events = events;
+        ev.data.fd = fd;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) != 0) {
+            return false;
+        }
+        const std::size_t i = handler_index(fd);
+        if (i != kNoHandler) {
+            handlers_[i].events = events;
+        }
+        return true;
+    }
+
+    // Unregister `fd` from the epoll set and drop its handler. Idempotent: a
+    // missing fd is a no-op (the caller may also have closed it). NEVER closes the
+    // fd — ownership stays with the registrant (ProdNetwork RAII-closes its own).
+    void remove_fd(int fd) {
+        if (fd < 0) {
+            return;
+        }
+        if (epoll_fd_ >= 0) {
+            // EPOLL_CTL_DEL: ignore ENOENT (already gone) / EBADF (closed already).
+            ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        }
+        const std::size_t i = handler_index(fd);
+        if (i != kNoHandler) {
+            handlers_.erase(handlers_.begin() + static_cast<std::ptrdiff_t>(i));
+            trace(core::TraceAction::Schedule,
+                  std::string("fd_del fd=") + std::to_string(fd));
+        }
+    }
+
+    [[nodiscard]] std::size_t registered_fd_count() const noexcept {
+        return handlers_.size();
+    }
+
+    // ---- stoppable / bounded run loops (servers + networked tests) -------
+    //
+    // run() drives to QUIESCENCE: no ready work, no timers, AND no registered fds.
+    // A networked node has a listen fd registered, so it would NOT quiesce — it
+    // would block in epoll_wait forever. So networked tests/servers use one of:
+    //
+    //   run_until(pred)        — pump the loop until `pred()` is true (checked each
+    //                            turn). The bounded networked-test driver.
+    //   run_with_deadline(ns)  — pump until the reactor's now() passes an ABSOLUTE
+    //                            deadline (a HARD wall guard so a lost frame / half-
+    //                            open socket can NEVER hang the loop), OR quiescence.
+    //   run_until(pred, ns)    — both: stop on pred OR the absolute deadline.
+    //
+    // All share the SAME loop body as run(): drain ready (FIFO, the one resume site
+    // L1), then epoll_wait (dispatch ready fds to handlers + fire due timers).
+
+    // Pump until `pred()` returns true OR an absolute now()-deadline passes (ns).
+    // deadline_ns <= 0 means "no deadline" (only pred stops it). Returns true if
+    // pred fired, false if the deadline tripped first.
+    bool run_until(const std::function<bool()>& pred, core::Tick deadline_ns = 0) {
+        trace(core::TraceAction::RunStart, {});
+        bool pred_fired = false;
+        for (;;) {
+            if (stop_) {
+                break;
+            }
+            if (pred && pred()) {
+                pred_fired = true;
+                break;
+            }
+            if (deadline_ns > 0 && clock_.now() >= deadline_ns) {
+                break; // HARD wall guard: never hang on a lost frame / half-open fd.
+            }
+            if (!ready_.empty()) {
+                core::detail::ReadyItem item = ready_.pop();
+                trace(core::TraceAction::Resume,
+                      std::string("seq=") + std::to_string(item.seq));
+                item.handle.resume(); // the ONE and ONLY resume site (L1)
+                continue;
+            }
+            // Ready queue empty. If nothing can ever wake us, quiesce.
+            if (timers_.empty() && handlers_.empty()) {
+                break;
+            }
+            wait_and_dispatch(deadline_ns);
+        }
+        trace(core::TraceAction::RunEnd, {});
+        return pred_fired;
+    }
+
+    // Pump until an absolute now()-deadline passes (ns) or the loop quiesces.
+    void run_with_deadline(core::Tick deadline_ns) {
+        run_until(std::function<bool()>{}, deadline_ns);
+    }
 
     // ---- core::detail::SchedulerSink ------------------------------------
 
@@ -220,6 +356,45 @@ private:
         return a.arm_seq < b.arm_seq;
     }
 
+    // An fd registered on the epoll set + its handler. The handler SCHEDULES
+    // continuations (never resumes inline). Kept in a sorted-by-fd vector so all
+    // iteration is deterministic and lookup is a tight scan / binary search.
+    struct FdEntry {
+        int fd = -1;
+        std::uint32_t events = 0;
+        FdHandler on_ready{};
+    };
+
+    static constexpr std::size_t kNoHandler = static_cast<std::size_t>(-1);
+
+    // Index of fd in the sorted handler table, or kNoHandler. Binary search.
+    [[nodiscard]] std::size_t handler_index(int fd) const noexcept {
+        std::size_t lo = 0;
+        std::size_t hi = handlers_.size();
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (handlers_[mid].fd < fd) {
+                lo = mid + 1;
+            } else if (handlers_[mid].fd > fd) {
+                hi = mid;
+            } else {
+                return mid;
+            }
+        }
+        return kNoHandler;
+    }
+
+    // Insert a handler keeping handlers_ sorted by fd (no duplicate fd — caller
+    // guarantees a fresh EPOLL_CTL_ADD'd fd).
+    void insert_handler(int fd, std::uint32_t events, FdHandler on_ready) {
+        std::size_t pos = 0;
+        while (pos < handlers_.size() && handlers_[pos].fd < fd) {
+            ++pos;
+        }
+        handlers_.insert(handlers_.begin() + static_cast<std::ptrdiff_t>(pos),
+                         FdEntry{fd, events, std::move(on_ready)});
+    }
+
     // The deadline of the earliest pending timer (deterministic min by the same
     // (deadline, arm_seq) key used to fire). Caller ensures timers_ is non-empty.
     [[nodiscard]] core::Tick earliest_deadline() const noexcept {
@@ -232,33 +407,64 @@ private:
         return timers_[min_idx].deadline;
     }
 
-    // Block in epoll_wait until the earliest timer's deadline (or an fd event, in
-    // S4b), then fire EVERY timer whose deadline has passed, in (deadline, arm_seq)
-    // order. Called only when the ready queue is empty and at least one timer
-    // pends. Firing fulfills the Promise, which (L1) SCHEDULES its waiter.
-    void wait_and_fire_timers() {
-        // Compute the epoll_wait timeout = earliest deadline - now(), in
-        // MILLISECONDS, rounded UP so we never wake before the deadline, clamped
-        // to >= 0 (a past/zero deadline -> timeout 0 -> return immediately).
-        const core::Tick due = earliest_deadline();
+    // Block in epoll_wait until the earliest timer's deadline / the run deadline /
+    // a ready fd, then DISPATCH every ready fd to its handler (which SCHEDULES, never
+    // resumes inline — L1) AND fire EVERY timer whose deadline has passed, in
+    // (deadline, arm_seq) order. Two additive branches on the SAME wait, exactly as
+    // the S4a design note promised. Called only when the ready queue is empty and at
+    // least one timer OR one fd pends.
+    //
+    // `deadline_ns` is an OPTIONAL absolute now() bound (a hard wall guard for the
+    // networked loop; 0 = none): the wait timeout is the MIN of (earliest timer due)
+    // and (run deadline), so a node with only a listen fd and no timers still wakes
+    // by the deadline instead of blocking forever on a lost frame.
+    void wait_and_dispatch(core::Tick deadline_ns) {
+        // Compute the epoll_wait timeout = (min wake instant) - now(), in
+        // MILLISECONDS, rounded UP so we never wake before it, clamped to >= 0.
         const core::Tick now = clock_.now();
-        int timeout_ms = 0;
-        if (due > now) {
-            // ns -> ms, round up. Cap at INT_MAX-equivalent so the cast is safe.
-            const core::Tick ns = due - now;
-            const core::Tick ms = (ns + 999'999) / 1'000'000;
-            constexpr core::Tick kMaxMs = 60'000; // 60s ceiling: bounded waits
-            timeout_ms = static_cast<int>(ms > kMaxMs ? kMaxMs : ms);
+        core::Tick wake_at = 0;
+        bool have_wake = false;
+        if (!timers_.empty()) {
+            wake_at = earliest_deadline();
+            have_wake = true;
+        }
+        if (deadline_ns > 0 && (!have_wake || deadline_ns < wake_at)) {
+            wake_at = deadline_ns;
+            have_wake = true;
+        }
+        // -1 == block indefinitely (only legal when an fd can wake us; we only reach
+        // here with a timer, a deadline, or a registered fd, so an indefinite block
+        // here is always woken by a socket event).
+        int timeout_ms = -1;
+        if (have_wake) {
+            timeout_ms = 0;
+            if (wake_at > now) {
+                const core::Tick ns = wake_at - now;
+                const core::Tick ms = (ns + 999'999) / 1'000'000;
+                constexpr core::Tick kMaxMs = 60'000; // 60s ceiling: bounded waits
+                timeout_ms = static_cast<int>(ms > kMaxMs ? kMaxMs : ms);
+            }
         }
 
-        // epoll_wait BLOCKS (never a busy spin). No fds are registered in S4a, so
-        // it returns on the timeout; S4b adds fd handlers and this same call also
-        // returns on ready socket fds (events[] non-empty) for dispatch. We ignore
-        // the (empty) event set here and proceed to fire due timers.
+        // epoll_wait BLOCKS (never a busy spin). Returns on the timeout, or on ready
+        // socket fds (events[0..n)) for dispatch.
         epoll_event events[kMaxEvents];
         const int n = ::epoll_wait(epoll_fd_, events, kMaxEvents, timeout_ms);
-        (void)n; // S4a: no fds registered, so n is 0 on timeout (EINTR -> n<0, fine);
-                 // S4b dispatches events[0..n) to their fd handlers here.
+        // n < 0 (EINTR) is fine: fall through, fire due timers, loop. n == 0 is the
+        // timeout. n > 0 dispatches each ready fd to its handler.
+        for (int i = 0; i < n; ++i) {
+            const int fd = events[i].data.fd;
+            const std::uint32_t revents = events[i].events;
+            const std::size_t hi = handler_index(fd);
+            if (hi != kNoHandler) {
+                // Copy the handler out before invoking: the handler may add/remove
+                // fds (mutating handlers_), so we must not hold an index/reference
+                // into the vector across the call (V-RKV1: no live ref across a
+                // mutation of a growable container).
+                FdHandler h = handlers_[hi].on_ready;
+                h(revents);
+            }
+        }
 
         fire_due_timers();
     }
@@ -329,6 +535,7 @@ private:
     int epoll_fd_ = -1;                                     // owned; RAII-closed
     core::detail::ReadyQueue ready_{};                      // strict FIFO (L3)
     std::vector<Timer> timers_{};                           // (deadline, arm_seq) keyed
+    std::vector<FdEntry> handlers_{};                       // sorted-by-fd; socket fds
     std::vector<std::coroutine_handle<>> owned_frames_{};   // frames the reactor owns
     core::Trace trace_{};                                   // in-memory run trace
     std::uint64_t enqueue_seq_ = 0;                         // ready-queue enqueue seq
