@@ -134,13 +134,32 @@ public:
     //     state as a single run_until(d2) (no work is skipped or double-fired).
     // run() itself is untouched and the Phase-1 determinism self-test (which never
     // calls this) is byte-identical.
-    void run_until(Tick deadline) {
+    //
+    // OPTIONAL STEP BACKSTOP (`max_steps`, default 0 = UNBOUNDED). A root-cause-
+    // independent guard against a zero-virtual-time message storm: if a bug makes
+    // coroutines schedule each other forever WITHOUT advancing virtual time (e.g.
+    // a leader re-shipping a snapshot every tick, AppendEntries↔response ping-pong),
+    // the ready queue never empties, vtime never reaches `deadline`, and the loop
+    // spins on real CPU forever. With max_steps>0, this caps the number of resume
+    // steps for ONE call; on hitting the cap it STOPS and returns false (a stalled-
+    // progress signal) so a test FAILS loudly instead of hanging the host.
+    // DETERMINISM: with the default max_steps==0 the `++steps`/compare branch is the
+    // ONLY added work and never trips, never traces, never alters firing order —
+    // the run() self-test, runtime_determinism, and seed_sweep are byte-identical.
+    // Returns true if the window finished normally (deadline reached / quiesced),
+    // false if the step cap was hit (forward progress stalled at one virtual time).
+    bool run_until(Tick deadline, std::uint64_t max_steps = 0) {
         trace(TraceAction::RunStart, {});
+        std::uint64_t steps = 0;
         for (;;) {
             if (!ready_.empty()) {
                 detail::ReadyItem item = ready_.pop();
                 trace(TraceAction::Resume, std::string("seq=") + std::to_string(item.seq));
                 item.handle.resume(); // the ONE and ONLY resume site (L1)
+                if (max_steps != 0 && ++steps >= max_steps) {
+                    trace(TraceAction::RunEnd, {});
+                    return false;  // step cap hit: zero-vtime storm / stalled progress
+                }
                 continue;
             }
             // L4: ready queue empty. Stop if no timers pend OR the earliest
@@ -152,6 +171,7 @@ public:
             fire_earliest_timers();
         }
         trace(TraceAction::RunEnd, {});
+        return true;
     }
 
     // ADDITIVE: run for `d` ticks of virtual time from the current vtime. Thin

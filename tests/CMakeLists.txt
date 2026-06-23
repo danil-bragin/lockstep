@@ -474,6 +474,35 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
     add_test(NAME consensus_crosscheck_test
              COMMAND lockstep_consensus_crosscheck_test)
   endif()
+
+  # --- Phase 4 C4.3: LOG SNAPSHOTTING / COMPACTION gate (the snapshot gate) ----
+  # P4-SNAPSHOT gate (specs/Snapshot.tla, model-checked clean + committed). Drives
+  # BOTH independently-built Raft impls (raft_a + raft_b) under a snapshot-heavy
+  # fault storm (≫threshold submits + crash/restart so a node must be caught up by
+  # InstallSnapshot) and asserts conformance to Snapshot.tla WITHOUT regressing
+  # Consensus.tla: (a) StateMachineSafety (no committed entry lost/diverged after
+  # compaction); (b) RecoveredEqualsFull (a node caught up via InstallSnapshot has
+  # the same committed state); (c) compaction actually fires + bounds the in-memory
+  # log (measured); (d) determinism byte-identical; (e) the five checkers still 0
+  # violations on both impls; (f) the A-vs-B cross-check still agrees. TEETH: a
+  # deliberately-wrong compaction (empty/dropped snapshot state) is CAUGHT. Builds
+  # only if its source exists. Non-provider TU → forbidden-lint scans it. Inherits
+  # TIMEOUT 90.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_snapshot_test.cpp")
+    add_executable(lockstep_consensus_snapshot_test consensus_snapshot_test.cpp)
+    target_include_directories(lockstep_consensus_snapshot_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_snapshot_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_harness
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_snapshot_test
+             COMMAND lockstep_consensus_snapshot_test)
+  endif()
 else()
   message(WARNING
     "lockstep_consensus / runtime / providers_sim / harness not all found; "

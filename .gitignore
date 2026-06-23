@@ -52,3 +52,6 @@ states_*/
 
 # mutation-engine backups — never commit (a stray one = interrupted mutation)
 *.mutbak
+
+# clangd editor index cache
+.cache/

@@ -133,6 +133,11 @@ inline void snapshot(ClusterRunState* st) {
             ns.commit_index = st->nodes[i]->commit_index();
             const std::span<const LogEntry> lg = st->nodes[i]->log();
             ns.log.assign(lg.begin(), lg.end());  // deep copy out
+            // C4.3 snapshot measurement (introspection; not a safety observable).
+            ns.snapshot_index = st->nodes[i]->snapshot_index();
+            ns.physical_log_size = st->nodes[i]->physical_log_size();
+            ns.snapshots_taken = st->nodes[i]->snapshots_taken();
+            ns.snapshots_installed = st->nodes[i]->snapshots_installed();
         } else {
             // A crashed node serves nothing; record an empty/idle snapshot so the
             // checkers skip it (ElectionSafety/LogMatching only read live nodes).
@@ -396,6 +401,28 @@ inline Tick compute_deadline(const ClusterConfig* cfg) {
     return horizon + settle + cfg->election_timeout_max * 4;
 }
 
+// DEFENSE-IN-DEPTH step backstop bound (root-cause-independent). A generous, fully
+// DETERMINISTIC upper bound on how many scheduler resume-steps one healthy run can
+// legitimately take, so that a real run NEVER trips it but a zero-virtual-time
+// message storm (a bug that keeps the ready queue non-empty without advancing the
+// clock — e.g. an InstallSnapshot↔AppendEntries ping-pong) is cut off as a
+// DETECTABLE failure instead of spinning the host forever.
+//
+// Bound = (virtual-time horizon) * (per-tick step budget). Each virtual tick a
+// correct run does O(nodes^2) RPC hops plus per-node coroutine resumptions; we use
+// a fat constant per (tick * node^2) so headroom is enormous (legitimate runs use a
+// tiny fraction) while an unbounded same-tick storm — which would do MANY times this
+// many steps at a SINGLE tick — is caught. Pure fn of cfg ⇒ identical across replays.
+inline std::uint64_t compute_step_cap(const ClusterConfig* cfg) {
+    const std::uint64_t horizon = static_cast<std::uint64_t>(compute_deadline(cfg));
+    const std::uint64_t nodes = cfg->n_nodes == 0 ? 1 : cfg->n_nodes;
+    // Per-tick budget: ~256 resume-steps per node-pair per virtual tick (huge
+    // headroom over the handful a real tick uses), plus a flat floor so tiny
+    // horizons still allow startup/election churn.
+    const std::uint64_t per_tick = 256ULL * nodes * nodes;
+    return horizon * per_tick + 1'000'000ULL;
+}
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -478,7 +505,13 @@ inline Tick compute_deadline(const ClusterConfig* cfg) {
     // workload+fault+settle horizon, then STOP (later heartbeats stay pending).
     // Deterministic: the deadline is a pure fn of cfg, so replays are identical.
     const Tick deadline = detail::compute_deadline(&cfg);
-    st->sched.run_until(deadline);
+    // DEFENSE-IN-DEPTH: bound the resume-steps for this window. With a correct impl
+    // the deadline is reached with steps to spare and finished==true. A zero-virtual-
+    // time storm (the InstallSnapshot livelock class) trips the cap → finished==false
+    // → progress_stalled, which a test surfaces as a LOUD failure (host never hangs).
+    const std::uint64_t step_cap = detail::compute_step_cap(&cfg);
+    const bool finished = st->sched.run_until(deadline, step_cap);
+    st->run.progress_stalled = !finished;
 
     // Final snapshot + reconstruct the committed log (cross-check payload).
     detail::snapshot(st);

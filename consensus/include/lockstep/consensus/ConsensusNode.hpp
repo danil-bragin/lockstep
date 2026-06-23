@@ -216,6 +216,31 @@ public:
 
     // This node's id (== its INetwork Endpoint id). Stable for the node's life.
     [[nodiscard]] virtual std::uint64_t id() const noexcept = 0;
+
+    // ---- C4.3 snapshot introspection (OPTIONAL; default no-op) -------------
+    // These are NOT part of the safety-observable surface (the five conformance
+    // checkers read only role/term/log/commit_index above). They exist so the
+    // snapshot conformance test can MEASURE compaction (the log prefix actually
+    // discarded) and detect that a lagging follower was caught up by
+    // InstallSnapshot, WITHOUT changing observable behavior. A node that does not
+    // implement snapshotting (teeth stubs, the always-follower baseline) keeps the
+    // defaults — zero, i.e. "never compacted", which is honest for it.
+
+    // snapshot.lastIncludedIndex: the absolute index through which this node has
+    // snapshotted + DISCARDED its in-memory log prefix (0 = no snapshot yet).
+    [[nodiscard]] virtual Index snapshot_index() const noexcept { return 0; }
+
+    // The number of entries PHYSICALLY retained in memory (the compacted suffix).
+    // With snapshotting this is bounded; without it, it equals the full log length.
+    [[nodiscard]] virtual std::size_t physical_log_size() const noexcept { return 0; }
+
+    // Monotone counters: how many times this node took a snapshot / adopted a
+    // leader's snapshot via InstallSnapshot. Prove compaction + catch-up actually
+    // fired (the test asserts these are non-zero across the sweep — non-vacuous).
+    [[nodiscard]] virtual std::uint64_t snapshots_taken() const noexcept { return 0; }
+    [[nodiscard]] virtual std::uint64_t snapshots_installed() const noexcept {
+        return 0;
+    }
 };
 
 // ----------------------------------------------------------------------------
