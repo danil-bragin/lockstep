@@ -72,6 +72,16 @@ using lockstep::storage::Snapshot;
 using lockstep::storage::Value;
 using lockstep::storage::WalEngine;
 
+// printf-friendly view of an optional<Value> (Value == std::string). The
+// explicit if-guard makes the not-engaged case unmistakable to the optional
+// checker (a `o.has_value() ? o->c_str() : "nil"` ternary it cannot model).
+const char* opt_cstr(const std::optional<Value>& o) {
+    if (o.has_value()) {
+        return o->c_str();
+    }
+    return "nil";
+}
+
 int g_failures = 0;
 
 #define CHECK(cond, ...)                                                          \
@@ -375,8 +385,7 @@ void test_crash_consistency() {
                              static_cast<unsigned long long>(crash_step),
                              static_cast<unsigned long long>(tip), k.c_str(),
                              static_cast<unsigned long long>(at),
-                             want.has_value() ? want->c_str() : "nil",
-                             got.has_value() ? got->c_str() : "nil");
+                             opt_cstr(want), opt_cstr(got));
                 break;  // one witness per seed is enough
             }
         }
@@ -533,12 +542,8 @@ void test_mvcc_concurrent() {
                              static_cast<unsigned long long>(seed),
                              res.probe_keys[i].c_str(),
                              static_cast<unsigned long long>(res.snap.at),
-                             res.reads_at_snap_early[i].has_value()
-                                 ? res.reads_at_snap_early[i]->c_str()
-                                 : "nil",
-                             res.reads_at_snap_late[i].has_value()
-                                 ? res.reads_at_snap_late[i]->c_str()
-                                 : "nil");
+                             opt_cstr(res.reads_at_snap_early[i]),
+                             opt_cstr(res.reads_at_snap_late[i]));
                 break;
             }
         }

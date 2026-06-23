@@ -20,7 +20,13 @@ set_property(CACHE LOCKSTEP_SANITIZER PROPERTY STRINGS "" asan tsan ubsan msan)
 
 add_library(lockstep_sanitizers INTERFACE)
 
+# _san_flags : flags for BOTH compile and link (the sanitizer + the libc++
+#              header include path).
+# _san_link_flags : link-ONLY flags (-stdlib, lib search path, rpath, -lc++/
+#              -lc++abi); passing these at compile time trips
+#              -Werror=unused-command-line-argument.
 set(_san_flags "")
+set(_san_link_flags "")
 
 if(LOCKSTEP_SANITIZER STREQUAL "asan")
   # AddressSanitizer + LeakSanitizer. -fno-omit-frame-pointer for usable traces.
@@ -51,6 +57,35 @@ elseif(LOCKSTEP_SANITIZER STREQUAL "msan")
       -fsanitize-memory-track-origins=2
       -fno-omit-frame-pointer
       -g)
+    # REAL MSan needs the standard library itself built with -fsanitize=memory,
+    # else MSan false-positives in stdlib internals (std::string/optional/map).
+    # tools/docker builds an instrumented libc++ at $LOCKSTEP_MSAN_LIBCXX; when
+    # present, replace the default stdlib with it. Without it, MSan still runs but
+    # WILL emit stdlib false positives (loudly warned).
+    if(DEFINED ENV{LOCKSTEP_MSAN_LIBCXX} AND NOT "$ENV{LOCKSTEP_MSAN_LIBCXX}" STREQUAL "")
+      set(_msan_cxx "$ENV{LOCKSTEP_MSAN_LIBCXX}")
+      message(STATUS "MSan: using instrumented libc++ at ${_msan_cxx}")
+      # Compile-side: drop the default C++ include dirs and point at the
+      # instrumented headers. (-stdlib selects the runtime and is a no-op at
+      # compile under -nostdinc++, so it lives in the link-only list below;
+      # passing it at compile time trips -Werror=unused-command-line-argument.)
+      list(APPEND _san_flags
+        -nostdinc++
+        "-isystem${_msan_cxx}/include/c++/v1")
+      # Link-ONLY: select libc++, the library search path, rpath, and the libs
+      # themselves. Passed at compile time these are unused command-line
+      # arguments and -Werror turns that into a build error.
+      list(APPEND _san_link_flags
+        -stdlib=libc++
+        "-L${_msan_cxx}/lib"
+        "-Wl,-rpath,${_msan_cxx}/lib"
+        -lc++ -lc++abi)
+    else()
+      message(WARNING
+        "MSan WITHOUT an instrumented libc++ (LOCKSTEP_MSAN_LIBCXX unset): "
+        "EXPECT FALSE POSITIVES in stdlib internals. Build the instrumented "
+        "libc++ (tools/docker) for a real MSan run.")
+    endif()
   endif()
 
 elseif(NOT LOCKSTEP_SANITIZER STREQUAL "")
@@ -60,4 +95,7 @@ endif()
 if(_san_flags)
   target_compile_options(lockstep_sanitizers INTERFACE ${_san_flags})
   target_link_options(lockstep_sanitizers INTERFACE ${_san_flags})
+endif()
+if(_san_link_flags)
+  target_link_options(lockstep_sanitizers INTERFACE ${_san_link_flags})
 endif()

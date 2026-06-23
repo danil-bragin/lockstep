@@ -480,6 +480,123 @@ else()
     "consensus_harness_test not built (Phase 4 Stage M pending).")
 endif()
 
+# --- Phase 5 Stage M: distributed-txn verification machinery teeth gate -------
+# P5-MACHINERY gate (specs/CommitOrdering.tla; briefs/phase5.md Stage M). Proves
+# the txn SEAM (txn/Transaction.hpp: the one-shot Transaction + the call-site-
+# visible D5 selector) + the strict-serializable ORACLE + the differential /
+# linearizability HARNESS + the per-D5-level CONSISTENCY CHECKERS have TEETH —
+# BEFORE the real distributed-txn impl exists. Asserts (A) each deliberately-
+# WRONG txn executor is FLAGGED by the checker mapping to the CommitOrdering.tla
+# invariant / D5 rule it breaks (OLLPSound / SerializedBySeqLog / ReadsMatch
+# SerialPrefix / D5ReadYourWrites), with witness + replayable seed; (B) the
+# HONEST executor passes all checkers + makes progress (no false positive) and
+# the no-progress baseline is vacuously safe but caught as making NO progress
+# (vacuous != correct); (C) determinism — same seed => byte-identical rendered
+# outcome (in-test + the external double-run diff under a stable marker). Links
+# ONLY the header-only txn lib (self-contained value-shaped seam + checkers; no
+# scheduler/sim needed at Stage M). Non-provider TU -> forbidden-lint scans it.
+# Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_txn)
+  add_executable(lockstep_txn_harness_test txn_harness_test.cpp)
+  target_include_directories(lockstep_txn_harness_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_txn_harness_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_txn)
+  add_test(NAME txn_harness_test COMMAND lockstep_txn_harness_test)
+else()
+  message(WARNING
+    "lockstep_txn target not found; txn_harness_test not built "
+    "(Phase 5 Stage M pending).")
+endif()
+
+# --- Phase 5 Stage I: the REAL deterministic distributed-txn executor ---------
+# P5-IMPL gate (specs/CommitOrdering.tla; briefs/phase5.md C5.1-C5.6). The FIRST
+# real Lockstep transaction executor (txn/DeterministicExecutor.hpp): one-shot
+# submission (C5.1), Calvin-style deterministic SEQUENTIAL commit ordering over
+# the seqLog (C5.2, no 2PC), OLLP recon + bounded re-sequence at the txn's
+# serialization-point snapshot (C5.3), the four D5 read levels each served to
+# EXACTLY its contract (C5.4/C5.5), deterministic abort/retry + ExactlyOnce apply
+# (C5.6) — backed by the REAL Phase-3 MVCC storage::WalEngine driven on the
+# deterministic core::Scheduler. Asserts, over a seed sweep (<=64 in-gate, env
+# override): the Stage-M DiffHarness + ALL 8 checkers pass with 0 violations
+# (differential-vs-oracle match, strict-serializable/linearizable, each D5 level
+# EXACTLY its contract, OLLP sound + retry terminates, ExactlyOnce) + PROGRESS
+# (txns commit, not vacuous) + DETERMINISM (same seed => byte-identical rendered
+# outcome). Links the txn lib + the real storage engine + runtime + sim PRNG/
+# disk (the executor drives the engine on a scheduler internally). Non-provider
+# TU -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT 90.
+if(TARGET lockstep_txn AND TARGET lockstep_storage AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_sim)
+  add_executable(lockstep_txn_impl_test txn_impl_test.cpp)
+  target_include_directories(lockstep_txn_impl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_txn_impl_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME txn_impl_test COMMAND lockstep_txn_impl_test)
+
+  # --- Phase 5 Stage I: the SECOND, INDEPENDENT txn executor (impl B) ----------
+  # P5-IMPL-B gate (specs/CommitOrdering.tla; briefs/phase5.md; master-plan §6.5).
+  # The DUAL independent transaction executor (txn/IndependentExecutor.hpp): built
+  # FROM THE SPEC, NOT from impl A — a pure value model (history-scan
+  # ValueAfterPrefix; NO MVCC engine, NO scheduler, NO coroutines) so the two impls
+  # do not share a blind spot. Asserts the SAME deliverable as impl A's gate over a
+  # seed sweep (<=64 in-gate, LOCKSTEP_TXN_SEEDS override): the Stage-M DiffHarness
+  # + ALL 8 checkers, 0 violations (differential-vs-oracle, strict-serializable,
+  # each D5 level EXACTLY its contract, OLLP sound + bounded retry, ExactlyOnce) +
+  # PROGRESS + DETERMINISM. Links the txn lib only (the value model needs no engine).
+  # Non-provider TU -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/txn_impl_b_test.cpp")
+    add_executable(lockstep_txn_impl_b_test txn_impl_b_test.cpp)
+    target_include_directories(lockstep_txn_impl_b_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_txn_impl_b_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME txn_impl_b_test COMMAND lockstep_txn_impl_b_test)
+  endif()
+
+  # --- Phase 5 Stage V: DUAL-IMPL CROSS-CHECK GATE (the §6.5 gate) -------------
+  # P5-XCHECK gate (master-plan §6.5; briefs/phase5.md). Runs BOTH independently-
+  # built txn executors (DeterministicExecutor impl A + IndependentExecutor impl B)
+  # on the SAME seed + workload + ExecConfig over a seed sweep and asserts: (1)
+  # CROSS-CHECK — A and B produce the SAME committed effects (per txn: status,
+  # writes, result, seq/version, strict-read values); a divergence at a committed
+  # effect = at least one is wrong (reported with seed + witnessing txn); (2)
+  # CONFORM — both impls individually match the strict-serializable oracle + pass
+  # the 8-checker battery; (3) PROGRESS — commits accumulate (agreement non-
+  # vacuous); (4) DETERMINISM — same seed => byte-identical rendered outcome for
+  # each impl. Links the txn lib + the real storage engine (impl A drives it) +
+  # runtime + sim. Non-provider TU -> forbidden-lint scans it. Inherits TIMEOUT.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/txn_crosscheck_test.cpp")
+    add_executable(lockstep_txn_crosscheck_test txn_crosscheck_test.cpp)
+    target_include_directories(lockstep_txn_crosscheck_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_txn_crosscheck_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME txn_crosscheck_test COMMAND lockstep_txn_crosscheck_test)
+  endif()
+else()
+  message(WARNING
+    "lockstep_txn / storage / runtime / providers_sim not all found; "
+    "txn_impl_test not built (Phase 5 Stage I pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
@@ -487,7 +604,22 @@ endif()
 # off-by-one infinite loop (mid+0 vs mid+1) that hung standalone yet slipped a
 # timeout-less ctest. Deterministic sims finish in well under a second; 90s is a
 # generous ceiling that still kills any true hang fast.
+#
+# SANITIZER SCALING: instrumented builds run several times slower (MSan with
+# origin-tracking ~3-5x, ASan/TSan/UBSan ~2-3x). The heavy consensus seed-sweep
+# tests legitimately spill past 90s under MSan (observed: consensus_impl_a /
+# consensus_crosscheck timed out at 90s while finishing well under a second in a
+# plain build). Scale the ceiling by the sanitizer so the timeout still catches
+# a TRUE hang fast without false-failing slow-but-terminating instrumented runs.
+if(LOCKSTEP_SANITIZER STREQUAL "msan")
+  set(_lockstep_test_timeout 600)   # MSan+origins: the slowest instrumentation
+elseif(NOT LOCKSTEP_SANITIZER STREQUAL "")
+  set(_lockstep_test_timeout 300)   # ASan / TSan / UBSan
+else()
+  set(_lockstep_test_timeout 90)    # plain debug/release
+endif()
 get_property(_lockstep_all_tests DIRECTORY PROPERTY TESTS)
 if(_lockstep_all_tests)
-  set_tests_properties(${_lockstep_all_tests} PROPERTIES TIMEOUT 90)
+  set_tests_properties(${_lockstep_all_tests}
+    PROPERTIES TIMEOUT ${_lockstep_test_timeout})
 endif()
