@@ -553,7 +553,22 @@ endif()
 # off-by-one infinite loop (mid+0 vs mid+1) that hung standalone yet slipped a
 # timeout-less ctest. Deterministic sims finish in well under a second; 90s is a
 # generous ceiling that still kills any true hang fast.
+#
+# SANITIZER SCALING: instrumented builds run several times slower (MSan with
+# origin-tracking ~3-5x, ASan/TSan/UBSan ~2-3x). The heavy consensus seed-sweep
+# tests legitimately spill past 90s under MSan (observed: consensus_impl_a /
+# consensus_crosscheck timed out at 90s while finishing well under a second in a
+# plain build). Scale the ceiling by the sanitizer so the timeout still catches
+# a TRUE hang fast without false-failing slow-but-terminating instrumented runs.
+if(LOCKSTEP_SANITIZER STREQUAL "msan")
+  set(_lockstep_test_timeout 600)   # MSan+origins: the slowest instrumentation
+elseif(NOT LOCKSTEP_SANITIZER STREQUAL "")
+  set(_lockstep_test_timeout 300)   # ASan / TSan / UBSan
+else()
+  set(_lockstep_test_timeout 90)    # plain debug/release
+endif()
 get_property(_lockstep_all_tests DIRECTORY PROPERTY TESTS)
 if(_lockstep_all_tests)
-  set_tests_properties(${_lockstep_all_tests} PROPERTIES TIMEOUT 90)
+  set_tests_properties(${_lockstep_all_tests}
+    PROPERTIES TIMEOUT ${_lockstep_test_timeout})
 endif()

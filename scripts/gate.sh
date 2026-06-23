@@ -153,8 +153,15 @@ header "STAGE 2/8  clang-tidy"
 if have clang-tidy; then
   # Runs against the debug compile_commands.json if present.
   if [ -f build/debug/compile_commands.json ]; then
+    # Lint the .cpp translation units only — they ARE in compile_commands.json,
+    # so includes resolve. Headers are checked transitively via the .clang-tidy
+    # HeaderFilterRegex (passing a .hpp directly has no compile command -> bogus
+    # "file not found"). providers/ is exempt (the nondeterminism quarantine);
+    # tools/ is exempt too (tools/lint/fixtures/dirty/*.cpp are DELIBERATELY-bad
+    # code — rand/sockets/syscalls — that exercise the forbidden-lint, not real
+    # code, so they must not be clang-tidy'd).
     run_stage "clang-tidy" bash -c \
-      'git ls-files "*.cpp" "*.hpp" | grep -v "^providers/" | xargs -r clang-tidy -p build/debug'
+      'git ls-files "*.cpp" | grep -v "^providers/" | grep -v "^tools/" | xargs -r clang-tidy -p build/debug'
   else
     echo "[FAIL] clang-tidy: build/debug/compile_commands.json missing (configure debug first)"
     record "clang-tidy" FAIL
