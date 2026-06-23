@@ -27,6 +27,14 @@
 // Records currently emitted:
 //   random seed <u64>            — the PRNG seed (the whole stream replays from it)
 //   clock now <i64-tick>         — one observed now() return value, in arm order
+//   disk read <at> <len> <errc> <hexbytes>
+//                                — one observed READ: offset, requested length,
+//                                  the returned ErrorCode (decimal), and the bytes
+//                                  actually delivered, lower-hex, no separators
+//                                  (empty on a non-ok read). Reads are the ONLY
+//                                  nondeterministic boundary INPUT a disk replay
+//                                  needs: appends/syncs are deterministic given
+//                                  the data, so the read LOG is sufficient.
 //
 // A REPLAY provider consumes the records of its kind IN ORDER and reproduces the
 // IDENTICAL observations. Because ProdRandom reuses sim's exact splitmix64, the
@@ -41,12 +49,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <lockstep/core/Error.hpp>
+#include <lockstep/core/Future.hpp>
 #include <lockstep/core/IClock.hpp>
+#include <lockstep/core/IDisk.hpp>
 #include <lockstep/core/IRandom.hpp>
 
 namespace lockstep::prod {
@@ -70,11 +81,15 @@ enum class TraceKind : std::uint8_t {
 }
 
 // One recorded boundary observation. `op` and `args` are interpreted per `kind`.
-// Kept stringly + decimal-only so render() is byte-stable across platforms.
+// Kept stringly + decimal-only so render() is byte-stable across platforms. The
+// optional `blob` is a lower-hex byte string appended AFTER the decimal args (the
+// S3 disk read-bytes payload); it is empty for Random/Clock records, so their
+// rendered lines are byte-identical to before this field existed (append-only).
 struct TraceRecord {
     TraceKind kind{};
     std::string op{};
     std::vector<std::int64_t> args{}; // decimal args; u64 seeds stored bit-cast
+    std::string blob{};               // optional lower-hex bytes (disk read data)
 
     [[nodiscard]] std::string render() const {
         std::string out = to_token(kind);
@@ -84,9 +99,46 @@ struct TraceRecord {
             out += ' ';
             out += std::to_string(a);
         }
+        if (!blob.empty()) {
+            out += ' ';
+            out += blob;
+        }
         return out;
     }
 };
+
+// Hex codec for the disk read-bytes blob. Lower-hex, two chars per byte, no
+// separators — byte-stable across platforms (no locale, no float).
+[[nodiscard]] inline std::string bytes_to_hex(std::span<const std::byte> b) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(b.size() * 2);
+    for (std::byte by : b) {
+        const auto v = static_cast<unsigned>(std::to_integer<unsigned char>(by));
+        out.push_back(kHex[(v >> 4) & 0xF]);
+        out.push_back(kHex[v & 0xF]);
+    }
+    return out;
+}
+
+[[nodiscard]] inline std::vector<std::byte> hex_to_bytes(const std::string& h) {
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        return 0;
+    };
+    std::vector<std::byte> out;
+    out.reserve(h.size() / 2);
+    for (std::size_t i = 0; i + 1 < h.size(); i += 2) {
+        const int v = (nib(h[i]) << 4) | nib(h[i + 1]);
+        out.push_back(static_cast<std::byte>(v));
+    }
+    return out;
+}
 
 // The trace: an ordered, append-only buffer of records. render() is the canonical
 // byte stream the byte-identical replay proof diffs.
@@ -231,6 +283,129 @@ public:
 private:
     std::vector<core::Tick> samples_{};
     mutable std::size_t cursor_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// DISK record-replay (S3). On prod a READ is the nondeterministic boundary INPUT
+// (the bytes the platter actually returns); append/sync are deterministic given
+// the data stream, so the read LOG is exactly what an offline replay needs.
+// ---------------------------------------------------------------------------
+
+// RecordingDisk — wraps a real ProdDisk (any IDisk) and logs each READ's returned
+// ErrorCode + delivered bytes into the shared trace, in call order. append/sync
+// are forwarded untouched (the wrapper only OBSERVES reads). Because ProdDisk does
+// inline synchronous IO, the wrapped Future is already-ready when it returns, so
+// we can read its delivered bytes straight off `into` to log them — no co_await
+// needed inside the wrapper (and none of the returned span is captured across a
+// suspend, V-RKV1).
+class RecordingDisk final : public core::IDisk {
+public:
+    RecordingDisk(core::IDisk& inner, ReplayTrace& trace) noexcept
+        : inner_(&inner), trace_(&trace) {}
+
+    [[nodiscard]] core::Future<core::Error>
+    append(std::span<const std::byte> data, core::Offset& out_offset) override {
+        return inner_->append(data, out_offset);
+    }
+
+    [[nodiscard]] core::Future<core::Error>
+    read(core::Offset at, std::span<std::byte> into) override {
+        const std::uint64_t want = into.size();
+        core::Future<core::Error> f = inner_->read(at, into);
+        // ProdDisk completes INLINE → f is already-ready here; read its completion
+        // VALUE (the Error, set via set_value) to log the observation. We are not a
+        // coroutine, so we resume the ready awaiter directly to pull the value out
+        // (await_ready() is true; await_resume() returns the value).
+        const core::Error e = completed_value(f);
+        const auto errc = static_cast<std::int64_t>(static_cast<unsigned>(e.code));
+        // On an ok read the bytes in `into` are the delivered payload; on a
+        // non-ok read `into` is unspecified, so we log no bytes (empty blob).
+        std::string hex;
+        if (e.code == core::ErrorCode::Ok) {
+            hex = bytes_to_hex(std::span<const std::byte>(into.data(), into.size()));
+        }
+        TraceRecord rec{TraceKind::Disk, "read",
+                        {static_cast<std::int64_t>(at),
+                         static_cast<std::int64_t>(want), errc},
+                        std::move(hex)};
+        trace_->append(std::move(rec));
+        return f;
+    }
+
+    [[nodiscard]] core::Future<core::Error> sync() override { return inner_->sync(); }
+
+private:
+    // Pull the completion VALUE off an already-ready Future<Error> (the Error set
+    // via set_value, the convention SimDisk/ProdDisk use). await_resume copies the
+    // trivially-copyable Error and leaves the future's stored value intact, so the
+    // real driver may still await `f` and observe the same outcome.
+    static core::Error completed_value(core::Future<core::Error>& f) {
+        auto awaiter = f.operator co_await();
+        return awaiter.await_resume();
+    }
+
+    core::IDisk* inner_;
+    ReplayTrace* trace_;
+};
+
+// ReplayDisk — reproduces the recorded READ observations offline (sim-usable,
+// pure: no syscalls). It consumes the Disk read records IN ORDER and, for each
+// read(), fills `into` with the recorded bytes and returns the recorded
+// ErrorCode. append/sync are replay-inert no-ops (deterministic given the data;
+// nothing to reproduce). This is what makes a prod disk incident replayable.
+class ReplayDisk final : public core::IDisk {
+public:
+    explicit ReplayDisk(const ReplayTrace& trace, core::Scheduler& sched)
+        : sched_(&sched) {
+        for (const TraceRecord& r : trace.records()) {
+            if (r.kind == TraceKind::Disk && r.op == "read") {
+                reads_.push_back(ReadObs{r.args.size() > 2 ? r.args[2] : 0,
+                                         hex_to_bytes(r.blob)});
+            }
+        }
+    }
+
+    [[nodiscard]] core::Future<core::Error>
+    append(std::span<const std::byte> /*data*/, core::Offset& out_offset) override {
+        out_offset = 0; // deterministic; appends are not replayed from the trace
+        return ready(core::Error{});
+    }
+
+    [[nodiscard]] core::Future<core::Error>
+    read(core::Offset /*at*/, std::span<std::byte> into) override {
+        if (cursor_ >= reads_.size()) {
+            return ready(core::Error{core::ErrorCode::NotFound, "replay trace exhausted"});
+        }
+        const ReadObs& obs = reads_[cursor_++];
+        const auto code = static_cast<core::ErrorCode>(static_cast<std::uint16_t>(obs.errc));
+        if (code == core::ErrorCode::Ok) {
+            const std::size_t n = into.size() < obs.bytes.size() ? into.size()
+                                                                 : obs.bytes.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                into[i] = obs.bytes[i];
+            }
+        }
+        return ready(core::Error{code, "replay"});
+    }
+
+    [[nodiscard]] core::Future<core::Error> sync() override { return ready(core::Error{}); }
+
+private:
+    struct ReadObs {
+        std::int64_t errc = 0;
+        std::vector<std::byte> bytes{};
+    };
+
+    [[nodiscard]] core::Future<core::Error> ready(core::Error e) {
+        core::Promise<core::Error> p = core::make_promise<core::Error>(sched_);
+        core::Future<core::Error> f = p.get_future();
+        p.set_value(e);
+        return f;
+    }
+
+    core::Scheduler* sched_;
+    std::vector<ReadObs> reads_{};
+    std::size_t cursor_ = 0;
 };
 
 } // namespace lockstep::prod

@@ -859,6 +859,38 @@ else()
     "prod_provider_test not built (Phase 7 S2 pending).")
 endif()
 
+# --- Phase 7 S3: PROD Disk conformance + crash-injection + disk record-replay -
+# P7-S3 gate (briefs/phase7.md S3; V-PROD-CONTRACT + V-PROD-REPLAY). Runs the
+# REUSABLE S1 universal IDisk suite (conformance::universal::check_disk_contract)
+# VERBATIM against the PROD file-backed disk (prod::ProdDisk) via a ProdDiskFactory
+# with the SAME member shape as the S1 SimDiskFactory; a CRASH-INJECTION durability
+# test over a REAL temp file (synced survives close+reopen byte-identical; nothing
+# synced lost — no lying fsync; un-synced tail may be absent); and a disk
+# RECORD->REPLAY byte-identity proof. tests/ is on the include path so
+# "provider_conformance/..." resolves. Links the header-only runtime + sim + prod
+# providers. Non-provider TU -> forbidden-lint scans it (NO <chrono>/<random>/
+# <thread>, NO raw file IO here; all real disk IO stays in providers/prod/). The
+# test owns a UNIQUE mkdtemp scratch dir and cleans up after itself. Inherits the
+# dir-wide TIMEOUT.
+if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim
+   AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_disk_test prod_disk_test.cpp)
+  target_include_directories(lockstep_prod_disk_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_disk_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_sim
+      lockstep_providers_prod)
+  add_test(NAME prod_disk_test COMMAND lockstep_prod_disk_test)
+else()
+  message(WARNING
+    "lockstep_runtime / providers_sim / providers_prod not all found; "
+    "prod_disk_test not built (Phase 7 S3 pending).")
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
