@@ -91,6 +91,11 @@ using core::Promise;
 struct NodeAddr {
     std::uint64_t id = 0;
     std::uint16_t port = 0;
+    // Dial host for this peer. Default 127.0.0.1 (single-host / loopback cluster, the
+    // historical behavior). A CROSS-MACHINE cluster records each peer's real IP/hostname
+    // here (via add_peer(id, host, port)) so outbound connect() dials it instead of
+    // loopback. Empty/unset => treated as 127.0.0.1.
+    std::string host = "127.0.0.1";
 };
 
 // The 4-byte LE length prefix size + the HELLO id size (8-byte LE node id sent as
@@ -317,12 +322,17 @@ public:
     // socket here. A node's outbound send() to that peer dials 127.0.0.1:port via this
     // address-map entry (the peer LISTENS in its OWN process). Used to teach this
     // process where its peers live. Idempotent / overwrites the recorded port.
-    void add_peer(std::uint64_t id, std::uint16_t port) { record_port(id, port); }
+    // Loopback overload (host defaults to 127.0.0.1) — historical single-host callers.
+    void add_peer(std::uint64_t id, std::uint16_t port) { record_port(id, "127.0.0.1", port); }
+    // CROSS-MACHINE overload: record a peer's real (host, port) so connect() dials it.
+    void add_peer(std::uint64_t id, const std::string& host, std::uint16_t port) {
+        record_port(id, host.empty() ? "127.0.0.1" : host, port);
+    }
 
     // Per-node INetwork handle. The node must already be add_node()'d.
     [[nodiscard]] ProdNetwork* node(std::uint64_t id);
 
-    // The recorded loopback port of a peer (0 if unknown). Used by connect().
+    // The recorded port of a peer (0 if unknown). Used by connect().
     [[nodiscard]] std::uint16_t port_of(std::uint64_t id) const noexcept {
         for (const NodeAddr& a : addrs_) {
             if (a.id == id) {
@@ -332,10 +342,22 @@ public:
         return 0;
     }
 
-    void record_port(std::uint64_t id, std::uint16_t port) {
+    // The recorded dial host of a peer ("127.0.0.1" if unknown). Used by connect().
+    [[nodiscard]] std::string host_of(std::uint64_t id) const {
+        for (const NodeAddr& a : addrs_) {
+            if (a.id == id) {
+                return a.host.empty() ? std::string("127.0.0.1") : a.host;
+            }
+        }
+        return "127.0.0.1";
+    }
+
+    void record_port(std::uint64_t id, std::uint16_t port) { record_port(id, "127.0.0.1", port); }
+    void record_port(std::uint64_t id, const std::string& host, std::uint16_t port) {
         for (NodeAddr& a : addrs_) {
             if (a.id == id) {
                 a.port = port;
+                a.host = host;
                 return;
             }
         }
@@ -345,7 +367,7 @@ public:
             ++pos;
         }
         addrs_.insert(addrs_.begin() + static_cast<std::ptrdiff_t>(pos),
-                      NodeAddr{id, port});
+                      NodeAddr{id, port, host});
     }
 
 private:
@@ -514,7 +536,13 @@ private:
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = ::htons(port);
-        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        // Dial the peer's recorded host (127.0.0.1 for a single-host cluster; a real IP for
+        // a cross-machine cluster taught via add_peer(id, host, port)).
+        const std::string peer_host = bus_->host_of(to.id);
+        if (::inet_pton(AF_INET, peer_host.c_str(), &addr.sin_addr) != 1) {
+            ::close(fd);
+            return nullptr;
+        }
         const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
         const bool connected_now = (rc == 0);
         if (rc != 0 && errno != EINPROGRESS) {
@@ -1111,7 +1139,16 @@ inline bool ProdNetworkBus::add_node_on_port(std::uint64_t id, std::uint16_t wan
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = ::htons(want_port); // 0 == ephemeral; >0 == fixed (cross-process)
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    // Bind address: 127.0.0.1 by default (single-host cluster, unreachable from outside).
+    // A CROSS-MACHINE cluster sets LOCKSTEP_BIND_ADDR=0.0.0.0 so the listen socket accepts
+    // connections from peers on other hosts. (getenv is a prod-provider read, not in core.)
+    const char* bind_addr = std::getenv("LOCKSTEP_BIND_ADDR");
+    if (bind_addr == nullptr || bind_addr[0] == '\0') {
+        bind_addr = "127.0.0.1";
+    }
+    if (::inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    }
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         ::close(fd); // fixed port already taken: fail fast (the caller does NOT spin)
         return false;

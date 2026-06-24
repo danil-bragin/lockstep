@@ -106,6 +106,7 @@ namespace consensus = lockstep::consensus;
 struct Peer {
     std::uint64_t id = 0;
     std::uint16_t port = 0;
+    std::string host = "127.0.0.1";  // dial host; 127.0.0.1 for a single-host cluster
 };
 
 struct Args {
@@ -189,22 +190,38 @@ std::uint64_t parse_u64(const char* s, std::uint64_t fallback) {
     return (end != nullptr && *end == '\0') ? static_cast<std::uint64_t>(v) : fallback;
 }
 
-// Parse "id:port" into a Peer. Returns false on a malformed token.
+// Parse a peer token into a Peer. Accepts BOTH:
+//   "id:port"        -> host defaults to 127.0.0.1 (single-host cluster, historical)
+//   "id:host:port"   -> CROSS-MACHINE: dial `host` (an IP) for this peer
+// Returns false on a malformed token.
 bool parse_peer(const char* s, Peer& out) {
     if (s == nullptr) {
         return false;
     }
-    const char* colon = std::strchr(s, ':');
-    if (colon == nullptr || colon == s || colon[1] == '\0') {
+    const char* c1 = std::strchr(s, ':');
+    if (c1 == nullptr || c1 == s || c1[1] == '\0') {
         return false;
     }
-    const std::string id_str(s, colon);
+    const std::string id_str(s, c1);
     const std::uint64_t id = parse_u64(id_str.c_str(), 0);
-    const std::uint64_t port = parse_u64(colon + 1, 0);
+    std::string host = "127.0.0.1";
+    std::uint64_t port = 0;
+    const char* c2 = std::strchr(c1 + 1, ':');
+    if (c2 == nullptr) {
+        // id:port
+        port = parse_u64(c1 + 1, 0);
+    } else {
+        // id:host:port
+        if (c2 == c1 + 1 || c2[1] == '\0') {
+            return false;
+        }
+        host.assign(c1 + 1, c2);
+        port = parse_u64(c2 + 1, 0);
+    }
     if (id == 0 || port == 0 || port > 65535) {
         return false;
     }
-    out = Peer{id, static_cast<std::uint16_t>(port)};
+    out = Peer{id, static_cast<std::uint16_t>(port), host};
     return true;
 }
 
@@ -466,7 +483,7 @@ int main(int argc, char** argv) {
     cluster.reserve(args.peers.size());
     for (const Peer& p : args.peers) {
         if (p.id != args.node_id) {
-            bus.add_peer(p.id, p.port);
+            bus.add_peer(p.id, p.host, p.port);
         }
         cluster.push_back(p.id);
     }
