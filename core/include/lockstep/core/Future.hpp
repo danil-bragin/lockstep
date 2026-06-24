@@ -29,6 +29,7 @@
 #include <lockstep/core/Error.hpp>
 #include <lockstep/core/Trace.hpp>
 #include <lockstep/core/detail/SchedulerSink.hpp>
+#include <lockstep/core/detail/SharedStatePool.hpp>
 
 namespace lockstep::core {
 
@@ -282,8 +283,21 @@ private:
 inline Future<void> Promise<void>::get_future() noexcept { return Future<void>(state_); }
 
 // Helpers to mint a fresh Promise/Future pair bound to a scheduler sink.
+//
+// S8.7 — the SharedState storage is drawn from the sink's per-scheduler pool via
+// std::allocate_shared (the fused control-block + SharedState<T> block is recycled on
+// last-reference-drop, not heap-freed). Ownership semantics are UNCHANGED: still a
+// std::shared_ptr whose refcount drives the recycle point, exactly as make_shared did —
+// so there is no use-after-free and the sim stays byte-identical (pure memory reuse).
+// If no sink is given (sink == nullptr, a degenerate test path), fall back to a plain
+// heap allocation since there is no pool to draw from.
 template <class T>
 [[nodiscard]] Promise<T> make_promise(detail::SchedulerSink* sink) {
+    if (sink != nullptr) {
+        return Promise<T>(std::allocate_shared<detail::SharedState<T>>(
+            detail::PoolAllocator<detail::SharedState<T>>(&sink->shared_state_pool()),
+            sink));
+    }
     return Promise<T>(std::make_shared<detail::SharedState<T>>(sink));
 }
 

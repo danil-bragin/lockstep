@@ -56,6 +56,19 @@ if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
       lockstep_runtime)
   add_test(NAME scheduler_timer_order COMMAND lockstep_scheduler_timer_order_test)
 
+  # --- S8.7 SharedState pool: recycle-on-last-drop, no early recycle ---
+  # Locks the per-sink SharedState pool's load-bearing safety: a freed slot is
+  # RECYCLED by the next mint, a still-held slot is NEVER aliased, and a
+  # set-but-not-consumed state survives a dropped Promise (the no-UAF argument made
+  # executable). Header-only runtime; ASan/UBSan watch the churn loop for any UAF.
+  add_executable(lockstep_shared_state_pool_test shared_state_pool_test.cpp)
+  target_link_libraries(lockstep_shared_state_pool_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime)
+  add_test(NAME shared_state_pool COMMAND lockstep_shared_state_pool_test)
+
   # --- Phase 1 ADVERSARIAL determinism gate (P1-VERIFY, independent author) ---
   # The FULL gate the brief P1-VERIFY calls for: the ping-pong gate (3 spec
   # assertions), a multi-seed sweep, a forced-bug byte-reproducibility check, and

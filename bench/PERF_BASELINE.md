@@ -520,3 +520,115 @@ unchanged** (~17k 1-node, ~15–24k 3-node at depth) because the persist path wa
   is the fsyncs-per-commit measurement (0.016 at depth) proving the coalescing.
 - Profiling counters are prod-only (`ProdDisk`/`lockstepd`); they feed NO ordering and do NOT
   exist in the sim, so determinism + the A-vs-B cross-check are untouched.
+
+---
+
+# S8.7 — POOL the Future SharedState (cut the dominant explicit per-op alloc)
+
+> **OPTIMIZATION (core change), proven no-regression by sim BYTE-IDENTICAL determinism.**
+> Touches `core/Future.hpp` + `core/detail/SchedulerSink.hpp` + a new
+> `core/detail/SharedStatePool.hpp` — the MOST fundamental async primitive, used by the
+> sim Scheduler, the prod ProdReactor, and every consensus/txn/storage/query coroutine.
+> The spec is UNCHANGED (no behavior change); the load-bearing proof is that the
+> deterministic sim renders BYTE-IDENTICAL traces/committed-logs/fingerprints before vs
+> after (a correct memory pool changes only WHERE objects live, never values or order).
+
+## What + why
+
+S8.6 measured ~31 heap allocs per committed op on the single reactor thread. The
+tractable, dominant EXPLICIT allocation is `std::make_shared<SharedState<T>>` minted
+once per Promise/Future pair (one per disk op, net send, timer, KV op, …). S8.7
+RECYCLES that storage with a per-scheduler-sink object pool instead of heap-freeing it.
+
+## The pool (where it lives, the recycle point, the no-UAF argument)
+
+- **Lives in `SchedulerSink`** (the abstract base both `core::Scheduler` and
+  `prod::ProdReactor` implement) as a concrete `SharedStatePool` member — so BOTH the
+  sim and prod inherit their OWN pool; it is freed with the sink. `make_promise<T>(sink)`
+  (the single mint chokepoint, ~40 call sites) routes the SharedState allocation through
+  it via `std::allocate_shared<SharedState<T>>(PoolAllocator{&pool}, sink)`.
+- **Ownership UNCHANGED.** Still a `std::shared_ptr`; the Promise, the Future, and the
+  FutureAwaiter all hold copies exactly as before. The refcount still drives lifetime.
+  Only the allocator changed.
+- **RECYCLE POINT == last-reference-drop, EXACTLY as today.** `allocate_shared` fuses the
+  control block + `SharedState<T>` into ONE block; when the LAST `shared_ptr` reference
+  drops, the library destroys the object and calls the pool allocator's `deallocate()`,
+  which links the block onto a per-size free list instead of returning it to the OS. So a
+  slot is recycled at PRECISELY the instant the old `make_shared` block would have been
+  `delete`d: after BOTH the Promise set it AND the awaiter consumed it (whichever
+  shared_ptr is last). **No earlier recycle ⇒ no use-after-free, no recycling a slot a
+  coroutine still references.** The allocator copy travels with the control block, so a
+  block always returns to the pool it came from (no cross-pool corruption). Single-thread
+  with the sink (L6): plain vectors, no atomics.
+- A dedicated unit test (`shared_state_pool`) locks this: a freed slot IS recycled by the
+  next mint, a still-held slot is NEVER aliased, and a set-but-not-consumed state survives
+  a dropped Promise (the no-UAF property made executable). ASan/UBSan clean over a
+  20k-cycle churn loop.
+
+## BYTE-IDENTICAL determinism (the strongest no-regression proof)
+
+Stash the change, capture the rendered output, restore, capture again, `diff`:
+
+```
+runtime_determinism (full event trace incl promise_set/schedule/resume) : IDENTICAL
+seed_sweep (multi-seed fingerprints)                                     : IDENTICAL
+consensus_crosscheck (A-vs-B committed-log cross-check)                  : IDENTICAL
+```
+
+All three diffs are EMPTY — the pool is invisible to output, as a pure memory-reuse
+optimization must be (ordering keys are arm/enqueue SEQUENCE numbers, never addresses).
+
+## Safety (the change is used by EVERYTHING)
+
+- **ASan + TSan + UBSan: all 40 ctests PASS under each** (use-after-free / double-free /
+  lost-wakeup are the risks; none triggered). Mac `gate.sh` green.
+- **Consensus**: A-vs-B cross-check + 5 conformance checkers + N=1 + membership + snapshot
+  all PASS, byte-identical. **TLC unaffected** (no spec change).
+- **Prod (container, Release)**: `prod_cluster_smoke` **ALL PASS** (replication agreement +
+  kill/restart catch-up); `prod_jepsen` **ALL 3 SCENARIOS PASS** — `acked=32 durable=32`,
+  ZERO committed-acked entries lost, no split-brain, V-XCHECK order held.
+- **clang-tidy clean** on the new pool headers (clang-analyzer owning-memory /
+  use-after-free / member-init all pass).
+
+## ALLOC/OP before → after (container, Release, `-DLOCKSTEP_PROFILE_ALLOC`, 1-node depth-16, count=4000)
+
+| | allocs/op | the `<=128` bucket (the SharedState make_shared block) |
+|--|-----------|--------------------------------------------------------|
+| BEFORE | **31.15** | 13,411 allocs (~3.35/op) |
+| AFTER  | **27.89** | **706 allocs (~0.18/op)** |
+
+**−3.26 allocs/op (~10.5%).** The `<=128` bucket — which held the fused
+`make_shared<SharedState<T>>` blocks — collapsed from 13,411 to 706 (a drop of 12,705
+allocs ≈ **3.18/op**, almost exactly the total −3.26/op gain). That ~12.7k WAS the
+SharedState allocation; pooling recycled it away. The 706 still in `<=128` are OTHER
+64–128 B allocations on the path (small std::function / string-buffer mints), not
+SharedState — SharedState's own contribution to that bucket is now ~0. The remaining ~28
+allocs/op live in the `<=32`/`<=64` buckets and ARE the coroutine frames
+(compiler-controlled) + small payload strings — the RESIDUAL next cost (secondary; frame
+elision is harder and not chased here).
+
+## COMMIT throughput before → after (container, Release, median of 3 fresh passes, count=4000, value=16B)
+
+| config | depth | BEFORE commit_tput | AFTER commit_tput |
+|--------|-------|--------------------|-------------------|
+| 1-node | 1     | 3795.8             | 3960.6            |
+| 1-node | 64    | 16579.7            | **17252.0**       |
+| 3-node | 1     | 802.8              | 803.6             |
+| 3-node | 64    | 13180.4 (hi var)   | 18191.9 (hi var)  |
+
+**HONEST:** the 1-node depth-64 ceiling moved 16.6k → 17.3k (~+4%), which is WITHIN this
+contended container's run-to-run variance band (BEFORE max 17.8k, AFTER min 16.7k). So the
+proximate, clean, load-independent WIN is the alloc reduction (−3.3 allocs/op, the
+SharedState bucket eliminated); throughput is at-or-slightly-above baseline. Throughput did
+not jump because the ~28 residual allocs/op are coroutine frames that still dominate the
+per-op reactor CPU (the S8.1 standing finding) — the SharedState alloc was ~10% of the
+explicit churn, so removing it is a ~10% explicit-alloc win, not a throughput multiplier.
+The ceiling is unchanged-to-slightly-up; the RESIDUAL lever is coroutine-frame elision.
+
+## Honest caveats (S8.7)
+
+- **Laptop container, `--cpus=4`, real wall-clock** — throughput numbers are relative,
+  high-variance; the alloc/op COUNT is load-independent and is the firm receipt.
+- The pool is **pure memory reuse**: the sim is byte-identical (proven), so the win is
+  fewer allocations, not different behavior. Coroutine frames are the next alloc cost and
+  are NOT addressed here (compiler-controlled; would need HALO/frame-elision work).

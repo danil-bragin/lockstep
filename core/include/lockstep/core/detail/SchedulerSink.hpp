@@ -12,6 +12,7 @@
 #include <string>
 
 #include <lockstep/core/Trace.hpp>
+#include <lockstep/core/detail/SharedStatePool.hpp>
 
 namespace lockstep::core::detail {
 
@@ -20,6 +21,15 @@ namespace lockstep::core::detail {
 class SchedulerSink {
 public:
     virtual ~SchedulerSink() = default;
+
+    // S8.7 — the per-sink SharedState pool. make_promise<T>() mints the Future/Promise
+    // shared state through this pool's allocator so a completed+consumed SharedState's
+    // storage is RECYCLED (free-listed) instead of heap-freed, eliminating the dominant
+    // per-op make_shared allocation. The pool is a CONCRETE member of this abstract base
+    // so BOTH the sim Scheduler and the prod ProdReactor inherit it; it lives and dies
+    // with the sink (freed in ~SharedStatePool). It is pure memory reuse — INVISIBLE to
+    // output, so the sim stays byte-identical. Single-threaded with the sink (L6).
+    [[nodiscard]] SharedStatePool& shared_state_pool() noexcept { return ss_pool_; }
 
     // Schedule a coroutine onto the ready queue (FIFO). This is the ONLY way a
     // waiter is ever resumed after suspension — promise fulfillment and task
@@ -33,6 +43,11 @@ public:
 
     // Current virtual time, for trace stamping at the primitive layer.
     [[nodiscard]] virtual std::int64_t vtime() const noexcept = 0;
+
+private:
+    // S8.7 — recycled storage for Future/Promise SharedState. One per sink; never shared
+    // across sinks (sim and prod each own theirs). Freed with the sink.
+    SharedStatePool ss_pool_{};
 };
 
 } // namespace lockstep::core::detail
