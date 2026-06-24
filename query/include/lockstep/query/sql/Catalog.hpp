@@ -282,6 +282,48 @@ inline void put_pk_int(std::string& out, std::int64_t v) {
     return row;
 }
 
+// PROJECTED / LAZY decode (the scan-decode optimization). Decode ONLY the columns in
+// `need` (true == decode this column index); the rest are SKIPPED — for an INT field
+// we step over its fixed 8 bytes, for a TEXT field we step over its length WITHOUT
+// copying the bytes (the dominant cost on a wide TEXT row). The PK is always cheap
+// (reconstructed from the key) so it is decoded iff needed. Skipped columns are left
+// default-constructed (Datum{} == INT 0) — the caller MUST only read columns it asked
+// for (the v2 pipeline computes `need` from projection + WHERE + GROUP BY + aggregates).
+// PURE inverse over the needed subset; byte-identical to decode_row for those columns,
+// so the conformance gate (== full-decode reference) still proves equality.
+[[nodiscard]] inline std::vector<Datum> decode_row_projected(
+    const Table& t, const Key& key, const Value& value,
+    const std::vector<bool>& need) {
+    std::vector<Datum> row(t.columns.size());
+    if (need[t.pk_index]) {
+        row[t.pk_index] = decode_pk(t, key);
+    }
+    std::size_t off = 0;
+    for (std::size_t c = 0; c < t.columns.size(); ++c) {
+        if (c == t.pk_index) {
+            continue;
+        }
+        const Type ty = static_cast<Type>(static_cast<unsigned char>(value[off]));
+        off += 1;
+        const std::uint32_t len = get_be32(value, off);
+        off += 4;
+        if (need[c]) {
+            if (ty == Type::Int) {
+                std::uint64_t bits = 0;
+                for (std::uint32_t b = 0; b < len; ++b) {
+                    bits = (bits << 8) | static_cast<unsigned char>(value[off + b]);
+                }
+                row[c] = Datum::make_int(static_cast<std::int64_t>(bits));
+            } else {
+                row[c] = Datum::make_text(value.substr(off, len));
+            }
+        }
+        // else: SKIP the field bytes (no copy, no parse) — just advance the offset.
+        off += len;
+    }
+    return row;
+}
+
 // ----------------------------------------------------------------------------
 // THE CATALOG — table name -> schema. Deterministic dense table-id assignment (in
 // CREATE order). An ordered map => deterministic iteration. No ambient state.

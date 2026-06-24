@@ -27,14 +27,23 @@
 //   sql_bench_driver --rows N       — override the table size
 //   sql_bench_driver --iters K      — override the per-shape repetition count
 //
-// FLAG (a real finding, NOT this stage's task): building the N-row table costs
-// O(N^2) because the v1 write path (Engine::submit_write) re-submits the WHOLE
-// accumulated write-log as one batch per INSERT (so a read-modify-write body sees
-// prior committed state through the verified executor). That is a WRITE-path cost,
-// unrelated to the SQL SELECT pipeline this bench measures; the default N is kept
-// modest (500) so the one-time build does not dominate the per-query numbers. A
-// future write-path optimization (incremental prime instead of full-batch re-submit)
-// would remove it — out of scope here (Database/Engine write semantics UNCHANGED).
+// WRITE-PATH NOTE (the SQL-optimize stage FIXED the dominant O(N^2)): the v1 write
+// path used to re-submit the WHOLE accumulated write-log as one batch per INSERT AND
+// re-prime the full committed history each statement — O(committed) per write, so
+// O(N^2) to build N rows (observed: N=2000 ~18s). The SQL Engine now applies writes
+// INCREMENTALLY: the read-modify-write decision runs in the Engine over the verified
+// read path (a strict point-get of the live committed store), then ONE pure-writer
+// txn commits through the verified executor + Database::apply_committed lands it
+// incrementally (no whole-history rebuild). Build is now ~O(N) of SQL work (observed:
+// N=2000 ~0.04s, ~460x). A RESIDUAL near-quadratic remains in storage (the WalEngine
+// memtable does a LINEAR scan over keys per get/insert — WalEngine.hpp find/
+// versions_for, "a binary search would do; a linear scan is fine + clear") — that is a
+// PROTECTED storage cost, pre-existing, affecting all workloads, FLAGGED not changed
+// here. The default N stays 500 so the (now cheap) build never dominates the per-query
+// numbers. See bench/PERF_BASELINE.md (the SQL-optimize section) for the before/after.
+//
+// --build-only times JUST the build (the write path); --only <substr> isolates one
+// query shape for external per-shape timing. Everything is BOUNDED (N capped).
 
 #include <cstdint>
 #include <cstdio>
@@ -85,14 +94,17 @@ std::uint64_t fold(std::uint64_t acc, const ExecResult& r) {
     return acc;
 }
 
-// Build an N-row table emp(id INT PK, dept TEXT, sal INT, age INT) deterministically,
-// PLUS a join table dpt(did INT PK, region TEXT) keyed by an INT dept id (0..4), so a
-// 2-table equi-join `emp.deptid = dpt.did` exercises the HASH-JOIN path over N rows.
-// emp gets an extra INT `deptid` column (0..4) that equi-joins to dpt.did.
+// Build an N-row table emp(id INT PK, dept TEXT, sal INT, age INT, deptid INT, bio TEXT)
+// deterministically, PLUS a join table dpt(did INT PK, region TEXT) keyed by an INT dept
+// id (0..4), so a 2-table equi-join `emp.deptid = dpt.did` exercises the HASH-JOIN path
+// over N rows. emp gets an extra INT `deptid` column (0..4) that equi-joins to dpt.did,
+// and a WIDE TEXT `bio` payload column (~64 bytes) the projected/filtered SELECT shapes
+// DO NOT reference — so the lazy/projected decode (skip the unreferenced wide field)
+// is measurable: a `SELECT id` over emp must SKIP copying every row's bio.
 SqlEngine build_table(std::uint64_t n) {
     SqlEngine eng;
     (void)eng.exec(
-        "CREATE TABLE emp (id INT, dept TEXT, sal INT, age INT, deptid INT, "
+        "CREATE TABLE emp (id INT, dept TEXT, sal INT, age INT, deptid INT, bio TEXT, "
         "PRIMARY KEY (id))");
     (void)eng.exec("CREATE TABLE dpt (did INT, region TEXT, PRIMARY KEY (did))");
     const char* regions[] = {"north", "south", "east", "west", "central"};
@@ -107,9 +119,14 @@ SqlEngine build_table(std::uint64_t n) {
         const std::string dept = depts[dx];
         const std::int64_t sal = static_cast<std::int64_t>(rng.below(1000));
         const std::int64_t age = static_cast<std::int64_t>(rng.below(50)) + 18;
-        (void)eng.exec("INSERT INTO emp (id, dept, sal, age, deptid) VALUES (" +
+        // A deterministic ~64-byte payload (no rng-dependent length: fixed width so the
+        // checksum is stable + the skipped-bytes win is uniform across rows).
+        std::string bio = "bio-" + std::to_string(i) + "-";
+        bio.resize(64, static_cast<char>('a' + static_cast<char>(dx)));
+        (void)eng.exec("INSERT INTO emp (id, dept, sal, age, deptid, bio) VALUES (" +
                        std::to_string(i) + ", '" + dept + "', " + std::to_string(sal) +
-                       ", " + std::to_string(age) + ", " + std::to_string(dx) + ")");
+                       ", " + std::to_string(age) + ", " + std::to_string(dx) + ", '" +
+                       bio + "')");
     }
     return eng;
 }
@@ -159,6 +176,10 @@ std::vector<Shape> full_shapes(std::uint64_t n) {
          2000},
         {"filter  full scan + ANY-col predicate",
          "SELECT id, sal FROM emp WHERE sal > 500 AND dept = 'eng'", 2000},
+        {"project full scan, 1 narrow col (skip wide bio)",
+         "SELECT id FROM emp", 2000},
+        {"projfilt full scan + filter, skip wide bio",
+         "SELECT id, sal FROM emp WHERE sal > 500", 2000},
         {"order   full scan + ORDER BY + LIMIT",
          "SELECT id, sal FROM emp ORDER BY sal DESC LIMIT 10", 1000},
         {"groupby full scan + GROUP BY + 5 aggs",
@@ -192,11 +213,17 @@ std::vector<Shape> smoke_shapes(std::uint64_t n) {
 
 int main(int argc, char** argv) {
     bool smoke = false;
+    bool build_only = false;
+    std::string only;  // run ONLY shapes whose label contains this substring
     std::uint64_t n = 500;
     std::uint64_t iters_override = 0;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--smoke") == 0) {
             smoke = true;
+        } else if (std::strcmp(argv[i], "--build-only") == 0) {
+            build_only = true;  // measure ONLY the N-row table build (the write path)
+        } else if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
+            only = argv[++i];  // isolate one shape for external per-shape timing
         } else if (std::strcmp(argv[i], "--rows") == 0 && i + 1 < argc) {
             n = static_cast<std::uint64_t>(std::strtoull(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
@@ -209,6 +236,27 @@ int main(int argc, char** argv) {
     }
     if (n == 0) {
         n = 1;
+    }
+    // BOUNDED: cap N so an accidental O(N^2) write path cannot hang the host (the
+    // build-N curve sweep tops out at 8000; a generous cap leaves room without
+    // letting a regression run unbounded).
+    constexpr std::uint64_t kMaxRows = 200000;
+    if (n > kMaxRows) {
+        n = kMaxRows;
+    }
+
+    // --build-only: time JUST the table build (the WRITE path), print a row checksum
+    // proving the rows were really written. Used to chart the build-N curve (the
+    // O(N^2) -> O(N) write fix) WITHOUT the per-query scan cost mixed in.
+    if (build_only) {
+        SqlEngine beng = build_table(n);
+        const ExecResult all = beng.exec("SELECT id, dept, sal, age, deptid FROM emp");
+        std::uint64_t cs = fold(1469598103934665603ULL, all);
+        std::printf("BUILD-ONLY rows=%llu built=%llu checksum=%016llx\n",
+                    static_cast<unsigned long long>(n),
+                    static_cast<unsigned long long>(all.rows.size()),
+                    static_cast<unsigned long long>(cs));
+        return 0;
     }
 
     SqlEngine eng = build_table(n);
@@ -244,6 +292,9 @@ int main(int argc, char** argv) {
 
     std::uint64_t total_iters = parse_iters;
     for (const Shape& sh : shapes) {
+        if (!only.empty() && sh.label.find(only) == std::string::npos) {
+            continue;  // --only: skip non-matching shapes (per-shape isolation timing)
+        }
         const std::uint64_t cs = run_shape(eng, sh);
         total_iters += sh.iters;
         std::printf(" %-38s iters=%-8llu checksum=%016llx\n", sh.label.c_str(),
