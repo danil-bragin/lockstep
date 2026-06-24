@@ -101,6 +101,18 @@ public:
         // is single-threaded by contract; no other thread races it) — known-safe here.
         const char* e = ::getenv("LOCKSTEP_REACTOR_DIAG");  // NOLINT(concurrency-mt-unsafe)
         diag_timers_ = (e != nullptr && e[0] == '1');
+        // PERF (S8.6): the in-memory event trace is a SIM-DETERMINISM artifact. In a
+        // long-lived prod daemon it costs a std::string heap alloc + std::to_string per
+        // scheduler event (many per committed op) AND grows trace_ UNBOUNDEDLY — pure
+        // per-op reactor CPU + memory churn with NO production consumer (nothing in the
+        // prod stack reads ProdReactor::event_trace()). So tracing is OFF by default on
+        // the prod reactor and ON only when LOCKSTEP_REACTOR_TRACE=1 (the determinism /
+        // replay tests that DO render the trace set it). When off, trace() short-circuits
+        // and every hot call site skips building its payload string (traced() guards it),
+        // so the dominant per-op allocation disappears. Read ONCE at construction on the
+        // single reactor thread (single-threaded by contract; no race).
+        const char* te = ::getenv("LOCKSTEP_REACTOR_TRACE");  // NOLINT(concurrency-mt-unsafe)
+        trace_enabled_ = (te != nullptr && te[0] == '1');
     }
 
     ProdReactor(const ProdReactor&) = delete;
@@ -154,7 +166,9 @@ public:
         std::uint64_t id = next_task_id_++;
         h.promise().task_id = id;
         owned_frames_.push_back(h);
-        trace(core::TraceAction::Spawn, std::string("id=") + std::to_string(id));
+        if (trace_enabled_) {
+            trace(core::TraceAction::Spawn, std::string("id=") + std::to_string(id));
+        }
         ready_.push(core::detail::ReadyItem{h, enqueue_seq_++});
     }
 
@@ -224,9 +238,11 @@ public:
             return false;
         }
         insert_handler(fd, events, std::move(on_ready));
-        trace(core::TraceAction::Schedule,
-              std::string("fd_add fd=") + std::to_string(fd) +
-                  " ev=" + std::to_string(events));
+        if (trace_enabled_) {
+            trace(core::TraceAction::Schedule,
+                  std::string("fd_add fd=") + std::to_string(fd) +
+                      " ev=" + std::to_string(events));
+        }
         return true;
     }
 
@@ -263,8 +279,10 @@ public:
         const std::size_t i = handler_index(fd);
         if (i != kNoHandler) {
             handlers_.erase(handlers_.begin() + static_cast<std::ptrdiff_t>(i));
-            trace(core::TraceAction::Schedule,
-                  std::string("fd_del fd=") + std::to_string(fd));
+            if (trace_enabled_) {
+                trace(core::TraceAction::Schedule,
+                      std::string("fd_del fd=") + std::to_string(fd));
+            }
         }
     }
 
@@ -332,13 +350,24 @@ public:
 
     void schedule(std::coroutine_handle<> h, core::TraceAction why,
                   std::string payload) override {
-        trace(why, std::move(payload));
+        if (trace_enabled_) {
+            trace(why, std::move(payload));
+        }
         ready_.push(core::detail::ReadyItem{h, enqueue_seq_++});
     }
 
     std::uint64_t trace(core::TraceAction action, std::string payload) override {
+        // PERF (S8.6): no-op when tracing is off — no trace_ growth, no payload retained.
+        // Hot call sites also guard with traced() so the payload string is never built.
+        if (!trace_enabled_) {
+            return 0;
+        }
         return trace_.record(action, vtime(), std::move(payload));
     }
+
+    // PERF (S8.6): true iff the event trace is enabled. Hot paths gate their payload
+    // string construction on this so a disabled trace costs nothing (no alloc, no append).
+    [[nodiscard]] bool traced() const noexcept { return trace_enabled_; }
 
     // Real monotonic time (ProdClock ns ticks) — the prod analogue of virtual
     // time, used to stamp the trace. Never decreases (steady_clock guarantee).
@@ -358,8 +387,10 @@ public:
         const core::Tick deadline = clock_.now() + (d > 0 ? d : 0);
         const std::uint64_t arm = timer_arm_seq_++;
         timers_.push_back(Timer{deadline, arm, std::move(p)});
-        trace(core::TraceAction::TimerArm,
-              std::string("due=") + std::to_string(deadline) + " arm=" + std::to_string(arm));
+        if (trace_enabled_) {
+            trace(core::TraceAction::TimerArm, std::string("due=") +
+                      std::to_string(deadline) + " arm=" + std::to_string(arm));
+        }
         return f;
     }
 
@@ -514,8 +545,10 @@ private:
     void drain_ready_bounded() {
         for (int n = 0; n < kReadyDrainBudget && !ready_.empty(); ++n) {
             core::detail::ReadyItem item = ready_.pop();
-            trace(core::TraceAction::Resume,
-                  std::string("seq=") + std::to_string(item.seq));
+            if (trace_enabled_) {
+                trace(core::TraceAction::Resume,
+                      std::string("seq=") + std::to_string(item.seq));
+            }
             item.handle.resume(); // the ONE and ONLY resume site (L1)
         }
     }
@@ -602,7 +635,10 @@ private:
         }
         // Fire: fulfilling each Promise SCHEDULES its waiter (L1). Trace each.
         for (Timer& t : firing) {
-            trace(core::TraceAction::TimerFire, std::string("arm=") + std::to_string(t.arm_seq));
+            if (trace_enabled_) {
+                trace(core::TraceAction::TimerFire,
+                      std::string("arm=") + std::to_string(t.arm_seq));
+            }
             t.promise.set_value();
         }
     }
@@ -630,6 +666,11 @@ private:
     std::uint64_t timer_arm_seq_ = 0;                       // timer-arm seq
     std::uint64_t next_task_id_ = 0;                        // spawned-task id seq
     bool stop_ = false;                                     // long-lived-loop break
+
+    // PERF (S8.6) — event tracing OFF by default on the prod reactor (no prod consumer);
+    // LOCKSTEP_REACTOR_TRACE=1 re-enables it for the determinism/replay tests that render
+    // it. When off, trace() is a no-op and hot call sites skip building their payloads.
+    bool trace_enabled_ = false;
 
     // DIAGNOSTIC (S8.2a, env-gated) — max timer-fire lateness vs deadline under load.
     bool diag_timers_ = false;                              // LOCKSTEP_REACTOR_DIAG=1

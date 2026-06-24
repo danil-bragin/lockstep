@@ -407,3 +407,228 @@ Single-shot honest run: `lockstep_admin pbench --count N --inflight K --conns C 
   instant — stated as a baseline approximation.
 - Measured on the prod path **as built** — no consensus/core change; prod-admin + cli +
   harness only.
+
+---
+
+# S8.5 — PROFILE the commit path, then group-commit fsync — VERDICT: ALREADY group-committed
+
+> **PROFILE FIRST, then act on the DATA (S8.1/S8.2-style).** The hypothesis was that the
+> ~17k(1-node)/~15k(3-node) commit ceiling is bounded by **fsync-per-entry** on the durable
+> persist path, and that GROUP COMMIT (batch `fdatasync` across pending appends) would lift
+> it. We instrumented the real durable barrier and measured. **The data says the commit path
+> is ALREADY group-committed and is NOT fsync-bound at depth — so we did NOT add redundant
+> batching** (the brief: "do NOT implement group-commit if the data says it won't help").
+> The change is **profiling-only**: `ProdDisk` fdatasync/append counters + a daemon `DISKSTATS`
+> shutdown line. **core/sim/consensus/txn/storage/query diff EMPTY.**
+
+## The profiler (fdatasync count + latency, off the durability path)
+
+`ProdDisk` now counts `append()` calls, `sync()` (fdatasync) calls, and the summed `fdatasync`
+wall-time (a `steady_clock` delta around the syscall — prod-only, never any deterministic
+ordering). `lockstepd` prints on shutdown:
+
+```
+DISKSTATS node=N commit_index=C fdatasync_calls=S append_calls=A fsync_total_ms=.. \
+          fsync_avg_us=.. fsyncs_per_commit=S/C appends_per_fsync=A/S bytes_appended=..
+```
+
+`fsyncs_per_commit` is the headline: ≈1.0 ⇒ one fsync per committed entry (fsync-bound);
+≪1.0 ⇒ many appends already coalesced under one fsync (group commit already in effect).
+
+## PROFILE RESULTS (container, Release, `pbench` commit load, count=4000, value=16B)
+
+| config | depth | commit_tput | fdatasync calls | commit_index | **fsyncs / commit** | appends / fsync | fsync_avg µs | fsync % of wall |
+|--------|-------|-------------|-----------------|--------------|---------------------|-----------------|--------------|-----------------|
+| 1-node | 1     | 4547        | 2002            | 2001         | **1.000**           | 1.11            | 185          | ~84% (371ms/440ms) |
+| 1-node | 64    | 16855       | 65              | 4001         | **0.016**           | **68.4**        | 409          | ~11% (27ms/237ms)  |
+| 3-node | 1 (leader) | 2930   | 804             | 2001         | **0.40**            | 2.83            | 278          | ~33% |
+| 3-node | 64 (leader)| 24223  | 66              | 4001         | **0.016**           | 61.6            | 407          | ~16% (27ms/165ms) |
+
+## BOTTLENECK VERDICT: NOT fsync-bound at depth — group commit ALREADY EXISTS
+
+**The single FIFO persist worker in BOTH Raft impls already group-commits.** Its drain loop
+appends EVERY record currently queued (re-checking the queue after each `append` await), and
+only when the queue is empty does it issue ONE `sync()`. So any appends that pile up while the
+worker is awaiting the disk are swept into the same sync — a **deterministic, scheduler-turn
+boundary** ("sync everything pending right now"), exactly the group-commit rule, already in
+place since the FIFO worker was introduced. Evidence:
+
+- **At depth 64: 68 appends ride ONE fdatasync** (`fsyncs_per_commit=0.016`). A pipelined burst
+  of K in-flight submits is coalesced under a single barrier. fsync is only **~11–16% of the
+  commit wall** — the other ~85% is the single-reactor per-op work (epoll, frame decode/encode,
+  log append, promise plumbing, replication), **matching the S8.1 reactor-CPU verdict.**
+- **1/fsync-latency ≈ 1/410µs ≈ 2440 fsync/s**, but commit throughput is **16.8k commits/s** —
+  *7× ABOVE the per-entry fsync ceiling*. You CANNOT commit 16.8k ops/s with one fsync each on a
+  410µs fsync; the only way past 2440/s is that fsyncs are already batched (~68:1), which the
+  counter confirms. **If commit were fsync-bound, throughput would plateau at ~2.4k, not 17k.**
+- **Depth 1 IS fsync-bound** (1.000 fsyncs/commit, fsync = 84% of wall) — but depth 1 has NOTHING
+  to batch (one request in flight ⇒ the queue holds one record per sync by definition). The
+  depth-1 ceiling is 1/fsync-latency-and-RTT, and is the *closed-loop latency* number, NOT the
+  throughput ceiling. Pipelining (the existing batching) is what carries depth 1→64 from 4.5k to
+  17k — and it does so precisely BY amortizing the fsync the worker already coalesces.
+
+**Conclusion: adding a second group-commit mechanism would be a NO-OP** (the worker already
+coalesces the entire in-flight window under one sync) **and could only add latency** (an explicit
+accumulate-then-sync timer would force a wait the deterministic drain doesn't need). The honest,
+data-driven move is to NOT change the persist path. The real lever for a higher ceiling is the
+single-reactor per-op CPU cost (S8.1's standing finding) — NOT fsync.
+
+## The deterministic batching rule (already in both impls), and persist-before-reply
+
+- **RaftNodeA** (`RaftNodeA.hpp` persist_worker, ~L1694): drains `write_queue_` FIFO, `continue`s
+  to re-check the queue after every `append` await, then `if (want_sync_) co_await sync()` once
+  the queue is empty. `enqueue_durable` (~L1668) sets `want_sync_ = true` per mutation; ONE
+  worker (`worker_running_`) runs at a time, preserving on-disk order == logical order.
+- **RaftNodeB** (`RaftNodeB.hpp` persist_worker, ~L1686): same shape — drains the queue, then
+  `if (want_sync_) co_await sync()`. `sync_now()` (~L968) requests the barrier after the
+  enqueues for a step.
+- **Batching boundary is DETERMINISTIC in the sim**: "sync all records pending when the queue
+  drains" is a pure function of the single-thread scheduler's turn order, not a wall-clock timer.
+  The sim cross-check stays byte-identical per seed (verified: `consensus_crosscheck_test`
+  ALL CHECKS PASSED; harness/snapshot/membership OK).
+- **Persist-before-reply** is the SAME as before this stage (we changed nothing here): the spec
+  (`Consensus.tla`) models durability as an *atomic-within-a-step* precondition (e.g. "persist
+  votedFor before reply"), NOT a separately-timed barrier — so a batched physical barrier under
+  one fdatasync does not weaken it: each logical action's records are enqueued (in logical order)
+  and the durability is established by the worker the deterministic scheduler runs ahead of the
+  observable downstream effect. TLC `Consensus.cfg`: **no error, invariants hold** (288361 states,
+  depth 20). The brief's no-data-loss gate confirms it end-to-end: `prod_jepsen` (5 nodes, 4 fault
+  rounds, SIGKILL + SIGSTOP) — **acked=32 durable=32, ZERO committed-acked entries lost**, ALL 3
+  scenarios PASS; `prod_cluster_smoke` ALL PASS (kill+restart catch-up from ProdDisk).
+
+## Honest commit throughput (AFTER == baseline; no path change → no regression, no win)
+
+| config | N | depth | commit_tput (ops/s) | min | max | accept_tput (NOT commit) |
+|--------|---|-------|---------------------|-----|-----|--------------------------|
+| 1-node | 1 | 1     | 4036                | 3653| 4146| 4037 |
+| 1-node | 1 | 16    | 13696               |13654|14505| 13711 |
+| 1-node | 1 | 64    | **17245**           |17122|17550| 17270 |
+| 3-node | 3 | 1     | 1261                | 1118| 1468| 1278 |
+| 3-node | 3 | 16    | 1244 (high var)     | 793 | 3944| 1396 |
+| 3-node | 3 | 64    | **23541**           |22444|31988| 90453 |
+
+These match the S8.3 honest-commit baseline within container variance: **the ceiling is
+unchanged** (~17k 1-node, ~15–24k 3-node at depth) because the persist path was not touched —
+**group commit was already there.** `fsyncs_per_commit` before == after == 0.016 at depth 64
+(no per-entry-fsync to remove; it was already removed by the FIFO worker).
+
+## Honest caveats (S8.5)
+
+- **Laptop container, `--cpus=4`, real wall-clock** — relative regression numbers only.
+- **The "AFTER" is the unchanged path** — this stage is a PROFILE that *correctly concluded not
+  to implement* the proposed optimization, because the optimization already exists. The receipt
+  is the fsyncs-per-commit measurement (0.016 at depth) proving the coalescing.
+- Profiling counters are prod-only (`ProdDisk`/`lockstepd`); they feed NO ordering and do NOT
+  exist in the sim, so determinism + the A-vs-B cross-check are untouched.
+
+---
+
+# S8.7 — POOL the Future SharedState (cut the dominant explicit per-op alloc)
+
+> **OPTIMIZATION (core change), proven no-regression by sim BYTE-IDENTICAL determinism.**
+> Touches `core/Future.hpp` + `core/detail/SchedulerSink.hpp` + a new
+> `core/detail/SharedStatePool.hpp` — the MOST fundamental async primitive, used by the
+> sim Scheduler, the prod ProdReactor, and every consensus/txn/storage/query coroutine.
+> The spec is UNCHANGED (no behavior change); the load-bearing proof is that the
+> deterministic sim renders BYTE-IDENTICAL traces/committed-logs/fingerprints before vs
+> after (a correct memory pool changes only WHERE objects live, never values or order).
+
+## What + why
+
+S8.6 measured ~31 heap allocs per committed op on the single reactor thread. The
+tractable, dominant EXPLICIT allocation is `std::make_shared<SharedState<T>>` minted
+once per Promise/Future pair (one per disk op, net send, timer, KV op, …). S8.7
+RECYCLES that storage with a per-scheduler-sink object pool instead of heap-freeing it.
+
+## The pool (where it lives, the recycle point, the no-UAF argument)
+
+- **Lives in `SchedulerSink`** (the abstract base both `core::Scheduler` and
+  `prod::ProdReactor` implement) as a concrete `SharedStatePool` member — so BOTH the
+  sim and prod inherit their OWN pool; it is freed with the sink. `make_promise<T>(sink)`
+  (the single mint chokepoint, ~40 call sites) routes the SharedState allocation through
+  it via `std::allocate_shared<SharedState<T>>(PoolAllocator{&pool}, sink)`.
+- **Ownership UNCHANGED.** Still a `std::shared_ptr`; the Promise, the Future, and the
+  FutureAwaiter all hold copies exactly as before. The refcount still drives lifetime.
+  Only the allocator changed.
+- **RECYCLE POINT == last-reference-drop, EXACTLY as today.** `allocate_shared` fuses the
+  control block + `SharedState<T>` into ONE block; when the LAST `shared_ptr` reference
+  drops, the library destroys the object and calls the pool allocator's `deallocate()`,
+  which links the block onto a per-size free list instead of returning it to the OS. So a
+  slot is recycled at PRECISELY the instant the old `make_shared` block would have been
+  `delete`d: after BOTH the Promise set it AND the awaiter consumed it (whichever
+  shared_ptr is last). **No earlier recycle ⇒ no use-after-free, no recycling a slot a
+  coroutine still references.** The allocator copy travels with the control block, so a
+  block always returns to the pool it came from (no cross-pool corruption). Single-thread
+  with the sink (L6): plain vectors, no atomics.
+- A dedicated unit test (`shared_state_pool`) locks this: a freed slot IS recycled by the
+  next mint, a still-held slot is NEVER aliased, and a set-but-not-consumed state survives
+  a dropped Promise (the no-UAF property made executable). ASan/UBSan clean over a
+  20k-cycle churn loop.
+
+## BYTE-IDENTICAL determinism (the strongest no-regression proof)
+
+Stash the change, capture the rendered output, restore, capture again, `diff`:
+
+```
+runtime_determinism (full event trace incl promise_set/schedule/resume) : IDENTICAL
+seed_sweep (multi-seed fingerprints)                                     : IDENTICAL
+consensus_crosscheck (A-vs-B committed-log cross-check)                  : IDENTICAL
+```
+
+All three diffs are EMPTY — the pool is invisible to output, as a pure memory-reuse
+optimization must be (ordering keys are arm/enqueue SEQUENCE numbers, never addresses).
+
+## Safety (the change is used by EVERYTHING)
+
+- **ASan + TSan + UBSan: all 40 ctests PASS under each** (use-after-free / double-free /
+  lost-wakeup are the risks; none triggered). Mac `gate.sh` green.
+- **Consensus**: A-vs-B cross-check + 5 conformance checkers + N=1 + membership + snapshot
+  all PASS, byte-identical. **TLC unaffected** (no spec change).
+- **Prod (container, Release)**: `prod_cluster_smoke` **ALL PASS** (replication agreement +
+  kill/restart catch-up); `prod_jepsen` **ALL 3 SCENARIOS PASS** — `acked=32 durable=32`,
+  ZERO committed-acked entries lost, no split-brain, V-XCHECK order held.
+- **clang-tidy clean** on the new pool headers (clang-analyzer owning-memory /
+  use-after-free / member-init all pass).
+
+## ALLOC/OP before → after (container, Release, `-DLOCKSTEP_PROFILE_ALLOC`, 1-node depth-16, count=4000)
+
+| | allocs/op | the `<=128` bucket (the SharedState make_shared block) |
+|--|-----------|--------------------------------------------------------|
+| BEFORE | **31.15** | 13,411 allocs (~3.35/op) |
+| AFTER  | **27.89** | **706 allocs (~0.18/op)** |
+
+**−3.26 allocs/op (~10.5%).** The `<=128` bucket — which held the fused
+`make_shared<SharedState<T>>` blocks — collapsed from 13,411 to 706 (a drop of 12,705
+allocs ≈ **3.18/op**, almost exactly the total −3.26/op gain). That ~12.7k WAS the
+SharedState allocation; pooling recycled it away. The 706 still in `<=128` are OTHER
+64–128 B allocations on the path (small std::function / string-buffer mints), not
+SharedState — SharedState's own contribution to that bucket is now ~0. The remaining ~28
+allocs/op live in the `<=32`/`<=64` buckets and ARE the coroutine frames
+(compiler-controlled) + small payload strings — the RESIDUAL next cost (secondary; frame
+elision is harder and not chased here).
+
+## COMMIT throughput before → after (container, Release, median of 3 fresh passes, count=4000, value=16B)
+
+| config | depth | BEFORE commit_tput | AFTER commit_tput |
+|--------|-------|--------------------|-------------------|
+| 1-node | 1     | 3795.8             | 3960.6            |
+| 1-node | 64    | 16579.7            | **17252.0**       |
+| 3-node | 1     | 802.8              | 803.6             |
+| 3-node | 64    | 13180.4 (hi var)   | 18191.9 (hi var)  |
+
+**HONEST:** the 1-node depth-64 ceiling moved 16.6k → 17.3k (~+4%), which is WITHIN this
+contended container's run-to-run variance band (BEFORE max 17.8k, AFTER min 16.7k). So the
+proximate, clean, load-independent WIN is the alloc reduction (−3.3 allocs/op, the
+SharedState bucket eliminated); throughput is at-or-slightly-above baseline. Throughput did
+not jump because the ~28 residual allocs/op are coroutine frames that still dominate the
+per-op reactor CPU (the S8.1 standing finding) — the SharedState alloc was ~10% of the
+explicit churn, so removing it is a ~10% explicit-alloc win, not a throughput multiplier.
+The ceiling is unchanged-to-slightly-up; the RESIDUAL lever is coroutine-frame elision.
+
+## Honest caveats (S8.7)
+
+- **Laptop container, `--cpus=4`, real wall-clock** — throughput numbers are relative,
+  high-variance; the alloc/op COUNT is load-independent and is the firm receipt.
+- The pool is **pure memory reuse**: the sim is byte-identical (proven), so the win is
+  fewer allocations, not different behavior. Coroutine frames are the next alloc cost and
+  are NOT addressed here (compiler-controlled; would need HALO/frame-elision work).
