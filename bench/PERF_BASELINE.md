@@ -958,12 +958,22 @@ Per-op latency = (total wall for `iters` repetitions) / `iters`. Table N = 500 r
 | groupby— full scan + GROUP BY + 5 aggs   | 1 000   | **~1.06 ms**  | scan/decode 500 + grouped fold (COUNT/SUM/MIN/MAX/AVG) |
 | having — GROUP BY + HAVING + ORDER BY    | 1 000   | **~1.05 ms**  | as groupby + HAVING filter + group sort |
 | distinct— full scan + DISTINCT + ORDER   | 1 000   | **~1.05 ms**  | scan/decode 500 + de-dup + sort |
+| join   — 2-table equi-join (hash join)   | 1 000   | **~1.14 ms**  | scan/decode 500 emp + 5 dpt + build hash index + probe (500 matched rows) |
+| joingrp— join + GROUP BY + AVG + ORDER   | 1 000   | **~1.17 ms**  | as join + grouped fold over 5 groups + group sort |
 
 Stable across two runs (variance < ~5%). The point-get is ~3 orders of magnitude cheaper
 than a full-scan query: the **PK fast-path** (a single `Query.get` of the order-preserving
 encoded key) avoids decoding the whole table, while any full-scan filter/aggregate is
 linear in the row count + the decode cost. Parse is ~1 µs and is NOT the bottleneck for any
 executing query — the row decode + pipeline dominates.
+
+The **2-table equi-join** (`emp.deptid = dpt.did`, 500 emp × 5 dpt) lands near the other
+full-scan shapes (~1.14 ms): it takes the **hash-join** path — scan+decode both tables, build
+an ordered hash index on the (tiny) right table's key, probe with each left row. The cost is
+still dominated by the same per-row KV decode of the 500-row left table, not the join itself;
+the build/probe over 500 + 5 rows is cheap on top. Adding GROUP BY + AVG + ORDER over the 5
+joined groups adds little (~+0.03 ms). The join is sugar over the SAME `Query.scan` reads —
+the combine is a pure in-memory step (V-RKV1 deterministic; `std::map` index, no rng).
 
 ## Honest caveats
 

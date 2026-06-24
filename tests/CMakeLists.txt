@@ -970,6 +970,29 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME sql_aggregates_test COMMAND lockstep_sql_aggregates_test)
+
+  # sql_join_test (SQL v3): the EXTENDED FROM surface — INNER / LEFT [OUTER] / comma-
+  # cross joins with ON predicates, qualified columns (table.col + AS alias), multi-
+  # join (left-deep), self-join, 3-table join, and NULL-introducing LEFT joins. Each
+  # is cross-checked == an INDEPENDENT relational reference model (hand-written
+  # join/filter/group/order ops over typed-row maps, NO KV/Database/txn path): joined
+  # rows / default order / NULL semantics (COUNT(col) skips NULL, comparison-with-NULL
+  # is false) / aggregates == the model exactly. The hash-join and nested-loop paths
+  # agree. The TEETH catch a wrong join (LEFT's NULL rows returned for an INNER, or a
+  # dropped ON => cartesian). Still pure sugar over the verified scan surface.
+  add_executable(lockstep_sql_join_test sql_join_test.cpp)
+  target_include_directories(lockstep_sql_join_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_join_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_join_test COMMAND lockstep_sql_join_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "

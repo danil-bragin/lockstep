@@ -102,6 +102,7 @@ enum class Tok : std::uint8_t {
     Ge,       // >=
     Semi,     // ;
     Star,     // *
+    Dot,      // .  (v3: qualified column table.col)
     End,      // end of input
     Bad,      // a lexing error (unterminated string / stray byte)
 };
@@ -193,6 +194,10 @@ public:
             case '*':
                 ++i_;
                 t.kind = Tok::Star;
+                return t;
+            case '.':
+                ++i_;
+                t.kind = Tok::Dot;
                 return t;
             default:
                 break;
@@ -410,6 +415,32 @@ private:
         }
         out = cur_.text;
         advance();
+        return std::nullopt;
+    }
+
+    // v3: consume an optionally-QUALIFIED column reference: <ident> ['.' <ident>].
+    //   `tbl.col`  => qualifier="tbl",  column="col"
+    //   `col`      => qualifier="",     column="col"
+    // The qualifier is resolved against the joined schema at plan time (NOT here — the
+    // parser has no catalog). A trailing '.' with no column name is a clean error.
+    [[nodiscard]] std::optional<ParseError> expect_qualified_column(
+        const char* what, std::string& qualifier_out, std::string& column_out) {
+        std::string first;
+        if (auto e = expect_ident(what, first)) {
+            return e;
+        }
+        if (cur_.kind == Tok::Dot) {
+            advance();  // '.'
+            std::string second;
+            if (auto e = expect_ident("a column name after '.'", second)) {
+                return e;
+            }
+            qualifier_out = std::move(first);
+            column_out = std::move(second);
+        } else {
+            qualifier_out.clear();
+            column_out = std::move(first);
+        }
         return std::nullopt;
     }
 
@@ -644,7 +675,9 @@ private:
         return is_kw("from") || is_kw("where") || is_kw("group") || is_kw("having") ||
                is_kw("order") || is_kw("limit") || is_kw("offset") || is_kw("at") ||
                is_kw("and") || is_kw("or") || is_kw("asc") || is_kw("desc") ||
-               is_kw("by");
+               is_kw("by") || is_kw("join") || is_kw("inner") || is_kw("left") ||
+               is_kw("right") || is_kw("outer") || is_kw("cross") || is_kw("on") ||
+               is_kw("as");
     }
 
     // Try to parse an AGGREGATE call at the cursor: NAME '(' ('*' | col) ')'.
@@ -694,13 +727,16 @@ private:
             agg.kind = AggKind::CountStar;
             label = "COUNT(*)";
         } else {
+            std::string qual;
             std::string col;
-            if (auto e = expect_ident("a column name inside the aggregate", col)) {
+            if (auto e = expect_qualified_column("a column name inside the aggregate",
+                                                 qual, col)) {
                 return e;
             }
             agg.kind = kind;
+            agg.qualifier = qual;
             agg.column = col;
-            label = upper(fn) + "(" + col + ")";
+            label = upper(fn) + "(" + (qual.empty() ? col : qual + "." + col) + ")";
         }
         if (auto e = expect(Tok::RParen, "')' to close the aggregate")) {
             return e;
@@ -752,16 +788,21 @@ private:
                     sel.items.push_back(std::move(item));
                     sel.has_aggregates = true;
                 } else {
+                    std::string qual;
                     std::string c;
-                    if (auto e = expect_ident("a column name, aggregate, or '*'", c)) {
+                    if (auto e = expect_qualified_column(
+                            "a column name, aggregate, or '*'", qual, c)) {
                         return ParseResult{*e};
                     }
                     SelectItem item;
                     item.kind = SelectItemKind::Column;
+                    item.qualifier = qual;
                     item.column = c;
-                    item.label = c;
+                    // The output label is the qualified spelling for a qualified ref so
+                    // self-joins distinguish a.x from b.x; bare for an unqualified one.
+                    item.label = qual.empty() ? c : qual + "." + c;
                     sel.items.push_back(std::move(item));
-                    sel.columns.push_back(std::move(c));  // mirror for the v1 path
+                    sel.columns.push_back(c);  // mirror for the v1 single-table path
                 }
                 if (cur_.kind == Tok::Comma) {
                     advance();
@@ -773,7 +814,9 @@ private:
         if (auto e = expect_kw("from")) {
             return ParseResult{*e};
         }
-        if (auto e = expect_ident("a table name after FROM", sel.table)) {
+        // v3: the FROM/JOIN list (left-deep). Fills sel.from; sel.table mirrors the
+        // base entry's table for the v1/v2 single-table path.
+        if (auto e = parse_from(sel)) {
             return ParseResult{*e};
         }
 
@@ -785,7 +828,13 @@ private:
             if (auto e = parse_predicate(sel.filter, /*allow_agg=*/false)) {
                 return ParseResult{*e};
             }
-            extract_pk_fastpath(sel);
+            // The PK fast path is a SINGLE-TABLE optimization. With a JOIN (or an
+            // alias != table), WHERE runs over the joined row, so never lower it to a
+            // base-table point/range read.
+            if (!sel.is_join() && sel.from.size() == 1 &&
+                sel.from[0].alias == sel.from[0].table) {
+                extract_pk_fastpath(sel);
+            }
         }
 
         // Optional GROUP BY <cols>.
@@ -795,11 +844,15 @@ private:
                 return ParseResult{*e};
             }
             for (;;) {
-                std::string c;
-                if (auto e = expect_ident("a column name in GROUP BY", c)) {
+                // v3: a GROUP BY column may be qualified (table.col); we store the
+                // qualified SPELLING ("a.x" or "x") and the engine resolves it.
+                std::string qual;
+                std::string col;
+                if (auto e = expect_qualified_column("a column name in GROUP BY", qual,
+                                                     col)) {
                     return ParseResult{*e};
                 }
-                sel.group_by.push_back(std::move(c));
+                sel.group_by.push_back(qual.empty() ? col : qual + "." + col);
                 if (cur_.kind == Tok::Comma) {
                     advance();
                     continue;
@@ -824,7 +877,8 @@ private:
             }
             for (;;) {
                 OrderKey key;
-                if (auto e = expect_ident("a column name in ORDER BY", key.column)) {
+                if (auto e = expect_qualified_column("a column name in ORDER BY",
+                                                     key.qualifier, key.column)) {
                     return ParseResult{*e};
                 }
                 if (is_kw("asc")) {
@@ -992,11 +1046,14 @@ private:
             leaf.operand = OperandKind::Agg;
             leaf.agg = agg;
         } else {
+            std::string qual;
             std::string col;
-            if (auto e = expect_ident("a column name in the predicate", col)) {
+            if (auto e = expect_qualified_column("a column name in the predicate", qual,
+                                                 col)) {
                 return e;
             }
             leaf.operand = OperandKind::Column;
+            leaf.qualifier = qual;
             leaf.column = col;
         }
 
@@ -1041,8 +1098,24 @@ private:
         }
         advance();
         leaf.op = op;
-        if (auto e = expect_literal(leaf.literal)) {
-            return e;
+        // The RHS is either a LITERAL (the v1/v2 case) or, in an ON / general
+        // predicate over a joined schema, ANOTHER column (col-vs-col theta, e.g. an
+        // equi-join key a.x = b.y). An aggregate operand never has a column RHS.
+        if (!is_agg && (cur_.kind == Tok::Ident)) {
+            std::string rq;
+            std::string rc;
+            if (auto e = expect_qualified_column("a column name on the right of the "
+                                                 "comparison",
+                                                 rq, rc)) {
+                return e;
+            }
+            leaf.rhs_is_column = true;
+            leaf.rhs_qualifier = rq;
+            leaf.rhs_column = rc;
+        } else {
+            if (auto e = expect_literal(leaf.literal)) {
+                return e;
+            }
         }
         p.nodes.push_back(std::move(leaf));
         out = static_cast<std::int32_t>(p.nodes.size() - 1);
@@ -1062,8 +1135,10 @@ private:
             return;
         }
         const PredNode& r = p.nodes[static_cast<std::size_t>(p.root)];
+        // The fast path only fires for an UNQUALIFIED column vs a LITERAL (a qualified
+        // ref or a col-vs-col theta is never a PK point/range candidate).
         if (r.kind == PredNodeKind::Cmp && r.operand == OperandKind::Column &&
-            r.op == CmpOp::Eq) {
+            r.qualifier.empty() && !r.rhs_is_column && r.op == CmpOp::Eq) {
             sel.where = SelectWhereKind::Eq;
             sel.where_column = r.column;
             sel.eq_value = r.literal;
@@ -1074,6 +1149,8 @@ private:
             const PredNode& rr = p.nodes[static_cast<std::size_t>(r.right)];
             if (l.kind == PredNodeKind::Cmp && rr.kind == PredNodeKind::Cmp &&
                 l.operand == OperandKind::Column && rr.operand == OperandKind::Column &&
+                l.qualifier.empty() && rr.qualifier.empty() && !l.rhs_is_column &&
+                !rr.rhs_is_column &&
                 l.column == rr.column && l.op == CmpOp::Ge && rr.op == CmpOp::Le) {
                 sel.where = SelectWhereKind::Between;
                 sel.where_column = l.column;
@@ -1081,6 +1158,120 @@ private:
                 sel.hi_value = rr.literal;
             }
         }
+    }
+
+    // v3: parse ONE table reference: <table> [AS <alias> | <alias>]. The alias is the
+    // binding name in the joined schema (defaults to the table name). A keyword may
+    // NOT be used as a bare alias (it would swallow JOIN/WHERE/...); an explicit AS
+    // <alias> still requires an identifier.
+    [[nodiscard]] std::optional<ParseError> parse_table_ref(JoinEntry& e) {
+        if (auto er = expect_ident("a table name", e.table)) {
+            return er;
+        }
+        if (is_kw("as")) {
+            advance();
+            if (auto er = expect_ident("an alias after AS", e.alias)) {
+                return er;
+            }
+        } else if (cur_.kind == Tok::Ident && !at_clause_boundary()) {
+            // A bare alias: an identifier that is NOT a clause keyword.
+            if (auto er = expect_ident("an alias", e.alias)) {
+                return er;
+            }
+        } else {
+            e.alias = e.table;  // no alias => bind by the table name
+        }
+        return std::nullopt;
+    }
+
+    // v3: FROM <ref> ( ',' <ref> | [INNER] JOIN <ref> ON <pred> | LEFT [OUTER] JOIN
+    //                  <ref> ON <pred> | CROSS JOIN <ref> )*
+    // Builds the left-deep sel.from list. Each non-base entry carries its JoinKind +
+    // (for INNER/LEFT) an ON predicate. A comma or CROSS JOIN is a cartesian (no ON).
+    // ON without a predicate, or a JOIN with no ON for INNER/LEFT, is a clean error.
+    [[nodiscard]] std::optional<ParseError> parse_from(SelectStmt& sel) {
+        JoinEntry base;
+        if (auto e = parse_table_ref(base)) {
+            return e;
+        }
+        sel.from.push_back(std::move(base));
+        sel.table = sel.from[0].table;  // mirror for the v1/v2 single-table path
+
+        for (;;) {
+            if (cur_.kind == Tok::Comma) {
+                advance();
+                JoinEntry je;
+                je.kind = JoinKind::Cross;  // comma == cross join
+                if (auto e = parse_table_ref(je)) {
+                    return e;
+                }
+                sel.from.push_back(std::move(je));
+                continue;
+            }
+            // An explicit JOIN keyword sequence.
+            JoinKind kind = JoinKind::Inner;
+            bool is_join_clause = false;
+            if (is_kw("cross")) {
+                advance();
+                if (auto e = expect_kw("join")) {
+                    return e;
+                }
+                kind = JoinKind::Cross;
+                is_join_clause = true;
+            } else if (is_kw("inner")) {
+                advance();
+                if (auto e = expect_kw("join")) {
+                    return e;
+                }
+                kind = JoinKind::Inner;
+                is_join_clause = true;
+            } else if (is_kw("left")) {
+                advance();
+                if (is_kw("outer")) {
+                    advance();  // LEFT OUTER == LEFT
+                }
+                if (auto e = expect_kw("join")) {
+                    return e;
+                }
+                kind = JoinKind::Left;
+                is_join_clause = true;
+            } else if (is_kw("right") || is_kw("full")) {
+                return make_err("only INNER and LEFT [OUTER] joins are supported "
+                                "(RIGHT/FULL are OUT)");
+            } else if (is_kw("join")) {
+                advance();  // bare JOIN == INNER JOIN
+                kind = JoinKind::Inner;
+                is_join_clause = true;
+            }
+            if (!is_join_clause) {
+                break;  // no more FROM/JOIN entries
+            }
+            JoinEntry je;
+            je.kind = kind;
+            if (auto e = parse_table_ref(je)) {
+                return e;
+            }
+            if (kind == JoinKind::Cross) {
+                // A CROSS JOIN takes no ON (a dangling ON is rejected as trailing).
+                if (is_kw("on")) {
+                    return make_err("CROSS JOIN does not take an ON predicate");
+                }
+            } else {
+                // INNER / LEFT require ON <predicate>.
+                if (!is_kw("on")) {
+                    return make_err(
+                        "expected ON <predicate> after " +
+                        std::string(kind == JoinKind::Left ? "LEFT" : "INNER") +
+                        " JOIN");
+                }
+                advance();  // ON
+                if (auto e = parse_predicate(je.on, /*allow_agg=*/false)) {
+                    return e;
+                }
+            }
+            sel.from.push_back(std::move(je));
+        }
+        return std::nullopt;
     }
 
     // AT STRICT | AT SNAPSHOT n | AT BOUNDED n | AT RYW n
