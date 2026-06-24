@@ -1514,7 +1514,7 @@ private:
         if (commit_index_ > applied_index_) {
             applied_index_ = commit_index_;
         }
-        if (applied_index_ > snap_base_ && log_.size() > kSnapshotThreshold) {
+        if (applied_index_ > snap_base_ && log_.size() > cfg_.snapshot_threshold) {
             take_snapshot();
         }
     }

@@ -388,6 +388,13 @@ public:
         nc.election_timeout_max = timing.election_max;
         nc.heartbeat_interval = timing.heartbeat;
         nc.request_deadline = timing.request_deadline;
+        // PROD compaction cadence: snapshot every ~4096 entries instead of every 8. Each
+        // snapshot RE-SERIALIZES the whole accumulated state (O(n)); at the gate's default
+        // of 8 a long single-daemon run pays O(n^2) of redundant snapshot I/O. 4096 keeps
+        // the retained log bounded (~tens of KB for small values) while cutting snapshot
+        // frequency ~512x. Compaction is transparent to the committed log (Snapshot.tla),
+        // so correctness + recovery are unchanged. The sim/cross-check keep the default 8.
+        nc.snapshot_threshold = 4096;
 
         const consensus::ConsensusNodeFactory factory =
             consensus::raft_a::make_raft_a_factory();

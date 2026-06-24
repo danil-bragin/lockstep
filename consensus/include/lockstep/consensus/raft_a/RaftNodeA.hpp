@@ -1604,7 +1604,7 @@ private:
         // TakeSnapshot guard: only fold/discard an APPLIED prefix, and only once the
         // retained suffix is large enough to be worth compacting.
         if (applied_index_ > snap_base_ &&
-            log_.size() > kSnapshotThreshold) {
+            log_.size() > cfg_.snapshot_threshold) {
             take_snapshot();
         }
     }

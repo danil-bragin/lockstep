@@ -326,6 +326,16 @@ struct NodeConfig {
     // Bounded client-side patience: how long submit-driven traffic waits before the
     // harness considers an op timed out (kept here so the impl + harness agree).
     core::Tick request_deadline = 200;
+
+    // C4.3 COMPACTION cadence: snapshot once the retained log suffix exceeds this many
+    // entries. Default 8 keeps the in-gate/conformance/cross-check workload triggering
+    // compaction frequently (coverage) AND byte-identical to the historical constexpr.
+    // PROD raises it (lockstepd sets a large value) because each snapshot RE-SERIALIZES
+    // the whole accumulated state (O(n)); firing every 8 ops makes a long single-daemon
+    // run pay O(n^2) of redundant snapshot I/O. A larger prod cadence cuts that constant
+    // by orders of magnitude. The threshold is INVISIBLE to the committed log (compaction
+    // is transparent per Snapshot.tla), so A and B stay byte-identical for equal values.
+    std::size_t snapshot_threshold = 8;
 };
 
 // THE FACTORY. Returns ONE replica wired to its deps + config. The ClusterDriver
