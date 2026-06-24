@@ -121,24 +121,29 @@ namespace seq = ::lockstep::consensus::sequencer;
         if (emitted.count(e.txn_id) != 0) {
             continue;  // already placed at its lowest-rank-shard position (dedup)
         }
-        // The seal gate: a txn is placed ONLY when it is fully committed on EVERY
-        // shard it touches (XShardCommit.tla Sealable / all-or-nothing). A txn not
-        // yet present on all its shards in the sealed log is skipped — NONE of its
-        // writes apply, never a partial cross-shard commit.
+        // The seal gate (FAIL-CLOSED — XShardCommit.tla Sealable / all-or-nothing):
+        // a txn is placed ONLY when its required shard set is KNOWN and it is fully
+        // committed on EVERY shard it touches. A txn whose footprint is unknown
+        // (absent from shards_by_txn) cannot be PROVEN fully committed, so it is
+        // DROPPED — never emitted unproven. A txn not yet present on all its shards
+        // is likewise dropped. Either way NONE of its writes apply: never a partial
+        // cross-shard commit. (Dropping the unknown closes the atomicity bypass a
+        // fall-through would open if a caller ever passed a phantom global entry.)
         const auto sit = shards_by_txn.find(e.txn_id);
-        if (sit != shards_by_txn.end()) {
-            const std::set<seq::ShardId>& need = sit->second;
-            const std::set<seq::ShardId>& have = seen_on[e.txn_id];
-            bool complete = true;
-            for (const seq::ShardId s : need) {
-                if (have.count(s) == 0) {
-                    complete = false;
-                    break;
-                }
+        if (sit == shards_by_txn.end()) {
+            continue;  // unknown footprint => cannot prove all-committed => drop
+        }
+        const std::set<seq::ShardId>& need = sit->second;
+        const std::set<seq::ShardId>& have = seen_on[e.txn_id];
+        bool complete = true;
+        for (const seq::ShardId s : need) {
+            if (have.count(s) == 0) {
+                complete = false;
+                break;
             }
-            if (!complete) {
-                continue;  // not sealed on all its shards yet => not committed
-            }
+        }
+        if (!complete) {
+            continue;  // not sealed on all its shards yet => not committed
         }
         emitted.insert(e.txn_id);
         order.push_back(e.txn_id);

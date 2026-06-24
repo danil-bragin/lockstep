@@ -1069,6 +1069,119 @@ int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts
     return 1;  // no host accepted (caller retries later)
 }
 
+// ============================================================================
+// Phase 9 S9.4 — REPLICATED-SHARD LEADER-ROUTED CLIENT (`rsubmit` / `rstatus`).
+// ============================================================================
+// Each shard is an N-node Raft group spread across N PROCESSES; a shard's LEADER can be
+// on ANY of the N processes. So routing a key is two steps: (1) key -> shard s (hash%M),
+// (2) leader-FIND among shard s's N admin ports (reuse the NotLeader-retry from `submit`,
+// scoped to ONE shard's N ports). The client computes each shard's N admin ports from the
+// SAME deterministic port scheme the daemon uses, so it needs only --shards M --procs N
+// --base-port B (no explicit host list).
+//
+//   admin_port(proc p in 1..N, shard s in 0..M-1) = base + (p-1)*(2*M) + M + s
+//
+// This mirrors prod::shard_detail::repl_admin_port — kept in sync by construction (same
+// arithmetic). rsubmit is DURABLE-by-default (await commit on the accepting leader, same
+// as submit). rstatus prints every replica's STATUS grouped by shard (the HA test reads
+// it to confirm each shard's group has a live leader + agreeing committed logs).
+
+struct ReplTopo {
+    std::uint64_t shards = 0;   // M
+    std::uint64_t procs = 0;    // N
+    std::uint16_t base = 0;     // global base port
+};
+
+std::uint16_t repl_admin_port(const ReplTopo& t, std::uint64_t proc_1based,
+                              std::uint64_t shard) {
+    const std::uint64_t stride = 2 * t.shards;
+    return static_cast<std::uint16_t>(t.base + (proc_1based - 1) * stride + t.shards +
+                                      shard);
+}
+
+// The N admin ports of shard s's replica group (one per process).
+std::vector<std::uint16_t> shard_admin_ports(const ReplTopo& t, std::uint64_t shard) {
+    std::vector<std::uint16_t> ports;
+    ports.reserve(t.procs);
+    for (std::uint64_t p = 1; p <= t.procs; ++p) {
+        ports.push_back(repl_admin_port(t, p, shard));
+    }
+    return ports;
+}
+
+// rsubmit: route a key to its shard, then DURABLE leader-find submit among that shard's N
+// admin ports. Prints one SUBMIT line; exit 0 only if the write COMMITTED (durable).
+// Bounded leader-find retry (an election in flight resolves within the retry budget).
+int cmd_rsubmit(const std::string& key, const std::string& value, const ReplTopo& t) {
+    const std::uint64_t shard = fnv1a(key) % t.shards;
+    const std::vector<std::uint16_t> ports = shard_admin_ports(t, shard);
+    std::printf("RROUTE key=%s shard=%llu ports=", key.c_str(),
+                static_cast<unsigned long long>(shard));
+    for (std::size_t i = 0; i < ports.size(); ++i) {
+        std::printf("%s%u", i == 0 ? "" : ",", ports[i]);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+    // Leader-find with bounded retry across the shard's N ports (handles an election in
+    // flight). Reuses do_submit (the NotLeader-retry round-trip) + confirm_durable.
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        for (std::uint16_t port : ports) {
+            SubmitOutcome so;
+            const bool replied = do_submit(port, value, so);
+            if (replied && so.accepted) {
+                Client probe(port);
+                const core::Tick deadline =
+                    (probe.ok ? probe.reactor.now() : 0) + kDurableWallNs;
+                const DurableResult dr =
+                    confirm_durable(port, value, so.index, deadline);
+                const bool durable = (dr == DurableResult::Committed);
+                std::printf("SUBMIT key=%s value=%s accepted=1 durable=%d shard=%llu "
+                            "port=%u term=%llu index=%llu\n",
+                            key.c_str(), value.c_str(), durable ? 1 : 0,
+                            static_cast<unsigned long long>(shard), port,
+                            static_cast<unsigned long long>(so.term),
+                            static_cast<unsigned long long>(so.index));
+                std::fflush(stdout);
+                if (durable) {
+                    return 0;
+                }
+                // not durable (overwrite/timeout): retry the leader-find loop.
+            }
+            // NotLeader / no reply: try the next process's replica.
+        }
+    }
+    std::printf("SUBMIT key=%s value=%s accepted=0 durable=0 shard=%llu port=0\n",
+                key.c_str(), value.c_str(),
+                static_cast<unsigned long long>(shard));
+    std::fflush(stdout);
+    return 1;
+}
+
+// rstatus: print every replica's STATUS, grouped by shard. One RSTATUS line per (shard,
+// proc) so the HA test can see each shard's group (who is leader, committed-log digest).
+int cmd_rstatus(const ReplTopo& t) {
+    for (std::uint64_t s = 0; s < t.shards; ++s) {
+        for (std::uint64_t p = 1; p <= t.procs; ++p) {
+            const std::uint16_t port = repl_admin_port(t, p, s);
+            prod::AdminStatus st;
+            const bool ok = do_status(port, st);
+            std::printf("RSTATUS shard=%llu proc=%llu port=%u ok=%d role=%u term=%llu "
+                        "commit=%llu log=",
+                        static_cast<unsigned long long>(s),
+                        static_cast<unsigned long long>(p), port, ok ? 1 : 0,
+                        static_cast<unsigned>(st.role),
+                        static_cast<unsigned long long>(st.term),
+                        static_cast<unsigned long long>(st.commit_index));
+            for (std::size_t i = 0; i < st.committed.size(); ++i) {
+                std::printf("%s%s", i == 0 ? "" : ",", st.committed[i].c_str());
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 std::uint64_t parse_u64_opt(const char* s, std::uint64_t fallback) {
@@ -1093,13 +1206,20 @@ int main(int argc, char** argv) {
             "       lockstep_admin pbench --count N [--inflight K] [--conns C] "
             "[--value-bytes B] --host PORT [--host PORT ...]\n"
             "       lockstep_admin mbench --count N [--inflight K] [--value-bytes B] "
-            "--host SHARD0_PORT --host SHARD1_PORT ... (multi-shard key-routed load)\n");
+            "--host SHARD0_PORT --host SHARD1_PORT ... (multi-shard key-routed load)\n"
+            "       lockstep_admin rsubmit KEY VALUE --shards M --procs N --base-port B "
+            "(replicated-shard: route key->shard, leader-find among the shard's N "
+            "replicas, durable submit)\n"
+            "       lockstep_admin rstatus --shards M --procs N --base-port B "
+            "(replicated-shard: every replica's STATUS grouped by shard)\n");
         return 2;
     }
 
     const std::string verb = argv[1];
     std::vector<std::uint16_t> hosts;
     std::string value;
+    std::string key;          // S9.4 rsubmit routing key
+    ReplTopo topo;            // S9.4 replicated-shard topology (--shards/--procs/--base-port)
     BenchArgs ba;
     PipeArgs pa;
     bool await_durable = true;  // S8.4: submit is DURABLE (await commit) by default.
@@ -1112,6 +1232,14 @@ int main(int argc, char** argv) {
         }
         value = argv[2];
         i = 3;
+    } else if (verb == "rsubmit") {
+        if (argc < 4) {
+            std::fprintf(stderr, "lockstep_admin rsubmit: missing KEY VALUE\n");
+            return 2;
+        }
+        key = argv[2];
+        value = argv[3];
+        i = 4;
     }
 
     for (; i < argc; ++i) {
@@ -1139,7 +1267,30 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--no-await") == 0) {
             // Accept-only submit (load-harness accept measurement); DEFAULT is durable.
             await_durable = false;
+        } else if (std::strcmp(argv[i], "--shards") == 0 && i + 1 < argc) {
+            topo.shards = parse_u64_opt(argv[i + 1], topo.shards);
+            ++i;
+        } else if (std::strcmp(argv[i], "--procs") == 0 && i + 1 < argc) {
+            topo.procs = parse_u64_opt(argv[i + 1], topo.procs);
+            ++i;
+        } else if (std::strcmp(argv[i], "--base-port") == 0 && i + 1 < argc) {
+            topo.base = parse_port(argv[i + 1]);
+            ++i;
         }
+    }
+
+    // Phase 9 S9.4 replicated-shard verbs: routed by topology, not an explicit --host list.
+    if (verb == "rsubmit" || verb == "rstatus") {
+        if (topo.shards == 0 || topo.procs == 0 || topo.base == 0) {
+            std::fprintf(stderr,
+                         "lockstep_admin %s: requires --shards M --procs N --base-port B\n",
+                         verb.c_str());
+            return 2;
+        }
+        if (verb == "rsubmit") {
+            return cmd_rsubmit(key, value, topo);
+        }
+        return cmd_rstatus(topo);
     }
     // pbench shares --count + --value-bytes with bench (the --count/--value-bytes flags
     // land in ba; copy them across so pbench honors them).

@@ -1193,6 +1193,29 @@ if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
   set_tests_properties(prod_jepsen PROPERTIES TIMEOUT 300)
 endif()
 
+# --- Phase 9 S9.4: REPLICATED SHARDS (3-node Raft group per shard, HA) [LINUX] -
+# P9-S9.4 gate. Each shard is an N-node Raft group spread across N PROCESSES (combines
+# the S9.1 thread-per-shard daemon with the S5b-2 multi-process Raft cluster — verified
+# consensus core UNCHANGED). prod_replicated_shards.sh brings up N=3 procs x M shard-
+# replicas, asserts: (1) every shard's group elects a leader; (2) key-routed rsubmit
+# commits durably on a quorum; (3) SIGKILL one process (one replica of EVERY shard) ->
+# every shard stays available + keeps committing on the surviving quorum (HA); (4)
+# restart that process on its SAME data dir -> its replicas rejoin + catch up from
+# ProdDisk with NO committed-data loss. PROCESS-CLEANUP: trap SIGKILLs every tracked
+# child on every path; each lockstepd self-deadlines (--run-seconds). BOUNDED throughout.
+# Built ONLY on Linux (needs lockstepd + lockstep_admin); macOS host stays green.
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
+  add_test(
+    NAME prod_replicated_shards
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_replicated_shards.sh)
+  # A generous ceiling that still kills any true hang fast; the script's internal
+  # absolute deadlines + each daemon's --run-seconds are well under this.
+  set_tests_properties(prod_replicated_shards PROPERTIES TIMEOUT 240)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
