@@ -885,6 +885,28 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME query_conformance_test COMMAND lockstep_query_conformance_test)
+
+  # --- Phase 7 S5a closure: QUERY-PATH PERSISTENCE + CRASH RECOVERY -----------
+  # Proves the committed query state is DURABLE on an injected core::IDisk and
+  # RECOVERS on a restart (write via the durable query path -> "crash" (drop the
+  # in-memory Database/Server, keep the SimDisk image) -> reopen over the SAME
+  # IDisk -> recover() -> every committed value is queryable, recovered from the
+  # query-side disk, NOT by replaying the consensus log). Reuses the verified
+  # storage::WalEngine recovery. Deterministic (fixed SimDisk seed). Non-provider
+  # TU -> forbidden-lint scans it. Inherits the dir-wide TIMEOUT.
+  add_executable(lockstep_query_persist_test query_persist_test.cpp)
+  target_include_directories(lockstep_query_persist_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_query_persist_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME query_persist_test COMMAND lockstep_query_persist_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "
@@ -1073,6 +1095,28 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_query AND TARGET lockstep_txn
       lockstep_providers_sim
       lockstep_providers_prod)
   add_test(NAME prod_server_test COMMAND lockstep_prod_server_test)
+
+  # --- Phase 7 S5a closure: QUERY STATE on a REAL ProdDisk file [LINUX ONLY] ---
+  # Networking-free prod half of the persistence gate: drives query::Database over
+  # an injected prod::ProdDisk (real file) — apply_committed (WAL'd + fdatasync'd) ->
+  # "crash" (drop the DB + close the fd, file survives) -> reopen ProdDisk + Database
+  # over the SAME file -> recover() -> every committed value queryable from the real
+  # file (NOT the consensus log). Proves the seam recovers on a REAL device, not just
+  # SimDisk. No reactor/TCP (independent of the prod-server round-trip path). Inherits
+  # the dir-wide TIMEOUT.
+  add_executable(lockstep_query_persist_prod_test query_persist_prod_test.cpp)
+  target_include_directories(lockstep_query_persist_prod_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_query_persist_prod_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME query_persist_prod_test COMMAND lockstep_query_persist_prod_test)
 endif()
 
 # --- Phase 7 S5b-1: REAL Raft CONSENSUS node on PROD providers [LINUX ONLY] ---

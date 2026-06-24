@@ -34,20 +34,21 @@
 // storage change.
 //
 // ----------------------------------------------------------------------------
-// DESIGN NOTE / CONTRACT FLAG (the storage seam): wire::Server owns a
-// query::Database BY VALUE and Database does NOT expose a disk/engine injection
-// seam — its D5 read path internally builds a scheduler-local storage::WalEngine
-// over an INTERNAL sim::SimDisk on each run() (Database.hpp), and the committed
-// effect is held in-memory (the dedup table + the live write-set history). So
-// "WalEngine(MVCC) on the ProdDisk" is NOT reachable through the existing surface
-// WITHOUT changing query/ — which the brief forbids (core/sim/query/txn/storage
-// stay UNCHANGED; a needed change is a DESIGN SMELL to FLAG, not fix). We therefore
-// run the wire::Server's stack as the architecture supports it (in-memory MVCC) and
-// OWN a ProdDisk over the node's data dir as the durability anchor the future
-// lockstepd / S5b consensus log will write through — proving ProdDisk assembles on
-// the prod providers here, ready for the persistent path. The end-to-end CORRECTNESS
-// (submit -> read-back -> match, exactly-once) is fully proven on the real socket;
-// the in-memory vs ProdDisk-backed MVCC distinction is flagged, not silently papered.
+// STORAGE SEAM (Phase 7 S5a flag CLOSED): wire::Server now exposes a disk-injection
+// seam and query::Database backs its committed query state with ONE persistent
+// storage::WalEngine over an injected core::IDisk (Database.hpp). This node injects
+// the durable ProdDisk over the data dir, so the committed query state is WAL'd to
+// disk as it commits and RECOVERS on a restart (recover() rebuilds the store from
+// the durable WAL prefix — the verified crash-recovery path) WITHOUT replaying the
+// consensus log.
+//
+// SCHEDULER PUMPING (the correctness point): the persistent engine runs on
+// disk_sched_ (the ProdDisk's OWN scheduler), and Database::apply_committed() /
+// run() / recover() PUMP disk_sched_ INLINE (PersistentStore::apply_committed does
+// sched_->run() to drain the WAL append+sync). ProdDisk does synchronous inline IO,
+// so its Futures resolve without needing the reactor's epoll/timer loop — the
+// commit completes within the handle_submit call. disk_sched_ is therefore NOT
+// dependent on the ProdReactor pumping it; it is self-driven by the query layer.
 //
 // ----------------------------------------------------------------------------
 // LINUX-ONLY (epoll + sockets). The whole class is compiled only under __linux__
@@ -63,6 +64,7 @@
 
 #ifdef __linux__
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -113,7 +115,12 @@ public:
           disk_(disk_sched_, cfg.data_dir.empty()
                                  ? std::string("/dev/null")
                                  : (cfg.data_dir + "/lockstepd.wal")),
-          server_(net_ != nullptr ? wire::Server(*net_) : wire::Server()),
+          // The committed QUERY STATE is backed by the durable ProdDisk over the data
+          // dir (S5a closure), driven on disk_sched_ (the disk's own scheduler, pumped
+          // INLINE by the query layer — not by the reactor). A restart recovers it via
+          // recover(). When no data dir is given the disk is /dev/null (no durability).
+          server_(net_ != nullptr ? wire::Server(*net_, disk_sched_, disk_)
+                                   : wire::Server(disk_sched_, disk_)),
           cfg_(cfg) {}
 
     ProdServerNode(const ProdServerNode&) = delete;
@@ -161,6 +168,12 @@ public:
         return server_.applied_submits();
     }
     [[nodiscard]] std::uint64_t rejected() const noexcept { return server_.rejected(); }
+
+    // RECOVER the committed query state from the durable ProdDisk after a restart
+    // (the node was re-constructed over the SAME data dir). `durable_len` is the
+    // on-disk WAL file length. After this, a Query returns every committed value
+    // WITHOUT replaying the consensus log (S5a closure).
+    void recover(std::size_t durable_len) { server_.recover(durable_len); }
     [[nodiscard]] Seq tip() const noexcept { return server_.tip(); }
 
     // The reactor's shared clock (ONE identity) — handed to a client stub's IClock&.
