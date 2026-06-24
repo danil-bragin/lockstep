@@ -139,6 +139,16 @@ struct Args {
     // reuse of the existing consensus surface (NO consensus change).
     std::uint64_t shards = 1;
     std::uint16_t shard_base_port = 0;  // REQUIRED in multi-shard mode (>0)
+
+    // --- Phase 9 S9.4 REPLICATED SHARDS (HA: each shard an N-node Raft group) ---
+    // When --cluster-size N (>1) is given alongside --shards M + --shard-base-port,
+    // this process hosts M shard-REPLICAS (M threads); shard s's Raft group is the
+    // s-th replica across the N processes (an N-node group). --proc-id P (1..N) is
+    // THIS process's id (== its Raft node id in every shard's group). Peers' ports are
+    // computed from the deterministic port scheme (no --peer list needed; every
+    // process agrees a priori). cluster_size<=1 keeps the S9.1 single-node shard path.
+    std::uint64_t proc_id = 1;
+    std::uint64_t cluster_size = 1;
 };
 
 std::uint64_t parse_u64(const char* s, std::uint64_t fallback) {
@@ -204,6 +214,10 @@ Args parse_args(int argc, char** argv) {
         } else if (std::strcmp(k, "--shard-base-port") == 0) {
             a.shard_base_port =
                 static_cast<std::uint16_t>(parse_u64(v, a.shard_base_port));
+        } else if (std::strcmp(k, "--proc-id") == 0) {
+            a.proc_id = parse_u64(v, a.proc_id);
+        } else if (std::strcmp(k, "--cluster-size") == 0) {
+            a.cluster_size = parse_u64(v, a.cluster_size);
         }
     }
     return a;
@@ -234,6 +248,40 @@ int run_multishard(const Args& args) {
     return prod::run_shards(cfg);
 }
 
+// Phase 9 S9.4 — REPLICATED-SHARD dispatch. Each of the N processes hosts M shard-
+// replicas (M threads); shard s's Raft group is the s-th replica across the N processes.
+// The thread orchestration + deterministic cross-process port scheme live in
+// prod::run_repl_shards (providers/prod, the lint-exempt real-thread boundary). This thin
+// wrapper maps the daemon Args onto prod::ReplShardRunConfig. Verified consensus core is
+// UNCHANGED — this is prod orchestration over the S5b-2 multi-process Raft surface.
+int run_repl_multishard(const Args& args) {
+    if (args.shard_base_port == 0) {
+        std::fprintf(stderr,
+                     "lockstepd: replicated shards require --shard-base-port P (>0)\n");
+        return 2;
+    }
+    if (args.proc_id == 0 || args.proc_id > args.cluster_size) {
+        std::fprintf(stderr,
+                     "lockstepd: replicated shards require 1<=--proc-id<=--cluster-size "
+                     "(got proc-id=%llu cluster-size=%llu)\n",
+                     static_cast<unsigned long long>(args.proc_id),
+                     static_cast<unsigned long long>(args.cluster_size));
+        return 2;
+    }
+    prod::ReplShardRunConfig cfg;
+    cfg.shards = args.shards;
+    cfg.proc_id = args.proc_id;
+    cfg.cluster_size = args.cluster_size;
+    cfg.base_port = args.shard_base_port;
+    cfg.data_dir = args.data_dir;
+    cfg.seed = args.seed;
+    cfg.run_seconds = args.run_seconds;
+    cfg.election_min_ms = args.election_min_ms;
+    cfg.election_max_ms = args.election_max_ms;
+    cfg.heartbeat_ms = args.heartbeat_ms;
+    return prod::run_repl_shards(cfg);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -255,6 +303,13 @@ int main(int argc, char** argv) {
     // (so the scaling baseline measures the identical code, just one thread). The legacy
     // single-process daemon path below (the UNCHANGED Phase 7/8 cluster member) stays the
     // default when neither --shard-base-port nor --shards>1 is given.
+    // Phase 9 S9.4: REPLICATED-SHARD mode. Entered when --cluster-size N>1 is given
+    // (with --shard-base-port + --shards M): this process hosts M shard-replicas, each
+    // shard an N-node Raft group across the N processes. Takes precedence over the S9.1
+    // single-node multi-shard path below.
+    if (args.cluster_size > 1 && (args.shard_base_port != 0 || args.shards >= 1)) {
+        return run_repl_multishard(args);
+    }
     if (args.shard_base_port != 0 || args.shards > 1) {
         return run_multishard(args);
     }
