@@ -178,14 +178,22 @@ ClientRequest(s, v) ==
     /\ UNCHANGED <<currentTerm, state, votedFor, commitIndex, votesGranted, messages>>
 
 \* Replication: leader s sends entries (>=0) to follower d from some nextIndex.
-\* We let prevLogIndex range over any valid index of the leader's log; entries are the
-\* suffix after prevLogIndex.  This non-deterministically covers all nextIndex choices.
+\* We let prevLogIndex range over any valid index of the leader's log; entries are a
+\* PREFIX of the suffix after prevLogIndex -- i.e. SubSeq(log, prevLogIndex+1, lastIndex)
+\* for any lastIndex in prevLogIndex .. Len(log).  This non-deterministically covers all
+\* nextIndex choices AND all BOUNDED-BATCH sizes (S8.2b: the impls cap a send to at most
+\* kMaxBatch entries -> lastIndex = Min(Len(log), prevLogIndex + kMaxBatch), one concrete
+\* point in this set).  Generalizing entries from "whole suffix" (lastIndex = Len) to "any
+\* prefix of the suffix" strictly ADDS behaviors -- the old whole-suffix send is still
+\* reachable (lastIndex = Len) -- so it WEAKENS no invariant: Log Matching / leaderCommit
+\* are sound for any contiguous AppendEntries range, which is exactly Raft Fig.2.
 AppendEntries(s, d) ==
     /\ state[s] = Leader
     /\ s # d
     /\ \E prevLogIndex \in 0 .. Len(log[s]) :
+       \E lastIndex \in prevLogIndex .. Len(log[s]) :
          LET prevLogTerm == TermAt(log[s], prevLogIndex)
-             entries     == SubSeq(log[s], prevLogIndex + 1, Len(log[s]))
+             entries     == SubSeq(log[s], prevLogIndex + 1, lastIndex)
          IN Send([ mtype         |-> "AppendEntries",
                    mterm         |-> currentTerm[s],
                    msource       |-> s,

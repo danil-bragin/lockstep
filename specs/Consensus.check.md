@@ -123,3 +123,24 @@ The depth of the complete state graph search is 9.
 
 Both fixes were to the ACTIONS. The four invariants are **unchanged from the skeleton**
 (ElectionSafety, LogMatching, StateMachineSafety, LeaderAppendOnly — verbatim).
+
+## S8.2b — bounded-batch AppendEntries (spec-before-code refinement)
+
+The impls (RaftNodeA/B) cap each `AppendEntries` to at most `kMaxBatch` (=64) entries
+instead of shipping the whole unacked suffix, so a pipelined client burst no longer builds
+an O(backlog) per-send payload that blocks the single reactor coroutine and starves the
+heartbeat timer (the S8.2a-diagnosed 3-node collapse). For the spec to PERMIT what the code
+does (spec-before-code), `AppendEntries(s, d)` was generalized so `entries` is now **any
+prefix of the suffix** after `prevLogIndex` — `SubSeq(log[s], prevLogIndex+1, lastIndex)`
+for a non-deterministically chosen `lastIndex \in prevLogIndex .. Len(log[s])` — rather than
+forced to the whole suffix (`lastIndex = Len`). A bounded batch is the concrete point
+`lastIndex = Min(Len(log), prevLogIndex + kMaxBatch)`.
+
+This is a STRICT GENERALIZATION (it only ADDS reachable behaviors; the old whole-suffix
+send is still reachable at `lastIndex = Len`), so **no invariant is weakened** — Log
+Matching and the `leaderCommit = Max(commitIndex, Min(mleaderCommit, lastNew))` adoption are
+sound for ANY contiguous `[prevLogIndex+1 .. lastIndex]` range (exactly Raft Fig.2, which
+always carries a chosen range). TLC re-checked the SAME four invariants over the larger
+state space and found **no error** (288,361 distinct states; depth 20; the
+`MaxMsgs`/`MaxLogLen`/`MaxTerm` bounds keep the extra `\E lastIndex` branching finite). The
+change is to the ACTION only; the four invariants remain verbatim.

@@ -645,8 +645,22 @@ public:
             advance_commit_index();
             apply_and_maybe_snapshot();
         }
-        // Push the new entry out promptly (replication also runs on heartbeats).
-        broadcast_append_entries();
+        // S8.2b COALESCE the per-submit broadcast. The OLD code broadcast on EVERY
+        // submit, so a depth-K pipelined burst did K full re-scans of the unacked
+        // suffix x peers — O(backlog x inflight) synchronous reactor work that blocked
+        // the one coroutine + starved the heartbeat (S8.2a collapse). Now a submit
+        // marks replication PENDING and kicks at most ONE bounded pass per scheduler
+        // turn: repl_kicked_ de-dups submits arriving back-to-back in the same turn so
+        // they coalesce into a single bounded broadcast. The flag clears at the top of
+        // each ticker turn; a still-pending backlog is flushed there. Liveness holds:
+        // entries beyond the first bounded batch ship on the next ack (on_append_response
+        // re-kick) or the next tick.
+        repl_pending_ = true;
+        if (!repl_kicked_) {
+            repl_kicked_ = true;
+            broadcast_append_entries();
+            repl_pending_ = false;
+        }
         return r;
     }
 
@@ -697,8 +711,11 @@ public:
         votes_granted_.clear();
         next_index_.clear();
         match_index_.clear();
+        sent_index_.clear();
         leader_hint_ = UINT64_MAX;
         recovered_ = false;
+        repl_pending_ = false;
+        repl_kicked_ = false;
         // C4.2: drop the in-memory config chain to init; recovery rebuilds it from
         // the durable CONFIG records (recover-to-prefix).
         cfg_chain_ = init_config_chain();
@@ -985,6 +1002,7 @@ private:
         leader_hint_ = self_;
         next_index_.assign(cluster_size(), llen() + 1);
         match_index_.assign(cluster_size(), 0);
+        sent_index_.assign(cluster_size(), 0);  // S8.2b: no batch in flight yet
         match_index_[index_of(self_)] = llen();
         // C4.2: a new leader must NOT assume its head config is cluster-committed; it
         // re-proves the head via adoption acks (commit-before-next across an election
@@ -1086,12 +1104,28 @@ private:
         w.u64(prev_index);
         w.u64(prev_term);
         w.u64(commit_index_);
-        std::uint64_t count = llen() - prev_index;
+        // S8.2b BOUNDED REPLICATION BATCHING: ship at most kMaxBatch entries per
+        // AppendEntries (NOT the whole unacked suffix). Capping the chosen
+        // [prevLogIndex+1 .. k] range is a pure refinement of Consensus.tla
+        // AppendEntries (which already permits a subset) — no invariant weakened. It
+        // bounds each send to O(kMaxBatch) reactor work so a depth-K pipelined burst
+        // can't build an O(backlog) suffix that, re-shipped x peers x inflight, blocks
+        // the single reactor coroutine + starves the heartbeat (the S8.2a 3-node
+        // collapse). LIVENESS: the next batch rides the follower's ack (on_append_resp
+        // re-kicks send_append_entries while the follower lags) and every heartbeat.
+        std::uint64_t avail = llen() - prev_index;
+        std::uint64_t count = avail < kMaxBatch ? avail : kMaxBatch;
         w.u64(count);
-        for (Index abs = prev_index + 1; abs <= llen(); ++abs) {
+        Index last = prev_index + static_cast<Index>(count);
+        for (Index abs = prev_index + 1; abs <= last; ++abs) {
             const LogEntry& e = entry_at(abs);
             w.u64(e.term);
             w.str(e.value);
+        }
+        // S8.2b: record the highest index in this batch so on_append_response only
+        // re-kicks once the batch is fully ACKED (no in-flight overlap / cascade).
+        if (pi < sent_index_.size()) {
+            sent_index_[pi] = last;
         }
         send_to(peer, w.finish());
     }
@@ -1447,6 +1481,16 @@ private:
             next_index_[pi] = m.match_index + 1;
             advance_commit_index();
             apply_and_maybe_snapshot();  // apply + maybe compact on the leader
+            // S8.2b: ship the next bounded batch at ack rate (tick-only drain would cap
+            // 3-node throughput at kMaxBatch/tick), but ONLY once the previous batch is
+            // fully ACKED (match_index >= sent_index_) so at most ONE batch is in flight
+            // per peer. A naive per-ack re-kick re-ships the still-in-flight tail every
+            // ack -> doubles the leader's send rate -> heartbeat starvation -> election
+            // (measured: 3-node depth-1 regressed to fault=1). The sent_index_ gate
+            // removes the overlap/cascade; no re-kick once caught up (no busy loop).
+            if (match_index_[pi] >= sent_index_[pi] && next_index_[pi] <= llen()) {
+                send_append_entries(m.from);
+            }
         } else {
             // Decrement nextIndex and retry (log backtracking). replicate switches
             // to InstallSnapshot once nextIndex-1 falls below the snapshot base.
@@ -1556,12 +1600,21 @@ private:
     // C4.3 compaction trigger: snapshot once the retained suffix exceeds this many
     // entries AND there is a fresh applied prefix to fold + discard.
     static constexpr std::size_t kSnapshotThreshold = 8;
+    // S8.2b BOUNDED REPLICATION BATCHING: max entries per AppendEntries (mirror of
+    // RaftNodeA::kMaxBatch). Bounds each send to O(kMaxBatch) reactor work so a
+    // pipelined burst no longer blocks the single reactor coroutine + starves the
+    // heartbeat timer (S8.2a-diagnosed 3-node collapse). 64 = sane Raft default.
+    static constexpr std::uint64_t kMaxBatch = 64;
     // Measurement counters (introspection only; NOT persisted, reset on crash).
     std::uint64_t snapshots_taken_ = 0;
     std::uint64_t snapshots_installed_ = 0;
 
     std::vector<bool> votes_granted_;          // by cluster index (Candidate)
     std::vector<Index> next_index_;            // by cluster index (Leader)
+    // S8.2b: highest index shipped to each peer in its last AppendEntries batch; the
+    // ack handler re-kicks only once match_index_ >= sent_index_ (previous batch fully
+    // landed) so at most one bounded batch is in flight per peer (no re-send cascade).
+    std::vector<Index> sent_index_;            // by cluster index (Leader)
     std::vector<Index> match_index_;           // by cluster index (Leader)
 
     // ---- C4.2 MEMBERSHIP CHANGE state (Membership.tla) ----------------
@@ -1581,6 +1634,15 @@ private:
     bool recovered_ = false;                   // async disk recovery done?
     std::uint64_t loop_epoch_ = 0;             // bumped on crash/restart to retire old coroutines
     core::Tick election_deadline_ = 0;
+
+    // ---- S8.2b replication coalescing (de-dup per-submit broadcast bursts) -----
+    // repl_pending_: a submit appended an entry whose replication kick was coalesced
+    // away this turn (the ticker re-broadcasts unconditionally next turn). repl_kicked_:
+    // a bounded broadcast already fired this scheduler turn, so further submits this
+    // turn only mark pending (one kick per turn, not K). Pure in-memory scheduling
+    // hints, NOT durable / NOT safety state; reset on crash.
+    bool repl_pending_ = false;
+    bool repl_kicked_ = false;
 
     // Durable write pipeline. write_queue_ holds framed records not yet handed to
     // IDisk; the worker drains them in order, then sync()s if want_sync_. A single
@@ -1771,6 +1833,12 @@ inline core::Task RaftNodeB::ticker(std::uint64_t epoch) {
             continue;
         }
         if (role_ == Role::Leader) {
+            // S8.2b: fresh scheduler turn — re-open the per-turn coalesce gate (clear
+            // here, BEFORE the broadcast below, so the next submit-burst re-arms a
+            // single bounded kick). repl_pending_ is subsumed by the unconditional
+            // heartbeat broadcast that follows, so no separate flush is needed.
+            repl_kicked_ = false;
+            repl_pending_ = false;
             broadcast_append_entries();
             // C4.2: keep pushing the config rollout until it commits (a dropped
             // ConfigChange is retried each heartbeat); no-op once Settled.

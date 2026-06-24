@@ -11,12 +11,19 @@
 //       (role 0=Follower 1=Candidate 2=Leader). A node that does not reply within the
 //       deadline prints ok=0 (the orchestrator treats it as down / not-yet-up).
 //
-//   submit VALUE --host PORT [--host PORT ...]
+//   submit VALUE [--no-await] --host PORT [--host PORT ...]
 //       SUBMIT VALUE to the nodes in order; on NotLeader, retry the next host until one
-//       ACCEPTS (the LEADER-FIND client). Prints:
-//         SUBMIT value=<V> accepted=<0|1> port=<P> term=<T> index=<I> leader_hint=<H>
-//       accepted=1 means the leader appended it at <index>; accepted=0 means no host in
-//       the list accepted within the per-host deadline (caller retries later).
+//       ACCEPTS (the LEADER-FIND client). S8.4 DURABLE-BY-DEFAULT: success now means the
+//       write is COMMITTED (durable on a quorum), not merely accepted. After a host
+//       accepts {term,index}, poll that node until commit_index covers the index AND the
+//       entry there is STILL our value (a stale leader's accepted-but-uncommitted entry
+//       can be overwritten / lost — accept != commit), THEN report durable=1. Prints:
+//         SUBMIT value=<V> accepted=<0|1> durable=<0|1> port=<P> term=<T> index=<I> ...
+//       durable=1 means COMMITTED (exit 0); durable=0 means accepted but NOT confirmed
+//       committed within the bounded deadline (exit nonzero — caller retries). --no-await
+//       reverts to accept-only (omits durable=; the load harness's accept measurement);
+//       the DEFAULT awaits commit so a client is told "done" only when the write is
+//       durable. The poll is BOUNDED by an absolute deadline — never an unbounded spin.
 //
 //   bench --count N [--value-bytes B] [--commit-samples S] --host PORT [--host PORT ...]
 //       Phase 7 S7 PERFORMANCE BASELINE driver. Over ONE persistent client reactor +
@@ -51,6 +58,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -74,6 +82,15 @@ constexpr std::uint64_t kClientId = 9'000'000'001ULL;
 // spin. 1.5 s absorbs cross-process connect + reply latency while killing any hang.
 constexpr core::Tick kReqWallNs = 1'500'000'000;
 
+// S8.4 DURABLE SUBMIT — how long (absolute, BOUNDED) the durable `submit` waits for the
+// accepted entry to COMMIT (commit_index covers its index AND the value there is still
+// ours) before reporting NOT-durable (the caller retries). accept != commit: a leader
+// that crashes before a quorum replicates an accepted-but-UNcommitted entry LEGITIMATELY
+// loses it (Raft only promises COMMITTED entries survive). So a durable submit reports
+// success ONLY once the entry is COMMITTED — never merely accepted. 5 s comfortably
+// covers replication+commit on a healthy quorum yet kills any hang.
+constexpr core::Tick kDurableWallNs = 5'000'000'000;
+
 std::uint16_t parse_port(const char* s) {
     if (s == nullptr) {
         return 0;
@@ -93,6 +110,17 @@ core::Task status_rpc(core::INetwork* cli, core::Endpoint admin, prod::AdminStat
     co_await cli->send(admin, {req.data(), req.size()});
     core::Message rep = co_await cli->recv();
     *ok = prod::decode_status(rep.payload, *out);
+    *done = true;
+    co_return;
+}
+
+// ---- one CHEAP commit-index round-trip (S8.3; O(1) on the server, NO log) --
+core::Task stat_commit_rpc(core::INetwork* cli, core::Endpoint admin,
+                           prod::AdminCommit* out, bool* ok, bool* done) {
+    const std::vector<std::byte> req = prod::encode_stat_commit();
+    co_await cli->send(admin, {req.data(), req.size()});
+    core::Message rep = co_await cli->recv();
+    *ok = prod::decode_stat_commit(rep.payload, *out);
     *done = true;
     co_return;
 }
@@ -128,26 +156,36 @@ core::Task submit_rpc(core::INetwork* cli, core::Endpoint admin, std::string val
 // A fresh client endpoint dialing one admin port. The admin endpoint id used for
 // dialing is synthetic (admin ports map to distinct synthetic peer ids in the client's
 // bus); each call recreates the reactor/bus so a prior connection never lingers.
+//
+// CLIENT-ID UNIQUENESS (S8.3): the daemon's admin net learns each inbound connection by
+// the connecting node's HELLO id and routes a reply via send(msg.from). If TWO client
+// connections to the SAME daemon share a node id, the daemon collapses them to ONE
+// connection and a reply for one is sent down the other — the second client never gets
+// its reply. So every concurrent client (each load conn AND each commit poller) MUST use
+// a DISTINCT id. `client_id` defaults to kClientId for the single-shot verbs; the
+// concurrent paths pass a unique id per connection.
 struct Client {
     prod::ProdReactor reactor;
     prod::ProdNetworkBus bus{reactor};
     bool ok = false;
+    std::uint64_t self_id = 0;
     std::uint64_t admin_peer_id = 0;
 
-    explicit Client(std::uint16_t admin_port) {
+    explicit Client(std::uint16_t admin_port, std::uint64_t client_id = kClientId) {
         if (!reactor.valid()) {
             return;
         }
+        self_id = client_id;
         // Synthetic peer id for the target admin endpoint (unique per port).
         admin_peer_id = 8'000'000'000ULL + admin_port;
-        if (!bus.add_node(kClientId)) {  // our own ephemeral client listen socket
+        if (!bus.add_node(self_id)) {  // our own ephemeral client listen socket
             return;
         }
         bus.add_peer(admin_peer_id, admin_port);  // record where the daemon's admin lives
         ok = true;
     }
 
-    [[nodiscard]] core::INetwork* net() { return bus.node(kClientId); }
+    [[nodiscard]] core::INetwork* net() { return bus.node(self_id); }
     [[nodiscard]] core::Endpoint admin_ep() const { return core::Endpoint{admin_peer_id}; }
 };
 
@@ -160,6 +198,19 @@ bool do_status(std::uint16_t port, prod::AdminStatus& out) {
     bool ok = false;
     bool done = false;
     c.reactor.spawn(status_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// Run the CHEAP commit query against one admin port; fill `out`. True if a reply decoded.
+bool do_commit(std::uint16_t port, prod::AdminCommit& out) {
+    Client c(port);
+    if (!c.ok) {
+        return false;
+    }
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(stat_commit_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
     c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
     return done && ok;
 }
@@ -200,6 +251,17 @@ bool bench_status(Client& c, prod::AdminStatus& out) {
     bool ok = false;
     bool done = false;
     c.reactor.spawn(status_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// One CHEAP commit-index round-trip on an EXISTING client reactor/connection (S8.3).
+// O(1) on the server (no log serialized), so polling commit progress per submit is cheap
+// and does NOT degrade as the durable log grows.
+bool bench_commit(Client& c, prod::AdminCommit& out) {
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(stat_commit_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
     c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
     return done && ok;
 }
@@ -373,6 +435,313 @@ int cmd_bench(const BenchArgs& ba, const std::vector<std::uint16_t>& hosts) {
     return read_ok ? 0 : 1;
 }
 
+// ============================================================================
+// PIPELINED / CONCURRENT BENCH (S8.1) — OPEN-LOOP load to find the REAL ceiling.
+// ============================================================================
+// The S7 `bench` verb is CLOSED-LOOP (concurrency 1: send->recv->send...), so its
+// throughput is 1/latency by construction — it measures latency, not the throughput
+// ceiling. `pbench` keeps K requests IN FLIGHT on ONE persistent connection (a sliding
+// WINDOW: fire K submits without waiting, then for each reply fire one more), and/or
+// drives C such connections concurrently on ONE client reactor. Real throughput is the
+// total ACCEPTED ops over the wall time of the loop (NOT 1/latency).
+//
+// WHY THIS REVEALS THE BOTTLENECK: pipelining removes the per-request client<->server
+// ROUND-TRIP stall. If throughput RISES with depth, the round-trip (network / commit
+// RTT) was the limit. If it stays FLAT, the server's per-op serial work (reactor CPU,
+// or fdatasync if accept blocked on sync) is the limit. The admin serve-loop processes
+// frames from one connection SERIALLY (recv->handle->send), but the connection BUFFERS
+// queued inbound frames (FIFO), so K pipelined submits ARE accepted without K round
+// trips. submit->ACCEPT does NOT block on fdatasync (the persist worker syncs in the
+// background), so pbench measures the ACCEPT ceiling = reactor/CPU + append + the serve
+// loop's per-frame cost.
+//
+// BOUNDED: finite total N, finite window K, an absolute wall deadline; never a spin.
+//
+// S8.3 HONEST COMMIT THROUGHPUT (the HEADLINE). accept_tput above is the leader's LOCAL
+// APPEND rate: submit() returns at ACCEPT (term,index assigned), BEFORE the entry is
+// committed (replicated to a quorum + commit_index advanced). With S8.2b batching, append
+// is cheap, so accept_tput inflates FAR past the real commit ceiling (measured: 3-node
+// depth-64 accept_tput ~46k/s while only ~1900/4000 had committed when the load
+// "finished"). So after the accept load, pbench POLLS the new CHEAP O(1) commit-index
+// query (StatCommit — role/term/commit only, no log serialized) on every host until the
+// cluster commit_index covers the highest accepted index; commit_tput = accepted /
+// (wall until commit covers all accepted). HEADLINE = commit_tput; accept_tput kept as a
+// clearly-labeled secondary (leader-append, NOT commit). The cheap poll is O(1) so it
+// does NOT degrade with log size — the hot path no longer pays the full-log STATUS cost.
+
+struct PipeArgs {
+    std::uint64_t count = 2000;        // total submits across all connections (FINITE)
+    std::uint64_t value_bytes = 16;
+    std::uint64_t inflight = 16;       // window depth K per connection (>=1)
+    std::uint64_t conns = 1;           // concurrent client connections C (>=1)
+};
+
+// Per-connection pipeline state (heap-stable; the coroutine holds a raw pointer to it).
+struct PipeConn {
+    Client* client = nullptr;          // owns reactor/bus (shared reactor via the driver)
+    std::uint64_t to_send = 0;         // submits still to fire on THIS connection
+    std::uint64_t base_seq = 0;        // first value seq for this conn (distinct values)
+    std::uint64_t next_seq = 0;        // next value seq to fire
+    std::uint64_t value_bytes = 16;
+    std::uint64_t window = 1;          // K
+    std::uint64_t accepted = 0;        // replies that were SubmitOk
+    std::uint64_t replied = 0;         // total replies seen
+    std::uint64_t max_index = 0;       // highest log index ACCEPTED (the commit target)
+    bool fault = false;                // a not-accepted / decode failure stops the conn
+    bool done = false;
+};
+
+// The pipelined driver for ONE connection: keep `window` submits outstanding. Fire the
+// first window, then on EACH reply fire the next (sliding window) until `to_send` are all
+// fired AND all replies are in. send() and recv() are independent coroutines awaited in
+// lockstep order (the connection delivers in send order, the serve loop replies in that
+// order, so the j-th recv corresponds to the j-th send). BOUNDED by `to_send`.
+//
+// EARLY STOP on a NotLeader/garbage reply: if leadership is lost mid-run we STOP firing
+// new submits and DRAIN the already-outstanding replies, then finish. This keeps the
+// measured throughput honest (it covers the STABLE-leader window, not a long tail of
+// doomed NotLeader submits that would dilute the denominator) and bounds the run.
+core::Task pipe_run(PipeConn* st) {
+    core::INetwork* net = st->client->net();
+    const core::Endpoint admin = st->client->admin_ep();
+    std::uint64_t outstanding = 0;
+    bool stop_sending = false;
+    // Prime the window.
+    while (outstanding < st->window && st->next_seq < st->base_seq + st->to_send) {
+        const std::string v = make_value(st->next_seq++, st->value_bytes);
+        const std::vector<std::byte> req = prod::encode_submit(v);
+        co_await net->send(admin, {req.data(), req.size()});
+        ++outstanding;
+    }
+    // Drain + refill: one recv per outstanding, fire a replacement if any remain and we
+    // have not hit a fault. Loop while ANY reply is still outstanding (covers the early-
+    // stop drain) — bounded by the total ever sent.
+    while (outstanding > 0) {
+        core::Message rep = co_await net->recv();
+        --outstanding;
+        ++st->replied;
+        prod::admin_detail::Reader r{rep.payload.data(), rep.payload.size(), 0, true};
+        const auto kind = static_cast<prod::AdminKind>(r.u8());
+        if (kind == prod::AdminKind::SubmitOk) {
+            ++st->accepted;
+            r.u64();  // skip the reply's term field to reach the index
+            const std::uint64_t index = r.u64();
+            if (r.ok() && index > st->max_index) {
+                st->max_index = index;  // highest accepted index = the commit target
+            }
+        } else {
+            st->fault = true;       // NotLeader / garbage: leadership lost — stop firing.
+            stop_sending = true;
+        }
+        if (!stop_sending && st->next_seq < st->base_seq + st->to_send) {
+            const std::string v = make_value(st->next_seq++, st->value_bytes);
+            const std::vector<std::byte> req = prod::encode_submit(v);
+            co_await net->send(admin, {req.data(), req.size()});
+            ++outstanding;
+        }
+    }
+    st->done = true;
+    co_return;
+}
+
+// One persistent client connection per concurrent stream, ALL on ONE shared reactor (so
+// C connections are driven concurrently by the single client reactor — true in-flight
+// concurrency at the client). Returns the process exit code; prints a PBENCH line.
+int cmd_pbench(const PipeArgs& pa, const std::vector<std::uint16_t>& hosts) {
+    const std::uint16_t leader_port = find_leader_port(hosts);
+    if (leader_port == 0) {
+        std::printf("PBENCH error=no_leader\n");
+        std::fflush(stdout);
+        return 1;
+    }
+    const std::uint64_t conns = pa.conns == 0 ? 1 : pa.conns;
+    const std::uint64_t window = pa.inflight == 0 ? 1 : pa.inflight;
+
+    // Split the total count across the C connections (the LAST takes the remainder).
+    std::vector<std::unique_ptr<Client>> clients;
+    std::vector<std::unique_ptr<PipeConn>> states;
+    clients.reserve(conns);
+    states.reserve(conns);
+    for (std::uint64_t ci = 0; ci < conns; ++ci) {
+        // DISTINCT id per load connection so the daemon routes each conn's replies back
+        // to the right connection (a shared id would collapse them — see Client docs).
+        auto cl = std::make_unique<Client>(leader_port, kClientId + ci);
+        if (!cl->ok) {
+            std::printf("PBENCH error=client_init\n");
+            std::fflush(stdout);
+            return 1;
+        }
+        clients.push_back(std::move(cl));
+    }
+
+    // Each Client owns its own reactor (epoll fd + bus). To drive C connections
+    // concurrently we ROUND-ROBIN pump every reactor a short slice so all C have
+    // outstanding work at once (a finite, deadline-bounded loop — never a spin). With
+    // C=1 this is a single connection at window depth K (pure pipelining).
+    const std::uint64_t per = pa.count / conns;
+    const std::uint64_t rem = pa.count % conns;
+    std::uint64_t seq = 0;
+    for (std::uint64_t ci = 0; ci < conns; ++ci) {
+        auto st = std::make_unique<PipeConn>();
+        st->client = clients[ci].get();
+        st->value_bytes = pa.value_bytes;
+        st->window = window;
+        st->to_send = per + (ci + 1 == conns ? rem : 0);
+        st->base_seq = seq;
+        st->next_seq = seq;
+        seq += st->to_send;
+        clients[ci]->reactor.spawn(pipe_run(st.get()));
+        states.push_back(std::move(st));
+    }
+
+    // Bound the whole load: a generous absolute wall (scaled by count); if it elapses we
+    // stop (a stall is a finding, not a hang). We measure elapsed time from the MAX now()
+    // across all reactors — a reactor that finishes early stops being pumped (its clock
+    // freezes), so the per-reactor clock is NOT a safe global wall. The max over all live
+    // reactors always advances while ANY connection is pumped, so the guard never wedges.
+    auto max_now = [&]() -> core::Tick {
+        core::Tick m = 0;
+        for (std::uint64_t ci = 0; ci < conns; ++ci) {
+            const core::Tick n = clients[ci]->reactor.now();
+            if (n > m) {
+                m = n;
+            }
+        }
+        return m;
+    };
+    const core::Tick t0 = max_now();
+    const core::Tick wall_ns = t0 +
+                               static_cast<core::Tick>(pa.count) * 2'000'000 + // ~2ms/op cap
+                               5'000'000'000;                                  // +5s floor
+    bool all_done = false;
+    while (!all_done && max_now() < wall_ns) {
+        all_done = true;
+        for (std::uint64_t ci = 0; ci < conns; ++ci) {
+            if (!states[ci]->done) {
+                all_done = false;
+                // Pump THIS reactor one short slice so every connection progresses.
+                clients[ci]->reactor.run_until([&] { return states[ci]->done; },
+                                               clients[ci]->reactor.now() + 1'000'000);
+            }
+        }
+    }
+    const core::Tick t1 = max_now();
+    const double elapsed_ms = static_cast<double>(t1 - t0) / 1'000'000.0;
+
+    std::uint64_t accepted = 0;
+    std::uint64_t replied = 0;
+    std::uint64_t commit_target = 0;  // highest accepted log index across all conns
+    bool any_fault = false;
+    bool any_unfinished = false;
+    for (std::uint64_t ci = 0; ci < conns; ++ci) {
+        accepted += states[ci]->accepted;
+        replied += states[ci]->replied;
+        if (states[ci]->max_index > commit_target) {
+            commit_target = states[ci]->max_index;
+        }
+        any_fault = any_fault || states[ci]->fault;
+        any_unfinished = any_unfinished || !states[ci]->done;
+    }
+    // accept_tput = leader-LOCAL-APPEND rate (submit returns at append, BEFORE commit).
+    const double accept_tput = elapsed_ms > 0.0
+                            ? static_cast<double>(accepted) / (elapsed_ms / 1000.0)
+                            : 0.0;
+
+    // ----------------------------------------------------------------------
+    // S8.3 HONEST COMMIT THROUGHPUT. accept_tput above measures the leader's local
+    // APPEND rate — submit() returns when the entry is appended (term,index assigned),
+    // BEFORE it is committed (replicated to a quorum + commit_index advanced). With
+    // batching (S8.2b) append is cheap, so accept_tput inflates well past the real
+    // COMMIT ceiling. To measure HONEST commit throughput we now POLL the CHEAP O(1)
+    // commit-index query (StatCommit) on EVERY host until the cluster's commit_index
+    // COVERS the highest accepted index (commit_target). Because the leader only
+    // advances commit_index once a QUORUM has acked, the max commit_index across hosts
+    // reaching commit_target == quorum-committed. The poll is O(1) per call (no log
+    // serialized), so polling per progress-check does NOT degrade as the log grows.
+    //
+    // commit_tput = accepted / (wall time from the FIRST submit until commit covers all
+    // accepted submits). This is the HEADLINE. BOUNDED by an absolute catch-up wall.
+    double commit_tput = 0.0;
+    double commit_elapsed_ms = 0.0;
+    std::uint64_t commit_reached = 0;
+    bool commit_covered = false;
+    if (commit_target > 0) {
+        // A dedicated cheap-poll client per host (separate from the load connections).
+        // Each gets a DISTINCT id (well above the load-conn ids) so the daemon does NOT
+        // collapse a poller connection with a load connection (see Client docs).
+        std::vector<std::unique_ptr<Client>> pollers;
+        pollers.reserve(hosts.size());
+        std::uint64_t poller_id = kClientId + 1'000'000ULL;
+        for (std::uint16_t port : hosts) {
+            auto pc = std::make_unique<Client>(port, poller_id++);
+            if (pc->ok) {
+                pollers.push_back(std::move(pc));
+            }
+        }
+        // Catch-up wall: generous, scaled by count (a stall here is a finding, bounded).
+        const core::Tick catchup_wall =
+            static_cast<core::Tick>(pa.count) * 4'000'000 + 10'000'000'000;  // ~4ms/op +10s
+        core::Tick poll_t0 = 0;
+        for (auto& p : pollers) {
+            if (p->reactor.now() > poll_t0) {
+                poll_t0 = p->reactor.now();
+            }
+        }
+        const core::Tick poll_deadline = poll_t0 + catchup_wall;
+        auto poll_max_now = [&]() -> core::Tick {
+            core::Tick m = 0;
+            for (auto& p : pollers) {
+                if (p->reactor.now() > m) {
+                    m = p->reactor.now();
+                }
+            }
+            return m;
+        };
+        while (!commit_covered && poll_max_now() < poll_deadline) {
+            commit_reached = 0;
+            for (auto& p : pollers) {
+                prod::AdminCommit ac;
+                if (bench_commit(*p, ac) && ac.commit_index > commit_reached) {
+                    commit_reached = ac.commit_index;  // max == the leader's commit_index
+                }
+            }
+            if (commit_reached >= commit_target) {
+                commit_covered = true;
+                break;
+            }
+        }
+        const core::Tick commit_t1 = poll_max_now();
+        // Commit wall measured from the load's t0 (max_now baseline) to commit coverage.
+        // The poll reactors are distinct from the load reactors, so we approximate the
+        // commit-completion instant by the accept-phase wall + the poll catch-up wall.
+        commit_elapsed_ms = elapsed_ms +
+            static_cast<double>(commit_t1 - poll_t0) / 1'000'000.0;
+        commit_tput = (commit_covered && commit_elapsed_ms > 0.0)
+                          ? static_cast<double>(accepted) / (commit_elapsed_ms / 1000.0)
+                          : 0.0;
+    }
+
+    std::printf(
+        "PBENCH count=%llu inflight=%llu conns=%llu value_bytes=%llu "
+        "commit_tput=%.1f commit_elapsed_ms=%.3f commit_target=%llu commit_reached=%llu "
+        "commit_covered=%d accept_tput=%.1f accept_elapsed_ms=%.3f "
+        "accepted=%llu replied=%llu fault=%d unfinished=%d\n",
+        static_cast<unsigned long long>(pa.count),
+        static_cast<unsigned long long>(window),
+        static_cast<unsigned long long>(conns),
+        static_cast<unsigned long long>(pa.value_bytes),
+        commit_tput, commit_elapsed_ms,
+        static_cast<unsigned long long>(commit_target),
+        static_cast<unsigned long long>(commit_reached),
+        commit_covered ? 1 : 0,
+        accept_tput, elapsed_ms,
+        static_cast<unsigned long long>(accepted),
+        static_cast<unsigned long long>(replied), any_fault ? 1 : 0,
+        any_unfinished ? 1 : 0);
+    std::fflush(stdout);
+    return (any_unfinished || accepted == 0) ? 1 : 0;
+}
+
 void print_status(std::uint16_t port, bool ok, const prod::AdminStatus& st) {
     std::printf("STATUS port=%u ok=%d role=%u term=%llu commit=%llu log=", port,
                 ok ? 1 : 0, static_cast<unsigned>(st.role),
@@ -394,23 +763,107 @@ int cmd_status(const std::vector<std::uint16_t>& hosts) {
     return 0;
 }
 
+// S8.3 CHEAP commit query — the O(1) counterpart of `status` (role/term/commit ONLY, no
+// log digest). Prints one line per host. This is the verb a commit-progress poll uses so
+// it never pays the full-log STATUS re-serialization cost.
+int cmd_commit(const std::vector<std::uint16_t>& hosts) {
+    for (std::uint16_t port : hosts) {
+        prod::AdminCommit ac;
+        const bool ok = do_commit(port, ac);
+        std::printf("COMMIT port=%u ok=%d role=%u term=%llu commit=%llu\n", port,
+                    ok ? 1 : 0, static_cast<unsigned>(ac.role),
+                    static_cast<unsigned long long>(ac.term),
+                    static_cast<unsigned long long>(ac.commit_index));
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
+// S8.4 DURABLE CONFIRMATION — given an accepted {value, index}, decide whether it is
+// COMMITTED on `port`: poll STATUS until commit_index >= index AND the entry at that
+// 1-based index is STILL `value`. The committed-log digest STATUS returns is the FULL
+// durable log; index `idx` lives at committed[idx-1]. Three terminating outcomes (all
+// BOUNDED by the absolute `deadline` — never a spin):
+//   * COMMITTED: commit_index covers idx AND committed[idx-1] == value  -> durable.
+//   * OVERWRITTEN: commit_index covers idx but committed[idx-1] != value -> a NEW leader
+//     overwrote this stale-leader entry (spec conflict rule). NOT durable; caller retries
+//     with a fresh submit (a different index). We stop polling immediately (it can never
+//     become ours again at this index).
+//   * TIMEOUT: deadline elapsed before commit_index reached idx -> NOT durable (the entry
+//     may yet commit, but we will NOT report success on an un-confirmed write).
+// Returns true ONLY for COMMITTED. `port` is the ACCEPTING node (the leader that took the
+// entry); its own commit_index advancing to idx means a QUORUM replicated+acked it.
+enum class DurableResult : std::uint8_t { Committed, Overwritten, Timeout };
+
+DurableResult confirm_durable(std::uint16_t port, const std::string& value,
+                              std::uint64_t idx, core::Tick deadline_ns) {
+    Client c(port);
+    if (!c.ok) {
+        return DurableResult::Timeout;
+    }
+    while (c.reactor.now() < deadline_ns) {
+        prod::AdminStatus st;
+        bool ok = false;
+        bool done = false;
+        c.reactor.spawn(status_rpc(c.net(), c.admin_ep(), &st, &ok, &done));
+        c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+        if (done && ok && st.commit_index >= idx) {
+            // commit_index covers our index: the entry there is FINAL (committed entries
+            // never change). Is it still ours?
+            if (idx >= 1 && idx <= st.committed.size() && st.committed[idx - 1] == value) {
+                return DurableResult::Committed;
+            }
+            return DurableResult::Overwritten;  // a new leader overwrote our slot.
+        }
+        // not yet committed to our index: poll again (bounded by `deadline_ns`).
+    }
+    return DurableResult::Timeout;
+}
+
 // LEADER-FIND submit: try each host in order; the LEADER accepts (accepted=1), a
-// follower replies NotLeader (we try the next host). Print the outcome.
-int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts) {
+// follower replies NotLeader (we try the next host).
+//
+// S8.4 DURABLE-BY-DEFAULT: a successful response now means the write is COMMITTED (durable
+// on a quorum), not merely accepted (appended by a possibly-stale leader). After a host
+// accepts {term,index}, we POLL that node (confirm_durable) until commit_index covers the
+// index AND the entry there is STILL our value — only THEN print durable=1. On
+// timeout/overwrite/leader-change we print durable=0 (caller retries with a fresh submit).
+// `await_durable=false` (--no-await) reverts to the OLD accept-only behaviour (durable
+// omitted) for the load harness's accept measurement — but the DEFAULT awaits commit.
+int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts,
+               bool await_durable) {
     for (std::uint16_t port : hosts) {
         SubmitOutcome so;
         const bool replied = do_submit(port, value, so);
         if (replied && so.accepted) {
-            std::printf("SUBMIT value=%s accepted=1 port=%u term=%llu index=%llu "
-                        "leader_hint=0\n",
-                        value.c_str(), port, static_cast<unsigned long long>(so.term),
+            if (!await_durable) {
+                // accept-only mode: report the append (NOT a durability claim).
+                std::printf("SUBMIT value=%s accepted=1 port=%u term=%llu index=%llu "
+                            "leader_hint=0\n",
+                            value.c_str(), port,
+                            static_cast<unsigned long long>(so.term),
+                            static_cast<unsigned long long>(so.index));
+                std::fflush(stdout);
+                return 0;
+            }
+            // Durable-by-default: confirm the accepted entry COMMITTED (commit_index
+            // covers it AND the value is still ours) before reporting success.
+            Client probe(port);  // a stable now() baseline for the absolute deadline.
+            const core::Tick deadline = (probe.ok ? probe.reactor.now() : 0) + kDurableWallNs;
+            const DurableResult dr = confirm_durable(port, value, so.index, deadline);
+            const bool durable = (dr == DurableResult::Committed);
+            std::printf("SUBMIT value=%s accepted=1 durable=%d port=%u term=%llu "
+                        "index=%llu leader_hint=0\n",
+                        value.c_str(), durable ? 1 : 0, port,
+                        static_cast<unsigned long long>(so.term),
                         static_cast<unsigned long long>(so.index));
             std::fflush(stdout);
-            return 0;
+            return durable ? 0 : 1;  // not-durable -> nonzero (caller retries).
         }
         // NotLeader or no reply: try the next host (the leader-find retry loop).
     }
-    std::printf("SUBMIT value=%s accepted=0 port=0 term=0 index=0 leader_hint=0\n",
+    std::printf("SUBMIT value=%s accepted=0 durable=0 port=0 term=0 index=0 "
+                "leader_hint=0\n",
                 value.c_str());
     std::fflush(stdout);
     return 1;  // no host accepted (caller retries later)
@@ -432,9 +885,13 @@ int main(int argc, char** argv) {
         std::fprintf(
             stderr,
             "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
-            "       lockstep_admin submit VALUE --host PORT [--host PORT ...]\n"
+            "       lockstep_admin commit --host PORT [--host PORT ...]\n"
+            "       lockstep_admin submit VALUE [--no-await] --host PORT "
+            "[--host PORT ...]\n"
             "       lockstep_admin bench --count N [--value-bytes B] "
-            "[--commit-samples S] --host PORT [--host PORT ...]\n");
+            "[--commit-samples S] --host PORT [--host PORT ...]\n"
+            "       lockstep_admin pbench --count N [--inflight K] [--conns C] "
+            "[--value-bytes B] --host PORT [--host PORT ...]\n");
         return 2;
     }
 
@@ -442,6 +899,8 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> hosts;
     std::string value;
     BenchArgs ba;
+    PipeArgs pa;
+    bool await_durable = true;  // S8.4: submit is DURABLE (await commit) by default.
     int i = 2;
 
     if (verb == "submit") {
@@ -469,8 +928,21 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--commit-samples") == 0 && i + 1 < argc) {
             ba.commit_samples = parse_u64_opt(argv[i + 1], ba.commit_samples);
             ++i;
+        } else if (std::strcmp(argv[i], "--inflight") == 0 && i + 1 < argc) {
+            pa.inflight = parse_u64_opt(argv[i + 1], pa.inflight);
+            ++i;
+        } else if (std::strcmp(argv[i], "--conns") == 0 && i + 1 < argc) {
+            pa.conns = parse_u64_opt(argv[i + 1], pa.conns);
+            ++i;
+        } else if (std::strcmp(argv[i], "--no-await") == 0) {
+            // Accept-only submit (load-harness accept measurement); DEFAULT is durable.
+            await_durable = false;
         }
     }
+    // pbench shares --count + --value-bytes with bench (the --count/--value-bytes flags
+    // land in ba; copy them across so pbench honors them).
+    pa.count = ba.count;
+    pa.value_bytes = ba.value_bytes;
 
     if (hosts.empty()) {
         std::fprintf(stderr, "lockstep_admin: no --host PORT given\n");
@@ -480,11 +952,17 @@ int main(int argc, char** argv) {
     if (verb == "status") {
         return cmd_status(hosts);
     }
+    if (verb == "commit") {
+        return cmd_commit(hosts);
+    }
     if (verb == "submit") {
-        return cmd_submit(value, hosts);
+        return cmd_submit(value, hosts, await_durable);
     }
     if (verb == "bench") {
         return cmd_bench(ba, hosts);
+    }
+    if (verb == "pbench") {
+        return cmd_pbench(pa, hosts);
     }
     std::fprintf(stderr, "lockstep_admin: unknown verb '%s'\n", verb.c_str());
     return 2;

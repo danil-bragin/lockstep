@@ -54,6 +54,8 @@
 #include <unistd.h>    // close
 
 #include <cstdint>
+#include <cstdio>   // diagnostic print (env-gated)
+#include <cstdlib>  // getenv (diagnostic gate)
 #include <coroutine>
 #include <functional>
 #include <string>
@@ -92,7 +94,14 @@ public:
     // with the reactor's vtime()/now()/timer-deadline source — no second ProdClock
     // with a divergent origin. now()/vtime()/arm_timer() all read the same origin.
     ProdReactor() noexcept
-        : clock_(this), epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)) {}
+        : clock_(this), epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)) {
+        // DIAGNOSTIC (S8.2a, env-gated, OFF by default): LOCKSTEP_REACTOR_DIAG=1 turns
+        // on max-timer-lateness tracking, printed at destruction. Prod-layer only.
+        // getenv is read ONCE at construction on the single reactor thread (the reactor
+        // is single-threaded by contract; no other thread races it) — known-safe here.
+        const char* e = ::getenv("LOCKSTEP_REACTOR_DIAG");  // NOLINT(concurrency-mt-unsafe)
+        diag_timers_ = (e != nullptr && e[0] == '1');
+    }
 
     ProdReactor(const ProdReactor&) = delete;
     ProdReactor& operator=(const ProdReactor&) = delete;
@@ -103,6 +112,12 @@ public:
     // reactor still owns — a clean run to quiescence leaves none, but defensive
     // cleanup keeps ASan/LSan quiet (mirrors Scheduler's destructor).
     ~ProdReactor() override {
+        if (diag_timers_) {
+            std::fprintf(stderr,
+                         "[reactor-diag] max_timer_lateness_us=%lld fires=%llu\n",
+                         static_cast<long long>(diag_max_late_ns_ / 1000),
+                         static_cast<unsigned long long>(diag_fire_count_));
+        }
         for (auto& frame : owned_frames_) {
             if (frame) {
                 frame.destroy();
@@ -156,11 +171,12 @@ public:
             if (stop_) {
                 break;
             }
+            // FAIRNESS (S8.2a): fire any DUE timer BEFORE draining ready work, so a
+            // heartbeat that has come due is sent even when the ready queue stays hot
+            // under a client-I/O burst (see drain_ready_bounded / wait_and_dispatch).
+            maybe_fire_due_timers();
             if (!ready_.empty()) {
-                core::detail::ReadyItem item = ready_.pop();
-                trace(core::TraceAction::Resume,
-                      std::string("seq=") + std::to_string(item.seq));
-                item.handle.resume(); // the ONE and ONLY resume site (L1)
+                drain_ready_bounded();
                 continue;
             }
             // Ready queue empty. Quiesce if nothing can ever wake us (no timers AND
@@ -289,11 +305,12 @@ public:
             if (deadline_ns > 0 && clock_.now() >= deadline_ns) {
                 break; // HARD wall guard: never hang on a lost frame / half-open fd.
             }
+            // FAIRNESS (S8.2a): fire any DUE timer BEFORE draining ready work — a
+            // heartbeat due NOW is sent even while a client-I/O burst keeps refilling
+            // the ready queue (this is the loop lockstepd's leader actually runs).
+            maybe_fire_due_timers();
             if (!ready_.empty()) {
-                core::detail::ReadyItem item = ready_.pop();
-                trace(core::TraceAction::Resume,
-                      std::string("seq=") + std::to_string(item.seq));
-                item.handle.resume(); // the ONE and ONLY resume site (L1)
+                drain_ready_bounded();
                 continue;
             }
             // Ready queue empty. If nothing can ever wake us, quiesce.
@@ -483,6 +500,43 @@ private:
         fire_due_timers();
     }
 
+    // FAIRNESS (S8.2a) — pop at most kReadyDrainBudget ready items, in strict FIFO
+    // order (the SAME L1 resume site), then RETURN so the loop re-checks due timers.
+    // This bounds the run of ready work between timer checks: a continuously-refilling
+    // ready queue (a client-I/O burst on the leader reactor — each fd dispatch
+    // schedules a serve-loop continuation that schedules more) can no longer starve a
+    // due heartbeat, because after at most kReadyDrainBudget resumes control returns to
+    // maybe_fire_due_timers(). Order is UNCHANGED (FIFO ready.pop(), the one resume
+    // site L1); only the GRANULARITY of interleaving with the timer check changes. With
+    // no timers pending the budget is irrelevant to correctness (the loop just re-loops
+    // and keeps draining), so the T1-T4 quiescence tests (no fds, drive to empty) are
+    // unaffected.
+    void drain_ready_bounded() {
+        for (int n = 0; n < kReadyDrainBudget && !ready_.empty(); ++n) {
+            core::detail::ReadyItem item = ready_.pop();
+            trace(core::TraceAction::Resume,
+                  std::string("seq=") + std::to_string(item.seq));
+            item.handle.resume(); // the ONE and ONLY resume site (L1)
+        }
+    }
+
+    // FAIRNESS (S8.2a) — cheap guard around fire_due_timers(): a single now() read + a
+    // min-deadline scan; fire ONLY when a timer is actually due. Called at the TOP of
+    // every loop iteration (run / run_until) so a heartbeat whose deadline has passed is
+    // sent before the next ready item, EVEN when the ready queue is hot. No-op (one
+    // now() + a tiny scan, no firing) when no timer is due or none pend — so the hot
+    // path with no due timer pays only the scan. Fires in the SAME (deadline, arm_seq)
+    // order as the timeout path (fire_due_timers), so timer-ordering (T1-T4) is intact.
+    void maybe_fire_due_timers() {
+        if (timers_.empty()) {
+            return;
+        }
+        if (earliest_deadline() > clock_.now()) {
+            return; // nothing due yet — do not disturb the ready/epoll path.
+        }
+        fire_due_timers();
+    }
+
     // Fire every timer whose deadline has passed (now() >= deadline), in the
     // deterministic (deadline, arm_seq) order. Collect due indices, sort by the
     // key, MOVE out the timers (so erasing does not invalidate a Promise held
@@ -534,6 +588,18 @@ private:
         for (const std::size_t idx : idx_desc) {
             timers_.erase(timers_.begin() + static_cast<std::ptrdiff_t>(idx));
         }
+        // DIAGNOSTIC (S8.2a, env-gated) — track how LATE timers fire vs their deadline
+        // under load. Pure prod-layer measurement (no behavior change): if a heartbeat
+        // timer fires far past its deadline, the heartbeat-starvation hypothesis holds.
+        if (diag_timers_) {
+            for (const Timer& t : firing) {
+                const core::Tick late = now - t.deadline;  // now >= deadline (due)
+                if (late > diag_max_late_ns_) {
+                    diag_max_late_ns_ = late;
+                }
+                ++diag_fire_count_;
+            }
+        }
         // Fire: fulfilling each Promise SCHEDULES its waiter (L1). Trace each.
         for (Timer& t : firing) {
             trace(core::TraceAction::TimerFire, std::string("arm=") + std::to_string(t.arm_seq));
@@ -544,6 +610,14 @@ private:
     // epoll_wait scratch capacity. S4a registers no fds (n is always 0 on the
     // timeout path); sized for S4b's socket fan-in without a per-wait alloc.
     static constexpr int kMaxEvents = 64;
+
+    // FAIRNESS (S8.2a) — max ready items resumed between two due-timer checks. Large
+    // enough that normal bursts drain in one pass (no needless re-scan overhead) yet
+    // bounded so a self-refilling ready queue (client-I/O burst) ALWAYS yields back to
+    // maybe_fire_due_timers() within at most this many resumes — a due heartbeat is
+    // never starved past one budget's worth of client work. The timer check between
+    // batches is O(timers) (a handful), so the amortized cost is negligible.
+    static constexpr int kReadyDrainBudget = 64;
 
     ProdClock clock_{};                                     // real monotonic clock
     int epoll_fd_ = -1;                                     // owned; RAII-closed
@@ -556,6 +630,11 @@ private:
     std::uint64_t timer_arm_seq_ = 0;                       // timer-arm seq
     std::uint64_t next_task_id_ = 0;                        // spawned-task id seq
     bool stop_ = false;                                     // long-lived-loop break
+
+    // DIAGNOSTIC (S8.2a, env-gated) — max timer-fire lateness vs deadline under load.
+    bool diag_timers_ = false;                              // LOCKSTEP_REACTOR_DIAG=1
+    core::Tick diag_max_late_ns_ = 0;                       // worst late-fire seen
+    std::uint64_t diag_fire_count_ = 0;                     // # timers fired
 };
 
 } // namespace lockstep::prod
