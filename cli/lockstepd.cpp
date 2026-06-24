@@ -88,6 +88,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 #endif  // LOCKSTEP_PROFILE_ALLOC
 
+#include <lockstep/prod/ProdAuth.hpp>  // AUTH/RBAC — principal->role->permission policy
 #include <lockstep/prod/ProdConsensusNode.hpp>
 #include <lockstep/prod/ProdLog.hpp>  // Phase 10 OBSERVABILITY — structured lifecycle log
 #include <lockstep/prod/ProdNetwork.hpp>
@@ -165,6 +166,18 @@ struct Args {
     std::string tls_cert;
     std::string tls_key;
     std::string tls_ca;
+
+    // --- AUTH / RBAC (Phase: auth-rbac) ---------------------------------------
+    // RBAC maps the authenticated PRINCIPAL (the mTLS client cert CN, exposed by the
+    // provider) to a ROLE -> a PERMISSION set over operation classes. This cli passes only
+    // a policy PATH + inline grant STRINGS — it never touches OpenSSL (the provider extracts
+    // the CN). --auth-policy FILE loads `principal=CN role=NAME` lines; --auth-grant CN=ROLE
+    // adds one mapping inline (repeatable); --auth-plaintext MODE sets the no-cert posture
+    // (enforce|anonymous-reader|open). With none of these, RBAC is OPEN (legacy allow-all),
+    // so the existing non-auth runs are byte-identical.
+    std::string auth_policy;            // path to a policy file (optional)
+    std::vector<std::string> auth_grants;  // inline CN=ROLE grants (repeatable)
+    std::string auth_plaintext;         // plaintext posture: enforce|anonymous-reader|open
 };
 
 std::uint64_t parse_u64(const char* s, std::uint64_t fallback) {
@@ -244,9 +257,34 @@ Args parse_args(int argc, char** argv) {
             a.tls_key = v;
         } else if (std::strcmp(k, "--tls-ca") == 0) {
             a.tls_ca = v;
+        } else if (std::strcmp(k, "--auth-policy") == 0) {
+            a.auth_policy = v;
+        } else if (std::strcmp(k, "--auth-grant") == 0) {
+            a.auth_grants.emplace_back(v);
+        } else if (std::strcmp(k, "--auth-plaintext") == 0) {
+            a.auth_plaintext = v;
         }
     }
     return a;
+}
+
+// AUTH/RBAC: build the policy from the daemon Args. Loads the file (if any) then applies
+// the inline grants + plaintext posture on top. Returns false ONLY on a policy-FILE open
+// error (the caller then REFUSES to run rather than silently run unprotected). With no
+// auth flags at all the returned policy is not enabled() -> RBAC stays OPEN (legacy).
+bool build_auth_policy(const Args& args, prod::AuthPolicy& out) {
+    if (!args.auth_policy.empty()) {
+        if (!out.load_file(args.auth_policy)) {
+            return false;
+        }
+    }
+    for (const std::string& g : args.auth_grants) {
+        out.parse_line(g);  // "CN=ROLE" shorthand or "principal=.. role=.."
+    }
+    if (!args.auth_plaintext.empty()) {
+        out.parse_line("plaintext=" + args.auth_plaintext);
+    }
+    return true;
 }
 
 constexpr core::Tick kMsToNs = 1'000'000;
@@ -447,6 +485,24 @@ int main(int argc, char** argv) {
     if (!node.valid()) {
         std::fprintf(stderr, "lockstepd: failed to assemble consensus node\n");
         return 1;
+    }
+
+    // --- AUTH/RBAC: build + install the policy BEFORE start() ----------------
+    // The principal is the mTLS cert CN (provider-extracted); the policy maps it to a role
+    // -> permission. Installed before the admin serve-loop is spawned so every request is
+    // gated. A bad policy FILE makes the daemon REFUSE to run (never run unprotected).
+    {
+        prod::AuthPolicy policy;
+        if (!build_auth_policy(args, policy)) {
+            std::fprintf(stderr, "lockstepd: failed to load auth policy file '%s'\n",
+                         args.auth_policy.c_str());
+            return 1;
+        }
+        if (policy.enabled()) {
+            std::printf("lockstepd: RBAC ENABLED (%zu principal mappings)\n", policy.size());
+            std::fflush(stdout);
+        }
+        node.set_auth_policy(std::move(policy));
     }
 
     const core::Endpoint ep = node.endpoint();

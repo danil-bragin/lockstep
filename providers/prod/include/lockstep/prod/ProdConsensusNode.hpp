@@ -94,6 +94,7 @@
 #include <lockstep/core/Scheduler.hpp>
 #include <lockstep/core/Task.hpp>
 
+#include <lockstep/prod/ProdAuth.hpp>    // AUTH/RBAC — principal->role->permission policy
 #include <lockstep/prod/ProdDisk.hpp>
 #include <lockstep/prod/ProdMetrics.hpp>  // Phase 10 OBSERVABILITY — metrics registry
 #include <lockstep/prod/ProdNetwork.hpp>
@@ -134,6 +135,11 @@ enum class AdminKind : std::uint8_t {
     // set as a UTF-8 text blob. The full-log Status path is untouched.
     Metrics = 8,     // req: [Metrics]
     MetricsRep = 9,  // rep: [MetricsRep][str prometheus_text]
+    // AUTH/RBAC: the server returns this when the connection's PRINCIPAL lacks permission
+    // for the requested operation class (fail-closed). The op is NOT executed. The reply
+    // carries a short reason string so the client/test can confirm it was an auth denial
+    // (not a dead node / not-leader). This is the AUTHZ gate AFTER the mTLS AUTHN gate.
+    AuthDenied = 10,    // rep: [AuthDenied][str reason]
 };
 
 // A decoded STATUS reply (the client-observable cluster state across the socket).
@@ -286,6 +292,19 @@ struct Reader {
     out.role = r.u8();
     out.term = r.u64();
     out.commit_index = r.u64();
+    return r.ok();
+}
+
+// AUTH/RBAC: is this reply an AUTH-DENIED frame? (the principal lacked permission; the op
+// did NOT execute). Returns true + fills `reason` on an AuthDenied reply, false otherwise.
+[[nodiscard]] inline bool decode_auth_denied(std::span<const std::byte> payload,
+                                             std::string& reason) {
+    admin_detail::Reader r{payload.data(), payload.size(), 0, true};
+    const auto kind = static_cast<AdminKind>(r.u8());
+    if (kind != AdminKind::AuthDenied) {
+        return false;
+    }
+    reason = r.str();
     return r.ok();
 }
 
@@ -445,6 +464,14 @@ public:
     // (single-writer); a scrape reads it on the same thread. set_metric_shard() stamps
     // the shard label (the multi-shard runner calls it before start()).
     void set_metric_shard(std::uint64_t shard_idx) noexcept { metrics_.shard = shard_idx; }
+
+    // ---- AUTH/RBAC — install the principal->role->permission policy ------------
+    // The daemon loads a policy (from --auth-policy / inline grants) and sets it here
+    // BEFORE start(). When the policy is not enabled() (none configured), enforcement is
+    // OPEN (every op allowed) so the existing non-auth deployments are byte-identical.
+    void set_auth_policy(AuthPolicy policy) { auth_ = std::move(policy); }
+    [[nodiscard]] const AuthPolicy& auth_policy() const noexcept { return auth_; }
+
     [[nodiscard]] ProdMetrics& metrics() noexcept { return metrics_; }
     [[nodiscard]] const ProdMetrics& metrics() const noexcept { return metrics_; }
 
@@ -575,10 +602,14 @@ private:
     // (NEVER unbounded). Each iteration co_awaits recv() then send(): a single
     // round-trip. On a malformed frame it simply ignores it (no reply) and continues.
     static core::Task admin_serve(ProdConsensusNode* self, int budget) {
-        core::INetwork* net = self->admin_net_;
+        ProdNetwork* net = self->admin_net_;
         for (int i = 0; i < budget; ++i) {
             core::Message msg = co_await net->recv();
-            std::vector<std::byte> reply = self->handle_admin(msg.payload);
+            // AUTH/RBAC: snapshot the PRINCIPAL (peer cert CN) of the connection that
+            // delivered THIS frame right after recv() returns — before any other recv()
+            // can overwrite the side-channel. Copy it (the handler may co_await on send).
+            const std::string principal = net->last_principal();
+            std::vector<std::byte> reply = self->handle_admin(msg.payload, principal);
             if (!reply.empty()) {
                 co_await net->send(msg.from, {reply.data(), reply.size()});
             }
@@ -586,9 +617,36 @@ private:
         co_return;
     }
 
+    // AUTH/RBAC: the OPERATION CLASS each admin verb belongs to. READ verbs observe
+    // (Status/StatCommit/Metrics); WRITE verbs mutate (Submit). An UNKNOWN / malformed
+    // verb maps to None -> DENIED before any dispatch (fail-closed). (There is no admin-
+    // control verb on this surface yet; membership/config/shutdown ride other paths.)
+    [[nodiscard]] static OpClass op_class_of(AdminKind kind) noexcept {
+        switch (kind) {
+            case AdminKind::Submit:
+                return OpClass::Write;
+            case AdminKind::Status:
+            case AdminKind::StatCommit:
+            case AdminKind::Metrics:
+                return OpClass::Read;
+            default:
+                return OpClass::None;  // unknown/reply kinds -> DENIED (never executed).
+        }
+    }
+
+    // Build an AUTH-DENIED reply (the op did NOT execute). Carries a short reason.
+    [[nodiscard]] static std::vector<std::byte> auth_denied(const std::string& reason) {
+        std::vector<std::byte> rep;
+        admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::AuthDenied));
+        admin_detail::put_str(rep, reason);
+        return rep;
+    }
+
     // Decode one admin request payload + produce the reply payload bytes (or empty on
-    // a malformed frame). Pure routing over the node's surface — no IO here.
-    [[nodiscard]] std::vector<std::byte> handle_admin(std::span<const std::byte> req) {
+    // a malformed frame). Pure routing over the node's surface — no IO here. `principal`
+    // is the authenticated client identity (mTLS cert CN; empty == anonymous/plaintext).
+    [[nodiscard]] std::vector<std::byte> handle_admin(std::span<const std::byte> req,
+                                                      const std::string& principal) {
         admin_detail::Reader r{req.data(), req.size(), 0, true};
         const auto kind = static_cast<AdminKind>(r.u8());
         std::vector<std::byte> rep;
@@ -596,6 +654,17 @@ private:
         // gauges + transition counters from the observables on each request (O(1)).
         metrics_.client_requests.inc();
         refresh_metrics();
+        // AUTH/RBAC ENFORCEMENT — BEFORE any dispatch / submit(). Resolve the op class
+        // (None for a malformed/unknown verb) and check the principal's permission. On a
+        // miss, return AUTH-DENIED and DO NOT execute (default-deny / fail-closed). When
+        // no policy is configured, auth_.allow() is always true (legacy open path).
+        if (!r.ok()) {
+            return auth_denied("malformed request");  // never dispatch a torn frame.
+        }
+        const OpClass cls = op_class_of(kind);
+        if (!auth_.allow(principal, cls)) {
+            return auth_denied("principal '" + principal + "' lacks permission");
+        }
         if (kind == AdminKind::Submit) {
             const std::string value = r.str();
             if (!r.ok()) {
@@ -659,10 +728,13 @@ private:
     std::uint64_t self_id_;
     std::uint64_t admin_id_;
     core::INetwork* net_;        // consensus peer-RPC handle (owned by the bus)
-    core::INetwork* admin_net_;  // admin/client handle (owned by the bus)
+    ProdNetwork* admin_net_;     // admin/client handle (owned by the bus); ProdNetwork so
+                                 // the AUTH layer can read last_principal() (peer cert CN)
     ProdRandom rng_;             // election jitter / backoff (seeded)
     ProdDisk disk_;              // the DURABLE consensus log over data_dir (S9.2: reactor-bound)
     std::unique_ptr<consensus::ConsensusNode> node_;  // impl A, UNCHANGED
+
+    AuthPolicy auth_{};  // AUTH/RBAC principal->role->permission policy (empty == OPEN/legacy)
 
     // Phase 10 OBSERVABILITY state (single reactor thread; single-writer).
     ProdMetrics metrics_;                // per-node/shard registry (labeled in the ctor)
