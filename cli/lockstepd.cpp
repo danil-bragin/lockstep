@@ -89,6 +89,7 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 #endif  // LOCKSTEP_PROFILE_ALLOC
 
 #include <lockstep/prod/ProdConsensusNode.hpp>
+#include <lockstep/prod/ProdLog.hpp>  // Phase 10 OBSERVABILITY — structured lifecycle log
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
 #include <lockstep/prod/ProdShardRunner.hpp>  // Phase 9 S9.1 multi-shard orchestrator
@@ -149,6 +150,11 @@ struct Args {
     // process agrees a priori). cluster_size<=1 keeps the S9.1 single-node shard path.
     std::uint64_t proc_id = 1;
     std::uint64_t cluster_size = 1;
+
+    // --- Phase 10 OBSERVABILITY -----------------------------------------------
+    // Structured lifecycle logs are emitted by default (a bounded, small set of events).
+    // --verbose enables debug-level events (still bounded; no per-op spam in the daemon).
+    bool verbose = false;
 };
 
 std::uint64_t parse_u64(const char* s, std::uint64_t fallback) {
@@ -218,6 +224,10 @@ Args parse_args(int argc, char** argv) {
             a.proc_id = parse_u64(v, a.proc_id);
         } else if (std::strcmp(k, "--cluster-size") == 0) {
             a.cluster_size = parse_u64(v, a.cluster_size);
+        } else if (std::strcmp(k, "--verbose") == 0) {
+            // OBSERVABILITY: --verbose 1 enables debug-level lifecycle events (the
+            // pair-based parser takes a value so a bare flag never desyncs the pairing).
+            a.verbose = (parse_u64(v, 0) != 0);
         }
     }
     return a;
@@ -396,6 +406,22 @@ int main(int argc, char** argv) {
                 node.disk_valid() ? "ok" : "UNAVAILABLE");
     std::fflush(stdout);
 
+    // --- OBSERVABILITY: structured lifecycle logger -------------------------------
+    // ts_ms comes from the reactor's prod clock (now()/1e6), never a raw wall-clock call
+    // (this TU is lint-scanned: time must come through the provider surface). A bounded,
+    // small set of events (startup / shutdown); --verbose adds debug-level events.
+    const prod::ProdLog slog(args.verbose);
+    const auto ms = [&reactor]() -> std::uint64_t {
+        return static_cast<std::uint64_t>(reactor.now() / 1'000'000);
+    };
+    slog.event(ms(), "startup",
+               {{"node", args.node_id},
+                {"listen_port", static_cast<std::uint64_t>(args.listen_port)},
+                {"admin_port", static_cast<std::uint64_t>(args.admin_port)},
+                {"cluster_size", static_cast<std::uint64_t>(cluster.size())},
+                {"seed", args.seed},
+                {"disk", node.disk_valid() ? "ok" : "unavailable"}});
+
     // --- start the node + admin serve-loop, run the BOUNDED reactor loop ------
     // A generous bounded admin recv budget (NEVER an unbounded loop). The reactor run
     // is BOUNDED by an absolute now()-deadline (run_seconds), a hard wall guard so the
@@ -441,6 +467,13 @@ int main(int argc, char** argv) {
                 consensus::role_name(node.role()),
                 static_cast<unsigned long long>(node.term()),
                 ci);
+    // OBSERVABILITY: structured shutdown event (parseable counterpart of the prose line).
+    slog.event(ms(), "shutdown",
+               {{"node", args.node_id},
+                {"role", consensus::role_name(node.role())},
+                {"term", static_cast<std::uint64_t>(node.term())},
+                {"commit_index", ci},
+                {"fdatasync_calls", syncs}});
     std::printf("DISKSTATS node=%llu commit_index=%llu fdatasync_calls=%llu "
                 "append_calls=%llu fsync_total_ms=%.2f fsync_avg_us=%.2f "
                 "fsyncs_per_commit=%.3f appends_per_fsync=%.3f bytes_appended=%llu\n",

@@ -95,6 +95,7 @@
 #include <lockstep/core/Task.hpp>
 
 #include <lockstep/prod/ProdDisk.hpp>
+#include <lockstep/prod/ProdMetrics.hpp>  // Phase 10 OBSERVABILITY — metrics registry
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdRandom.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
@@ -127,6 +128,12 @@ enum class AdminKind : std::uint8_t {
     // checkers depend on its committed-log digest, so it stays intact.
     StatCommit = 6,     // req: [StatCommit]
     StatCommitRep = 7,  // rep: [StatCommitRep][u8 role][u64 term][u64 commit]
+    // Phase 10 OBSERVABILITY: scrape this node's metrics in Prometheus text-exposition
+    // format. Cheap (O(#metrics), NOT O(log)): the handler refreshes the gauges from the
+    // existing consensus observables + the disk counters and serializes the fixed metric
+    // set as a UTF-8 text blob. The full-log Status path is untouched.
+    Metrics = 8,     // req: [Metrics]
+    MetricsRep = 9,  // rep: [MetricsRep][str prometheus_text]
 };
 
 // A decoded STATUS reply (the client-observable cluster state across the socket).
@@ -241,6 +248,12 @@ struct Reader {
     admin_detail::put_u8(b, static_cast<std::uint8_t>(AdminKind::StatCommit));
     return b;
 }
+// Phase 10 OBSERVABILITY: the METRICS scrape request (reply carries the Prometheus text).
+[[nodiscard]] inline std::vector<std::byte> encode_metrics() {
+    std::vector<std::byte> b;
+    admin_detail::put_u8(b, static_cast<std::uint8_t>(AdminKind::Metrics));
+    return b;
+}
 
 // Decode a STATUS reply payload (client side). Returns false on a malformed frame.
 [[nodiscard]] inline bool decode_status(std::span<const std::byte> payload,
@@ -273,6 +286,19 @@ struct Reader {
     out.role = r.u8();
     out.term = r.u64();
     out.commit_index = r.u64();
+    return r.ok();
+}
+
+// Phase 10 OBSERVABILITY: decode the METRICS reply — the Prometheus text blob (or empty
+// on a malformed frame / a node that does not support the verb).
+[[nodiscard]] inline bool decode_metrics(std::span<const std::byte> payload,
+                                         std::string& out) {
+    admin_detail::Reader r{payload.data(), payload.size(), 0, true};
+    const auto kind = static_cast<AdminKind>(r.u8());
+    if (kind != AdminKind::MetricsRep) {
+        return false;
+    }
+    out = r.str();
     return r.ok();
 }
 
@@ -347,6 +373,11 @@ public:
         const consensus::ConsensusNodeFactory factory =
             consensus::raft_a::make_raft_a_factory();
         node_ = factory(deps, nc);
+
+        // Phase 10 OBSERVABILITY: label this node's metrics stream. shard defaults to 0
+        // (the single-shard daemon); the multi-shard runner overrides it via
+        // set_metric_shard() before start(). node label = the Raft node id.
+        metrics_.node = self_id;
     }
 
     ProdConsensusNode(const ProdConsensusNode&) = delete;
@@ -407,6 +438,79 @@ public:
     }
     [[nodiscard]] consensus::Index commit_index() const noexcept {
         return node_->commit_index();
+    }
+
+    // ---- Phase 10 OBSERVABILITY — metrics surface ----------------------------
+    // The metrics registry for THIS node/shard. Mutated ONLY on this reactor's thread
+    // (single-writer); a scrape reads it on the same thread. set_metric_shard() stamps
+    // the shard label (the multi-shard runner calls it before start()).
+    void set_metric_shard(std::uint64_t shard_idx) noexcept { metrics_.shard = shard_idx; }
+    [[nodiscard]] ProdMetrics& metrics() noexcept { return metrics_; }
+    [[nodiscard]] const ProdMetrics& metrics() const noexcept { return metrics_; }
+
+    // Refresh the gauge snapshots from the EXISTING consensus observables + the disk
+    // counters, AND derive the transition counters (elections_started / leader_changes /
+    // steps_down / submits_committed) by EDGE-DETECTING against the last-seen snapshot.
+    // This is the "metrics READ the observables" boundary — no consensus change. Cheap:
+    // role/term/commit_index are member reads; log size is span.size(); the disk counters
+    // are member reads. NEVER walks the durable log. Call it on every admin request + on
+    // a METRICS scrape (both O(1)); the single reactor thread is the only caller.
+    void refresh_metrics() noexcept {
+        const auto role = static_cast<std::uint64_t>(node_->role());
+        const std::uint64_t term = node_->current_term();
+        const std::uint64_t ci = node_->commit_index();
+        const std::uint64_t lsz = node_->log().size();
+
+        // Edge-detect role/term transitions (counters are monotonic event tallies).
+        const auto leader = static_cast<std::uint64_t>(consensus::Role::Leader);
+        const auto candidate = static_cast<std::uint64_t>(consensus::Role::Candidate);
+        const auto follower = static_cast<std::uint64_t>(consensus::Role::Follower);
+        if (term > last_term_) {
+            // A new term began — if we entered it as a Candidate, an election started.
+            if (role == candidate) {
+                metrics_.elections_started.inc();
+            }
+        }
+        if (role == candidate && last_role_ != candidate) {
+            // Became a Candidate (a fresh election attempt) regardless of term recording.
+            metrics_.elections_started.inc();
+        }
+        if (role == leader && last_role_ != leader) {
+            metrics_.leader_changes.inc();
+        }
+        if (role == follower && last_role_ != follower &&
+            (last_role_ == leader || last_role_ == candidate)) {
+            metrics_.steps_down.inc();
+        }
+
+        // submits_committed: the count of OUR accepted entries that have reached commit.
+        // accepted_index_ is the highest index we accepted as leader; once commit_index
+        // covers a previously-uncovered accepted index, count those as committed. We only
+        // attribute commits up to our own accepted high-water (entries WE took), so the
+        // counter tracks the writes this node accepted that became durable.
+        if (ci > committed_seen_ && accepted_index_ > 0) {
+            const std::uint64_t up_to = ci < accepted_index_ ? ci : accepted_index_;
+            if (up_to > committed_seen_) {
+                metrics_.submits_committed.inc(up_to - committed_seen_);
+                committed_seen_ = up_to;
+            }
+        }
+
+        // in_flight: accepted-but-not-yet-committed entries this node took as leader.
+        const std::uint64_t inflight =
+            accepted_index_ > ci ? (accepted_index_ - ci) : 0;
+
+        metrics_.role.set(role);
+        metrics_.current_term.set(term);
+        metrics_.commit_index.set(ci);
+        metrics_.log_size.set(lsz);
+        metrics_.in_flight.set(inflight);
+        metrics_.fdatasync_calls.set(disk_.sync_calls());
+        metrics_.bytes_appended.set(disk_.bytes_appended());
+        metrics_.append_calls.set(disk_.append_calls());
+
+        last_role_ = role;
+        last_term_ = term;
     }
 
     // ---- S8.5 disk profiling passthrough (introspection only) -----------------
@@ -488,6 +592,10 @@ private:
         admin_detail::Reader r{req.data(), req.size(), 0, true};
         const auto kind = static_cast<AdminKind>(r.u8());
         std::vector<std::byte> rep;
+        // OBSERVABILITY: every admin request handled is a client request; refresh the
+        // gauges + transition counters from the observables on each request (O(1)).
+        metrics_.client_requests.inc();
+        refresh_metrics();
         if (kind == AdminKind::Submit) {
             const std::string value = r.str();
             if (!r.ok()) {
@@ -495,6 +603,12 @@ private:
             }
             const consensus::SubmitResult sr = node_->submit(value);
             if (sr.accepted) {
+                // OBSERVABILITY: count the accepted write + track its index as our commit
+                // high-water (refresh_metrics later attributes commits up to this index).
+                metrics_.submits_accepted.inc();
+                if (sr.index > accepted_index_) {
+                    accepted_index_ = sr.index;
+                }
                 admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::SubmitOk));
                 admin_detail::put_u64(rep, sr.term);
                 admin_detail::put_u64(rep, sr.index);
@@ -530,6 +644,13 @@ private:
             admin_detail::put_u8(rep, static_cast<std::uint8_t>(node_->role()));
             admin_detail::put_u64(rep, node_->current_term());
             admin_detail::put_u64(rep, node_->commit_index());
+        } else if (kind == AdminKind::Metrics) {
+            // Phase 10 OBSERVABILITY: scrape this node's metrics in Prometheus text
+            // format. refresh_metrics() (already called above) snapshotted the gauges +
+            // transition counters from the observables; encode the fixed metric set.
+            // O(#metrics), NOT O(log) — never walks the durable log.
+            admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::MetricsRep));
+            admin_detail::put_str(rep, encode_prometheus(metrics_));
         }
         return rep;
     }
@@ -542,6 +663,13 @@ private:
     ProdRandom rng_;             // election jitter / backoff (seeded)
     ProdDisk disk_;              // the DURABLE consensus log over data_dir (S9.2: reactor-bound)
     std::unique_ptr<consensus::ConsensusNode> node_;  // impl A, UNCHANGED
+
+    // Phase 10 OBSERVABILITY state (single reactor thread; single-writer).
+    ProdMetrics metrics_;                // per-node/shard registry (labeled in the ctor)
+    std::uint64_t last_role_ = 0;        // last-seen role for transition edge-detection
+    std::uint64_t last_term_ = 0;        // last-seen term for election edge-detection
+    std::uint64_t accepted_index_ = 0;   // highest index WE accepted as leader
+    std::uint64_t committed_seen_ = 0;   // highest of our accepted indices counted committed
 };
 
 }  // namespace lockstep::prod

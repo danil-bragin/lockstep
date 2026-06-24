@@ -64,6 +64,7 @@
 #include <lockstep/consensus/ConsensusNode.hpp>
 
 #include <lockstep/prod/ProdConsensusNode.hpp>
+#include <lockstep/prod/ProdLog.hpp>  // Phase 10 OBSERVABILITY — structured lifecycle log
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
 
@@ -171,6 +172,8 @@ inline void run_one_shard(const ShardRunConfig& cfg, const ShardPlan& plan,
             sync->failures.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        // OBSERVABILITY: stamp the shard label so this shard's metrics carry shard="<i>".
+        node->set_metric_shard(plan.index);
         node_ptr = node.get();
     }
 
@@ -183,6 +186,17 @@ inline void run_one_shard(const ShardRunConfig& cfg, const ShardPlan& plan,
                 static_cast<unsigned>(plan.listen_port), plan.data_dir.c_str(),
                 node_ptr->disk_valid() ? "ok" : "UNAVAILABLE");
     std::fflush(stdout);
+
+    // OBSERVABILITY: structured lifecycle events (ts_ms from the reactor's prod clock).
+    const ProdLog slog;
+    const auto ms = [&reactor]() -> std::uint64_t {
+        return static_cast<std::uint64_t>(reactor.now() / 1'000'000);
+    };
+    slog.event(ms(), "startup",
+               {{"shard", plan.index},
+                {"node", plan.node_id},
+                {"admin_port", static_cast<std::uint64_t>(plan.admin_port)},
+                {"disk", node_ptr->disk_valid() ? "ok" : "unavailable"}});
 
     constexpr int kAdminBudget = 1 << 20;
     node_ptr->start(kAdminBudget);
@@ -199,6 +213,12 @@ inline void run_one_shard(const ShardRunConfig& cfg, const ShardPlan& plan,
                 static_cast<unsigned long long>(node_ptr->commit_index()),
                 static_cast<unsigned long long>(node_ptr->disk_sync_calls()));
     std::fflush(stdout);
+    slog.event(ms(), "shutdown",
+               {{"shard", plan.index},
+                {"node", plan.node_id},
+                {"role", consensus::role_name(node_ptr->role())},
+                {"term", static_cast<std::uint64_t>(node_ptr->term())},
+                {"commit_index", static_cast<std::uint64_t>(node_ptr->commit_index())}});
     // bus/node/reactor RAII-destruct on THIS thread (no cross-thread teardown).
 }
 
@@ -382,6 +402,8 @@ inline void run_one_repl_shard(const ReplShardRunConfig& cfg, std::uint64_t shar
             sync->failures.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        // OBSERVABILITY: stamp the shard label (node label is the proc/Raft id from ctor).
+        node->set_metric_shard(shard);
         node_ptr = node.get();
     }
 
@@ -396,11 +418,32 @@ inline void run_one_repl_shard(const ReplShardRunConfig& cfg, std::uint64_t shar
                 node_ptr->disk_valid() ? "ok" : "UNAVAILABLE");
     std::fflush(stdout);
 
+    // OBSERVABILITY: structured lifecycle events (ts_ms from the reactor's prod clock).
+    const ProdLog slog;
+    const auto ms = [&reactor]() -> std::uint64_t {
+        return static_cast<std::uint64_t>(reactor.now() / 1'000'000);
+    };
+    slog.event(ms(), "startup",
+               {{"shard", shard},
+                {"node", node_id},
+                {"proc", cfg.proc_id},
+                {"admin_port", static_cast<std::uint64_t>(my_admin)},
+                {"cluster_size", cfg.cluster_size},
+                {"disk", node_ptr->disk_valid() ? "ok" : "unavailable"}});
+
     constexpr int kAdminBudget = 1 << 20;
     node_ptr->start(kAdminBudget);
     const core::Tick deadline_ns =
         reactor.now() + static_cast<core::Tick>(cfg.run_seconds) * 1'000'000'000;
     node_ptr->run_with_deadline(deadline_ns);
+
+    slog.event(ms(), "shutdown",
+               {{"shard", shard},
+                {"node", node_id},
+                {"proc", cfg.proc_id},
+                {"role", consensus::role_name(node_ptr->role())},
+                {"term", static_cast<std::uint64_t>(node_ptr->term())},
+                {"commit_index", static_cast<std::uint64_t>(node_ptr->commit_index())}});
 
     std::printf("lockstepd: repl-shard %llu proc %llu shutting down — node %llu role=%s "
                 "term=%llu commit_index=%llu fdatasync_calls=%llu\n",

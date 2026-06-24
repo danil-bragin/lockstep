@@ -125,6 +125,18 @@ core::Task stat_commit_rpc(core::INetwork* cli, core::Endpoint admin,
     co_return;
 }
 
+// ---- one METRICS scrape round-trip (Phase 10 OBSERVABILITY) ----------------
+// Sends the METRICS request, awaits the reply, decodes the Prometheus text blob.
+core::Task metrics_rpc(core::INetwork* cli, core::Endpoint admin, std::string* out,
+                       bool* ok, bool* done) {
+    const std::vector<std::byte> req = prod::encode_metrics();
+    co_await cli->send(admin, {req.data(), req.size()});
+    core::Message rep = co_await cli->recv();
+    *ok = prod::decode_metrics(rep.payload, *out);
+    *done = true;
+    co_return;
+}
+
 // ---- one SUBMIT round-trip (free function over stable pointers) ------------
 struct SubmitOutcome {
     bool replied = false;
@@ -211,6 +223,20 @@ bool do_commit(std::uint16_t port, prod::AdminCommit& out) {
     bool ok = false;
     bool done = false;
     c.reactor.spawn(stat_commit_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// Run a METRICS scrape against one admin port; fill `out` with the Prometheus text.
+// Returns true if a reply decoded. (Phase 10 OBSERVABILITY.)
+bool do_metrics(std::uint16_t port, std::string& out) {
+    Client c(port);
+    if (!c.ok) {
+        return false;
+    }
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(metrics_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
     c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
     return done && ok;
 }
@@ -979,6 +1005,25 @@ int cmd_commit(const std::vector<std::uint16_t>& hosts) {
     return 0;
 }
 
+// Phase 10 OBSERVABILITY — scrape each host's METRICS and print the Prometheus text
+// exposition verbatim to stdout (a scrape target a Prometheus server / a curl can read).
+// On a host that does not reply / does not support METRICS, prints a comment line so the
+// output stays valid Prometheus (comments begin with '#').
+int cmd_metrics(const std::vector<std::uint16_t>& hosts) {
+    for (std::uint16_t port : hosts) {
+        std::string text;
+        const bool ok = do_metrics(port, text);
+        if (ok) {
+            std::fputs(text.c_str(), stdout);
+        } else {
+            std::printf("# scrape_failed host=%u (node down or METRICS unsupported)\n",
+                        static_cast<unsigned>(port));
+        }
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
 // S8.4 DURABLE CONFIRMATION — given an accepted {value, index}, decide whether it is
 // COMMITTED on `port`: poll STATUS until commit_index >= index AND the entry at that
 // 1-based index is STILL `value`. The committed-log digest STATUS returns is the FULL
@@ -1199,6 +1244,8 @@ int main(int argc, char** argv) {
             stderr,
             "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
             "       lockstep_admin commit --host PORT [--host PORT ...]\n"
+            "       lockstep_admin metrics --host PORT [--host PORT ...] "
+            "(scrape Prometheus metrics)\n"
             "       lockstep_admin submit VALUE [--no-await] --host PORT "
             "[--host PORT ...]\n"
             "       lockstep_admin bench --count N [--value-bytes B] "
@@ -1307,6 +1354,9 @@ int main(int argc, char** argv) {
     }
     if (verb == "commit") {
         return cmd_commit(hosts);
+    }
+    if (verb == "metrics") {
+        return cmd_metrics(hosts);
     }
     if (verb == "submit") {
         return cmd_submit(value, hosts, await_durable);
