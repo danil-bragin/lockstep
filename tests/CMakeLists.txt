@@ -41,6 +41,16 @@ if(TARGET lockstep_runtime AND TARGET lockstep_providers_sim)
       lockstep_providers_sim)
   add_test(NAME runtime_determinism COMMAND lockstep_runtime_determinism_test)
 
+  # --- Pins the PORTABLE mul128 path in SeededRandom (#else schoolbook branch, dead
+  #     on __int128 hosts) so the mutation gate can kill its arithmetic mutants. ---
+  add_executable(lockstep_seeded_random_portable_test seeded_random_portable_test.cpp)
+  target_link_libraries(lockstep_seeded_random_portable_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_providers_sim)
+  add_test(NAME seeded_random_portable COMMAND lockstep_seeded_random_portable_test)
+
   # --- Phase 1 determinism: SAME-TICK timer firing order (mutation backprop) ---
   # Kills the surviving mutant at Scheduler.hpp:238 (the timer insertion-sort
   # `b - 1` -> `b - 0`). Arms MULTIPLE timers DUE AT THE SAME virtual tick with

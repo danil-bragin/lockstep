@@ -107,8 +107,15 @@ private:
     // 64x64 -> 128 multiply. Returns the low 64 bits; writes the high 64 to `hi`.
     // Uses __uint128_t when the compiler provides it (clang/gcc on this host),
     // else a portable schoolbook 32-bit-limb multiply.
+    //
+    // Public (a pure stateless helper, no state touched) so the portable
+    // schoolbook path can be conformance-tested directly even on a host that has
+    // __int128: a test TU defining LOCKSTEP_FORCE_PORTABLE_MUL128 before including
+    // this header forces the #else branch and cross-checks it against the
+    // __int128 reference. Without that macro every real build keeps the fast path.
+public:
     static std::uint64_t mul128(std::uint64_t a, std::uint64_t b, std::uint64_t& hi) noexcept {
-#if defined(__SIZEOF_INT128__)
+#if defined(__SIZEOF_INT128__) && !defined(LOCKSTEP_FORCE_PORTABLE_MUL128)
         unsigned __int128 prod = static_cast<unsigned __int128>(a) * b;
         hi = static_cast<std::uint64_t>(prod >> 64);
         return static_cast<std::uint64_t>(prod);
@@ -125,6 +132,7 @@ private:
 #endif
     }
 
+private:
     std::uint64_t state_;     // current splitmix64 state
     std::uint64_t seed_init_; // the original seed (for logging/replay)
 };

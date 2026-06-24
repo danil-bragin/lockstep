@@ -211,6 +211,14 @@ public:
     }
 
 private:
+    // "not found" sentinel for mailbox_index(). EQUIVALENT-MUTANT NOTE: the
+    // mutation gate flags the literal here (e.g. -1 -> -2) as surviving. It is a
+    // PROVEN equivalent mutant: kNpos is only ever produced by mailbox_index() and
+    // consumed by `== kNpos` / `!= kNpos` (uses ~L96/L299/L303); it is never an
+    // arithmetic operand and never collides with a real index (a handful of
+    // mailboxes), so any value outside the valid index range (SIZE_MAX, SIZE_MAX-1,
+    // ...) is behaviourally identical. Not killable without coverage theatre;
+    // documented instead (cf. the Scheduler insertion-sort guard).
     static constexpr std::size_t kNpos = static_cast<std::size_t>(-1);
 
     // ---- delivery (virtual-time timer Task) ------------------------------
