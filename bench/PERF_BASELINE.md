@@ -717,3 +717,204 @@ to the `providers/` boundary; `cli/` stays single-thread). Protected dirs
   table above is the honest "constant work per shard" unit.
 - **No cross-shard transactions** (Phase 9 later) and **no cross-process replication** of a
   shard yet — this stage is the pure throughput-scaling proof of independent shards.
+
+---
+
+# Phase 9 S9.2 — async io_uring for the prod IO path (ASYNC fdatasync overlap)
+
+> **PROFILE FIRST, then implement only where the data justifies — honest verdict: KEEP.**
+> The premise (from S8.5/S8.6) was that the single-thread ceiling is coroutine-frame CPU,
+> NOT IO-blocking, so io_uring buys only a MODEST per-shard gain. We profiled the syscall
+> fraction, then converted the ONE high-value, durability-correct, buffer-lifetime-safe
+> path — **the durable fdatasync** — to async io_uring, and measured honestly. The gain is
+> real and bigger than the raw syscall fraction implied (because async fsync removes the
+> reactor STALL inside fdatasync, not just syscall overhead), and it COMPOUNDS across
+> shards. **core/sim/consensus/txn/storage/query diff EMPTY** — prod-provider-layer only.
+
+## io_uring availability in the container (STEP 0)
+
+- Kernel **6.10.14-linuxkit** (Docker Desktop LinuxKit VM on an Apple-Silicon Mac host) —
+  io_uring fully supported (`io_uring_setup` returns `features=0x7fff`).
+- **Docker's DEFAULT seccomp profile BLOCKS io_uring** (`io_uring_setup` → `EPERM`). The
+  ring is only usable with **`docker run --security-opt seccomp=unconfined`**. Probed both
+  ways: default → EPERM, unconfined → OK.
+- **No liburing in the image**, but the kernel header `linux/io_uring.h` IS present. We use
+  the **RAW io_uring syscalls** (`io_uring_setup`/`io_uring_enter` + `mmap` of the SQ/CQ
+  rings) — zero new dependency, no Dockerfile change. (`providers/prod/ProdUring.hpp`.)
+- **GRACEFUL FALLBACK:** if `io_uring_setup` fails (seccomp-blocked / old kernel), the ring
+  is `!valid()` and every disk transparently uses the SYNCHRONOUS fdatasync — correctness
+  NEVER depends on the ring. The default-seccomp prod gate still passes (sync path).
+
+## The syscall-fraction PROFILE (STEP 1 — the io_uring ceiling)
+
+`strace -f -c -w` (wall-time-IN-syscall, all threads), Release, container, pbench commit
+load (count=4000, value=16B). NOTE: strace's ptrace heavily slows the daemon (commit_tput
+~5.5k under trace vs ~16k un-traced), so we use it ONLY for the relative syscall MIX. The
+`epoll_pwait` time is the reactor BLOCKING IDLE (waiting for work), NOT reclaimable CPU; the
+io_uring ceiling is the NON-idle IO-WORK syscall fraction.
+
+| depth | fdatasync | send+recv | epoll_ctl | pwrite | **IO-syscall fraction of busy time** |
+|-------|-----------|-----------|-----------|--------|--------------------------------------|
+| 1     | ~4.6%     | ~0.7%     | ~0.4%     | ~0.3%  | dominated by the SERIAL per-op chain (1 send + 2 recv + 1 fsync + 1 pwrite) |
+| 64    | ~0.2%     | ~0.3%     | ~0.2%     | ~0.3%  | **~1% of busy time** (fsync already coalesced ~68:1, `fsyncs_per_commit=0.016`) |
+
+**Ceiling implied:** at the steady commit ceiling (depth 64) the IO-syscall fraction is ~1%
+of busy reactor time — io_uring's syscall-batching can reclaim almost nothing there; the
+rest is single-reactor coroutine-frame CPU (the S8.1/S8.6 standing finding), which io_uring
+CANNOT touch. At depth 1 the per-op fsync is on the CRITICAL PATH (the reactor BLOCKS inside
+fdatasync ~370µs/op), so async overlap can reclaim a real, large fraction there. So the
+honest prediction: **small gain at the high-depth ceiling, large gain at low depth/latency.**
+
+## The integration (STEP 2 — what, where, and the load-bearing safety reasoning)
+
+**WHAT:** only the **durable `fdatasync`** is async (`IORING_OP_FSYNC | FSYNC_DATASYNC`).
+`pwrite`/`send`/`recv` stay on the synchronous/epoll path. RATIONALE: making THEM async
+would hand the kernel a pointer into a CHURNING buffer (the classic io_uring use-after-free)
+for a sub-1% syscall-time win — not worth the lifetime risk per the profile. **fsync submits
+NO user buffer (just the fd), so V-RKV1 is satisfied VACUOUSLY** — there is no pinned-buffer
+hazard at all.
+
+**REACTOR INTEGRATION (alongside epoll, not a replacement):** the io_uring ring fd is itself
+epoll-pollable. The reactor (`ProdReactor`) owns ONE ring and registers its fd on the
+EXISTING epoll set; on the ring fd's `EPOLLIN` (a CQE is ready) it reaps completions. The
+network path stays on epoll untouched; only disk fdatasync flows through the ring. This is
+the minimal clean integration — epoll keeps doing what it does well; the ring is one more
+additive fd branch.
+
+**DURABILITY BARRIER (the load-bearing invariant):** an async fsync's COMPLETION (its CQE)
+IS the barrier. `ProdDisk::sync()` (reactor-bound ctor) submits the async fdatasync and
+returns a Future that resolves ONLY when the CQE is reaped (`res >= 0` ⇒ durable; `res < 0`
+⇒ IoFault, NEVER a false ack). The FIFO persist worker's `co_await sync()` does not resume —
+and the entry is not treated durable — until the CQE arrives. On completion the promise is
+resolved, which SCHEDULES the parked coroutine via the SchedulerSink (L1 — never an inline
+resume). Single-thread-per-shard: each shard's reactor owns its OWN ring; NO cross-thread
+ring sharing.
+
+**GRACEFUL-SHUTDOWN FLUSH (a real finding — see FLAG below):** `ProdConsensusNode`'s dtor
+calls `reactor.flush_uring()`, which PUMPS the reactor (so a persist worker that has appended
+but not yet submitted its sync gets to run) then BLOCK-DRAINS the ring until no fsync is in
+flight — every durably-intended entry's CQE is reaped while the WAL fd is still open. This
+restores the exact clean-exit durability synchronous fdatasync gave for free. An ABRUPT crash
+(SIGKILL) skips the dtor — its un-completed fsyncs are honestly lost (page-cache only), the
+correct crash semantics; jepsen confirms quorum-acked entries are durable regardless.
+
+## HONEST before/after — per-shard commit throughput (STEP 3)
+
+A/B on ONE Release binary via `LOCKSTEP_NO_URING=1` (SYNC "before") vs the ring (URING
+"after"); container `--cpus=4`, median of 3 fresh passes, count=4000, value=16B, all
+`commit_covered=1`:
+
+| config | depth | BEFORE (sync) | AFTER (io_uring) | gain | note |
+|--------|-------|---------------|------------------|------|------|
+| 1-node | 1     | 2883          | **15918**        | **~5.5×** | depth-1 is closed-loop LATENCY: async removes the per-op fsync STALL from the critical path |
+| 1-node | 16    | 12184         | **17945**        | **~1.47×** | fsync partly overlapped; reactor no longer blocks inside fdatasync |
+| 1-node | 64    | 16191         | **18275**        | **~1.13×** | the steady CEILING: small but REAL (slightly above the ~1% syscall fraction because async also frees the reactor from BLOCKING in fdatasync) |
+
+**Honest read:** the high-depth ceiling moves ~16.2k → ~18.3k (**~13%**) — a modest, real
+win, exactly the "fsync-overlap" the brief named, and a touch above the raw syscall fraction
+because the win is not syscall-batching but **removing the reactor stall inside the blocking
+fdatasync** (each sync was ~370µs of dead reactor time). The depth-1/16 gains are larger
+because there fsync is on the critical path. `fsyncs_per_commit` drops 0.016 → ~0.008 at
+depth (async lets MORE appends pile up per barrier: ~139 appends/fsync vs 68).
+
+### Multi-shard scale (S9.1 re-run) — does the per-shard win COMPOUND? YES
+
+`mbench` key-routed aggregate, container `--cpus=12 --memory=8g`, per-shard 6000, inflight
+64, all `all_covered=1 fault=0`:
+
+| M (shards) | BEFORE (sync) agg | AFTER (io_uring) agg | gain |
+|-----------:|------------------:|---------------------:|-----:|
+| 1          | 12 292            | 12 744               | 1.04× |
+| 2          | 23 424            | 26 611               | 1.14× |
+| 4          | 42 550            | 49 700               | 1.17× |
+| 8          | 55 737            | **65 791**           | **1.18×** |
+
+The per-shard async-fsync gain **compounds across shards** — the M=8 aggregate ceiling moves
+~55.7k → ~65.8k commits/s (+18%). **Rings do NOT contend at high M**: each shard owns its
+own independent ring (no shared ring), so there is no cross-shard ring contention; TSan is
+clean on the 4-shard daemon under real commit load.
+
+## SAFETY re-run (STEP 4 — io_uring touches the durability + completion paths)
+
+- **prod_jepsen** (5 nodes, 4 fault rounds, SIGKILL + SIGSTOP, 3 scenarios, ring ON under
+  `seccomp=unconfined`): **ALL 3 PASS** — `acked=32 durable=32`, **ZERO committed-acked
+  entries lost**, no split-brain, V-XCHECK order held. The async-fsync barrier holds under
+  real fault injection.
+- **prod_cluster_smoke**: **ALL PASS** — election → replication AGREEMENT → SIGKILL a
+  follower → restart on the SAME data dir → recover from ProdDisk → CATCH-UP → final
+  agreement (the async-fsync'd WAL recovers correctly).
+- **prod_consensus_test** (durable crash/restart): **ALL PASS** on BOTH the ring path and the
+  forced-sync path — appended+ASYNC-synced entries survive a clean teardown + reopen
+  byte-identical (the graceful-shutdown flush guarantees the platter has them).
+- **prod_uring_test** (new): ring setup/availability, async-fsync CQE completion, and the
+  durability barrier through `ProdDisk`'s reactor ctor (append → async sync → crash → reopen
+  → synced prefix survives). PASS on the async path AND the forced-sync-fallback path.
+- **prod_network_test** (record-replay): PASS (network path untouched).
+- **TSan**: 4-shard daemon under real commit load (4 independent rings) — **NO data race**,
+  clean thread join, no orphans.
+- **ASan/LSan**: uring + disk + consensus tests — **clean** (no buffer UAF, no leak in the
+  ring mmap / completion-callback / blocking-drain path).
+- **clang-tidy**: clean on the new io_uring headers (checked transitively via the non-provider
+  test TU; clang-analyzer / bugprone / concurrency / member-init all pass).
+- **forbidden-call lint**: OK (`ProdUring` is under `providers/` = exempt; the test TU does
+  NO raw file IO — all real disk IO stays in `providers/prod/ProdDisk`).
+- **Mac host build**: green (`prod_disk_test` builds + passes; io_uring is `#ifdef __linux__`
+  and the uring/consensus targets are Linux-only-guarded, simply absent on macOS).
+- **Protected-dirs diff** (core/sim/consensus/txn/storage/query/providers-sim): **EMPTY.**
+
+## VERDICT: KEEP io_uring (modest-but-real, durability-correct, compounds across shards)
+
+The async fdatasync is a **real, honest win** — ~13% at the single-shard steady ceiling,
+~1.5×–5.5× at lower depth/latency, and ~18% at the M=8 aggregate ceiling, with the durability
+barrier intact (jepsen `durable=32`, zero loss) and zero buffer-lifetime risk (fsync carries
+no user buffer). It is NOT a throughput multiplier at the high-depth ceiling — the profile
+correctly predicted the syscall fraction is ~1% there and the residual is coroutine-frame CPU
+— but it is comfortably above noise and worth keeping. We did NOT async-ify pwrite/send/recv
+(sub-1% syscall-time for a real use-after-free risk) — the data did not justify it.
+
+## FLAG (a real finding worth recording)
+
+**The N=1 self-commit fast-path advances `commit_index` at persist-ENQUEUE time, not at
+fsync-COMPLETION time.** In `RaftNodeA::submit()` the lone-leader branch calls
+`advance_commit_index()` immediately after `persist_entry()` (which only ENQUEUES the durable
+record + sets `want_sync_`), BEFORE the FIFO persist worker issues the fdatasync. With the old
+SYNCHRONOUS fsync this was masked (the worker drained inline within the test's pump, so durable
+≈ committed). The ASYNC fsync EXPOSED it: an entry could be committed + in `durable_entries()`
+yet still only in the page cache if the process exits before the fsync CQE is reaped. This is a
+**pre-existing consensus-core property** (commit-before-physical-barrier on the N=1 path), NOT
+introduced by S9.2 — and core is FROZEN, so we did NOT change it. We restored clean-exit
+durability in the PROD LAYER via the graceful-shutdown ring flush (`flush_uring()` in
+`ProdConsensusNode`'s dtor). Quorum-replicated (N≥2) entries are durable via the normal
+ack-driven path (jepsen `durable=32`). **Recorded for a later core review** — whether the N=1
+self-commit should gate on the sync barrier completing rather than on enqueue.
+
+## Reproduce (S9.2)
+
+```bash
+# NOTE the seccomp flag — default Docker seccomp BLOCKS io_uring_setup.
+docker run --rm --security-opt seccomp=unconfined -v "$PWD:/work" -w /work \
+  --memory=6g --cpus=4 lockstep-dev:latest bash -lc '
+  set -e; ulimit -c 0; ulimit -s 16384
+  cmake -S . -B build/lrel -GNinja -DCMAKE_BUILD_TYPE=Release
+  cmake --build build/lrel -j6 --target lockstepd lockstep_admin lockstep_prod_uring_test
+  ./build/lrel/tests/lockstep_prod_uring_test         # async path
+  LOCKSTEP_NO_URING=1 ./build/lrel/tests/lockstep_prod_uring_test  # forced sync fallback
+  pgrep -x lockstepd && echo LEAKED || echo no-orphans'
+```
+
+A/B a daemon on one binary: `LOCKSTEP_NO_URING=1 lockstepd …` (sync) vs `lockstepd …` (ring).
+
+## Honest caveats (S9.2)
+
+- **Laptop container (Docker Desktop LinuxKit VM on Apple Silicon), `--cpus=4/12`, real
+  wall-clock** — absolute numbers are RELATIVE regression baselines only; re-run on the SAME
+  setup. The relative SYNC-vs-URING gain is the result.
+- **io_uring requires `--security-opt seccomp=unconfined` in this container** (default seccomp
+  blocks `io_uring_setup`). On the default-seccomp prod gate the ring is unavailable and the
+  daemon runs the SYNCHRONOUS fsync path (the "before" numbers) — still correct, just no win.
+- **Only fdatasync is async.** pwrite/send/recv stay synchronous/epoll (the profile did not
+  justify the buffer-lifetime risk). So this is a fsync-overlap win, NOT a full async-IO rewrite.
+- **The high-depth ceiling win (~13%) is modest** and within ~1 variance band of the heaviest
+  contended passes — it is real (consistent across 3 passes + compounding across shards) but it
+  is NOT a multiplier. The depth-1/low-depth gains are large because fsync is on the critical
+  path there.

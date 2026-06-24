@@ -321,9 +321,14 @@ public:
           net_(bus.node(self_id)),
           admin_net_(bus.node(admin_id)),
           rng_(seed),
-          disk_(disk_sched_, data_dir.empty()
-                                 ? std::string("/dev/null")
-                                 : (data_dir + "/consensus.wal")) {
+          // S9.2 — bind the consensus WAL disk to the REACTOR (not a throwaway sim
+          // Scheduler): Futures are minted from the reactor's SchedulerSink and sync()
+          // submits an ASYNC fdatasync through the reactor's io_uring ring, whose CQE is
+          // the durability barrier. Falls back to synchronous fdatasync if the ring is
+          // unavailable (seccomp-blocked) or the fd does not support it.
+          disk_(reactor, data_dir.empty()
+                             ? std::string("/dev/null")
+                             : (data_dir + "/consensus.wal")) {
         consensus::NodeDeps deps;
         deps.sched = &reactor;
         deps.clock = &reactor.clock();
@@ -349,6 +354,19 @@ public:
     ProdConsensusNode(ProdConsensusNode&&) = delete;
     ProdConsensusNode& operator=(ProdConsensusNode&&) = delete;
 
+    // S9.2 — GRACEFUL-SHUTDOWN DURABILITY FLUSH. The dtor BODY runs BEFORE member
+    // destructors (disk_ closes its fd in its own dtor), so flushing the reactor's
+    // in-flight async fdatasyncs HERE guarantees every durably-INTENDED entry reaches
+    // the platter while the WAL fd is still open — restoring the exact clean-exit
+    // durability synchronous fdatasync gave for free. An ABRUPT crash (SIGKILL) skips
+    // this dtor entirely (its un-completed fsyncs are honestly lost — correct crash
+    // semantics). No-op when the ring is unavailable.
+    ~ProdConsensusNode() {
+        if (reactor_ != nullptr) {
+            reactor_->flush_uring();
+        }
+    }
+
     // True if the consensus net + admin net + disk + node all assembled, AND the net
     // endpoint id agrees with the configured self_id (addressing consistency).
     [[nodiscard]] bool valid() const noexcept {
@@ -371,6 +389,10 @@ public:
         if (node_ == nullptr || admin_net_ == nullptr) {
             return;
         }
+        // S9.2 — register the reactor's io_uring ring fd on its epoll set so async
+        // fdatasync completions (CQEs) wake the loop and resolve the durability barrier.
+        // No-op if the ring is unavailable (then the disk stays on synchronous fdatasync).
+        reactor_->arm_uring();
         node_->start();
         reactor_->spawn(admin_serve(this, admin_budget));
     }
@@ -518,8 +540,7 @@ private:
     core::INetwork* net_;        // consensus peer-RPC handle (owned by the bus)
     core::INetwork* admin_net_;  // admin/client handle (owned by the bus)
     ProdRandom rng_;             // election jitter / backoff (seeded)
-    core::Scheduler disk_sched_; // mints ProdDisk's inline-ready Futures (harness only)
-    ProdDisk disk_;              // the DURABLE consensus log over data_dir
+    ProdDisk disk_;              // the DURABLE consensus log over data_dir (S9.2: reactor-bound)
     std::unique_ptr<consensus::ConsensusNode> node_;  // impl A, UNCHANGED
 };
 

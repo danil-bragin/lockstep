@@ -71,6 +71,7 @@
 #include <lockstep/core/detail/ReadyQueue.hpp>
 #include <lockstep/core/detail/SchedulerSink.hpp>
 #include <lockstep/prod/ProdClock.hpp>
+#include <lockstep/prod/ProdUring.hpp>
 
 namespace lockstep::prod {
 
@@ -113,6 +114,12 @@ public:
         // single reactor thread (single-threaded by contract; no race).
         const char* te = ::getenv("LOCKSTEP_REACTOR_TRACE");  // NOLINT(concurrency-mt-unsafe)
         trace_enabled_ = (te != nullptr && te[0] == '1');
+        // S9.2 — LOCKSTEP_NO_URING=1 forces the synchronous-fdatasync path even when the
+        // io_uring ring is available, so A/B before/after can run on ONE binary (the sync
+        // "before" vs the async "after") without a rebuild. Read ONCE at construction on
+        // the single reactor thread (single-threaded by contract; no race).
+        const char* ue = ::getenv("LOCKSTEP_NO_URING");  // NOLINT(concurrency-mt-unsafe)
+        uring_disabled_ = (ue != nullptr && ue[0] == '1');
     }
 
     ProdReactor(const ProdReactor&) = delete;
@@ -394,6 +401,45 @@ public:
         return f;
     }
 
+    // ---- io_uring async IO (S9.2 — async fdatasync overlap) -------------
+    //
+    // The reactor owns ONE io_uring ring (single-thread-per-shard; no cross-thread
+    // sharing). ProdDisk submits an async fdatasync through here; the COMPLETION
+    // (the CQE) is the durability barrier — the callback fires ONLY after the kernel
+    // confirms the data is durable, and it SCHEDULES the waiting coroutine (the
+    // callback resolves a Promise, which schedules via L1 — never an inline resume).
+    //
+    // FALLBACK: if the ring is unusable (io_uring_setup blocked by seccomp, or full),
+    // submit_fsync returns false and the caller does a synchronous fdatasync instead —
+    // correctness NEVER depends on the ring; the barrier is honored either way.
+
+    using FsyncDone = std::function<void(bool /*ok*/)>;
+
+    // True iff the ring is usable (io_uring available + set up). When false every
+    // ProdDisk on this reactor stays on the synchronous fdatasync path.
+    [[nodiscard]] bool uring_available() const noexcept {
+        return uring_.valid() && !uring_disabled_;
+    }
+
+    // Submit an async fdatasync of `fd`. On success returns true and `done(ok)` will be
+    // invoked LATER (on the CQE) with ok==true iff the fsync succeeded (data durable).
+    // Returns false if the ring is unavailable/full this turn — the caller must then do
+    // a synchronous fdatasync and honor the barrier inline. `done` resolves a Promise,
+    // which SCHEDULES the parked coroutine (L1) — completion handling is never inline.
+    [[nodiscard]] bool submit_fsync(int fd, FsyncDone done) {
+        if (!uring_.valid() || !ring_fd_registered_) {
+            return false;
+        }
+        const ProdUring::OpId id = next_uring_op_++;
+        if (!uring_.submit_fdatasync(fd, id)) {
+            return false; // SQ full / enter failed — caller falls back to sync fdatasync.
+        }
+        // Park the completion callback keyed by op id (sorted vector — deterministic,
+        // no unordered map). Matched + erased when its CQE is reaped.
+        insert_fsync_cb(id, std::move(done));
+        return true;
+    }
+
     // ---- introspection (tests) ------------------------------------------
 
     [[nodiscard]] const core::Trace& event_trace() const noexcept { return trace_; }
@@ -401,7 +447,129 @@ public:
     [[nodiscard]] std::size_t pending_timer_count() const noexcept { return timers_.size(); }
     [[nodiscard]] core::Tick now() const noexcept { return clock_.now(); }
 
+    // Register the io_uring ring fd on the reactor's epoll set so a ready CQE wakes the
+    // loop (EPOLLIN on the ring fd) and we reap completions. Idempotent; a no-op if the
+    // ring is unusable (then every disk stays synchronous). Called once before the node
+    // begins participating (ProdConsensusNode::start). Keeping it explicit (not in the
+    // ctor) avoids registering an fd before the reactor is fully constructed.
+    void arm_uring() {
+        if (ring_fd_registered_ || !uring_.valid() || uring_disabled_) {
+            return;
+        }
+        const int rfd = uring_.ring_fd();
+        if (add_fd(rfd, EPOLLIN, [this](std::uint32_t /*revents*/) { reap_uring(); })) {
+            ring_fd_registered_ = true;
+        }
+    }
+
+    [[nodiscard]] std::uint64_t uring_inflight() const noexcept {
+        return uring_.inflight();
+    }
+
+    // GRACEFUL-SHUTDOWN DURABILITY FLUSH (S9.2). Block until every in-flight async
+    // fdatasync has COMPLETED (its CQE reaped + the parked promise resolved), so a
+    // CLEAN process exit has all durably-INTENDED data on the platter before the disk
+    // fd is closed — exactly the guarantee synchronous fdatasync gave for free. This is
+    // the ANALOGUE of a clean fsync-before-close, NOT a substitute for the per-entry
+    // barrier (each entry's ack still waits on its own CQE during normal running). An
+    // ABRUPT crash (SIGKILL) bypasses this — its un-completed fsyncs are honestly lost
+    // (page-cache only), which is the correct crash semantics. Bounded by an absolute
+    // wall guard so a wedged ring can never hang shutdown. Called by ProdConsensusNode
+    // before it tears the disk down (and is idempotent / a no-op when the ring is off).
+    void flush_uring() {
+        if (!uring_.valid() || !ring_fd_registered_ || flushing_) {
+            return;
+        }
+        flushing_ = true; // guard against re-entrancy (a resumed coroutine calling back)
+        const core::Tick deadline = clock_.now() + 5'000'000'000LL; // 5s hard guard
+        // (1) PUMP the ready queue + timers so a persist worker that has APPENDED but not
+        //     yet reached its `co_await sync()` gets to RUN and SUBMIT its async fdatasync
+        //     (a queued-but-not-submitted sync is not yet "in flight"; we must let the
+        //     worker coroutine reach the submission point). This drains the ready queue to
+        //     quiescence WITHOUT blocking on epoll (we only run the cooperative part).
+        // (2) Then BLOCK-DRAIN the ring until no fsync is in flight — every durably-intended
+        //     entry's CQE is reaped + its promise resolved, so the data is on the platter.
+        // Iterate: pumping may resume the worker which submits another sync; draining that
+        // may let the worker enqueue+submit once more — loop until BOTH are quiescent.
+        for (;;) {
+            if (clock_.now() >= deadline) {
+                break; // hard wall guard — never hang shutdown on a wedged ring/worker.
+            }
+            // Drain ready work (the one resume site L1) so pending persist coroutines run.
+            while (!ready_.empty() && clock_.now() < deadline) {
+                maybe_fire_due_timers();
+                drain_ready_bounded();
+                reap_uring(); // a resumed worker may have submitted a sync that completed
+            }
+            if (uring_.inflight() == 0 && ready_.empty()) {
+                break; // fully quiescent: nothing appended-unsynced, nothing in flight.
+            }
+            // Block until at least one CQE is ready, then reap (resolving a promise may
+            // SCHEDULE the worker to submit its next sync -> handled by the next loop turn).
+            uring_.wait_completions(/*min_complete=*/1);
+            reap_uring();
+        }
+        flushing_ = false;
+    }
+
 private:
+    // Reap every ready CQE and fire its parked fsync callback. A CQE's res>=0 means the
+    // fdatasync succeeded (the data is DURABLE — the barrier holds); res<0 (== -errno)
+    // means the fsync FAILED and the callback gets ok=false so the caller surfaces
+    // IoFault (NEVER a false durability ack). The callback resolves a Promise, which
+    // SCHEDULES the parked coroutine via the SchedulerSink (L1) — completion handling is
+    // never an inline resume. The callbacks to fire are MOVED out of the table before
+    // invocation (a callback may submit a new fsync, mutating the table — V-RKV1: no live
+    // reference into a growable container across the call).
+    void reap_uring() {
+        struct Fired {
+            FsyncDone cb;
+            bool ok = false;
+        };
+        std::vector<Fired> fired;
+        uring_.reap([&](ProdUring::OpId id, std::int32_t res) {
+            const std::size_t i = fsync_cb_index(id);
+            if (i != kNoHandler) {
+                fired.push_back(Fired{std::move(fsync_cbs_[i].cb), res >= 0});
+                fsync_cbs_.erase(fsync_cbs_.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+        });
+        for (Fired& f : fired) {
+            if (f.cb) {
+                f.cb(f.ok); // resolves a Promise -> SCHEDULES the waiter (L1)
+            }
+        }
+    }
+
+    // A parked async-fsync completion callback, keyed by op id (sorted-by-id vector —
+    // deterministic, no unordered map).
+    struct FsyncCb {
+        ProdUring::OpId id = 0;
+        FsyncDone cb{};
+    };
+
+    [[nodiscard]] std::size_t fsync_cb_index(ProdUring::OpId id) const noexcept {
+        std::size_t lo = 0;
+        std::size_t hi = fsync_cbs_.size();
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (fsync_cbs_[mid].id < id) {
+                lo = mid + 1;
+            } else if (fsync_cbs_[mid].id > id) {
+                hi = mid;
+            } else {
+                return mid;
+            }
+        }
+        return kNoHandler;
+    }
+
+    void insert_fsync_cb(ProdUring::OpId id, FsyncDone cb) {
+        // op ids are monotonically increasing, so the new id always belongs at the end —
+        // the table stays sorted with a plain push_back.
+        fsync_cbs_.push_back(FsyncCb{id, std::move(cb)});
+    }
+
     // A pending real-time timer. Ordered by (deadline, arm_seq): earliest deadline
     // first, ties broken by arm order — the SAME deterministic monotonic key the
     // sim uses, so firing order is deterministic where real time permits.
@@ -676,6 +844,15 @@ private:
     bool diag_timers_ = false;                              // LOCKSTEP_REACTOR_DIAG=1
     core::Tick diag_max_late_ns_ = 0;                       // worst late-fire seen
     std::uint64_t diag_fire_count_ = 0;                     // # timers fired
+
+    // io_uring (S9.2) — the reactor's OWN ring (single-thread-per-shard; not shared).
+    // Async fdatasync submits here; the CQE is the durability barrier. RAII-closed.
+    ProdUring uring_{};                                     // one ring per reactor
+    bool uring_disabled_ = false;                          // LOCKSTEP_NO_URING=1 (A/B)
+    bool ring_fd_registered_ = false;                      // ring fd on epoll yet?
+    bool flushing_ = false;                                // re-entrancy guard for flush
+    ProdUring::OpId next_uring_op_ = 1;                     // fsync op-id sequence
+    std::vector<FsyncCb> fsync_cbs_{};                      // parked fsync completions
 };
 
 } // namespace lockstep::prod
