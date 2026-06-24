@@ -83,6 +83,48 @@
 //     joined table has `col`, it is AMBIGUOUS => a clean error (fail-closed). If none,
 //     unknown column => a clean error.
 //
+// v4 EXPLICIT NULL + SUBQUERIES (documented + EXACTLY mirrored by the reference model in
+// sql_subquery_test.cpp — a divergence is a BUG the conformance gate catches):
+//
+//   NULLABLE COLUMNS. A column is NULLABLE unless declared NOT NULL; the PRIMARY KEY is
+//   ALWAYS NOT NULL (forced in exec_create). A NULL is stored as a single reserved tag
+//   byte (Catalog::kNullTag) in the value tuple — a row with NO nulls encodes byte-
+//   identically to pre-v4, so the existing conformance/order gates still hold. INSERT
+//   may OMIT a nullable column (=> NULL) or write the `NULL` literal; omitting a NOT NULL
+//   column, or writing NULL into one, is a RAISED error (fail-closed). UPDATE ... SET
+//   col = NULL stores a NULL into a nullable column. A NULL column value gets NO
+//   secondary-index entry (a NULL is never matched by an indexed `= v` / BETWEEN lookup).
+//
+//   IS NULL / IS NOT NULL. `col IS NULL` is TRUE iff the value is NULL; `col IS NOT NULL`
+//   is its negation. These are the ONLY predicates that can be TRUE for a NULL operand.
+//
+//   THREE-VALUED LOGIC (collapsed to two-valued AT THE FILTER: a row is kept iff the
+//   predicate is TRUE; UNKNOWN => dropped). A comparison (=,!=,<,<=,>,>=) with a NULL
+//   operand is UNKNOWN => false: BOTH `val = 5` and `val != 5` DROP a NULL-val row.
+//
+//   AGGREGATES SKIP NULL. COUNT(*) counts EVERY row; COUNT(col)/SUM/MIN/MAX/AVG aggregate
+//   the PRESENT (non-NULL) values only. A NON-empty group whose aggregated column is ALL
+//   NULL yields COUNT=0, SUM=0, MIN/MAX/AVG=NULL. (The synthetic ungrouped-over-EMPTY-
+//   table group keeps the pinned pre-v4 rendering: COUNT=0, SUM=0, MIN/MAX/AVG=0.)
+//   GROUP BY treats NULL as ONE distinct group (all NULLs of a column group together);
+//   a NULL group key sorts FIRST under ORDER BY (cmp_datum: NULLs-first).
+//
+//   SUBQUERIES (UNCORRELATED only; lowered by RUNNING the inner SELECT through the same
+//   exec_select pipeline, ONCE, then applying the predicate — FLAG: a correlated subquery
+//   referencing an outer column resolves it as unknown => a clean error, never a wrong
+//   answer):
+//     * SCALAR `col <op> (SELECT agg/single-col)`: the subquery MUST return at most ONE
+//       row / exactly one column. >1 row is a RAISED error (cardinality, like real SQL);
+//       0 rows => the scalar is NULL => the comparison is UNKNOWN => the row is dropped.
+//     * `col [NOT] IN (SELECT col)`: membership under three-valued logic. IN is TRUE iff
+//       the probe equals some PRESENT subquery value. NOT IN is TRUE iff the probe equals
+//       NO present value AND the subquery had NO NULL; if the probe matches no present
+//       value BUT the subquery contained a NULL, NOT IN is UNKNOWN => the row is dropped
+//       (the load-bearing NULL-in-NOT-IN rule). A NULL probe is UNKNOWN for both.
+//     * `[NOT] EXISTS (SELECT ...)`: TRUE iff the subquery returns >=1 row (any shape);
+//       never UNKNOWN. NOT EXISTS is its negation (arrives as a prefix-NOT wrapping it).
+//   Subqueries are OUT of HAVING (a clean error).
+//
 // NULL SEMANTICS (introduced ONLY by LEFT JOIN; documented + mirrored in the model):
 //   * A comparison with a NULL operand is UNKNOWN, treated as FALSE in WHERE/ON/HAVING
 //     (SQL three-valued logic collapsed to two-valued at the filter: a row is kept iff
@@ -218,6 +260,10 @@ private:
             return ExecResult::failure("PRIMARY KEY column '" + c.pk_column +
                                        "' is not a declared column");
         }
+        // v4: the PRIMARY KEY column is ALWAYS NOT NULL (a NULL PK is meaningless and
+        // could never be addressed by the order-preserving key encoding). Force it
+        // regardless of any NOT NULL spelling in the DDL.
+        t.columns[t.pk_index].nullable = false;
         (void)catalog_.create(std::move(t));
         return ExecResult{};
     }
@@ -323,6 +369,16 @@ private:
     [[nodiscard]] static std::optional<std::string> coerce(const Column& col,
                                                            const Datum& in,
                                                            Datum& out) {
+        // v4: a NULL literal carries a placeholder type — re-type it to the column's
+        // declared type and accept it iff the column is NULLABLE (fail-closed otherwise).
+        if (in.is_null) {
+            if (!col.nullable) {
+                return std::string("NULL not allowed for NOT NULL column '") + col.name +
+                       "'";
+            }
+            out = Datum::make_null(col.type);
+            return std::nullopt;
+        }
         if (col.type != in.type) {
             return std::string("type mismatch for column '") + col.name +
                    "': expected " + type_name(col.type) + ", got " +
@@ -339,6 +395,15 @@ private:
                                      bool tombstone,
                                      std::vector<std::pair<Key, Value>>& out) {
         for (const Index& ix : t.indexes) {
+            // v4: a NULL column value gets NO index entry (a NULL is never matched by an
+            // `indexed_col = v` / BETWEEN lookup — comparison-with-NULL is UNKNOWN). So a
+            // NULL row is simply absent from the index; the residual full-predicate (run
+            // over point-got rows) still excludes it. This keeps the index == the table's
+            // matchable rows. (UPDATE removes the OLD entry only if the old value was
+            // non-NULL — symmetric, so a NULL<->value transition is maintained correctly.)
+            if (row[ix.column].is_null) {
+                continue;
+            }
             const Key ikey =
                 encode_index_entry(t.id, ix, row[ix.column], row[t.pk_index]);
             out.emplace_back(ikey, tombstone ? tombstone_marker() : std::string{});
@@ -351,14 +416,10 @@ private:
         if (t == nullptr) {
             return ExecResult::failure("unknown table '" + ins.table + "'");
         }
-        // Every column must be provided exactly once (no defaults/NULL in v1).
-        if (ins.columns.size() != t->columns.size()) {
-            return ExecResult::failure(
-                "INSERT must provide all " + std::to_string(t->columns.size()) +
-                " columns in v1 (no defaults/NULL); got " +
-                std::to_string(ins.columns.size()));
-        }
-        // Map named columns -> a row in schema order, with type checking.
+        // v4: columns may be OMITTED. A named column is set (with type checking + NULL
+        // re-typing); an omitted column defaults to NULL iff it is NULLABLE, else the
+        // INSERT is rejected (a NOT NULL column REQUIRES a value). The PK is NOT NULL, so
+        // omitting it is always an error.
         std::vector<Datum> row(t->columns.size());
         std::vector<bool> set(t->columns.size(), false);
         for (std::size_t k = 0; k < ins.columns.size(); ++k) {
@@ -377,6 +438,17 @@ private:
             }
             row[*idx] = d;
             set[*idx] = true;
+        }
+        for (std::size_t c = 0; c < t->columns.size(); ++c) {
+            if (set[c]) {
+                continue;
+            }
+            if (!t->columns[c].nullable) {
+                return ExecResult::failure(
+                    "INSERT omits NOT NULL column '" + t->columns[c].name +
+                    "' (provide a value)");
+            }
+            row[c] = Datum::make_null(t->columns[c].type);  // omitted nullable => NULL
         }
         const Datum& pk = row[t->pk_index];
         const Key key = encode_key(*t, pk);
@@ -1096,6 +1168,29 @@ private:
                 truth = !c;
                 return std::nullopt;
             }
+            case PredNodeKind::IsNull: {
+                // v4: <col> IS [NOT] NULL over the joined row.
+                std::size_t i = 0;
+                if (auto e = schema.resolve(n.qualifier, n.column, i)) return e;
+                const bool null = jr[i].is_null;
+                truth = n.is_not ? !null : null;
+                return std::nullopt;
+            }
+            case PredNodeKind::InList: {
+                // v4: <col> [NOT] IN (SELECT ...) over the joined row.
+                std::size_t i = 0;
+                if (auto e = schema.resolve(n.qualifier, n.column, i)) return e;
+                SubColumn sub;
+                if (auto e = run_sub_column(*n.subquery, sub)) return e;
+                return apply_in(jr[i], n.is_not, sub, truth);
+            }
+            case PredNodeKind::Exists: {
+                // v4: [NOT] EXISTS (SELECT ...).
+                bool ex = false;
+                if (auto e = run_exists_sub(*n.subquery, ex)) return e;
+                truth = n.is_not ? !ex : ex;
+                return std::nullopt;
+            }
             case PredNodeKind::Cmp:
                 break;
         }
@@ -1109,7 +1204,15 @@ private:
         }
         const Datum& lhs = jr[li];
         Datum rhs;
-        if (n.rhs_is_column) {
+        if (n.rhs_is_subquery) {
+            // v4: scalar subquery RHS over the joined row.
+            bool snull = false;
+            if (auto e = run_scalar_sub(*n.subquery, snull, rhs)) return e;
+            if (snull) {
+                truth = false;
+                return std::nullopt;
+            }
+        } else if (n.rhs_is_column) {
             std::size_t ri = 0;
             if (auto e = schema.resolve(n.rhs_qualifier, n.rhs_column, ri)) {
                 return e;
@@ -1467,6 +1570,13 @@ private:
                 truth = !c;
                 return std::nullopt;
             }
+            case PredNodeKind::IsNull:
+            case PredNodeKind::InList:
+            case PredNodeKind::Exists:
+                // v4: IS NULL / subqueries are not supported inside HAVING (rejected at
+                // parse time for subqueries). Fail-closed if one ever reaches here.
+                return std::string(
+                    "IS NULL / subqueries are not supported in HAVING");
             case PredNodeKind::Cmp:
                 break;
         }
@@ -1533,6 +1643,13 @@ private:
         // WHERE + HAVING predicate leaves (column operands + column rhs).
         const auto mark_pred = [&](const Predicate& p) {
             for (const PredNode& n : p.nodes) {
+                // v4: IsNull / InList reference a column too (not just Cmp leaves). A NULL
+                // test / IN-probe MUST decode its column, so include those node kinds.
+                if (n.kind == PredNodeKind::IsNull ||
+                    n.kind == PredNodeKind::InList) {
+                    mark(n.column);
+                    continue;
+                }
                 if (n.kind != PredNodeKind::Cmp) {
                     continue;
                 }
@@ -1647,8 +1764,9 @@ private:
         for (const std::int32_t li : leaves) {
             const PredNode& n = p.nodes[static_cast<std::size_t>(li)];
             if (n.kind != PredNodeKind::Cmp || n.operand != OperandKind::Column ||
-                !n.qualifier.empty() || n.rhs_is_column || n.op != CmpOp::Eq) {
-                continue;
+                !n.qualifier.empty() || n.rhs_is_column || n.rhs_is_subquery ||
+                n.literal.is_null || n.op != CmpOp::Eq) {
+                continue;  // v4: a NULL/subquery RHS is never an index point lookup
             }
             const auto col = t.column_index(n.column);
             if (!col || *col == t.pk_index || n.literal.type != t.columns[*col].type) {
@@ -1668,7 +1786,8 @@ private:
         for (std::size_t a = 0; a < leaves.size(); ++a) {
             const PredNode& na = p.nodes[static_cast<std::size_t>(leaves[a])];
             if (na.kind != PredNodeKind::Cmp || na.operand != OperandKind::Column ||
-                !na.qualifier.empty() || na.rhs_is_column || na.op != CmpOp::Ge) {
+                !na.qualifier.empty() || na.rhs_is_column || na.rhs_is_subquery ||
+                na.literal.is_null || na.op != CmpOp::Ge) {
                 continue;
             }
             const auto col = t.column_index(na.column);
@@ -2020,6 +2139,125 @@ private:
         return false;
     }
 
+    // ========================================================================
+    // v4: SUBQUERY EVALUATION. A subquery is LOWERED by running its inner SELECT through
+    // the SAME exec_select pipeline (no new query surface) and applying the predicate to
+    // its result. UNCORRELATED ONLY (FLAG): the inner SELECT does NOT see the outer row;
+    // it is evaluated ONCE and its result reused for every outer row (correct + cheap for
+    // an uncorrelated subquery; a correlated subquery referencing an outer column would
+    // resolve that column as unknown => a clean error, never a wrong answer). The inner
+    // SELECT reads the SAME committed store at the SAME D5 level the outer statement runs.
+    // ========================================================================
+
+    // The collected values of an IN/scalar subquery's single output column + whether any
+    // were NULL (load-bearing for NOT IN's three-valued logic).
+    struct SubColumn {
+        std::vector<Datum> values;  // the present (non-NULL) values, in result order
+        bool has_null = false;      // a NULL appeared in the subquery's column
+    };
+
+    // Run an uncorrelated subquery and extract its SINGLE output column. Errors if the
+    // subquery projects more than one column (a scalar/IN subquery is single-column).
+    [[nodiscard]] std::optional<std::string> run_sub_column(const SelectStmt& sub,
+                                                            SubColumn& out) {
+        const ExecResult r = exec_select(sub);
+        if (!r.ok) {
+            return std::string("subquery error: " + r.error);
+        }
+        for (const ResultRow& row : r.rows) {
+            if (row.cells.size() != 1) {
+                return std::string(
+                    "subquery must return exactly ONE column (got " +
+                    std::to_string(row.cells.size()) + ")");
+            }
+            const Datum& d = row.cells.front().second;
+            if (d.is_null) {
+                out.has_null = true;
+            } else {
+                out.values.push_back(d);
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Run a SCALAR subquery: it MUST return exactly one row / one column. >1 row is an
+    // ERROR (like real SQL). 0 rows => the scalar is NULL (the outer comparison is then
+    // UNKNOWN => false). Fills `is_null` + `value`.
+    [[nodiscard]] std::optional<std::string> run_scalar_sub(const SelectStmt& sub,
+                                                            bool& is_null, Datum& value) {
+        const ExecResult r = exec_select(sub);
+        if (!r.ok) {
+            return std::string("subquery error: " + r.error);
+        }
+        if (r.rows.size() > 1) {
+            return std::string(
+                "scalar subquery returned " + std::to_string(r.rows.size()) +
+                " rows (a scalar subquery must return at most one row)");
+        }
+        if (r.rows.empty()) {
+            is_null = true;  // 0 rows => NULL scalar
+            return std::nullopt;
+        }
+        if (r.rows.front().cells.size() != 1) {
+            return std::string("scalar subquery must return exactly ONE column");
+        }
+        const Datum& d = r.rows.front().cells.front().second;
+        is_null = d.is_null;
+        value = d;
+        return std::nullopt;
+    }
+
+    // Run an EXISTS subquery: TRUE iff it returns >=1 row (any shape). Never UNKNOWN.
+    [[nodiscard]] std::optional<std::string> run_exists_sub(const SelectStmt& sub,
+                                                            bool& exists) {
+        const ExecResult r = exec_select(sub);
+        if (!r.ok) {
+            return std::string("subquery error: " + r.error);
+        }
+        exists = !r.rows.empty();
+        return std::nullopt;
+    }
+
+    // Apply the IN / NOT IN membership test under SQL three-valued logic, given the
+    // probe Datum + the subquery column. Returns the COLLAPSED truth (UNKNOWN => false):
+    //   IN:      TRUE iff probe equals some present value; if not, UNKNOWN if a NULL was
+    //            present (=> false), else FALSE.
+    //   NOT IN:  the negation under three-valued logic: TRUE iff probe equals NO present
+    //            value AND no NULL was present; if probe matches a present value => FALSE;
+    //            if no match but a NULL was present => UNKNOWN (=> false). (This is the
+    //            load-bearing NOT-IN-with-NULL rule the conformance teeth check.)
+    // A NULL probe is itself UNKNOWN => false for both IN and NOT IN.
+    [[nodiscard]] static std::optional<std::string> apply_in(const Datum& probe,
+                                                             bool is_not,
+                                                             const SubColumn& sub,
+                                                             bool& truth) {
+        if (probe.is_null) {
+            truth = false;  // NULL IN/NOT IN anything is UNKNOWN
+            return std::nullopt;
+        }
+        bool matched = false;
+        for (const Datum& v : sub.values) {
+            if (v.type != probe.type) {
+                return std::string(
+                    "type mismatch in IN: probe is " + std::string(type_name(probe.type)) +
+                    ", subquery column is " + type_name(v.type));
+            }
+            if (cmp_datum(v, probe) == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!is_not) {
+            // IN: present-match => true; else UNKNOWN-if-null (false) else false.
+            truth = matched;  // (no-match + null => still false, same collapsed value)
+            return std::nullopt;
+        }
+        // NOT IN: a present match => false; no match + a NULL => UNKNOWN => false;
+        // no match + no NULL => true.
+        truth = (!matched && !sub.has_null);
+        return std::nullopt;
+    }
+
     // Evaluate a predicate node into `truth`. `group` is non-null for HAVING (so an
     // Agg operand resolves to the group's aggregate); for a WHERE row filter it is
     // null and `row` is the candidate row. Returns an error string on a type
@@ -2057,6 +2295,45 @@ private:
                 truth = !c;
                 return std::nullopt;
             }
+            case PredNodeKind::IsNull: {
+                // v4: <col> IS [NOT] NULL — the only predicate ever TRUE for a NULL.
+                // Valid in WHERE (group==null, `row` is the candidate); not in HAVING.
+                if (group != nullptr) {
+                    return std::string("IS NULL is not supported in HAVING");
+                }
+                const auto idx = t.column_index(n.column);
+                if (!idx) {
+                    return std::string("unknown column '" + n.column + "' in table '" +
+                                       t.name + "'");
+                }
+                const bool null = row[*idx].is_null;
+                truth = n.is_not ? !null : null;
+                return std::nullopt;
+            }
+            case PredNodeKind::InList: {
+                // v4: <col> [NOT] IN (SELECT ...) — uncorrelated subquery membership.
+                if (group != nullptr) {
+                    return std::string("IN subqueries are not supported in HAVING");
+                }
+                const auto idx = t.column_index(n.column);
+                if (!idx) {
+                    return std::string("unknown column '" + n.column + "' in table '" +
+                                       t.name + "'");
+                }
+                SubColumn sub;
+                if (auto e = run_sub_column(*n.subquery, sub)) return e;
+                return apply_in(row[*idx], n.is_not, sub, truth);
+            }
+            case PredNodeKind::Exists: {
+                // v4: [NOT] EXISTS (SELECT ...) — uncorrelated existence test.
+                if (group != nullptr) {
+                    return std::string("EXISTS subqueries are not supported in HAVING");
+                }
+                bool ex = false;
+                if (auto e = run_exists_sub(*n.subquery, ex)) return e;
+                truth = n.is_not ? !ex : ex;
+                return std::nullopt;
+            }
             case PredNodeKind::Cmp:
                 break;
         }
@@ -2078,11 +2355,29 @@ private:
             }
             lhs = row[*idx];
         }
-        if (lhs.type != n.literal.type) {
-            return std::string("type mismatch in predicate: comparing ") +
-                   type_name(lhs.type) + " to " + type_name(n.literal.type);
+        // v4: the RHS may be a SCALAR SUBQUERY (col <op> (SELECT agg)). Resolve it to a
+        // Datum (NULL if the subquery returned 0 rows; an error if it returned >1 row).
+        Datum rhs;
+        if (n.rhs_is_subquery) {
+            bool snull = false;
+            if (auto e = run_scalar_sub(*n.subquery, snull, rhs)) return e;
+            if (snull) {
+                truth = false;  // comparison with a NULL scalar is UNKNOWN
+                return std::nullopt;
+            }
+        } else {
+            rhs = n.literal;
         }
-        truth = apply_cmp(n.op, cmp_datum(lhs, n.literal));
+        // NULL operand => UNKNOWN => false (three-valued logic collapsed at filter).
+        if (lhs.is_null || rhs.is_null) {
+            truth = false;
+            return std::nullopt;
+        }
+        if (lhs.type != rhs.type) {
+            return std::string("type mismatch in predicate: comparing ") +
+                   type_name(lhs.type) + " to " + type_name(rhs.type);
+        }
+        truth = apply_cmp(n.op, cmp_datum(lhs, rhs));
         return std::nullopt;
     }
 
@@ -2123,10 +2418,13 @@ private:
     }
 
     // Compute one aggregate over a group. AVG(INT) truncates toward zero. MIN/MAX
-    // work for INT (numeric) + TEXT (lexicographic). An empty group yields COUNT 0;
-    // MIN/MAX/SUM/AVG over an empty group is impossible here (a group has >=1 row)
-    // EXCEPT the synthetic ungrouped-over-empty case, where COUNT=0 and SUM=0 and
-    // MIN/MAX/AVG render as 0 (the conventional empty-aggregate rendering we pin).
+    // work for INT (numeric) + TEXT (lexicographic).
+    //
+    // v4 NULL SEMANTICS (mirrors compute_agg_joined exactly): COUNT(*) counts EVERY row
+    // (incl. NULL-valued ones). COUNT(col) / SUM / MIN / MAX / AVG SKIP NULLs (aggregate
+    // over the PRESENT values only). A group with NO present value for the aggregated
+    // column yields COUNT=0, SUM=0, and MIN/MAX/AVG = typed NULL. The synthetic
+    // ungrouped-over-empty group yields COUNT=0, SUM=0, MIN/MAX/AVG NULL.
     [[nodiscard]] std::optional<std::string> compute_agg(const AggExpr& a,
                                                          const Table& t,
                                                          const Group& grp, Datum& out) {
@@ -2139,24 +2437,39 @@ private:
             return std::string("unknown column '" + a.column + "' in aggregate");
         }
         const std::size_t ci = *idx;
+        const Type ty = t.columns[ci].type;
+        // Collect the PRESENT (non-NULL) values of the aggregated column.
+        std::vector<const Datum*> present;
+        for (const auto* rp : grp.rows) {
+            const Datum& d = (*rp)[ci];
+            if (!d.is_null) {
+                present.push_back(&d);
+            }
+        }
         if (a.kind == AggKind::Count) {
-            // COUNT(col): every column is present (non-NULL) in this subset.
-            out = Datum::make_int(static_cast<std::int64_t>(grp.rows.size()));
+            out = Datum::make_int(static_cast<std::int64_t>(present.size()));
             return std::nullopt;
         }
         if (grp.rows.empty()) {
-            // Only the synthetic ungrouped-empty group. SUM=0; MIN/MAX/AVG=0.
+            // The SYNTHETIC ungrouped-over-empty group (zero member rows): SUM=0 and
+            // MIN/MAX/AVG render as 0 — the conventional empty-aggregate rendering we
+            // pinned pre-v4 (kept byte-stable so the existing aggregates gate holds).
             out = Datum::make_int(0);
             return std::nullopt;
         }
+        if (present.empty()) {
+            // A NON-empty group whose aggregated column is ALL NULL: SUM=0; MIN/MAX/AVG
+            // = typed NULL (the SQL three-valued result for an all-NULL aggregate).
+            out = (a.kind == AggKind::Sum) ? Datum::make_int(0) : Datum::make_null(ty);
+            return std::nullopt;
+        }
         if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
-            Datum best = (*grp.rows.front())[ci];
-            for (const auto* rp : grp.rows) {
-                const Datum& d = (*rp)[ci];
-                const int c = cmp_datum(d, best);
+            Datum best = *present.front();
+            for (const Datum* d : present) {
+                const int c = cmp_datum(*d, best);
                 if ((a.kind == AggKind::Min && c < 0) ||
                     (a.kind == AggKind::Max && c > 0)) {
-                    best = d;
+                    best = *d;
                 }
             }
             out = best;
@@ -2164,15 +2477,15 @@ private:
         }
         // SUM / AVG over INT (validated INT in validate_one_agg).
         std::int64_t sum = 0;
-        for (const auto* rp : grp.rows) {
-            sum += (*rp)[ci].i;
+        for (const Datum* d : present) {
+            sum += d->i;
         }
         if (a.kind == AggKind::Sum) {
             out = Datum::make_int(sum);
             return std::nullopt;
         }
         // AVG: integer truncation toward zero (C++ / divides truncates toward zero).
-        const std::int64_t n = static_cast<std::int64_t>(grp.rows.size());
+        const std::int64_t n = static_cast<std::int64_t>(present.size());
         out = Datum::make_int(n == 0 ? 0 : sum / n);
         return std::nullopt;
     }

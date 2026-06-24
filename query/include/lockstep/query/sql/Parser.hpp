@@ -380,7 +380,7 @@ private:
     ParseResult err(std::string msg) const { return ParseResult{make_err(std::move(msg))}; }
 
     // Expect a keyword (case-insensitive). Returns nullopt on success, an error
-    // otherwise (so callers write `if (auto e = expect_kw(...)) return *e;`).
+    // otherwise (so callers write `if (auto e = expect_kw(...)) return e;`).
     [[nodiscard]] std::optional<ParseError> expect_kw(const char* kw) {
         if (cur_.kind == Tok::Bad) {
             return make_err(cur_.bad_msg);
@@ -464,6 +464,18 @@ private:
         return make_err("expected a literal (integer or 'string')");
     }
 
+    // v4: consume a literal OR the NULL keyword (INSERT VALUES / a comparison RHS).
+    // A NULL literal carries `is_null=true` with a PLACEHOLDER type (Int); the Engine
+    // re-types it to the target column's declared type when it coerces the value.
+    [[nodiscard]] std::optional<ParseError> expect_value_or_null(Datum& out) {
+        if (is_kw("null")) {
+            advance();
+            out = Datum::make_null(Type::Int);  // type fixed up at coerce time
+            return std::nullopt;
+        }
+        return expect_literal(out);
+    }
+
     // --- grammar rules ---
 
     // CREATE TABLE t (...) | CREATE INDEX name ON t (col)
@@ -523,6 +535,20 @@ private:
             } else {
                 return err("expected a column type (INT or TEXT) — other types are "
                            "OUT in v1");
+            }
+            // v4: optional NOT NULL constraint. A column is NULLABLE by default; a
+            // NOT NULL column requires a present value at INSERT. (The PK column is
+            // forced NOT NULL in the Engine regardless.) A bare `NULL` after the type is
+            // accepted as the explicit "is nullable" spelling (default), for symmetry.
+            col.nullable = true;
+            if (is_kw("not")) {
+                advance();
+                if (auto e = expect_kw("null")) {
+                    return ParseResult{*e};
+                }
+                col.nullable = false;
+            } else if (is_kw("null")) {
+                advance();  // explicit NULL == the default (nullable)
             }
             st.create.columns.push_back(std::move(col));
             if (cur_.kind == Tok::Comma) {
@@ -642,7 +668,7 @@ private:
         }
         for (;;) {
             Datum v;
-            if (auto e = expect_literal(v)) {
+            if (auto e = expect_value_or_null(v)) {  // v4: NULL literal allowed
                 return ParseResult{*e};
             }
             st.insert.values.push_back(std::move(v));
@@ -681,7 +707,7 @@ private:
         if (auto e = expect(Tok::Eq, "'=' in SET")) {
             return ParseResult{*e};
         }
-        if (auto e = expect_literal(st.update.set_value)) {
+        if (auto e = expect_value_or_null(st.update.set_value)) {  // v4: SET col = NULL
             return ParseResult{*e};
         }
         // WHERE pk = v
@@ -735,7 +761,8 @@ private:
                is_kw("and") || is_kw("or") || is_kw("asc") || is_kw("desc") ||
                is_kw("by") || is_kw("join") || is_kw("inner") || is_kw("left") ||
                is_kw("right") || is_kw("outer") || is_kw("cross") || is_kw("on") ||
-               is_kw("as");
+               is_kw("as") || is_kw("is") || is_kw("in") || is_kw("exists") ||
+               is_kw("null") || is_kw("not") || is_kw("between");
     }
 
     // Try to parse an AGGREGATE call at the cursor: NAME '(' ('*' | col) ')'.
@@ -816,10 +843,21 @@ private:
     // SELECT [DISTINCT] (* | item, ...) FROM t [WHERE p] [GROUP BY ..] [HAVING ..]
     //                                          [ORDER BY ..] [LIMIT n [OFFSET m]] [AT ..]
     ParseResult parse_select() {
-        advance();  // SELECT
         Statement st;
         st.kind = StmtKind::Select;
-        SelectStmt& sel = st.select;
+        if (auto e = parse_select_stmt(st.select)) {
+            return ParseResult{*e};
+        }
+        return ParseResult{std::move(st)};
+    }
+
+    // v4: parse a SELECT body into `sel`. Factored out of parse_select() so a SUBQUERY
+    // (IN/EXISTS/scalar) can reuse the SAME SELECT grammar + AST shape (the subquery is
+    // a fully-formed SelectStmt the Engine runs through its normal SELECT pipeline). The
+    // cursor must be on the SELECT keyword; on return it sits AFTER the SELECT body (the
+    // caller consumes any trailing ')' or ';').
+    [[nodiscard]] std::optional<ParseError> parse_select_stmt(SelectStmt& sel) {
+        advance();  // SELECT
 
         if (is_kw("distinct")) {
             advance();
@@ -836,7 +874,7 @@ private:
                 bool is_agg = false;
                 std::string label;
                 if (auto e = parse_agg(agg, is_agg, label)) {
-                    return ParseResult{*e};
+                    return e;
                 }
                 if (is_agg) {
                     SelectItem item;
@@ -850,7 +888,7 @@ private:
                     std::string c;
                     if (auto e = expect_qualified_column(
                             "a column name, aggregate, or '*'", qual, c)) {
-                        return ParseResult{*e};
+                        return e;
                     }
                     SelectItem item;
                     item.kind = SelectItemKind::Column;
@@ -870,12 +908,12 @@ private:
             }
         }
         if (auto e = expect_kw("from")) {
-            return ParseResult{*e};
+            return e;
         }
         // v3: the FROM/JOIN list (left-deep). Fills sel.from; sel.table mirrors the
         // base entry's table for the v1/v2 single-table path.
         if (auto e = parse_from(sel)) {
-            return ParseResult{*e};
+            return e;
         }
 
         // Optional WHERE — v2 general predicate. We ALSO recognize a bare PK
@@ -884,7 +922,7 @@ private:
         if (is_kw("where")) {
             advance();
             if (auto e = parse_predicate(sel.filter, /*allow_agg=*/false)) {
-                return ParseResult{*e};
+                return e;
             }
             // The PK fast path is a SINGLE-TABLE optimization. With a JOIN (or an
             // alias != table), WHERE runs over the joined row, so never lower it to a
@@ -899,7 +937,7 @@ private:
         if (is_kw("group")) {
             advance();
             if (auto e = expect_kw("by")) {
-                return ParseResult{*e};
+                return e;
             }
             for (;;) {
                 // v3: a GROUP BY column may be qualified (table.col); we store the
@@ -908,7 +946,7 @@ private:
                 std::string col;
                 if (auto e = expect_qualified_column("a column name in GROUP BY", qual,
                                                      col)) {
-                    return ParseResult{*e};
+                    return e;
                 }
                 sel.group_by.push_back(qual.empty() ? col : qual + "." + col);
                 if (cur_.kind == Tok::Comma) {
@@ -923,7 +961,7 @@ private:
         if (is_kw("having")) {
             advance();
             if (auto e = parse_predicate(sel.having, /*allow_agg=*/true)) {
-                return ParseResult{*e};
+                return e;
             }
         }
 
@@ -931,13 +969,13 @@ private:
         if (is_kw("order")) {
             advance();
             if (auto e = expect_kw("by")) {
-                return ParseResult{*e};
+                return e;
             }
             for (;;) {
                 OrderKey key;
                 if (auto e = expect_qualified_column("a column name in ORDER BY",
                                                      key.qualifier, key.column)) {
-                    return ParseResult{*e};
+                    return e;
                 }
                 if (is_kw("asc")) {
                     advance();
@@ -959,10 +997,10 @@ private:
             advance();
             Datum d;
             if (auto e = expect_literal(d)) {
-                return ParseResult{*e};
+                return e;
             }
             if (d.type != Type::Int || d.i < 0) {
-                return err("LIMIT requires a non-negative integer");
+                return make_err("LIMIT requires a non-negative integer");
             }
             sel.has_limit = true;
             sel.limit = d.i;
@@ -970,10 +1008,10 @@ private:
                 advance();
                 Datum o;
                 if (auto e = expect_literal(o)) {
-                    return ParseResult{*e};
+                    return e;
                 }
                 if (o.type != Type::Int || o.i < 0) {
-                    return err("OFFSET requires a non-negative integer");
+                    return make_err("OFFSET requires a non-negative integer");
                 }
                 sel.offset = o.i;
             }
@@ -983,10 +1021,10 @@ private:
         if (is_kw("at")) {
             advance();
             if (auto e = parse_at_level(sel)) {
-                return ParseResult{*e};
+                return e;
             }
         }
-        return ParseResult{std::move(st)};
+        return std::nullopt;
     }
 
     // Map the current comparison token to a CmpOp; returns false if not a cmp op.
@@ -1077,10 +1115,54 @@ private:
         return parse_primary(p, allow_agg, out);
     }
 
+    // v4: parse `( SELECT ... )` into a shared SelectStmt (the nested subquery). The
+    // cursor must be on '('; on success it sits AFTER the matching ')'. The inner SELECT
+    // reuses the full SELECT grammar (so a subquery may itself have WHERE/JOIN/aggregates
+    // — UNCORRELATED only: it does not see the outer row; see the Engine's FLAG).
+    [[nodiscard]] std::optional<ParseError> parse_subquery(
+        std::shared_ptr<SelectStmt>& out) {
+        if (auto e = expect(Tok::LParen, "'(' to open a subquery")) {
+            return e;
+        }
+        if (!is_kw("select")) {
+            return make_err("expected SELECT to open a subquery");
+        }
+        auto sel = std::make_shared<SelectStmt>();
+        if (auto e = parse_select_stmt(*sel)) {
+            return e;
+        }
+        if (auto e = expect(Tok::RParen, "')' to close the subquery")) {
+            return e;
+        }
+        out = std::move(sel);
+        return std::nullopt;
+    }
+
     // primary ::= '(' or-expr ')' | <operand> <cmpop> <literal>
     //           | <column> BETWEEN a AND b   (sugar for col>=a AND col<=b)
     [[nodiscard]] std::optional<ParseError> parse_primary(Predicate& p, bool allow_agg,
                                                           std::int32_t& out) {
+        // v4: EXISTS ( SELECT ... ) — a subquery existence test. (NOT EXISTS arrives via
+        // the prefix NOT rule in parse_not, wrapping this Exists node.) Subqueries are
+        // OUT in HAVING (allow_agg) — a clean error, fail-closed.
+        if (is_kw("exists")) {
+            if (allow_agg) {
+                return make_err("EXISTS subqueries are not supported in HAVING");
+            }
+            advance();
+            std::shared_ptr<SelectStmt> sub;
+            if (auto e = parse_subquery(sub)) {
+                return e;
+            }
+            PredNode n;
+            n.kind = PredNodeKind::Exists;
+            n.is_not = false;
+            n.subquery = std::move(sub);
+            p.nodes.push_back(std::move(n));
+            out = static_cast<std::int32_t>(p.nodes.size() - 1);
+            return std::nullopt;
+        }
+
         if (cur_.kind == Tok::LParen) {
             advance();
             if (auto e = parse_or(p, allow_agg, out)) {
@@ -1113,6 +1195,70 @@ private:
             leaf.operand = OperandKind::Column;
             leaf.qualifier = qual;
             leaf.column = col;
+        }
+
+        // v4: <column> IS [NOT] NULL — a three-valued NULL test (the ONLY predicate that
+        // can ever be TRUE for a NULL operand). Not valid for an aggregate operand.
+        if (!is_agg && is_kw("is")) {
+            advance();
+            bool is_not = false;
+            if (is_kw("not")) {
+                advance();
+                is_not = true;
+            }
+            if (auto e = expect_kw("null")) {
+                return e;
+            }
+            PredNode n;
+            n.kind = PredNodeKind::IsNull;
+            n.operand = OperandKind::Column;
+            n.qualifier = leaf.qualifier;
+            n.column = leaf.column;
+            n.is_not = is_not;
+            p.nodes.push_back(std::move(n));
+            out = static_cast<std::int32_t>(p.nodes.size() - 1);
+            return std::nullopt;
+        }
+
+        // v4: <column> [NOT] IN ( SELECT col FROM ... ) — subquery membership. NULL
+        // semantics (a NULL in the subquery makes NOT IN UNKNOWN) are enforced by the
+        // Engine. (A literal IN-list `IN (1,2,3)` is OUT — only the subquery form here.)
+        {
+            bool in_not = false;
+            const Token save = cur_;
+            if (is_kw("not")) {
+                // Could be `NOT IN` — peek the next keyword. Only consume NOT if IN
+                // follows; otherwise this NOT belongs to a higher rule (shouldn't happen
+                // mid-primary, but stay safe and surface a clean error).
+                advance();
+                if (!is_kw("in")) {
+                    return make_err("expected IN after NOT in a predicate (only "
+                                    "<col> NOT IN (SELECT ...) is supported here)");
+                }
+                in_not = true;
+            }
+            if (is_kw("in")) {
+                if (is_agg) {
+                    return make_err("IN subqueries are not supported for an aggregate "
+                                    "operand");
+                }
+                advance();
+                std::shared_ptr<SelectStmt> sub;
+                if (auto e = parse_subquery(sub)) {
+                    return e;
+                }
+                PredNode n;
+                n.kind = PredNodeKind::InList;
+                n.operand = OperandKind::Column;
+                n.qualifier = leaf.qualifier;
+                n.column = leaf.column;
+                n.is_not = in_not;
+                n.subquery = std::move(sub);
+                p.nodes.push_back(std::move(n));
+                out = static_cast<std::int32_t>(p.nodes.size() - 1);
+                return std::nullopt;
+            }
+            (void)save;  // (NOT-without-IN already errored above)
         }
 
         // BETWEEN sugar (only for a column operand): col BETWEEN a AND b.
@@ -1156,10 +1302,21 @@ private:
         }
         advance();
         leaf.op = op;
-        // The RHS is either a LITERAL (the v1/v2 case) or, in an ON / general
-        // predicate over a joined schema, ANOTHER column (col-vs-col theta, e.g. an
-        // equi-join key a.x = b.y). An aggregate operand never has a column RHS.
-        if (!is_agg && (cur_.kind == Tok::Ident)) {
+        // The RHS is one of:
+        //   * a SCALAR SUBQUERY `(SELECT agg/single-col FROM ...)` (v4) — one row/one
+        //     col at run time, else an error; 0 rows => NULL => the comparison is UNKNOWN.
+        //   * the NULL literal (v4) — the comparison is then always UNKNOWN (false).
+        //   * ANOTHER column (col-vs-col theta, e.g. an equi-join key a.x = b.y).
+        //   * a plain LITERAL (the v1/v2 case).
+        // An aggregate operand (HAVING) only takes a literal RHS.
+        if (!is_agg && cur_.kind == Tok::LParen) {
+            std::shared_ptr<SelectStmt> sub;
+            if (auto e = parse_subquery(sub)) {
+                return e;
+            }
+            leaf.rhs_is_subquery = true;
+            leaf.subquery = std::move(sub);
+        } else if (!is_agg && cur_.kind == Tok::Ident && !at_clause_boundary()) {
             std::string rq;
             std::string rc;
             if (auto e = expect_qualified_column("a column name on the right of the "
@@ -1171,7 +1328,7 @@ private:
             leaf.rhs_qualifier = rq;
             leaf.rhs_column = rc;
         } else {
-            if (auto e = expect_literal(leaf.literal)) {
+            if (auto e = expect_value_or_null(leaf.literal)) {  // v4: NULL allowed
                 return e;
             }
         }
@@ -1195,8 +1352,12 @@ private:
         const PredNode& r = p.nodes[static_cast<std::size_t>(p.root)];
         // The fast path only fires for an UNQUALIFIED column vs a LITERAL (a qualified
         // ref or a col-vs-col theta is never a PK point/range candidate).
+        // v4: never lower a NULL-literal / subquery comparison to the PK point/range
+        // path (a NULL key is meaningless; `pk = NULL` is UNKNOWN => no rows, handled by
+        // the general filter). Require a present literal RHS.
         if (r.kind == PredNodeKind::Cmp && r.operand == OperandKind::Column &&
-            r.qualifier.empty() && !r.rhs_is_column && r.op == CmpOp::Eq) {
+            r.qualifier.empty() && !r.rhs_is_column && !r.rhs_is_subquery &&
+            !r.literal.is_null && r.op == CmpOp::Eq) {
             sel.where = SelectWhereKind::Eq;
             sel.where_column = r.column;
             sel.eq_value = r.literal;
@@ -1208,7 +1369,8 @@ private:
             if (l.kind == PredNodeKind::Cmp && rr.kind == PredNodeKind::Cmp &&
                 l.operand == OperandKind::Column && rr.operand == OperandKind::Column &&
                 l.qualifier.empty() && rr.qualifier.empty() && !l.rhs_is_column &&
-                !rr.rhs_is_column &&
+                !rr.rhs_is_column && !l.rhs_is_subquery && !rr.rhs_is_subquery &&
+                !l.literal.is_null && !rr.literal.is_null &&
                 l.column == rr.column && l.op == CmpOp::Ge && rr.op == CmpOp::Le) {
                 sel.where = SelectWhereKind::Between;
                 sel.where_column = l.column;
