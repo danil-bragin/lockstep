@@ -149,8 +149,101 @@ void test_select() {
 
     expect_err("SELECT FROM t", "empty projection");
     expect_err("SELECT * users", "missing FROM");
-    expect_err("SELECT * FROM t JOIN x", "JOIN is OUT (trailing input)");
+    expect_err("SELECT * FROM t JOIN x", "dangling JOIN (missing ON)");
     expect_err("SELECT * FROM t AT FUNKY", "unknown AT level");
+}
+
+// v3: JOIN / ON / alias / qualified-column grammar (valid ASTs + clean errors).
+void test_join() {
+    // INNER JOIN with an equi ON over qualified columns.
+    const Statement s1 = ok_parse(
+        "SELECT emp.name, dept.dname FROM emp JOIN dept ON emp.dept = dept.did");
+    CHECK(s1.kind == StmtKind::Select, "join select kind");
+    CHECK(s1.select.from.size() == 2, "two FROM entries");
+    CHECK(s1.select.is_join(), "is_join true");
+    CHECK(s1.select.from[0].table == "emp" && s1.select.from[0].alias == "emp",
+          "base table emp, alias defaults to name");
+    CHECK(s1.select.from[1].kind == JoinKind::Inner &&
+              s1.select.from[1].table == "dept",
+          "join entry is INNER on dept");
+    CHECK(s1.select.from[1].on.present(), "ON predicate present");
+    {
+        const PredNode& on = s1.select.from[1].on.nodes[static_cast<std::size_t>(
+            s1.select.from[1].on.root)];
+        CHECK(on.kind == PredNodeKind::Cmp && on.op == CmpOp::Eq, "ON is an equality");
+        CHECK(on.qualifier == "emp" && on.column == "dept", "ON lhs emp.dept");
+        CHECK(on.rhs_is_column && on.rhs_qualifier == "dept" && on.rhs_column == "did",
+              "ON rhs is column dept.did (equi-join key)");
+    }
+    // Qualified SELECT-list labels keep the qualifier (self-join disambiguation).
+    CHECK(s1.select.items.size() == 2 && s1.select.items[0].qualifier == "emp" &&
+              s1.select.items[0].column == "name" &&
+              s1.select.items[0].label == "emp.name",
+          "qualified select item emp.name");
+
+    // LEFT [OUTER] JOIN.
+    const Statement s2 = ok_parse(
+        "SELECT a.x FROM a LEFT JOIN b ON a.k = b.k");
+    CHECK(s2.select.from[1].kind == JoinKind::Left, "LEFT JOIN kind");
+    const Statement s2o = ok_parse(
+        "SELECT a.x FROM a LEFT OUTER JOIN b ON a.k = b.k");
+    CHECK(s2o.select.from[1].kind == JoinKind::Left, "LEFT OUTER == LEFT");
+
+    // AS alias + bare alias.
+    const Statement s3 = ok_parse(
+        "SELECT x.id, y.id FROM t AS x JOIN t AS y ON x.id = y.id");
+    CHECK(s3.select.from[0].alias == "x" && s3.select.from[1].alias == "y",
+          "AS aliases x / y on a self-join");
+    const Statement s3b = ok_parse("SELECT p.v FROM tbl p WHERE p.v > 0");
+    CHECK(s3b.select.from.size() == 1 && s3b.select.from[0].table == "tbl" &&
+              s3b.select.from[0].alias == "p",
+          "bare alias 'p' on a single table");
+
+    // Comma cross join + explicit CROSS JOIN.
+    const Statement s4 = ok_parse("SELECT a.id, b.id FROM a, b");
+    CHECK(s4.select.from.size() == 2 && s4.select.from[1].kind == JoinKind::Cross,
+          "comma => CROSS join");
+    const Statement s4c = ok_parse("SELECT a.id FROM a CROSS JOIN b");
+    CHECK(s4c.select.from[1].kind == JoinKind::Cross, "CROSS JOIN keyword");
+
+    // Multiple (left-deep) joins.
+    const Statement s5 = ok_parse(
+        "SELECT a.id FROM a JOIN b ON a.k = b.k JOIN c ON b.m = c.m");
+    CHECK(s5.select.from.size() == 3, "three-table left-deep join");
+    CHECK(s5.select.from[1].kind == JoinKind::Inner &&
+              s5.select.from[2].kind == JoinKind::Inner,
+          "both joins INNER");
+
+    // A bare JOIN == INNER JOIN.
+    const Statement s6 = ok_parse("SELECT a.id FROM a JOIN b ON a.k = b.k");
+    CHECK(s6.select.from[1].kind == JoinKind::Inner, "bare JOIN == INNER");
+
+    // A JOIN suppresses the PK fast-path (WHERE runs over the joined row).
+    const Statement s7 = ok_parse(
+        "SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.id = 5");
+    CHECK(s7.select.where == SelectWhereKind::None,
+          "JOIN suppresses the PK point fast-path");
+
+    // ORDER BY / GROUP BY accept qualified columns.
+    const Statement s8 = ok_parse(
+        "SELECT a.dept, COUNT(*) FROM a JOIN b ON a.k = b.k GROUP BY a.dept "
+        "ORDER BY a.dept DESC");
+    CHECK(s8.select.group_by.size() == 1 && s8.select.group_by[0] == "a.dept",
+          "qualified GROUP BY a.dept");
+    CHECK(s8.select.order_by.size() == 1 && s8.select.order_by[0].qualifier == "a" &&
+              s8.select.order_by[0].column == "dept" &&
+              s8.select.order_by[0].descending,
+          "qualified ORDER BY a.dept DESC");
+
+    // CLEAN POSITIONED ERRORS.
+    expect_err("SELECT * FROM a JOIN b", "INNER JOIN missing ON");
+    expect_err("SELECT * FROM a LEFT JOIN b", "LEFT JOIN missing ON");
+    expect_err("SELECT * FROM a JOIN b ON", "ON missing predicate");
+    expect_err("SELECT * FROM a CROSS JOIN b ON a.k = b.k", "CROSS takes no ON");
+    expect_err("SELECT * FROM a RIGHT JOIN b ON a.k = b.k", "RIGHT JOIN is OUT");
+    expect_err("SELECT * FROM a AS", "AS without an alias");
+    expect_err("SELECT a. FROM a", "dangling '.' (no column after qualifier)");
+    expect_err("SELECT * FROM a JOIN ON a.k = b.k", "JOIN without a table");
 }
 
 // v2: WHERE on ANY column — a general boolean predicate tree (=,!=,<,<=,>,>=,
@@ -314,6 +407,7 @@ int main() {
     test_insert();
     test_update_delete();
     test_select();
+    test_join();
     test_where_predicate();
     test_aggregates();
     test_order_limit_distinct();

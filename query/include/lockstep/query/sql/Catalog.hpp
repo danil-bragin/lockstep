@@ -105,11 +105,28 @@ struct Datum {
     Type type = Type::Int;
     std::int64_t i = 0;     // valid when type == Int
     std::string s;          // valid when type == Text
+    // v3 (JOIN): a SQL NULL. The base v1/v2 row encoding has NO nulls (every column is
+    // present), so `is_null` is ALWAYS false there. NULLs are introduced ONLY by a
+    // LEFT JOIN's unmatched right side (the NULL-filled columns). `type` still records
+    // the column's declared type so comparisons stay type-checked; the value bytes are
+    // ignored when is_null. NULL semantics (three-valued logic, COUNT(col) skips NULL,
+    // a comparison with NULL is UNKNOWN==false) are documented in Engine.hpp.
+    bool is_null = false;
 
-    static Datum make_int(std::int64_t v) { return Datum{Type::Int, v, {}}; }
-    static Datum make_text(std::string v) { return Datum{Type::Text, 0, std::move(v)}; }
+    static Datum make_int(std::int64_t v) { return Datum{Type::Int, v, {}, false}; }
+    static Datum make_text(std::string v) {
+        return Datum{Type::Text, 0, std::move(v), false};
+    }
+    // A typed NULL (carries the column type for type-checking, but no value).
+    static Datum make_null(Type t) { return Datum{t, 0, {}, true}; }
 
     [[nodiscard]] bool operator==(const Datum& o) const {
+        // NULL is not equal to anything (incl. another NULL) under SQL three-valued
+        // logic; but for the structural identity DISTINCT/render uses we treat two
+        // NULLs of the same type as the SAME output cell (a single NULL group/row).
+        if (is_null || o.is_null) {
+            return is_null && o.is_null && type == o.type;
+        }
         if (type != o.type) {
             return false;
         }
@@ -122,8 +139,12 @@ struct Datum {
         return type == Type::Int ? (i < o.i) : (s < o.s);
     }
 
-    // A stable text rendering for SELECT output / determinism dumps.
+    // A stable text rendering for SELECT output / determinism dumps. NULL renders as
+    // the literal "NULL" (distinct from any INT/TEXT value the subset produces).
     [[nodiscard]] std::string render() const {
+        if (is_null) {
+            return "NULL";
+        }
         return type == Type::Int ? std::to_string(i) : s;
     }
 };

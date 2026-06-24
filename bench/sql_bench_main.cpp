@@ -85,20 +85,31 @@ std::uint64_t fold(std::uint64_t acc, const ExecResult& r) {
     return acc;
 }
 
-// Build an N-row table emp(id INT PK, dept TEXT, sal INT, age INT) deterministically.
+// Build an N-row table emp(id INT PK, dept TEXT, sal INT, age INT) deterministically,
+// PLUS a join table dpt(did INT PK, region TEXT) keyed by an INT dept id (0..4), so a
+// 2-table equi-join `emp.deptid = dpt.did` exercises the HASH-JOIN path over N rows.
+// emp gets an extra INT `deptid` column (0..4) that equi-joins to dpt.did.
 SqlEngine build_table(std::uint64_t n) {
     SqlEngine eng;
     (void)eng.exec(
-        "CREATE TABLE emp (id INT, dept TEXT, sal INT, age INT, PRIMARY KEY (id))");
+        "CREATE TABLE emp (id INT, dept TEXT, sal INT, age INT, deptid INT, "
+        "PRIMARY KEY (id))");
+    (void)eng.exec("CREATE TABLE dpt (did INT, region TEXT, PRIMARY KEY (did))");
+    const char* regions[] = {"north", "south", "east", "west", "central"};
+    for (std::int64_t d = 0; d < 5; ++d) {
+        (void)eng.exec("INSERT INTO dpt (did, region) VALUES (" + std::to_string(d) +
+                       ", '" + regions[d] + "')");
+    }
     SplitMix rng(0x5EED1234ULL);
     const char* depts[] = {"eng", "sales", "ops", "hr", "legal"};
     for (std::uint64_t i = 0; i < n; ++i) {
-        const std::string dept = depts[rng.below(5)];
+        const std::uint64_t dx = rng.below(5);
+        const std::string dept = depts[dx];
         const std::int64_t sal = static_cast<std::int64_t>(rng.below(1000));
         const std::int64_t age = static_cast<std::int64_t>(rng.below(50)) + 18;
-        (void)eng.exec("INSERT INTO emp (id, dept, sal, age) VALUES (" +
+        (void)eng.exec("INSERT INTO emp (id, dept, sal, age, deptid) VALUES (" +
                        std::to_string(i) + ", '" + dept + "', " + std::to_string(sal) +
-                       ", " + std::to_string(age) + ")");
+                       ", " + std::to_string(age) + ", " + std::to_string(dx) + ")");
     }
     return eng;
 }
@@ -160,6 +171,12 @@ std::vector<Shape> full_shapes(std::uint64_t n) {
          1000},
         {"distinct full scan + DISTINCT + ORDER BY",
          "SELECT DISTINCT dept FROM emp ORDER BY dept", 1000},
+        {"join    2-table equi-join (hash join)",
+         "SELECT emp.id, dpt.region FROM emp JOIN dpt ON emp.deptid = dpt.did", 1000},
+        {"joingrp join + GROUP BY + aggregate",
+         "SELECT dpt.region, COUNT(*), AVG(emp.sal) FROM emp "
+         "JOIN dpt ON emp.deptid = dpt.did GROUP BY dpt.region ORDER BY dpt.region",
+         1000},
     };
 }
 
