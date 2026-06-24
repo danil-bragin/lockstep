@@ -993,3 +993,133 @@ the combine is a pure in-memory step (V-RKV1 deterministic; `std::map` index, no
   optimization.
 - **Not an optimization task.** No SQL fast-path beyond the existing PK point/range lowering
   was added; the in-memory pipeline is the straightforward O(rows·predicate) implementation.
+
+---
+
+# SQL-OPTIMIZE — profile-guided SQL-layer speedups (O(N^2) writes → O(N); lazy decode)
+
+> **OPTIMIZATION, SQL-LAYER ONLY.** Touches `query/sql/Engine.hpp` +
+> `query/sql/Catalog.hpp` (+ `bench/sql_bench_main.cpp`). **core / sim / consensus / txn /
+> storage / query::Database / query::Query diff EMPTY** (verified: `git diff --name-only`
+> hits none of them). The load-bearing gate — the SQL conformance == an independent
+> reference model — stays GREEN at elevated seeds and the bench checksums are
+> **byte-identical BEFORE vs AFTER** for every query shape (correctness unchanged; this
+> is pure speed). Mac host (SQL is portable), Release `-O2`, bounded (N capped, best-of-n).
+
+## Root cause (profiled FIRST)
+
+1. **O(N^2) table build — the SQL write path.** `Engine::submit_write` re-submitted the
+   WHOLE accumulated write-log as ONE batch per INSERT/UPDATE/DELETE (so a read-modify-write
+   txn body would see prior committed state through the executor, whose store starts EMPTY
+   per submit) AND then re-`prime`d the entire committed history into the read store. Both
+   are O(committed-writes) PER statement ⇒ **O(N^2)** to build N rows, paying heavyweight
+   txn re-execution + coroutine plumbing every time. Measured BEFORE (build-only, Release):
+
+   | N | BEFORE build | doubling factor |
+   |--:|-------------:|----------------:|
+   | 500  | 0.54 s  | —    |
+   | 1000 | 3.01 s  | 5.6× |
+   | 2000 | 18.45 s | 6.1× |
+   | 4000 | >120 s (hung past the 2-min wall guard) | — |
+
+   ~6× per doubling (worse than pure quadratic — the per-txn re-execution work itself grows).
+
+2. **Full-scan SELECT decodes every row fully.** Each scanned KV ran `decode_row`, which
+   decodes ALL non-PK columns (incl. copying/parsing a wide TEXT field) even when the query
+   references only a few columns.
+
+## Fix 1 — INCREMENTAL write apply (O(N^2) → O(N) of SQL work)
+
+The read-modify-write **decision** (dup-PK detect / decode+set / tombstone-a-present-row)
+now runs in the Engine over the **VERIFIED read path**: `read_committed(key)` is a strict
+point-get of the LIVE committed store (exactly what `SELECT WHERE pk = v` reads). The
+Engine then commits ONE **pure-writer** txn through the SAME verified executor (the
+write-set is produced by the verified surface, not hand-rolled) and lands it via the
+verified, incremental `Database::apply_committed` (one WAL'd apply, NO whole-history
+rebuild). No prior statement is ever re-executed. The whole `write_log_` + `prime` machinery
+is gone. **BUILD-N before/after (build-only, best-of-n, Release):**
+
+| N | BEFORE build | AFTER build | speedup |
+|--:|-------------:|------------:|--------:|
+| 500  | 0.54 s   | <0.01 s | ~100× |
+| 1000 | 3.01 s   | 0.01 s  | ~300× |
+| 2000 | 18.45 s  | 0.04 s  | **~460×** |
+| 4000 | >120 s (hang) | 0.14 s | **>850×** |
+
+The quadratic CURVE is flattened: the BEFORE column blows up ~6×/doubling and hangs at
+N=4000; the AFTER column is dominated by the residual below.
+
+**RESIDUAL FLAG (storage, PROTECTED — not changed here).** The AFTER build-only curve still
+grows ~3.8×/doubling (≈O(N^1.9)): N=4000 0.14s → 8000 0.49s → 16000 1.88s → 32000 7.38s.
+This is **not** the SQL re-submit (that is gone) — it is the `storage::WalEngine` memtable
+doing a **LINEAR scan over keys** on every `get`/insert (`WalEngine.hpp` `find` /
+`versions_for`: *"keys_ sorted ⇒ a binary search would do; a linear scan is fine + clear"*),
+so each point-get + each apply is O(N) keys ⇒ a residual O(N^2). It is **pre-existing**,
+affects EVERY query workload (not introduced by this stage), and lives in the **protected,
+verified** storage dir. Per the brief (prefer SQL-layer; FLAG any storage/Database change)
+it is **FLAGGED, not touched**. A binary-search / map lookup in the memtable would make the
+SQL build genuinely O(N log N) — a future storage stage with the full methodology.
+
+## Fix 2 — LAZY / PROJECTED scan decode (skip unreferenced columns)
+
+The single-table SELECT path computes a **column-need mask** (`needed_columns`: projection
+∪ WHERE ∪ GROUP BY ∪ aggregate targets ∪ ORDER BY ∪ PK) and decodes via a new
+`decode_row_projected`, which **skips** any unneeded field — for a TEXT column it steps over
+the length WITHOUT copying the bytes (the dominant cost on a wide row). Byte-identical to a
+full decode on the needed columns ⇒ results unchanged. **Isolated decode microbench**
+(2000-row scan, `emp` widened with a ~64-byte `bio` TEXT the projected/filtered shapes do
+NOT reference):
+
+| decode | µs / 2000-row scan | µs / row | speedup |
+|--------|-------------------:|---------:|--------:|
+| full decode (all 6 cols) | 124.4 | 0.062 | 1.00× |
+| projected (`SELECT id`)  | 58.3  | 0.029 | **2.13×** |
+| filtered (`id, sal`)     | 64.6  | 0.032 | **1.93×** |
+
+So the decode STEP is ~2× cheaper when a wide column is skipped. **HONEST end-to-end
+caveat:** in the FULL SELECT pipeline the per-row decode (~0.06 µs/row) is a SMALL fraction
+of the ~7.5 µs/row end-to-end full-scan cost — the rest is the storage MVCC scan over the
+**same linear-scan memtable** flagged above + per-row coroutine plumbing. So the lazy-decode
+win is real and proven on the decode step (~2×) but is **masked in the end-to-end SELECT** by
+the storage scan cost (the end-to-end project/projfilt/filter shapes moved ~0% at N=2000,
+within noise). The decode is no longer the bottleneck; the storage scan is.
+
+## Conformance UNCHANGED (the load-bearing gate)
+
+| test | seeds | result |
+|------|------:|--------|
+| `sql_conformance_test` | 300 | ALL PASS (SQL == reference model; PK-order; D5 snapshot; errors; teeth caught) |
+| `sql_aggregates_test`  | 200 | ALL PASS (WHERE-any-col / agg+GROUP BY+HAVING / ORDER+LIMIT / DISTINCT == model) |
+| `sql_join_test`        | 200 | ALL PASS (INNER/LEFT/CROSS + ON + qualified + self/3-table == model; NULL sem.) |
+| `query_conformance_test` | 64 | OK |
+
+All 9 `query_*`/`sql_*` ctests: **100% pass**. Bench checksums **byte-identical BEFORE vs
+AFTER** for point/range/filter/project/projfilt/order/groupby/having/distinct/join/joingrp.
+Determinism: two bench runs byte-identical. **ASan: clean** (all SQL tests + bench).
+**UBSan: clean** (all SQL tests PASS, build-only checksum matches Release). Protected dirs
+diff EMPTY.
+
+## Reproduce
+
+```bash
+ulimit -c 0; ulimit -s 16384
+cmake -S . -B build/sqlopt -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build/sqlopt -j6 --target lockstep_sql_bench_driver \
+  lockstep_sql_conformance_test lockstep_sql_aggregates_test lockstep_sql_join_test
+B=build/sqlopt/bench/lockstep_sql_bench_driver
+for N in 500 1000 2000 4000 8000; do /usr/bin/time -p $B --build-only --rows $N; done  # build-N curve
+$B --rows 500                                  # full per-shape bench (checksums)
+$B --rows 2000 --iters 300 --only project      # isolate one shape for external timing
+LOCKSTEP_SQL_SEEDS=300 build/sqlopt/tests/lockstep_sql_conformance_test
+```
+
+## Honest caveats (SQL-optimize)
+
+- **Mac host, real wall-clock, best-of-n** — absolute numbers are relative; the SHAPE of the
+  curve (quadratic gone) and the relative speedups are the result.
+- **The headline win is the write path** (~460× at N=2000, the quadratic flattened). The
+  lazy-decode win is proven on the decode step (~2×) but is **secondary / masked** end-to-end
+  by the storage scan cost — reported honestly, not inflated.
+- **The residual near-quadratic is storage (protected) — FLAGGED, not fixed**: the WalEngine
+  memtable linear-scan lookup. Fixing it (binary search) is the next lever and needs the full
+  verified-dir methodology.

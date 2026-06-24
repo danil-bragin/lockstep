@@ -269,26 +269,17 @@ private:
         const Key key = encode_key(*t, pk);
         const Value enc = encode_value(*t, row);
 
-        // Lower to a one-shot TxnFn: read the key (dup-PK detect), write if absent.
-        // The body is a PURE function of its declared read (V-DET-USER preserved).
-        TxnFn fn;
-        fn.id = next_txn_id_++;
-        fn.declared = reads(declare::strict(key));
-        fn.body = [key, enc](TxnContext& ctx) {
-            const ReadResult existing = ctx.read(key);
-            if (existing.has_value() && !is_tombstone(*existing)) {
-                return;  // a live row already occupies this PK (empty write == dup)
-            }
-            ctx.write(key, enc);
-        };
-        // Submit the WHOLE accumulated write-log so the executor's store carries
-        // prior committed writes forward (a single-statement batch starts empty,
-        // so the dup-detect read must run with the full history in one batch).
-        const bool wrote = submit_write(std::move(fn));
-        if (!wrote) {
+        // INCREMENTAL write path (see commit_write): the read-modify-write DECISION
+        // (dup-PK detect) runs in the Engine over the VERIFIED read path (the live
+        // committed store), so we never re-submit the whole prior write-log. The
+        // committed state is read with read_committed(key); the resulting write (or
+        // no-op) is committed through the verified executor + applied incrementally.
+        const ReadResult existing = read_committed(key);
+        if (existing.has_value() && !is_tombstone(*existing)) {
             return ExecResult::failure("duplicate primary key in table '" + ins.table +
                                        "' (row already exists)");
         }
+        commit_write(key, enc);
         ExecResult r;
         r.affected = 1;
         return r;
@@ -324,23 +315,20 @@ private:
             return ExecResult::failure(*e);
         }
         const Key key = encode_key(*t, pk);
-        const Table tab = *t;
         const std::size_t col = *set_idx;
-        TxnFn fn;
-        fn.id = next_txn_id_++;
-        fn.declared = reads(declare::strict(key));
-        fn.body = [key, tab, col, sv](TxnContext& ctx) {
-            const ReadResult existing = ctx.read(key);
-            if (!existing.has_value() || is_tombstone(*existing)) {
-                return;  // no row to update (empty write == 0 affected)
-            }
-            std::vector<Datum> row = decode_row(tab, key, *existing);
-            row[col] = sv;
-            ctx.write(key, encode_value(tab, row));
-        };
-        const bool wrote = submit_write(std::move(fn));
+        // INCREMENTAL: read the prior committed value over the verified read path,
+        // decode + set the column in the Engine, then commit the new value.
+        const ReadResult existing = read_committed(key);
+        if (!existing.has_value() || is_tombstone(*existing)) {
+            ExecResult r;
+            r.affected = 0;  // no row to update
+            return r;
+        }
+        std::vector<Datum> row = decode_row(*t, key, *existing);
+        row[col] = sv;
+        commit_write(key, encode_value(*t, row));
         ExecResult r;
-        r.affected = wrote ? 1 : 0;
+        r.affected = 1;
         return r;
     }
 
@@ -360,19 +348,17 @@ private:
             return ExecResult::failure(*e);
         }
         const Key key = encode_key(*t, pk);
-        TxnFn fn;
-        fn.id = next_txn_id_++;
-        fn.declared = reads(declare::strict(key));
-        fn.body = [key](TxnContext& ctx) {
-            const ReadResult existing = ctx.read(key);
-            if (!existing.has_value() || is_tombstone(*existing)) {
-                return;  // nothing to delete (empty write == 0 affected)
-            }
-            ctx.write(key, tombstone_marker());
-        };
-        const bool wrote = submit_write(std::move(fn));
+        // INCREMENTAL: read the prior committed value; if a live row exists, commit
+        // a tombstone (the verified executor + incremental apply path do the write).
+        const ReadResult existing = read_committed(key);
+        if (!existing.has_value() || is_tombstone(*existing)) {
+            ExecResult r;
+            r.affected = 0;  // nothing to delete
+            return r;
+        }
+        commit_write(key, tombstone_marker());
         ExecResult r;
-        r.affected = wrote ? 1 : 0;
+        r.affected = 1;
         return r;
     }
 
@@ -404,14 +390,20 @@ private:
             return ExecResult::failure(*err);
         }
 
-        // DECODE each KV -> a row, dropping tombstones.
+        // LAZY/PROJECTED DECODE (the scan-decode optimization). Compute the set of
+        // columns the query ACTUALLY references (projection + WHERE + GROUP BY +
+        // aggregates) and decode ONLY those per row, SKIPPING the rest (a wide TEXT
+        // column the query never touches is not copied/parsed). For a few-column
+        // projection or a filtered scan this cuts the dominant per-row decode cost.
+        // Byte-identical to a full decode on the needed columns => result unchanged.
+        const std::vector<bool> need = needed_columns(*t, sel);
         std::vector<std::vector<Datum>> rows;
         rows.reserve(kvs.size());
         for (const storage::KeyValue& kv : kvs) {
             if (is_tombstone(kv.second)) {
                 continue;
             }
-            rows.push_back(decode_row(*t, kv.first, kv.second));
+            rows.push_back(decode_row_projected(*t, kv.first, kv.second, need));
         }
 
         // (2) WHERE — apply the general predicate as a row filter UNLESS the PK fast
@@ -1351,6 +1343,65 @@ private:
         return std::nullopt;
     }
 
+    // Compute the COLUMN-NEED MASK for a single-table SELECT: which schema columns
+    // the query actually references, so the scan can decode ONLY those (lazy decode).
+    // A column is needed iff it appears in: the projection (SELECT list / star), the
+    // WHERE predicate, GROUP BY, an aggregate target, or ORDER BY. Unknown column
+    // names are simply ignored here (a later resolution step reports them as errors
+    // fail-closed) — this mask is a pure DECODE hint and never changes results: any
+    // column the pipeline later reads is included, and the PK is always decodable from
+    // the key. Conservative by construction (over-include is safe; under-include of a
+    // read column is impossible because every read site is enumerated below).
+    [[nodiscard]] static std::vector<bool> needed_columns(const Table& t,
+                                                          const SelectStmt& sel) {
+        std::vector<bool> need(t.columns.size(), false);
+        const auto mark = [&](const std::string& col) {
+            if (const auto idx = t.column_index(col)) {
+                need[*idx] = true;
+            }
+        };
+        // SELECT * needs every column; bail out to all-true.
+        if (sel.star) {
+            return std::vector<bool>(t.columns.size(), true);
+        }
+        // Projection / ORDER BY: the SELECT-list columns + aggregate targets.
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Column) {
+                mark(item.column);
+            } else if (item.agg.kind != AggKind::CountStar) {
+                mark(item.agg.column);  // COUNT(*) needs no column
+            }
+        }
+        for (const std::string& gc : sel.group_by) {
+            mark(gc);
+        }
+        for (const OrderKey& k : sel.order_by) {
+            mark(k.column);
+        }
+        // WHERE + HAVING predicate leaves (column operands + column rhs).
+        const auto mark_pred = [&](const Predicate& p) {
+            for (const PredNode& n : p.nodes) {
+                if (n.kind != PredNodeKind::Cmp) {
+                    continue;
+                }
+                if (n.operand == OperandKind::Column) {
+                    mark(n.column);
+                } else if (n.agg.kind != AggKind::CountStar) {
+                    mark(n.agg.column);
+                }
+                if (n.rhs_is_column) {
+                    mark(n.rhs_column);
+                }
+            }
+        };
+        mark_pred(sel.filter);
+        mark_pred(sel.having);
+        // The PK is needed by ORDER BY's PK tie-break (apply_order_by) AND is cheap to
+        // decode from the key; always include it so the deterministic tie-break holds.
+        need[t.pk_index] = true;
+        return need;
+    }
+
     // Dispatch the SELECT to a Query<L> of the AST level (the D5 dispatch point).
     // `pk_fast` selects the point/range fast path over the full scan. Returns an
     // error string on a bad level parameter, else fills `kvs`.
@@ -1894,54 +1945,64 @@ private:
         }
     }
 
-    // Submit a write statement as a one-shot txn. Each write goes through the
-    // VERIFIED txn surface — but a single-statement batch starts against an EMPTY
-    // executor store, so a read-modify-write body (dup-detect / update / delete)
-    // would never see prior committed state. We therefore keep the WHOLE write-log
-    // (every prior write-statement's TxnFn) and submit it as ONE ordered batch, so
-    // the executor carries committed writes forward WITHIN the batch exactly as the
-    // consensus seqLog would. The NEW statement is the LAST txn in the batch; its
-    // observable `writes_committed` tells us the effect:
-    //   non-empty => the statement wrote (INSERT persisted / UPDATE/DELETE matched)
-    //   empty     => a no-op (INSERT dup-PK / UPDATE/DELETE missing row)
-    // Returns true iff the new statement wrote (so the caller maps dup vs affected).
-    // After the batch, the committed write-sets re-prime the read-path store so
-    // subsequent SELECTs observe them (the verified Database::prime, byte-identical
-    // to the re-execution model the conformance gate judges).
-    bool submit_write(TxnFn fn) {
-        write_log_.push_back(std::move(fn));
-        txn::ExecConfig cfg;  // defaults: max_retry=2, replica_lag=0
-        const SubmitResult sr = db_.submit(write_log_, cfg);
+    // INCREMENTAL WRITE PATH (the O(N) write fix; was O(N^2)).
+    //
+    // OLD model: each write re-submitted the WHOLE accumulated write-log as one batch
+    // (so a read-modify-write body saw prior committed state through the executor's
+    // store, which starts EMPTY per submit) and then re-PRIMED the entire history into
+    // the read store. Both are O(committed-writes) PER statement => O(N^2) to build N
+    // rows. The executor + re-prime were paying to reconstruct, every time, state the
+    // verified PersistentStore already holds incrementally.
+    //
+    // NEW model: the read-modify-write DECISION (dup-PK detect / decode+set / tombstone
+    // a present row) runs in the Engine over the VERIFIED READ PATH — read_committed()
+    // is a strict point-get against the LIVE committed store (exactly what a SELECT
+    // WHERE pk = v reads). The Engine then commits ONE pure-writer txn through the SAME
+    // verified executor (so the write-set is produced by the verified surface, not
+    // hand-rolled) and applies its committed write-set INCREMENTALLY via the verified
+    // Database::apply_committed (one WAL'd apply, no whole-history rebuild). Each write
+    // is now O(1) amortized + one point read — O(N) (point) / O(N log N) (engine MVCC)
+    // to build N rows. The conformance gate proves the result is byte-identical: the
+    // read goes through the same Query<Strict> surface and the write through the same
+    // executor + the verified incremental apply.
 
-        // The new statement is the last submitted txn; find its commit (the batch is
-        // in seqLog order, so the last Committed entry with our id is it). We added
-        // it last, so the final commit corresponds to our statement.
-        bool wrote = false;
-        std::vector<txn::WriteSet> history;
-        history.reserve(sr.commits.size());
-        for (const txn::CommitInfo& c : sr.commits) {
-            if (c.status == txn::Status::Committed && !c.writes_committed.empty()) {
-                history.push_back(c.writes_committed);
+    // Strict point-get of a key against the LIVE committed store (the read path a
+    // SELECT WHERE pk = v takes). Returns the committed value (incl. a tombstone
+    // marker) or nullopt if absent. Pure function of the committed history + key.
+    [[nodiscard]] ReadResult read_committed(const Key& key) {
+        Query<Strict> q;
+        q.get(key);
+        const QueryResult qr = db_.run(q);
+        for (const PointResult& p : qr.points) {
+            if (p.key == key) {
+                return p.value;
             }
         }
-        if (!sr.commits.empty()) {
-            const txn::CommitInfo& last = sr.commits.back();
-            wrote = (last.status == txn::Status::Committed) &&
-                    !last.writes_committed.empty();
+        return std::nullopt;
+    }
+
+    // Commit ONE precomputed key->value write (the statement's already-decided effect)
+    // through the verified executor, then apply its committed write-set incrementally
+    // to the live store. The txn body is a PURE writer (no read) — V-DET-USER holds —
+    // so a single-txn batch over the empty executor store is correct (the decision was
+    // already made by read_committed over the live store).
+    void commit_write(const Key& key, const Value& value) {
+        TxnFn fn;
+        fn.id = next_txn_id_++;
+        fn.declared = reads(declare::strict(key));
+        fn.body = [key, value](TxnContext& ctx) { ctx.write(key, value); };
+
+        txn::ExecConfig cfg;  // defaults: max_retry=2, replica_lag=0
+        const SubmitResult sr = db_.submit(fn, cfg);
+        for (const txn::CommitInfo& c : sr.commits) {
+            if (c.status == txn::Status::Committed && !c.writes_committed.empty()) {
+                tip_ = db_.apply_committed(c.writes_committed);
+            }
         }
-        // If the new statement was a no-op (dup / missing), drop it from the log so a
-        // failed INSERT does not bloat every future batch (the no-op is not part of
-        // the committed history anyway).
-        if (!wrote) {
-            write_log_.pop_back();
-        }
-        tip_ = db_.prime(history);
-        return wrote;
     }
 
     Catalog catalog_;
     Database db_;
-    std::vector<TxnFn> write_log_;  // every committed write-statement's TxnFn, ordered
     Seq tip_ = 0;
     std::uint64_t next_txn_id_ = 1;
 };
