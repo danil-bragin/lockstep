@@ -75,6 +75,7 @@
 // output. All IO is through core::IDisk; all async on the scheduler; the CRC is
 // hand-rolled (no library). This whole engine is a pure function of (seed, ops).
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -296,31 +297,36 @@ public:
     [[nodiscard]] const std::vector<KeyVersions>& keys() const noexcept { return keys_; }
 
 private:
+    // keys_ is kept sorted by key (the on-disk-mirroring invariant), so the
+    // lookup is a BINARY SEARCH over it — O(log N) per get/insert instead of the
+    // old O(N) linear scan (the per-op quadratic the SQL bulk-build surfaced).
+    // This is PURE SPEED: lower_bound finds the SAME slot the linear scan walked
+    // to (first key not < `key`), so the visible key order, the MVCC version
+    // lists, and the mid-insert position are byte-identical to before — only the
+    // number of comparisons to reach the slot changes (V-DET unaffected).
+    [[nodiscard]] static bool key_lt(const KeyVersions& kv, const Key& key) noexcept {
+        return kv.key < key;
+    }
+
     [[nodiscard]] const KeyVersions* find(const Key& key) const {
-        // keys_ sorted ⇒ a binary search would do; a linear scan is fine + clear.
-        for (const KeyVersions& kv : keys_) {
-            if (kv.key == key) {
-                return &kv;
-            }
-            if (key < kv.key) {
-                break;  // sorted: past where it would be
-            }
+        auto it = std::lower_bound(keys_.begin(), keys_.end(), key, key_lt);
+        if (it != keys_.end() && it->key == key) {
+            return &*it;
         }
-        return nullptr;
+        return nullptr;  // not present (or past where it would sort)
     }
 
     KeyVersions& versions_for(const Key& key) {
-        std::size_t pos = 0;
-        while (pos < keys_.size() && keys_[pos].key < key) {
-            ++pos;
+        auto it = std::lower_bound(keys_.begin(), keys_.end(), key, key_lt);
+        if (it != keys_.end() && it->key == key) {
+            return *it;
         }
-        if (pos < keys_.size() && keys_[pos].key == key) {
-            return keys_[pos];
-        }
+        // Not present: insert a fresh KeyVersions at the lower-bound slot, keeping
+        // keys_ sorted — exactly the position the old linear walk computed.
         KeyVersions kv;
         kv.key = key;
-        keys_.insert(keys_.begin() + static_cast<std::ptrdiff_t>(pos), std::move(kv));
-        return keys_[pos];
+        auto ins = keys_.insert(it, std::move(kv));
+        return *ins;
     }
 
     std::vector<KeyVersions> keys_;  // sorted by key; each list Seq-ascending
