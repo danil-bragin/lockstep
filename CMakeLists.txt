@@ -17,6 +17,14 @@ endif()
 include(Warnings)          # INTERFACE target: lockstep_warnings
 include(Sanitizers)        # INTERFACE target: lockstep_sanitizers (driven by LOCKSTEP_SANITIZER)
 
+# TLS TRANSPORT (OpenSSL) — found ONCE at top level so OpenSSL_FOUND is visible to every
+# subdirectory (providers/prod uses it to enable the TLS transport; tests/ uses it to gate
+# the prod_tls_test). Linux-only: the prod transport (and thus TLS) is never built on macOS,
+# so the Mac host build stays green whether or not OpenSSL is installed there.
+if(UNIX AND NOT APPLE)
+  find_package(OpenSSL)
+endif()
+
 # --- Components (disjoint ownership per the Phase 0 integration contract) -----
 # core/ owns nothing above it. core/CMakeLists.txt is authored by agent A2 and
 # exposes the header-only INTERFACE target `lockstep_core`. We reference it but

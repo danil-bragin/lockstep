@@ -45,6 +45,18 @@ RUN git clone --depth 1 --branch llvmorg-18.1.8 \
  && rm -rf /tmp/llvm /tmp/llvm-msan
 ENV LOCKSTEP_MSAN_LIBCXX=/opt/libcxx-msan
 
+# TLS TRANSPORT ENCRYPTION — OpenSSL development headers + pkg-config for the prod TLS
+# transport (providers/prod/ProdTls.hpp wraps the real TCP transport in TLS/mTLS). The
+# runtime libssl3 is already in the ubuntu:24.04 base; libssl-dev adds /usr/include/openssl
+# + the link archives so CMake's find_package(OpenSSL) resolves and the TLS targets build
+# (and the prod_tls_test generates dev certs with the `openssl` CLI this package provides).
+# Its own SEPARATE layer so the heavy cached base + MSan-libc++ layers above are NOT
+# rebuilt. ADDED for the TLS-transport work.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libssl-dev \
+      pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
 # Default compiler = clang (the project pins C++23; gate.sh drives presets).
 ENV CC=clang CXX=clang++
 WORKDIR /work

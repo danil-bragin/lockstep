@@ -91,6 +91,15 @@ constexpr core::Tick kReqWallNs = 1'500'000'000;
 // covers replication+commit on a healthy quorum yet kills any hang.
 constexpr core::Tick kDurableWallNs = 5'000'000'000;
 
+// TLS TRANSPORT (opt-in): when --tls-cert/--tls-key/--tls-ca are passed, the admin client
+// connects over mTLS — it presents its CA-signed client cert AND verifies the server cert
+// against the CA. A wrong-CA server is REJECTED at the handshake; a client with no/wrong
+// cert is refused by the daemon (the auth teeth). Set once in main(), read by every Client
+// ctor. The cli never calls OpenSSL — these are PATHS handed to the provider (ProdNetwork).
+#ifdef LOCKSTEP_TLS
+prod::TlsConfig g_tls;  // g_tls.enabled gates whether the client wraps its connection.
+#endif
+
 std::uint16_t parse_port(const char* s) {
     if (s == nullptr) {
         return 0;
@@ -188,6 +197,17 @@ struct Client {
             return;
         }
         self_id = client_id;
+#ifdef LOCKSTEP_TLS
+        // mTLS: wrap the client connection. enable_tls builds the client SSL_CTX; the
+        // outbound connect then runs a real TLS handshake + verifies the server cert vs the
+        // CA. A build failure (bad cert/key/CA) leaves ok=false -> the round-trip fails
+        // (NEVER a silent cleartext fallback). Plaintext when g_tls.enabled is false.
+        if (g_tls.enabled) {
+            if (!bus.enable_tls(g_tls, prod::TlsAuth::MutualPeer)) {
+                return;
+            }
+        }
+#endif
         // Synthetic peer id for the target admin endpoint (unique per port).
         admin_peer_id = 8'000'000'000ULL + admin_port;
         if (!bus.add_node(self_id)) {  // our own ephemeral client listen socket
@@ -1323,6 +1343,20 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--base-port") == 0 && i + 1 < argc) {
             topo.base = parse_port(argv[i + 1]);
             ++i;
+#ifdef LOCKSTEP_TLS
+        } else if (std::strcmp(argv[i], "--tls-cert") == 0 && i + 1 < argc) {
+            g_tls.cert_path = argv[i + 1];
+            g_tls.enabled = true;
+            ++i;
+        } else if (std::strcmp(argv[i], "--tls-key") == 0 && i + 1 < argc) {
+            g_tls.key_path = argv[i + 1];
+            g_tls.enabled = true;
+            ++i;
+        } else if (std::strcmp(argv[i], "--tls-ca") == 0 && i + 1 < argc) {
+            g_tls.ca_path = argv[i + 1];
+            g_tls.enabled = true;
+            ++i;
+#endif
         }
     }
 

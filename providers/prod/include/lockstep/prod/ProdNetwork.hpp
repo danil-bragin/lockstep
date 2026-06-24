@@ -73,6 +73,7 @@
 #include <lockstep/core/Future.hpp>
 #include <lockstep/core/INetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
+#include <lockstep/prod/ProdTls.hpp>  // TLS transport (no-op header unless LOCKSTEP_TLS)
 
 namespace lockstep::prod {
 
@@ -123,7 +124,22 @@ public:
     [[nodiscard]] bool connected() const noexcept { return connected_; }
     [[nodiscard]] bool dead() const noexcept { return fd_ < 0; }
     [[nodiscard]] bool wants_write() const noexcept {
-        return !out_.empty() || !connected_;
+        if (!out_.empty() || !connected_) {
+            return true;
+        }
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        // TLS: pending handshake/app ciphertext, or staged app frames not yet flushed, or a
+        // queued client HELLO awaiting the handshake — all need EPOLLOUT to make progress.
+        if (tls_ != nullptr) {
+            if (tls_->wants_flush() || !tls_pending_.empty() || !hello_pending_.empty()) {
+                return true;
+            }
+            if (!tls_->handshake_done()) {
+                return true;  // keep driving the handshake (it may need to flush).
+            }
+        }
+#endif
+        return false;
     }
 
     void mark_connected() noexcept { connected_ = true; }
@@ -169,6 +185,35 @@ public:
     std::size_t& out_base() noexcept { return out_base_; }
     std::vector<PendingSend>& pending() noexcept { return pending_; }
 
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+    // ---- TLS (transport encryption) -------------------------------------
+    // When TLS is on, in_ holds CIPHERTEXT read off the socket (fed into the session's
+    // read BIO) and out_ holds CIPHERTEXT to write to the socket (drained from the write
+    // BIO). app_in_ holds the DECRYPTED app bytes awaiting frame reassembly (the plaintext
+    // analogue of in_ in the cleartext path). A non-TLS connection leaves tls_ null and
+    // app bytes flow through in_ directly (byte-identical to the original).
+    void attach_tls(std::unique_ptr<ProdTlsSession> s) noexcept { tls_ = std::move(s); }
+    [[nodiscard]] ProdTlsSession* tls() noexcept { return tls_.get(); }
+    [[nodiscard]] bool has_tls() const noexcept { return tls_ != nullptr; }
+    std::vector<std::byte>& app_in() noexcept { return app_in_; }
+    // A connecting (client-role) TLS endpoint must send its HELLO only AFTER the handshake
+    // completes (it cannot be queued as cleartext into out_). hello_pending_ stashes it.
+    void stash_hello(std::vector<std::byte> h) { hello_pending_ = std::move(h); }
+    [[nodiscard]] std::vector<std::byte>& hello_pending() noexcept { return hello_pending_; }
+
+    // A framed app message awaiting TLS encryption + flush. `plain` is the framed bytes
+    // (length prefix + payload); `encrypted` flips true once SSL_write has consumed it;
+    // `cipher_done_at` is the out_ (ciphertext) cumulative offset at which its ciphertext
+    // is fully flushed (set when encrypted). The promise fires once flushed past it.
+    struct TlsPendingSend {
+        std::vector<std::byte> plain{};
+        bool encrypted = false;
+        std::size_t cipher_done_at = 0;
+        Promise<Error> promise;
+    };
+    std::vector<TlsPendingSend>& tls_pending() noexcept { return tls_pending_; }
+#endif
+
     void close_fd() noexcept {
         if (fd_ >= 0) {
             ::close(fd_);
@@ -181,10 +226,16 @@ private:
     Endpoint peer_{};
     bool peer_known_ = false;
     bool connected_ = false;
-    std::vector<std::byte> out_{};            // pending outbound bytes (framed)
-    std::vector<std::byte> in_{};             // inbound bytes awaiting reassembly
+    std::vector<std::byte> out_{};            // pending outbound bytes (framed / ciphertext)
+    std::vector<std::byte> in_{};             // inbound bytes awaiting reassembly / ciphertext
     std::size_t out_base_ = 0;                // bytes already drained from out_ front
     std::vector<PendingSend> pending_{};      // per-message send completions
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+    std::unique_ptr<ProdTlsSession> tls_{};   // null == plaintext; else owns the SSL session
+    std::vector<std::byte> app_in_{};         // DECRYPTED app bytes awaiting reassembly
+    std::vector<std::byte> hello_pending_{};  // client HELLO queued until handshake done
+    std::vector<TlsPendingSend> tls_pending_{};  // app frames awaiting encrypt+flush
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -209,6 +260,44 @@ public:
     ProdNetworkBus& operator=(ProdNetworkBus&&) = delete;
 
     [[nodiscard]] ProdReactor& reactor() noexcept { return *reactor_; }
+
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+    // ---- TLS transport configuration (provider-layer; no core change) ----
+    // Enable TLS on this bus's transport with the given cert/key/CA. `auth` selects mTLS
+    // (consensus peers — both sides require + verify the peer cert) vs server-auth TLS
+    // (admin/wire clients — server presents its cert, client verifies it, client cert
+    // optional). Builds the SERVER + CLIENT SSL_CTX once; every connection on this bus then
+    // wraps its socket in a TLS session of the right role. Must be called BEFORE add_node /
+    // any connect. Returns false if the contexts fail to build (bad cert/key/CA) — the
+    // caller then refuses to run rather than fall back to cleartext.
+    bool enable_tls(const TlsConfig& cfg, TlsAuth auth) {
+        tls_cfg_ = cfg;
+        tls_auth_ = auth;
+        if (!cfg.enabled) {
+            tls_on_ = false;
+            return true;  // plaintext requested — nothing to build.
+        }
+        if (!tls_server_ctx_.init(TlsRole::Server, auth, cfg)) {
+            // A pure CLIENT (the admin client) has no listen socket and needs only the
+            // client ctx; a server-side build failure there is non-fatal IF the client
+            // ctx builds. But a daemon (which listens) needs the server ctx — surface it.
+            // We still try the client ctx so an admin client without a server cert works.
+        }
+        if (!tls_client_ctx_.init(TlsRole::Client, auth, cfg)) {
+            return false;
+        }
+        tls_on_ = true;
+        return true;
+    }
+
+    [[nodiscard]] bool tls_on() const noexcept { return tls_on_; }
+    [[nodiscard]] const ProdTlsContext& tls_server_ctx() const noexcept {
+        return tls_server_ctx_;
+    }
+    [[nodiscard]] const ProdTlsContext& tls_client_ctx() const noexcept {
+        return tls_client_ctx_;
+    }
+#endif
 
     // Register a node: open + bind a non-blocking loopback listen socket on an
     // EPHEMERAL port, record its port in the address map, register it on the reactor
@@ -263,6 +352,13 @@ private:
     ProdReactor* reactor_;
     std::vector<NodeAddr> addrs_{};                       // id -> loopback port
     std::vector<std::unique_ptr<ProdNetwork>> nodes_{};   // owned per-node handles
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+    TlsConfig tls_cfg_{};                                 // cert/key/CA paths
+    TlsAuth tls_auth_ = TlsAuth::MutualPeer;              // mTLS vs server-auth
+    bool tls_on_ = false;                                 // TLS wrapping active?
+    ProdTlsContext tls_server_ctx_{};                     // accept-side SSL_CTX
+    ProdTlsContext tls_client_ctx_{};                     // connect-side SSL_CTX
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -316,6 +412,19 @@ public:
             return f;
         }
 
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        if (c->has_tls()) {
+            // TLS path: stage the framed app bytes; encrypt+flush whatever the handshake
+            // state allows (encrypt() is a no-op until the handshake completes — the frame
+            // stays staged and is encrypted the moment the handshake lands). The promise
+            // fires when this frame's CIPHERTEXT is fully accepted into the socket.
+            queue_framed_tls(*c, payload, std::move(p));
+            drive_tls(*c);
+            arm_io(*c);
+            pump_write(*c);
+            return f;
+        }
+#endif
         // PERF (S8.6): frame the payload DIRECTLY into the connection's out_ buffer
         // (length prefix + bytes), no intermediate `framed` vector. The payload is
         // copied into out_ now (the caller need not keep it alive — INetwork contract).
@@ -407,6 +516,27 @@ private:
         for (std::size_t i = 0; i < kHelloLen; ++i) {
             hello[i] = static_cast<std::byte>((myid >> (8 * i)) & 0xFF);
         }
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        if (bus_->tls_on()) {
+            // CLIENT-role TLS session: the connecting side runs the TLS client handshake.
+            // The HELLO is APP data and must be sent ENCRYPTED after the handshake — stash
+            // it; drive_tls() sends it the moment the handshake completes.
+            auto sess = std::make_unique<ProdTlsSession>(bus_->tls_client_ctx(),
+                                                         TlsRole::Client);
+            if (!sess->valid()) {
+                ::close(fd);
+                return nullptr;
+            }
+            conn->attach_tls(std::move(sess));
+            conn->stash_hello(std::move(hello));
+            ProdConnection* raw = conn.get();
+            conns_.push_back(std::move(conn));
+            register_conn(*raw);
+            // Kick the handshake (it may emit ClientHello ciphertext into out_).
+            drive_tls(*raw);
+            return raw;
+        }
+#endif
         conn->queue_raw(std::span<const std::byte>(hello.data(), hello.size()));
         ProdConnection* raw = conn.get();
         conns_.push_back(std::move(conn));
@@ -425,9 +555,29 @@ private:
             // Inbound: peer id UNKNOWN until its HELLO arrives. Connected already.
             auto conn = std::make_unique<ProdConnection>(
                 fd, Endpoint{}, /*peer_known=*/false, /*connected=*/true);
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+            if (bus_->tls_on()) {
+                // SERVER-role TLS session: the accepting side runs the TLS server
+                // handshake (presents our cert; for mTLS it REQUIRES + verifies the peer
+                // cert — a no-cert / wrong-CA peer fails the handshake here = the teeth).
+                auto sess = std::make_unique<ProdTlsSession>(bus_->tls_server_ctx(),
+                                                             TlsRole::Server);
+                if (!sess->valid()) {
+                    ::close(fd);
+                    continue;
+                }
+                conn->attach_tls(std::move(sess));
+            }
+#endif
             ProdConnection* raw = conn.get();
             conns_.push_back(std::move(conn));
             register_conn(*raw);
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+            if (raw->has_tls()) {
+                drive_tls(*raw);  // begin the server handshake (await ClientHello).
+                arm_io(*raw);
+            }
+#endif
         }
     }
 
@@ -471,6 +621,14 @@ private:
             if (!c->connected()) {
                 c->mark_connected();
             }
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+            if (c->has_tls()) {
+                drive_tls(*c);  // advance handshake / encrypt staged frames into out_.
+                if (c->dead()) {
+                    return;
+                }
+            }
+#endif
             pump_write(*c);
             if (c->dead()) {
                 return;
@@ -500,6 +658,11 @@ private:
             if (w > 0) {
                 base += static_cast<std::size_t>(w);
                 complete_sends(c);
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+                if (c.has_tls()) {
+                    complete_tls_sends(c);
+                }
+#endif
                 continue;
             }
             if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -541,6 +704,158 @@ private:
         }
     }
 
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+    // ---- TLS IO helpers (only compiled when LOCKSTEP_TLS) ----------------
+
+    // Stage a framed app message for TLS encryption + flush. Builds the length-prefixed
+    // frame (same wire framing as the plaintext path — just carried INSIDE the TLS records)
+    // and records its completion promise. drive_tls() encrypts staged frames into out_.
+    void queue_framed_tls(ProdConnection& c, std::span<const std::byte> payload,
+                          Promise<Error> p) {
+        const std::size_t n = payload.size();
+        ProdConnection::TlsPendingSend ps;
+        ps.plain.reserve(kLenPrefix + n);
+        ps.plain.push_back(static_cast<std::byte>(n & 0xFF));
+        ps.plain.push_back(static_cast<std::byte>((n >> 8) & 0xFF));
+        ps.plain.push_back(static_cast<std::byte>((n >> 16) & 0xFF));
+        ps.plain.push_back(static_cast<std::byte>((n >> 24) & 0xFF));
+        ps.plain.insert(ps.plain.end(), payload.begin(), payload.end());
+        ps.promise = std::move(p);
+        c.tls_pending().push_back(std::move(ps));
+    }
+
+    // Drive the TLS state machine for `c`: advance the handshake; once done, send the
+    // stashed client HELLO + encrypt any staged app frames into out_ (ciphertext); always
+    // drain pending handshake/app ciphertext from the write BIO into out_. The reactor
+    // then flushes out_ to the socket (pump_write). A handshake / TLS failure DROPS the
+    // connection (the auth gate: a wrong-CA / no-cert peer dies here).
+    void drive_tls(ProdConnection& c) {
+        if (c.dead() || !c.has_tls() || !c.connected()) {
+            return;
+        }
+        ProdTlsSession* s = c.tls();
+        if (!s->handshake_done()) {
+            const int hs = s->do_handshake();
+            // Always drain any handshake ciphertext (ClientHello / ServerHello / ...).
+            s->drain_ciphertext(c.out());
+            if (hs < 0) {
+                drop_conn(c);  // handshake FAILED — cert verify / protocol error.
+                return;
+            }
+            if (hs == 0) {
+                return;  // handshake in progress — resume on the next fd-ready event.
+            }
+            // hs == 1: handshake COMPLETE. Send the stashed client HELLO (encrypted) first.
+            if (!c.hello_pending().empty()) {
+                std::vector<std::byte> hello;
+                hello.swap(c.hello_pending());
+                if (!s->encrypt(std::span<const std::byte>(hello.data(), hello.size()))) {
+                    drop_conn(c);
+                    return;
+                }
+            }
+        }
+        // Handshake done: retry any plaintext deferred mid-write, then encrypt staged frames.
+        if (!s->flush_pending_plain()) {
+            drop_conn(c);
+            return;
+        }
+        encrypt_staged(c);
+        s->drain_ciphertext(c.out());
+    }
+
+    // Encrypt every not-yet-encrypted staged app frame into the TLS write BIO, then drain
+    // the resulting ciphertext into out_ and mark each frame's ciphertext flush offset so
+    // its completion promise fires once flushed (complete_tls_sends). Encrypt in queue order
+    // so the wire byte order matches the app frame order (per-link order — the TCP/INetwork
+    // contract). A fatal encrypt error drops the connection.
+    void encrypt_staged(ProdConnection& c) {
+        ProdTlsSession* s = c.tls();
+        if (!s->handshake_done()) {
+            return;  // cannot encrypt before the handshake — frames stay staged.
+        }
+        for (auto& ps : c.tls_pending()) {
+            if (ps.encrypted) {
+                continue;
+            }
+            if (!s->encrypt(std::span<const std::byte>(ps.plain.data(), ps.plain.size()))) {
+                drop_conn(c);
+                return;
+            }
+            ps.encrypted = true;
+            // Drain the freshly produced ciphertext into out_; this frame is fully flushed
+            // once out_base reaches the current cumulative out_ length (out_base + out_.size).
+            s->drain_ciphertext(c.out());
+            ps.cipher_done_at = c.out_base() + c.out().size();
+            ps.plain.clear();
+            ps.plain.shrink_to_fit();
+        }
+    }
+
+    // Fire the completion promise of every staged TLS frame whose ciphertext is now fully
+    // flushed to the socket (out_base has passed its cipher_done_at). Same "accepted into
+    // the socket" contract as the plaintext complete_sends. Moves promises out before
+    // firing (V-RKV1 — no live ref into tls_pending across set_value's re-entrancy).
+    void complete_tls_sends(ProdConnection& c) {
+        std::vector<ProdConnection::TlsPendingSend>& pend = c.tls_pending();
+        const std::size_t flushed = c.out_base();
+        std::size_t done = 0;
+        while (done < pend.size() && pend[done].encrypted &&
+               pend[done].cipher_done_at <= flushed) {
+            ++done;
+        }
+        if (done == 0) {
+            return;
+        }
+        std::vector<Promise<Error>> firing;
+        firing.reserve(done);
+        for (std::size_t i = 0; i < done; ++i) {
+            firing.push_back(std::move(pend[i].promise));
+        }
+        pend.erase(pend.begin(), pend.begin() + static_cast<std::ptrdiff_t>(done));
+        for (Promise<Error>& pr : firing) {
+            pr.set_value(Error{});  // ciphertext accepted into the socket.
+        }
+    }
+
+    // Feed inbound ciphertext (just read into in_) to the TLS read BIO, advance the
+    // handshake / decrypt app bytes into app_in_, frame them, and flush any outbound
+    // ciphertext the read step produced (handshake replies, etc.). Drops the connection on
+    // a TLS failure (auth gate) or an orderly close_notify.
+    void tls_ingest(ProdConnection& c) {
+        ProdTlsSession* s = c.tls();
+        if (!c.in().empty()) {
+            const bool ok =
+                s->feed_ciphertext(std::span<const std::byte>(c.in().data(), c.in().size()));
+            c.in().clear();
+            if (!ok) {
+                drop_conn(c);
+                return;
+            }
+        }
+        if (!s->handshake_done()) {
+            // Advance the handshake with the bytes just fed; drive_tls drains its ciphertext
+            // and, on completion, sends the stashed HELLO + encrypts staged frames.
+            drive_tls(c);
+            if (c.dead() || !s->handshake_done()) {
+                return;  // still handshaking (or dropped) — no app bytes yet.
+            }
+        }
+        // Handshake complete: decrypt available app plaintext into app_in_, then frame it.
+        if (!s->decrypt(c.app_in())) {
+            drop_conn(c);  // fatal TLS error or peer close_notify.
+            return;
+        }
+        extract_frames(c);
+        // A decrypt step (renegotiation) can produce outbound ciphertext — flush it.
+        s->drain_ciphertext(c.out());
+        if (!c.out().empty() || !c.tls_pending().empty()) {
+            arm_io(c);
+            pump_write(c);
+        }
+    }
+#endif  // __linux__ && LOCKSTEP_TLS
+
     // Read available bytes, learn the peer from the HELLO, re-assemble complete
     // frames, and deliver/queue each. Handles frames split/coalesced across reads.
     void pump_read(ProdConnection& c) {
@@ -566,13 +881,27 @@ private:
             drop_conn(c); // hard read error
             return;
         }
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        if (c.has_tls()) {
+            // in_ now holds inbound CIPHERTEXT. Feed it to the TLS read BIO, advance the
+            // handshake / decrypt app bytes into app_in_, then frame from app_in_.
+            tls_ingest(c);
+            return;  // tls_ingest drives extract_frames + flush itself.
+        }
+#endif
         extract_frames(c);
     }
 
     // Pull the HELLO (once) + every complete length-framed message out of the
-    // connection's read buffer; deliver each reassembled payload.
+    // connection's read buffer; deliver each reassembled payload. The buffer is the raw
+    // socket buffer in_ for plaintext, or the DECRYPTED app buffer app_in_ for TLS (the
+    // socket in_ then holds ciphertext, consumed by the TLS layer before this runs).
     void extract_frames(ProdConnection& c) {
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        std::vector<std::byte>& in = c.has_tls() ? c.app_in() : c.in();
+#else
         std::vector<std::byte>& in = c.in();
+#endif
         std::size_t pos = 0;
         // HELLO: the connecting side's 8-byte LE id, sent first. Learn it once.
         if (!c.peer_known()) {
@@ -669,6 +998,12 @@ private:
             firing.push_back(std::move(ps.promise));
         }
         c.pending().clear();
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        for (auto& ps : c.tls_pending()) {
+            firing.push_back(std::move(ps.promise));
+        }
+        c.tls_pending().clear();
+#endif
         bus_->reactor().remove_fd(c.fd());
         c.close_fd();
         for (Promise<Error>& pr : firing) {
