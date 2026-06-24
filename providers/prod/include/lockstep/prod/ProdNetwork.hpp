@@ -139,21 +139,28 @@ public:
         Promise<Error> promise;  // completed when flushed past done_at
     };
 
-    // Queue framed bytes (caller already prepended the length prefix). Records a
-    // completion promise to fire when this message is fully written.
-    void queue_send(const std::vector<std::byte>& framed, Promise<Error> p) {
-        const std::size_t done_at = out_base_ + out_.size() + framed.size();
-        for (std::byte b : framed) {
-            out_.push_back(b);
-        }
+    // PERF (S8.6): frame `payload` DIRECTLY into the connection's out_ buffer (4-byte
+    // LE length prefix + the bytes), with NO intermediate `framed` vector and NO
+    // byte-by-byte push_back — one reserve + a bulk insert. This removes the per-send
+    // temporary allocation AND the double copy that send() previously paid (build a
+    // framed vector, then copy it byte-wise into out_). Records the completion promise
+    // to fire when this message is fully written. Behavior-identical wire bytes.
+    void queue_framed(std::span<const std::byte> payload, Promise<Error> p) {
+        const std::size_t n = payload.size();
+        const std::size_t total = kLenPrefix + n;
+        out_.reserve(out_.size() + total);
+        out_.push_back(static_cast<std::byte>(n & 0xFF));
+        out_.push_back(static_cast<std::byte>((n >> 8) & 0xFF));
+        out_.push_back(static_cast<std::byte>((n >> 16) & 0xFF));
+        out_.push_back(static_cast<std::byte>((n >> 24) & 0xFF));
+        out_.insert(out_.end(), payload.begin(), payload.end());
+        const std::size_t done_at = out_base_ + out_.size();
         pending_.push_back(PendingSend{done_at, std::move(p)});
     }
 
-    // Queue raw bytes with NO completion promise (the HELLO handshake).
+    // Queue raw bytes with NO completion promise (the HELLO handshake). Bulk insert.
     void queue_raw(std::span<const std::byte> bytes) {
-        for (std::byte b : bytes) {
-            out_.push_back(b);
-        }
+        out_.insert(out_.end(), bytes.begin(), bytes.end());
     }
 
     // Mutable access for the node's IO pump (kept inside the same TU).
@@ -309,19 +316,10 @@ public:
             return f;
         }
 
-        // Frame: 4-byte LE length prefix + payload. Copy the payload now (the caller
-        // need not keep it alive past the call — INetwork contract).
-        const std::size_t n = payload.size();
-        std::vector<std::byte> framed;
-        framed.reserve(kLenPrefix + n);
-        framed.push_back(static_cast<std::byte>(n & 0xFF));
-        framed.push_back(static_cast<std::byte>((n >> 8) & 0xFF));
-        framed.push_back(static_cast<std::byte>((n >> 16) & 0xFF));
-        framed.push_back(static_cast<std::byte>((n >> 24) & 0xFF));
-        for (std::byte b : payload) {
-            framed.push_back(b);
-        }
-        c->queue_send(framed, std::move(p));
+        // PERF (S8.6): frame the payload DIRECTLY into the connection's out_ buffer
+        // (length prefix + bytes), no intermediate `framed` vector. The payload is
+        // copied into out_ now (the caller need not keep it alive — INetwork contract).
+        c->queue_framed(payload, std::move(p));
 
         // Drive a flush attempt now; arm EPOLLOUT so the reactor finishes partial
         // writes. The promise completes when the message is fully accepted.
@@ -551,9 +549,9 @@ private:
             std::byte tmp[4096];
             const ssize_t r = ::recv(c.fd(), tmp, sizeof(tmp), 0);
             if (r > 0) {
-                for (ssize_t i = 0; i < r; ++i) {
-                    in.push_back(tmp[i]);
-                }
+                // PERF (S8.6): bulk-append the chunk (one insert) instead of a per-byte
+                // push_back loop — same bytes, far less overhead under a read burst.
+                in.insert(in.end(), tmp, tmp + r);
                 continue;
             }
             if (r == 0) {
@@ -641,8 +639,20 @@ private:
     // as connection read buffers churn (V-RKV1 — the INetwork "valid only during the
     // callback" contract, honored with a stable backing store).
     void deliver(Promise<Message> p, InboundMsg m) {
-        retained_.push_back(std::move(m.bytes));
-        std::span<const std::byte> view(retained_.back().data(), retained_.back().size());
+        // PERF (S8.6): a SINGLE reusable retained buffer instead of an unbounded
+        // vector-of-vectors that grew by one entry per delivered message and was NEVER
+        // freed (a steady leak + repeated reallocation of the outer vector). Only ONE
+        // delivered span is live at a time: deliver() schedules the waiter (L1, NOT
+        // inline), so the single consumer coroutine (recv_loop / admin_serve) does not
+        // run until control returns to the reactor; it then consumes msg.payload
+        // SYNCHRONOUSLY (decode / handle_admin — no co_await holding the span) before
+        // calling recv() again, which is the only path back into deliver(). A parked
+        // waiter is delivered to at most once (waiters_ then empty; later inbound queues
+        // in ready_). So overwriting retained_one_ on the next deliver cannot clobber a
+        // span still in use (V-RKV1 preserved — the backing store outlives every live
+        // span; moving the new bytes in only AFTER the previous consumer has drained).
+        retained_one_ = std::move(m.bytes);
+        std::span<const std::byte> view(retained_one_.data(), retained_one_.size());
         p.set_value(Message{m.from, view});
     }
 
@@ -695,7 +705,7 @@ private:
     std::vector<std::unique_ptr<ProdConnection>> conns_{}; // inbound + outbound
     std::vector<InboundMsg> ready_{};                      // reassembled, awaiting recv
     std::vector<Promise<Message>> waiters_{};              // parked recv promises (FIFO)
-    std::vector<std::vector<std::byte>> retained_{};       // stable spans for delivered msgs
+    std::vector<std::byte> retained_one_{};                // stable backing for the one live delivered span
 };
 
 // ---- ProdNetworkBus out-of-line members (need the full ProdNetwork type) ----

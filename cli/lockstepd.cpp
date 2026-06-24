@@ -34,12 +34,59 @@
 // surfaces (ProdConsensusNode / ProdNetworkBus) + plain argv parsing.
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
+
+// PERF PROFILER (S8.6) — a global operator new counter to measure HEAP ALLOCATIONS PER
+// COMMITTED OP on the single reactor thread, a LOAD-INDEPENDENT metric (host CPU
+// contention changes wall time, NOT the allocation COUNT). It is the receipt behind the
+// S8.6 "where does the per-op churn go" profile. COMPILE-GATED behind LOCKSTEP_PROFILE_ALLOC
+// so the SHIPPING daemon is byte-identical to before — a global operator new replacement
+// must NOT exist in the production binary (it can defeat the system allocator). Build the
+// profiling variant with -DLOCKSTEP_PROFILE_ALLOC and arm it at run time with
+// LOCKSTEP_ALLOC_PROFILE=1. Single-threaded (one reactor) so the counters need no atomics.
+#ifdef LOCKSTEP_PROFILE_ALLOC
+namespace {
+bool g_alloc_profile = false;
+std::uint64_t g_alloc_count = 0;
+std::uint64_t g_alloc_bytes = 0;
+// Size histogram buckets: <=32, <=64, <=128, <=512, <=4K, <=64K, >64K.
+std::uint64_t g_alloc_hist[7] = {0, 0, 0, 0, 0, 0, 0};
+std::uint64_t g_alloc_hbytes[7] = {0, 0, 0, 0, 0, 0, 0};
+inline int alloc_bucket(std::size_t n) {
+    if (n <= 32) return 0;
+    if (n <= 64) return 1;
+    if (n <= 128) return 2;
+    if (n <= 512) return 3;
+    if (n <= 4096) return 4;
+    if (n <= 65536) return 5;
+    return 6;
+}
+}  // namespace
+
+void* operator new(std::size_t n) {
+    if (g_alloc_profile) {
+        ++g_alloc_count;
+        g_alloc_bytes += n;
+        const int b = alloc_bucket(n);
+        ++g_alloc_hist[b];
+        g_alloc_hbytes[b] += n;
+    }
+    void* p = std::malloc(n == 0 ? 1 : n);
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+    return p;
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#endif  // LOCKSTEP_PROFILE_ALLOC
 
 #include <lockstep/prod/ProdConsensusNode.hpp>
 #include <lockstep/prod/ProdNetwork.hpp>
@@ -150,6 +197,16 @@ constexpr core::Tick kMsToNs = 1'000'000;
 int main(int argc, char** argv) {
     const Args args = parse_args(argc, argv);
 
+#ifdef LOCKSTEP_PROFILE_ALLOC
+    // PERF PROFILER (S8.6): turn on the alloc counter AFTER startup allocations so the
+    // count reflects the STEADY-STATE per-op path, not one-time setup. Armed below right
+    // before run_with_deadline; the env read here only decides whether to.
+    {
+        const char* ap = std::getenv("LOCKSTEP_ALLOC_PROFILE");  // NOLINT(concurrency-mt-unsafe)
+        g_alloc_profile = (ap != nullptr && ap[0] == '1');
+    }
+#endif
+
     if (args.listen_port == 0 || args.admin_port == 0 || args.peers.empty()) {
         std::fprintf(stderr,
                      "lockstepd: usage: --node-id N --listen-port P --admin-port A "
@@ -239,7 +296,24 @@ int main(int argc, char** argv) {
 
     const core::Tick deadline_ns =
         reactor.now() + static_cast<core::Tick>(args.run_seconds) * 1'000'000'000;
+#ifdef LOCKSTEP_PROFILE_ALLOC
+    // PERF PROFILER (S8.6): zero the alloc counters AT the steady-state boundary (node
+    // started, admin loop spawned, leader elected shortly after) so the reported count is
+    // the LOAD PHASE only, divided by committed entries below for allocs/committed-op.
+    const std::uint64_t commit_before = static_cast<std::uint64_t>(node.commit_index());
+    g_alloc_count = 0;
+    g_alloc_bytes = 0;
+    for (int b = 0; b < 7; ++b) {
+        g_alloc_hist[b] = 0;
+        g_alloc_hbytes[b] = 0;
+    }
+#endif
     node.run_with_deadline(deadline_ns);
+#ifdef LOCKSTEP_PROFILE_ALLOC
+    const std::uint64_t prof_allocs = g_alloc_count;
+    const std::uint64_t prof_bytes = g_alloc_bytes;
+    g_alloc_profile = false;  // stop counting during shutdown reporting
+#endif
 
     const unsigned long long ci =
         static_cast<unsigned long long>(node.commit_index());
@@ -265,5 +339,34 @@ int main(int argc, char** argv) {
                 static_cast<double>(sync_ns) / 1e6, avg_sync_us,
                 syncs_per_commit, appends_per_sync,
                 static_cast<unsigned long long>(node.disk_bytes_appended()));
+#ifdef LOCKSTEP_PROFILE_ALLOC
+    if (prof_allocs != 0 || prof_bytes != 0) {
+        const std::uint64_t committed_in_load =
+            (ci > commit_before) ? (ci - commit_before) : 0;
+        const double allocs_per_op =
+            committed_in_load ? (static_cast<double>(prof_allocs) /
+                                 static_cast<double>(committed_in_load))
+                              : 0.0;
+        const double bytes_per_op =
+            committed_in_load ? (static_cast<double>(prof_bytes) /
+                                 static_cast<double>(committed_in_load))
+                              : 0.0;
+        std::printf("ALLOCSTATS node=%llu committed_in_load=%llu heap_allocs=%llu "
+                    "heap_bytes=%llu allocs_per_op=%.2f bytes_per_op=%.1f\n",
+                    static_cast<unsigned long long>(ep.id),
+                    static_cast<unsigned long long>(committed_in_load),
+                    static_cast<unsigned long long>(prof_allocs),
+                    static_cast<unsigned long long>(prof_bytes), allocs_per_op,
+                    bytes_per_op);
+        static const char* kBucketName[7] = {"<=32", "<=64", "<=128",
+                                             "<=512", "<=4K", "<=64K", ">64K"};
+        for (int b = 0; b < 7; ++b) {
+            std::printf("ALLOCHIST node=%llu bucket=%-5s count=%llu bytes=%llu\n",
+                        static_cast<unsigned long long>(ep.id), kBucketName[b],
+                        static_cast<unsigned long long>(g_alloc_hist[b]),
+                        static_cast<unsigned long long>(g_alloc_hbytes[b]));
+        }
+    }
+#endif  // LOCKSTEP_PROFILE_ALLOC
     return 0;
 }
