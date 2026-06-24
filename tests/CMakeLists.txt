@@ -1266,6 +1266,24 @@ if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin AND OpenSSL
   set_tests_properties(prod_tls_test PROPERTIES TIMEOUT 150)
 endif()
 
+# --- AUTH + RBAC over mTLS (Phase: auth-rbac) [LINUX] ------------------------
+# Application-level identity (mTLS cert CN -> principal) + per-operation RBAC. Brings up a
+# single-node mTLS cluster with an --auth-policy and asserts the allow/deny MATRIX + the
+# TEETH (a reader's REFUSED write did NOT commit; an unknown principal is default-denied;
+# an authorized write still commits). Built ONLY on Linux + only when TLS is enabled (the
+# cert-CN extraction is OpenSSL-gated); the macOS host stays green (test absent). Needs
+# openssl on PATH (the dev image's libssl-dev). PROCESS-CLEANUP: traps EXIT/INT/TERM to
+# SIGKILL every tracked child; the daemon self-deadlines (--run-seconds).
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin AND OpenSSL_FOUND)
+  add_test(
+    NAME prod_auth_test
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_auth_test.sh)
+  set_tests_properties(prod_auth_test PROPERTIES TIMEOUT 150)
+endif()
+
 # --- Phase 7 S6: JEPSEN-STYLE PROD-CLUSTER CAPSTONE (V-PROD-CLUSTER) [LINUX] ---
 # P7-S6 gate (briefs/phase7.md S6 — THE capstone). Drives the REAL multi-process
 # lockstepd cluster (5 nodes) under a FAULT STORM — process CRASH/RESTART (SIGKILL +

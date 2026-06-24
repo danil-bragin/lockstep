@@ -66,11 +66,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include <lockstep/core/INetwork.hpp>
 #include <lockstep/core/Task.hpp>
 
+#include <lockstep/prod/ProdAuth.hpp>    // AUTH/RBAC — principal->role->permission policy
 #include <lockstep/prod/ProdDisk.hpp>
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdRandom.hpp>
@@ -188,14 +190,41 @@ public:
     // the member is a live part of the assembly (not dead weight).
     [[nodiscard]] ProdRandom& random() noexcept { return rng_; }
 
+    // ---- AUTH/RBAC — install the policy + bind the wire::Server enforcement hooks ----
+    // Called BEFORE start(). Binds the portable wire::Server auth callbacks to THIS node's
+    // ProdNetwork::last_principal() (the mTLS cert CN) + the given AuthPolicy, so the
+    // client-facing surface enforces RBAC before any submit/query is applied. When the
+    // policy is not enabled() (none configured), the hooks short-circuit to allow-all so
+    // the legacy non-auth path is byte-identical. The policy is moved into a heap box so
+    // the captured pointer stays stable for the server's lifetime.
+    void set_auth_policy(AuthPolicy policy) {
+        auth_ = std::make_unique<AuthPolicy>(std::move(policy));
+        if (!auth_->enabled()) {
+            return;  // OPEN: leave the wire::Server hooks unset (legacy allow-all).
+        }
+        AuthPolicy* pol = auth_.get();
+        ProdNetwork* pnet = net_;
+        server_.set_auth_hooks(
+            [pnet]() -> std::string {
+                return pnet != nullptr ? pnet->last_principal() : std::string{};
+            },
+            [pol](const std::string& principal, bool is_write) -> bool {
+                return pol->allow(principal,
+                                  is_write ? OpClass::Write : OpClass::Read);
+            });
+    }
+    [[nodiscard]] std::uint64_t auth_denied() const noexcept { return server_.auth_denied(); }
+
 private:
     ProdReactor* reactor_;       // the one event-loop thread (shared, not owned)
-    core::INetwork* net_;        // this node's ProdNetwork handle (owned by the bus)
+    ProdNetwork* net_;           // this node's ProdNetwork handle (owned by the bus); typed
+                                 // ProdNetwork so AUTH can read last_principal() (cert CN)
     ProdRandom rng_;             // election jitter / backoff entropy (seeded)
     core::Scheduler disk_sched_; // mints ProdDisk's inline-ready Futures (harness only)
     ProdDisk disk_;              // durability anchor over the data dir (RAII-closed)
     wire::Server server_;        // the UNCHANGED client-facing protocol server
     ProdServerConfig cfg_;
+    std::unique_ptr<AuthPolicy> auth_{};  // RBAC policy (stable box; hooks capture its ptr)
 };
 
 } // namespace lockstep::prod

@@ -468,11 +468,26 @@ public:
         return f;
     }
 
+    // The PRINCIPAL (mTLS client cert subject CN) of the connection that delivered the
+    // MOST RECENTLY recv()'d message. core::Message is FROZEN (no principal field — core
+    // is unchanged), so the prod admin handler / wire::Server read the identity off THIS
+    // side-channel right after recv() returns. SOUND because the single reactor thread
+    // drives recv()->handle()->send() strictly one message at a time (the same
+    // single-consumer discipline that makes retained_one_ safe): the value is exactly the
+    // principal of the just-delivered Message at the point the synchronous handler runs,
+    // before the next recv(). Empty string == no peer cert (plaintext or optional-absent
+    // client cert) == the anonymous principal.
+    [[nodiscard]] const std::string& last_principal() const noexcept {
+        return last_principal_;
+    }
+
 private:
-    // A reassembled inbound message awaiting recv() consumption.
+    // A reassembled inbound message awaiting recv() consumption. `principal` is the peer
+    // cert CN of the connection it arrived on (empty for plaintext / no client cert).
     struct InboundMsg {
         Endpoint from{};
         std::vector<std::byte> bytes{};
+        std::string principal{};
     };
 
     // ---- connection management ------------------------------------------
@@ -933,9 +948,24 @@ private:
             std::vector<std::byte> payload(in.begin() + static_cast<std::ptrdiff_t>(start),
                                            in.begin() + static_cast<std::ptrdiff_t>(start + len));
             pos = start + len;
-            enqueue_inbound(InboundMsg{c.peer(), std::move(payload)});
+            enqueue_inbound(InboundMsg{c.peer(), std::move(payload), principal_of(c)});
         }
         drain_front(in, pos);
+    }
+
+    // The PRINCIPAL carried by a connection: its TLS session's verified peer-cert CN.
+    // Empty for a plaintext connection (no TLS session) or when no client cert was
+    // presented. Provider-layer (OpenSSL) extraction stays inside ProdTls; here we just
+    // forward the resulting string.
+    [[nodiscard]] static std::string principal_of(ProdConnection& c) {
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        if (c.has_tls() && c.tls() != nullptr) {
+            return c.tls()->peer_cn();
+        }
+#else
+        (void)c;
+#endif
+        return {};
     }
 
     static void drain_front(std::vector<std::byte>& in, std::size_t pos) {
@@ -981,6 +1011,9 @@ private:
         // span still in use (V-RKV1 preserved — the backing store outlives every live
         // span; moving the new bytes in only AFTER the previous consumer has drained).
         retained_one_ = std::move(m.bytes);
+        // Stamp the principal of THIS delivered message on the side-channel before the
+        // waiter runs (the synchronous handler reads last_principal() right after recv()).
+        last_principal_ = std::move(m.principal);
         std::span<const std::byte> view(retained_one_.data(), retained_one_.size());
         p.set_value(Message{m.from, view});
     }
@@ -1041,6 +1074,7 @@ private:
     std::vector<InboundMsg> ready_{};                      // reassembled, awaiting recv
     std::vector<Promise<Message>> waiters_{};              // parked recv promises (FIFO)
     std::vector<std::byte> retained_one_{};                // stable backing for the one live delivered span
+    std::string last_principal_{};                         // principal (peer CN) of the last delivered Message
 };
 
 // ---- ProdNetworkBus out-of-line members (need the full ProdNetwork type) ----

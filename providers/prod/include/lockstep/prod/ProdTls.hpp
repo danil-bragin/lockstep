@@ -62,6 +62,7 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>  // X509 peer-cert subject CN extraction (the PRINCIPAL)
 
 #include <cstddef>
 #include <cstdint>
@@ -245,6 +246,40 @@ public:
     [[nodiscard]] bool valid() const noexcept { return valid_; }
     [[nodiscard]] bool handshake_done() const noexcept { return handshake_done_; }
 
+    // The PRINCIPAL — the VERIFIED peer certificate's subject Common Name (CN). This is
+    // the application identity RBAC maps to a role. Returns "" when no peer cert was
+    // presented (server-auth TLS with an optional/absent client cert) or before the
+    // handshake completes. The cert here is already CA-VERIFIED by the handshake
+    // (SSL_VERIFY_PEER on the server ctx + the CA load), so the CN is trustworthy — an
+    // attacker cannot present an arbitrary CN without a CA-signed cert (mTLS is the gate
+    // BELOW this; the CN is just the authenticated identity it carries). Cached after the
+    // first extraction; cheap thereafter. providers/prod is the OpenSSL boundary — this
+    // X509 call is permitted HERE and nowhere else; callers receive a plain std::string.
+    [[nodiscard]] std::string peer_cn() const {
+        if (!valid_ || !handshake_done_) {
+            return {};
+        }
+        if (peer_cn_cached_) {
+            return peer_cn_;
+        }
+        peer_cn_cached_ = true;
+        X509* cert = SSL_get_peer_certificate(ssl_);  // bumps the refcount — free below.
+        if (cert == nullptr) {
+            return {};  // no peer cert presented (server-auth TLS, optional client cert).
+        }
+        X509_NAME* subj = X509_get_subject_name(cert);
+        if (subj != nullptr) {
+            char buf[256];
+            const int len =
+                X509_NAME_get_text_by_NID(subj, NID_commonName, buf, sizeof(buf));
+            if (len > 0) {
+                peer_cn_.assign(buf, static_cast<std::size_t>(len));
+            }
+        }
+        X509_free(cert);  // release the refcount SSL_get_peer_certificate took (no leak).
+        return peer_cn_;
+    }
+
     // FEED inbound ciphertext (read off the socket) into the read BIO. The next SSL_read /
     // handshake step decrypts from it. Returns false on a BIO error (drop the connection).
     bool feed_ciphertext(std::span<const std::byte> bytes) {
@@ -399,6 +434,8 @@ private:
     bool valid_ = false;
     bool handshake_done_ = false;
     std::vector<std::byte> pending_plain_{};  // plaintext deferred by a WANT_READ mid-write
+    mutable bool peer_cn_cached_ = false;     // the principal (peer CN) extracted yet?
+    mutable std::string peer_cn_{};           // cached verified peer-cert subject CN
 };
 
 }  // namespace lockstep::prod

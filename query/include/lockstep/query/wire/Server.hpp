@@ -30,6 +30,7 @@
 // request stream it recv()s) — itself a pure fn of the sim seed.
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <span>
 #include <string>
@@ -135,6 +136,28 @@ public:
     // scheduler.
     Server(core::Scheduler& dsched, core::IDisk& disk) : net_(nullptr), db_(dsched, disk) {}
 
+    // ---- AUTH/RBAC (Phase: auth-rbac) ----------------------------------------
+    // The client-facing wire::Server is one of the two RBAC ENFORCEMENT POINTS (the prod
+    // admin handler is the other). query/ is NOT lint-exempt and must stay OpenSSL- and
+    // provider-FREE, so the identity + policy are injected as PORTABLE CALLBACKS by the
+    // prod assembly (ProdServerNode), which binds them to ProdNetwork::last_principal()
+    // (the mTLS cert CN) + a prod::AuthPolicy. With no hooks installed the server is OPEN
+    // (every request allowed) — byte-identical to the pre-auth path, so the sim tests +
+    // the LocalCluster harness keep working unchanged.
+    //
+    //   principal_fn : returns the authenticated principal of the CURRENT request (read
+    //                  right after recv(); empty == anonymous/plaintext).
+    //   authz_fn     : (principal, is_write) -> allowed? A Submit is a WRITE; a Query /
+    //                  Ping is a READ. DEFAULT-DENY is the caller's (AuthPolicy's) job —
+    //                  here we simply refuse to dispatch when authz_fn returns false.
+    using PrincipalFn = std::function<std::string()>;
+    using AuthzFn = std::function<bool(const std::string& principal, bool is_write)>;
+    void set_auth_hooks(PrincipalFn principal_fn, AuthzFn authz_fn) {
+        principal_fn_ = std::move(principal_fn);
+        authz_fn_ = std::move(authz_fn);
+    }
+    [[nodiscard]] std::uint64_t auth_denied() const noexcept { return auth_denied_; }
+
     // The recv-loop. Receives `max_msgs` frames (a bounded budget so the sim
     // quiesces — NEVER an unbounded loop), decodes+dispatches each, and replies.
     // A torn / corrupt frame is REJECTED at decode and DROPPED (no reply, no
@@ -154,6 +177,28 @@ public:
                 // will time out and retry. Count it for diagnostics.
                 ++rejected_;
                 continue;
+            }
+
+            // AUTH/RBAC ENFORCEMENT — BEFORE dispatch (never execute on a permission
+            // miss). The op class is read off the DECODED request (a malformed frame was
+            // already rejected above, so the gate can never be bypassed by garbage). A
+            // Submit is a WRITE; Query/Ping are READ. authz_fn is the policy; when no
+            // hooks are installed the request is allowed (legacy open path).
+            if (authz_fn_) {
+                const bool is_write = (req.kind == MsgKind::Submit);
+                const std::string principal = principal_fn_ ? principal_fn_() : std::string{};
+                if (!authz_fn_(principal, is_write)) {
+                    ++auth_denied_;
+                    Response denied;
+                    denied.kind = MsgKind::Error;
+                    denied.req_id = req.req_id;
+                    denied.error = "AUTH-DENIED: principal '" + principal +
+                                   "' lacks permission";
+                    std::vector<std::byte> dbytes = encode_response(denied);
+                    (void)co_await net_->send(
+                        from, std::span<const std::byte>(dbytes.data(), dbytes.size()));
+                    continue;  // op NOT dispatched / NOT applied.
+                }
             }
 
             const Response resp = dispatch(req);
@@ -330,6 +375,11 @@ private:
     Seq tip_ = 0;
     std::uint64_t rejected_ = 0;
     std::uint64_t applied_ = 0;
+
+    // AUTH/RBAC hooks (portable; provider-injected). Null == OPEN (legacy allow-all).
+    PrincipalFn principal_fn_{};
+    AuthzFn authz_fn_{};
+    std::uint64_t auth_denied_ = 0;  // count of requests refused by the RBAC gate
 };
 
 }  // namespace lockstep::query::wire

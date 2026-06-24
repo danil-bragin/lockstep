@@ -150,6 +150,7 @@ core::Task metrics_rpc(core::INetwork* cli, core::Endpoint admin, std::string* o
 struct SubmitOutcome {
     bool replied = false;
     bool accepted = false;
+    bool denied = false;  // AUTH/RBAC: the server refused the op (principal lacks perm)
     std::uint64_t term = 0;
     std::uint64_t index = 0;
     std::uint64_t leader_hint = 0;
@@ -169,6 +170,9 @@ core::Task submit_rpc(core::INetwork* cli, core::Endpoint admin, std::string val
         out->index = r.u64();
     } else if (kind == prod::AdminKind::NotLeader) {
         out->leader_hint = r.u64();
+    } else if (kind == prod::AdminKind::AuthDenied) {
+        // AUTH/RBAC: the principal lacked WRITE permission — the submit did NOT execute.
+        out->denied = true;
     }
     *done = true;
     co_return;
@@ -1097,9 +1101,13 @@ DurableResult confirm_durable(std::uint16_t port, const std::string& value,
 // omitted) for the load harness's accept measurement — but the DEFAULT awaits commit.
 int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts,
                bool await_durable) {
+    bool any_denied = false;  // AUTH/RBAC: did any host explicitly DENY the write?
     for (std::uint16_t port : hosts) {
         SubmitOutcome so;
         const bool replied = do_submit(port, value, so);
+        if (replied && so.denied) {
+            any_denied = true;  // record but keep trying others (could be a non-leader).
+        }
         if (replied && so.accepted) {
             if (!await_durable) {
                 // accept-only mode: report the append (NOT a durability claim).
@@ -1127,9 +1135,11 @@ int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts
         }
         // NotLeader or no reply: try the next host (the leader-find retry loop).
     }
-    std::printf("SUBMIT value=%s accepted=0 durable=0 port=0 term=0 index=0 "
+    // AUTH/RBAC: surface denied=1 so the test can distinguish a permission REFUSAL (the
+    // RBAC gate blocked the write) from a transient no-leader / unreachable host.
+    std::printf("SUBMIT value=%s accepted=0 durable=0 denied=%d port=0 term=0 index=0 "
                 "leader_hint=0\n",
-                value.c_str());
+                value.c_str(), any_denied ? 1 : 0);
     std::fflush(stdout);
     return 1;  // no host accepted (caller retries later)
 }
