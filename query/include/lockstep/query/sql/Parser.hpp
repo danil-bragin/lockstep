@@ -338,6 +338,8 @@ public:
             r = parse_delete();
         } else if (kw == "select") {
             r = parse_select();
+        } else if (kw == "drop") {
+            r = parse_drop_index();
         } else {
             return err("unknown / unsupported statement keyword '" + cur_.text +
                        "' (v1 supports CREATE/INSERT/UPDATE/DELETE/SELECT)");
@@ -464,9 +466,12 @@ private:
 
     // --- grammar rules ---
 
-    // CREATE TABLE t (c TYPE, ..., PRIMARY KEY (c))
+    // CREATE TABLE t (...) | CREATE INDEX name ON t (col)
     ParseResult parse_create() {
         advance();  // CREATE
+        if (is_kw("index")) {
+            return parse_create_index();
+        }
         if (auto e = expect_kw("table")) {
             return ParseResult{*e};
         }
@@ -543,6 +548,59 @@ private:
         if (!found) {
             return err("PRIMARY KEY column '" + st.create.pk_column +
                        "' is not a declared column");
+        }
+        return ParseResult{std::move(st)};
+    }
+
+    // CREATE INDEX <name> ON <table> (<col>) — single-column secondary index. A
+    // multi-column list (a comma after the column) is a clean "OUT in v1" error.
+    ParseResult parse_create_index() {
+        advance();  // INDEX
+        Statement st;
+        st.kind = StmtKind::CreateIndex;
+        if (auto e = expect_ident("an index name after CREATE INDEX",
+                                  st.create_index.index)) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect_kw("on")) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect_ident("a table name after ON", st.create_index.table)) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect(Tok::LParen, "'(' before the indexed column")) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect_ident("the indexed column name", st.create_index.column)) {
+            return ParseResult{*e};
+        }
+        if (cur_.kind == Tok::Comma) {
+            return err("multi-column INDEX is OUT in v1 (single-column secondary "
+                       "index only)");
+        }
+        if (auto e = expect(Tok::RParen, "')' after the indexed column")) {
+            return ParseResult{*e};
+        }
+        return ParseResult{std::move(st)};
+    }
+
+    // DROP INDEX <name> ON <table>
+    ParseResult parse_drop_index() {
+        advance();  // DROP
+        if (auto e = expect_kw("index")) {
+            return ParseResult{*e};
+        }
+        Statement st;
+        st.kind = StmtKind::DropIndex;
+        if (auto e = expect_ident("an index name after DROP INDEX",
+                                  st.drop_index.index)) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect_kw("on")) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect_ident("a table name after ON", st.drop_index.table)) {
+            return ParseResult{*e};
         }
         return ParseResult{std::move(st)};
     }

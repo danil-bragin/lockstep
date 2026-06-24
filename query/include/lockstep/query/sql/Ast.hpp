@@ -46,6 +46,20 @@ struct CreateStmt {
     std::string pk_column;  // the single PK column name
 };
 
+// CREATE INDEX <name> ON <table> (<col>) — a single-column SECONDARY INDEX. The
+// multi-column form is OUT (FLAG): the parser rejects a comma-separated column list.
+struct CreateIndexStmt {
+    std::string index;   // the index name (unique within the table)
+    std::string table;   // the table it indexes
+    std::string column;  // the single indexed column
+};
+
+// DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).
+struct DropIndexStmt {
+    std::string index;
+    std::string table;
+};
+
 // INSERT INTO <t> (<cols>) VALUES (<vals>)
 struct InsertStmt {
     std::string table;
@@ -252,6 +266,8 @@ enum class StmtKind : std::uint8_t {
     Update = 2,
     Delete = 3,
     Select = 4,
+    CreateIndex = 5,
+    DropIndex = 6,
 };
 
 struct Statement {
@@ -261,6 +277,8 @@ struct Statement {
     UpdateStmt update;
     DeleteStmt del;
     SelectStmt select;
+    CreateIndexStmt create_index;
+    DropIndexStmt drop_index;
 };
 
 }  // namespace lockstep::query::sql

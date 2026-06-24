@@ -187,6 +187,10 @@ public:
                 return exec_delete(st.del);
             case StmtKind::Select:
                 return exec_select(st.select);
+            case StmtKind::CreateIndex:
+                return exec_create_index(st.create_index);
+            case StmtKind::DropIndex:
+                return exec_drop_index(st.drop_index);
         }
         return ExecResult::failure("unknown statement kind");
     }
@@ -218,6 +222,102 @@ private:
         return ExecResult{};
     }
 
+    // --- CREATE INDEX <name> ON <table> (<col>) -------------------------------
+    // Registers a single-column secondary index in the catalog AND BACKFILLS it: an
+    // index entry is written for EVERY existing row of the table, atomically per row
+    // (the backfill rides the same verified write path the live maintenance uses). The
+    // index then stays consistent with the table because every later INSERT/UPDATE/
+    // DELETE maintains it in the SAME txn as the row write (commit_writes, below).
+    ExecResult exec_create_index(const CreateIndexStmt& ci) {
+        Table* t = catalog_.find_mut(ci.table);
+        if (t == nullptr) {
+            return ExecResult::failure("unknown table '" + ci.table + "'");
+        }
+        if (t->index_by_name(ci.index) != nullptr) {
+            return ExecResult::failure("index '" + ci.index + "' already exists on '" +
+                                       ci.table + "'");
+        }
+        const auto col = t->column_index(ci.column);
+        if (!col) {
+            return ExecResult::failure("unknown column '" + ci.column +
+                                       "' in table '" + ci.table + "'");
+        }
+        // Indexing the PK is pointless (the PK already has the table-row order index)
+        // and would never be chosen over the PK fast path — reject it fail-closed so a
+        // redundant index can never diverge.
+        if (*col == t->pk_index) {
+            return ExecResult::failure(
+                "cannot CREATE INDEX on the PRIMARY KEY column '" + ci.column +
+                "' (the PK is already an ordered access path)");
+        }
+        Index ix;
+        ix.name = ci.index;
+        ix.id = t->next_index_id++;
+        ix.column = *col;
+        t->indexes.push_back(ix);
+        const std::uint32_t table_id = t->id;
+        const std::size_t pk_index = t->pk_index;
+
+        // BACKFILL: scan every live row and write its index entry. Read through the
+        // verified scan path (a full table scan), then commit one index-entry write per
+        // row through the verified executor (one txn per row — atomic, ordered).
+        std::vector<storage::KeyValue> kvs;
+        {
+            Query<Strict> q;
+            q.scan(table_prefix(table_id), table_prefix_end(table_id));
+            collect(db_.run(q), kvs);
+        }
+        for (const storage::KeyValue& kv : kvs) {
+            if (is_tombstone(kv.second)) {
+                continue;
+            }
+            const std::vector<Datum> row = decode_row(*t, kv.first, kv.second);
+            const Key ikey =
+                encode_index_entry(table_id, ix, row[ix.column], row[pk_index]);
+            commit_writes({{ikey, std::string{}}});
+        }
+        return ExecResult{};
+    }
+
+    // --- DROP INDEX <name> ON <table> -----------------------------------------
+    // Remove the index from the catalog AND tombstone every one of its KV entries.
+    ExecResult exec_drop_index(const DropIndexStmt& di) {
+        Table* t = catalog_.find_mut(di.table);
+        if (t == nullptr) {
+            return ExecResult::failure("unknown table '" + di.table + "'");
+        }
+        const Index* ixp = t->index_by_name(di.index);
+        if (ixp == nullptr) {
+            return ExecResult::failure("unknown index '" + di.index + "' on table '" +
+                                       di.table + "'");
+        }
+        const Index ix = *ixp;  // copy before mutating the vector
+        const std::uint32_t table_id = t->id;
+        // Tombstone every index entry (the scan path ignores tombstones, so this fully
+        // retires the index's key range).
+        std::vector<storage::KeyValue> kvs;
+        {
+            Query<Strict> q;
+            const Key lo = index_prefix(table_id, ix.id);
+            q.scan(lo, key_successor(lo));
+            collect(db_.run(q), kvs);
+        }
+        for (const storage::KeyValue& kv : kvs) {
+            if (!is_tombstone(kv.second)) {
+                commit_writes({{kv.first, tombstone_marker()}});
+            }
+        }
+        // Erase from the catalog (so the planner stops choosing it).
+        for (std::size_t i = 0; i < t->indexes.size(); ++i) {
+            if (t->indexes[i].name == di.index) {
+                t->indexes.erase(t->indexes.begin() +
+                                 static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+        return ExecResult{};
+    }
+
     // Coerce a parsed literal Datum to a column's declared type (type checking).
     // INT<->TEXT mismatch is an error (no implicit conversion in v1).
     [[nodiscard]] static std::optional<std::string> coerce(const Column& col,
@@ -230,6 +330,19 @@ private:
         }
         out = in;
         return std::nullopt;
+    }
+
+    // Append the index-entry writes for `row` (one per secondary index) to `out`.
+    // `make` decides the value: a new entry (empty value) on INSERT/UPDATE-new, or a
+    // tombstone on DELETE/UPDATE-old. The PK is read from row[pk_index].
+    static void index_writes_for_row(const Table& t, const std::vector<Datum>& row,
+                                     bool tombstone,
+                                     std::vector<std::pair<Key, Value>>& out) {
+        for (const Index& ix : t.indexes) {
+            const Key ikey =
+                encode_index_entry(t.id, ix, row[ix.column], row[t.pk_index]);
+            out.emplace_back(ikey, tombstone ? tombstone_marker() : std::string{});
+        }
     }
 
     // --- INSERT ---------------------------------------------------------------
@@ -279,7 +392,11 @@ private:
             return ExecResult::failure("duplicate primary key in table '" + ins.table +
                                        "' (row already exists)");
         }
-        commit_write(key, enc);
+        // ATOMIC: the row write + every secondary-index entry for the new row commit in
+        // ONE txn (the index can never lag the row after a committed INSERT).
+        std::vector<std::pair<Key, Value>> writes{{key, enc}};
+        index_writes_for_row(*t, row, /*tombstone=*/false, writes);
+        commit_writes(writes);
         ExecResult r;
         r.affected = 1;
         return r;
@@ -324,9 +441,17 @@ private:
             r.affected = 0;  // no row to update
             return r;
         }
-        std::vector<Datum> row = decode_row(*t, key, *existing);
+        std::vector<Datum> old_row = decode_row(*t, key, *existing);
+        std::vector<Datum> row = old_row;
         row[col] = sv;
-        commit_write(key, encode_value(*t, row));
+        // ATOMIC: row write + index maintenance in ONE txn. For each secondary index,
+        // remove the OLD entry (old col value) and write the NEW entry (new col value);
+        // an index whose column is unchanged just rewrites the SAME entry key (idempotent
+        // — empty re-write). The row + all index deltas land in one committed write-set.
+        std::vector<std::pair<Key, Value>> writes{{key, encode_value(*t, row)}};
+        index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
+        index_writes_for_row(*t, row, /*tombstone=*/false, writes);
+        commit_writes(writes);
         ExecResult r;
         r.affected = 1;
         return r;
@@ -356,7 +481,11 @@ private:
             r.affected = 0;  // nothing to delete
             return r;
         }
-        commit_write(key, tombstone_marker());
+        // ATOMIC: tombstone the row + every secondary-index entry in ONE txn.
+        const std::vector<Datum> old_row = decode_row(*t, key, *existing);
+        std::vector<std::pair<Key, Value>> writes{{key, tombstone_marker()}};
+        index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
+        commit_writes(writes);
         ExecResult r;
         r.affected = 1;
         return r;
@@ -385,25 +514,48 @@ private:
         const bool pk_fast =
             sel.where != SelectWhereKind::None && sel.where_column == t->pk().name &&
             predicate_is_pure_pk(sel, *t);
-        std::vector<storage::KeyValue> kvs;
-        if (auto err = run_select_at_level(*t, sel, pk_fast, kvs)) {
-            return ExecResult::failure(*err);
+
+        // SECONDARY-INDEX ACCESS PATH (the new planner choice). When the PK fast path
+        // does NOT apply but the WHERE has an `indexed_col = v` or `indexed_col BETWEEN
+        // a AND b` term (a top-level Cmp, or a top-level AND containing one) on a column
+        // that has a secondary index, range-scan the INDEX for the matching col range to
+        // collect the PKs, then POINT-GET each row. The FULL filter still runs as a row
+        // filter (the RESIDUAL PREDICATE) in step (2) — the index narrows WHICH rows are
+        // read, never WHICH rows are returned. Falls back to a full scan when no usable
+        // index. PLANNER CHOICE (documented): prefer the index whenever an indexed eq/
+        // range term exists (an index scan is O(log N + matches), strictly cheaper than
+        // the O(N) full scan when the term is selective; for an eq on a unique-ish column
+        // it reads ~1 row). The simple rule: first usable indexed term wins.
+        std::vector<bool> need = needed_columns(*t, sel);
+        std::vector<std::vector<Datum>> rows;
+        bool used_index = false;
+        if (!pk_fast && sel.filter.present()) {
+            if (auto plan = choose_index_access(sel, *t)) {
+                if (auto err = read_via_index(*t, sel, *plan, need, rows)) {
+                    return ExecResult::failure(*err);
+                }
+                used_index = true;
+            }
         }
 
-        // LAZY/PROJECTED DECODE (the scan-decode optimization). Compute the set of
-        // columns the query ACTUALLY references (projection + WHERE + GROUP BY +
-        // aggregates) and decode ONLY those per row, SKIPPING the rest (a wide TEXT
-        // column the query never touches is not copied/parsed). For a few-column
-        // projection or a filtered scan this cuts the dominant per-row decode cost.
-        // Byte-identical to a full decode on the needed columns => result unchanged.
-        const std::vector<bool> need = needed_columns(*t, sel);
-        std::vector<std::vector<Datum>> rows;
-        rows.reserve(kvs.size());
-        for (const storage::KeyValue& kv : kvs) {
-            if (is_tombstone(kv.second)) {
-                continue;
+        if (!used_index) {
+            std::vector<storage::KeyValue> kvs;
+            if (auto err = run_select_at_level(*t, sel, pk_fast, kvs)) {
+                return ExecResult::failure(*err);
             }
-            rows.push_back(decode_row_projected(*t, kv.first, kv.second, need));
+            // LAZY/PROJECTED DECODE (the scan-decode optimization). Compute the set of
+            // columns the query ACTUALLY references (projection + WHERE + GROUP BY +
+            // aggregates) and decode ONLY those per row, SKIPPING the rest (a wide TEXT
+            // column the query never touches is not copied/parsed). For a few-column
+            // projection or a filtered scan this cuts the dominant per-row decode cost.
+            // Byte-identical to a full decode on the needed columns => result unchanged.
+            rows.reserve(kvs.size());
+            for (const storage::KeyValue& kv : kvs) {
+                if (is_tombstone(kv.second)) {
+                    continue;
+                }
+                rows.push_back(decode_row_projected(*t, kv.first, kv.second, need));
+            }
         }
 
         // (2) WHERE — apply the general predicate as a row filter UNLESS the PK fast
@@ -1465,6 +1617,279 @@ private:
         }
     }
 
+    // A chosen secondary-index access plan: WHICH index + the COL value range to scan.
+    // `eq` is the equality value when `is_eq`; otherwise [lo, hi] is the inclusive
+    // BETWEEN range. The residual predicate (the whole filter) is applied afterwards.
+    struct IndexPlan {
+        const Index* index = nullptr;
+        bool is_eq = false;
+        Datum eq;   // is_eq
+        Datum lo;   // BETWEEN lower (inclusive)
+        Datum hi;   // BETWEEN upper (inclusive)
+    };
+
+    // Scan the WHERE predicate for an `indexed_col = v` or `indexed_col BETWEEN a AND b`
+    // term usable as an index access path. We look at the predicate ROOT: a single Cmp
+    // Eq leaf, OR a top-level AND whose conjuncts include such a term (possibly nested
+    // left-deep — the parser builds AND left-associative). The term's column must (a)
+    // have a secondary index, (b) compare a bare column to a LITERAL of the column's
+    // TYPE. A BETWEEN lowers to `col >= lo AND col <= hi` (two Cmp leaves under an AND),
+    // which we also recognize. Returns the first usable plan (deterministic left-to-
+    // right scan) or nullopt. The PK fast path is checked FIRST by the caller, so a PK
+    // term never reaches here (and the PK has no secondary index anyway).
+    [[nodiscard]] std::optional<IndexPlan> choose_index_access(const SelectStmt& sel,
+                                                              const Table& t) {
+        const Predicate& p = sel.filter;
+        // Collect the top-level AND-conjunct leaf nodes (flatten left-deep ANDs).
+        std::vector<std::int32_t> leaves;
+        gather_and_leaves(p, p.root, leaves);
+        // First pass: an indexed equality (most selective).
+        for (const std::int32_t li : leaves) {
+            const PredNode& n = p.nodes[static_cast<std::size_t>(li)];
+            if (n.kind != PredNodeKind::Cmp || n.operand != OperandKind::Column ||
+                !n.qualifier.empty() || n.rhs_is_column || n.op != CmpOp::Eq) {
+                continue;
+            }
+            const auto col = t.column_index(n.column);
+            if (!col || *col == t.pk_index || n.literal.type != t.columns[*col].type) {
+                continue;
+            }
+            const Index* ix = t.index_for_column(*col);
+            if (ix == nullptr) {
+                continue;
+            }
+            IndexPlan plan;
+            plan.index = ix;
+            plan.is_eq = true;
+            plan.eq = n.literal;
+            return plan;
+        }
+        // Second pass: an indexed BETWEEN (col >= lo AND col <= hi over ONE column).
+        for (std::size_t a = 0; a < leaves.size(); ++a) {
+            const PredNode& na = p.nodes[static_cast<std::size_t>(leaves[a])];
+            if (na.kind != PredNodeKind::Cmp || na.operand != OperandKind::Column ||
+                !na.qualifier.empty() || na.rhs_is_column || na.op != CmpOp::Ge) {
+                continue;
+            }
+            const auto col = t.column_index(na.column);
+            if (!col || *col == t.pk_index || na.literal.type != t.columns[*col].type) {
+                continue;
+            }
+            const Index* ix = t.index_for_column(*col);
+            if (ix == nullptr) {
+                continue;
+            }
+            // Find a matching `col <= hi` conjunct on the SAME column.
+            for (std::size_t b = 0; b < leaves.size(); ++b) {
+                if (b == a) {
+                    continue;
+                }
+                const PredNode& nb = p.nodes[static_cast<std::size_t>(leaves[b])];
+                if (nb.kind == PredNodeKind::Cmp &&
+                    nb.operand == OperandKind::Column && nb.qualifier.empty() &&
+                    !nb.rhs_is_column && nb.op == CmpOp::Le && nb.column == na.column &&
+                    nb.literal.type == t.columns[*col].type) {
+                    IndexPlan plan;
+                    plan.index = ix;
+                    plan.is_eq = false;
+                    plan.lo = na.literal;
+                    plan.hi = nb.literal;
+                    return plan;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Flatten a left-deep AND tree into its conjunct LEAF node indices. A non-AND root
+    // is itself the single "leaf". (OR/NOT subtrees are NOT flattened — an indexed term
+    // under an OR is not safely usable as the sole access path, so we treat the whole
+    // OR/NOT node as an opaque leaf the index pass ignores.)
+    static void gather_and_leaves(const Predicate& p, std::int32_t node,
+                                  std::vector<std::int32_t>& out) {
+        if (node < 0) {
+            return;
+        }
+        const PredNode& n = p.nodes[static_cast<std::size_t>(node)];
+        if (n.kind == PredNodeKind::And) {
+            gather_and_leaves(p, n.left, out);
+            gather_and_leaves(p, n.right, out);
+        } else {
+            out.push_back(node);
+        }
+    }
+
+    // Execute a chosen index access: range-scan the index prefix for the matching col
+    // range to collect the (col, PK) entries, then POINT-GET each row + decode. The
+    // residual predicate (the whole WHERE) is applied by the caller in step (2), so
+    // this only narrows WHICH rows are fetched. Reads run at the SELECT's D5 level.
+    [[nodiscard]] std::optional<std::string> read_via_index(
+        const Table& t, const SelectStmt& sel, const IndexPlan& plan,
+        const std::vector<bool>& need, std::vector<std::vector<Datum>>& rows_out) {
+        // (a) The index range [lo, hi): col-ascending entries for the matching values.
+        Key lo = index_prefix(t.id, plan.index->id);
+        Key hi;
+        if (plan.is_eq) {
+            put_index_col(lo, plan.eq);
+            hi = key_successor(lo);  // all PK-suffixes under this exact col value
+        } else {
+            put_index_col(lo, plan.lo);
+            Key hi_pref = index_prefix(t.id, plan.index->id);
+            put_index_col(hi_pref, plan.hi);
+            hi = key_successor(hi_pref);  // inclusive upper bound (col <= hi)
+        }
+        std::vector<storage::KeyValue> index_kvs;
+        if (auto err = run_index_scan_at_level(sel, lo, hi, index_kvs)) {
+            return err;
+        }
+        // (b) For each live index entry, decode the PK from the entry key and POINT-GET
+        // the row. A tombstoned index entry (a stale slot a DROP/UPDATE retired) is
+        // skipped; a point-get that misses (the row was deleted but the index entry is
+        // momentarily a tombstone — never happens within one committed snapshot since
+        // maintenance is atomic) is skipped fail-safe. PK-ascending is NOT guaranteed by
+        // the index (it is COL-ascending); the pipeline re-sorts via ORDER BY / the PK
+        // tie-break, and the no-ORDER-BY case is handled below.
+        std::vector<std::pair<Datum, std::vector<Datum>>> fetched;  // (pk, row)
+        for (const storage::KeyValue& ikv : index_kvs) {
+            if (is_tombstone(ikv.second)) {
+                continue;
+            }
+            const Datum pk = decode_index_entry_pk(t, plan.index->id, ikv.first);
+            const Key rkey = encode_key(t, pk);
+            const ReadResult rv = point_get_at_level(sel, rkey);
+            if (!rv.has_value() || is_tombstone(*rv)) {
+                continue;  // index entry with no live row (defensive; atomicity prevents)
+            }
+            fetched.emplace_back(pk, decode_row_projected(t, rkey, *rv, need));
+        }
+        // (c) Emit rows in PK-ASCENDING order so the index path is byte-identical to the
+        // full-scan path (which yields PK-ascending) BEFORE the pipeline's ORDER BY /
+        // DISTINCT / aggregation. The conformance gate compares the two — same rows,
+        // same order. Sort by the order-preserving PK key bytes (total + deterministic).
+        std::stable_sort(fetched.begin(), fetched.end(),
+                         [](const auto& x, const auto& y) {
+                             return encode_pk(x.first) < encode_pk(y.first);
+                         });
+        rows_out.reserve(fetched.size());
+        for (auto& [pk, row] : fetched) {
+            (void)pk;
+            rows_out.push_back(std::move(row));
+        }
+        return std::nullopt;
+    }
+
+    // Decode the PK datum from an index ENTRY key. The entry is
+    // index_prefix ++ encode_index_col(col) ++ encode_pk(pk); skip the prefix, then the
+    // self-delimiting col token, leaving the PK suffix which decodes per the PK type.
+    [[nodiscard]] static Datum decode_index_entry_pk(const Table& t,
+                                                     std::uint32_t index_id,
+                                                     const Key& entry) {
+        const std::size_t prefix_len = index_prefix(t.id, index_id).size();
+        std::size_t off = prefix_len;
+        // Skip the self-delimiting col token. We need the indexed column's TYPE to skip
+        // it; recover the type from the index id.
+        Type ctype = Type::Int;
+        for (const Index& ix : t.indexes) {
+            if (ix.id == index_id) {
+                ctype = t.columns[ix.column].type;
+                break;
+            }
+        }
+        if (ctype == Type::Int) {
+            off += 9;  // put_pk_int width (sign byte + be64)
+        } else {
+            // Skip the escaped TEXT token up to the 0x00 0x00 terminator.
+            while (off + 1 < entry.size()) {
+                if (entry[off] == '\0') {
+                    if (entry[off + 1] == '\0') {
+                        off += 2;  // terminator
+                        break;
+                    }
+                    off += 2;  // escaped 0x00 0x01
+                } else {
+                    off += 1;
+                }
+            }
+        }
+        // The remaining suffix is encode_pk(pk). Reuse decode_pk by reconstructing a
+        // full row key: table_prefix ++ suffix (decode_pk strips the 6-byte prefix).
+        const std::string pk_suffix = entry.substr(off);
+        const Key row_key = table_prefix(t.id) + pk_suffix;
+        return decode_pk(t, row_key);
+    }
+
+    // Index range scan at the SELECT's D5 level. Mirrors run_select_at_level but reads
+    // the index key namespace [lo, hi). Returns the raw index KV entries.
+    [[nodiscard]] std::optional<std::string> run_index_scan_at_level(
+        const SelectStmt& sel, const Key& lo, const Key& hi,
+        std::vector<storage::KeyValue>& kvs) {
+        switch (sel.level) {
+            case Level::StrictSerializable: {
+                Query<Strict> q;
+                q.scan(lo, hi);
+                collect(db_.run(q), kvs);
+                return std::nullopt;
+            }
+            case Level::Snapshot: {
+                Query<Snapshot> q = snapshot_query(sel.snapshot_version);
+                q.scan(lo, hi);
+                collect(db_.run(q), kvs);
+                return std::nullopt;
+            }
+            case Level::BoundedStaleness: {
+                Query<Bounded> q = bounded_query(sel.max_lag);
+                q.scan(lo, hi);
+                collect(db_.run(q, /*replica_lag=*/0), kvs);
+                return std::nullopt;
+            }
+            case Level::ReadYourWrites: {
+                Query<RYW> q = ryw_query(sel.session);
+                q.scan(lo, hi);
+                collect(db_.run(q, /*replica_lag=*/0, /*session_last_write=*/tip_), kvs);
+                return std::nullopt;
+            }
+        }
+        return std::string("unsupported consistency level");
+    }
+
+    // A point-get of one row key at the SELECT's D5 level (the index path's per-PK row
+    // fetch). Returns the committed value (incl. a tombstone) or nullopt if absent.
+    [[nodiscard]] ReadResult point_get_at_level(const SelectStmt& sel, const Key& key) {
+        std::vector<storage::KeyValue> kvs;
+        switch (sel.level) {
+            case Level::StrictSerializable: {
+                Query<Strict> q;
+                q.get(key);
+                collect(db_.run(q), kvs);
+                break;
+            }
+            case Level::Snapshot: {
+                Query<Snapshot> q = snapshot_query(sel.snapshot_version);
+                q.get(key);
+                collect(db_.run(q), kvs);
+                break;
+            }
+            case Level::BoundedStaleness: {
+                Query<Bounded> q = bounded_query(sel.max_lag);
+                q.get(key);
+                collect(db_.run(q, /*replica_lag=*/0), kvs);
+                break;
+            }
+            case Level::ReadYourWrites: {
+                Query<RYW> q = ryw_query(sel.session);
+                q.get(key);
+                collect(db_.run(q, /*replica_lag=*/0, /*session_last_write=*/tip_), kvs);
+                break;
+            }
+        }
+        for (const storage::KeyValue& kv : kvs) {
+            if (kv.first == key) {
+                return kv.second;
+            }
+        }
+        return std::nullopt;
+    }
+
     // The fast path requires the PK WHERE's literal to match the PK column TYPE (a
     // TEXT literal compared to an INT PK is a general filter, never the encoded
     // range), AND the predicate to be PURELY that PK comparison (no extra AND/OR).
@@ -1981,16 +2406,31 @@ private:
         return std::nullopt;
     }
 
-    // Commit ONE precomputed key->value write (the statement's already-decided effect)
-    // through the verified executor, then apply its committed write-set incrementally
-    // to the live store. The txn body is a PURE writer (no read) — V-DET-USER holds —
-    // so a single-txn batch over the empty executor store is correct (the decision was
-    // already made by read_committed over the live store).
-    void commit_write(const Key& key, const Value& value) {
+    // Commit a SET OF precomputed key->value writes (the statement's already-decided
+    // effect — the row write PLUS its secondary-index entry writes) ATOMICALLY in ONE
+    // txn through the verified executor, then apply its committed write-set
+    // incrementally to the live store. ATOMIC INDEX MAINTENANCE: the row and every
+    // index entry land in the SAME committed write-set, so the index can NEVER diverge
+    // from the table after a committed write (no torn/stale index — the durability +
+    // atomicity is the existing verified txn path). The body is a PURE writer (no read)
+    // — V-DET-USER holds — so a single-txn batch over the empty executor store is
+    // correct (the read-modify-write decision was already made over the live store).
+    void commit_writes(const std::vector<std::pair<Key, Value>>& kvs) {
         TxnFn fn;
         fn.id = next_txn_id_++;
-        fn.declared = reads(declare::strict(key));
-        fn.body = [key, value](TxnContext& ctx) { ctx.write(key, value); };
+        std::vector<txn::Read> decl;
+        decl.reserve(kvs.size());
+        for (const auto& [k, v] : kvs) {
+            (void)v;
+            decl.push_back(declare::strict(k));
+        }
+        fn.declared = std::move(decl);
+        const std::vector<std::pair<Key, Value>> writes = kvs;
+        fn.body = [writes](TxnContext& ctx) {
+            for (const auto& [k, v] : writes) {
+                ctx.write(k, v);
+            }
+        };
 
         txn::ExecConfig cfg;  // defaults: max_retry=2, replica_lag=0
         const SubmitResult sr = db_.submit(fn, cfg);
@@ -1999,6 +2439,11 @@ private:
                 tip_ = db_.apply_committed(c.writes_committed);
             }
         }
+    }
+
+    // Convenience: a single-key write (back-compat for the index-only DDL paths).
+    void commit_write(const Key& key, const Value& value) {
+        commit_writes({{key, value}});
     }
 
     Catalog catalog_;

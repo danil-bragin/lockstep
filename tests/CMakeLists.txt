@@ -993,6 +993,28 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME sql_join_test COMMAND lockstep_sql_join_test)
+
+  # sql_index_test (SQL secondary indexes): CREATE INDEX + INSERT/UPDATE/DELETE with
+  # atomic index maintenance + the planner index access path (indexed eq / BETWEEN ->
+  # index range scan -> point-get -> residual predicate). Each indexed query is cross-
+  # checked == an INDEPENDENT reference model (no indexes) over a seeded workload:
+  # the indexed result == the full-scan/reference result (an index is an access path,
+  # not a semantic change). The TEETH catch a deliberately STALE index (skipped UPDATE
+  # maintenance) + a dropped residual predicate. Determinism byte-identical. Still pure
+  # sugar (KV pairs + planner) over the verified scan/get/range surface.
+  add_executable(lockstep_sql_index_test sql_index_test.cpp)
+  target_include_directories(lockstep_sql_index_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_index_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_index_test COMMAND lockstep_sql_index_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "

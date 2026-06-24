@@ -1123,3 +1123,72 @@ LOCKSTEP_SQL_SEEDS=300 build/sqlopt/tests/lockstep_sql_conformance_test
 - **The residual near-quadratic is storage (protected) — FLAGGED, not fixed**: the WalEngine
   memtable linear-scan lookup. Fixing it (binary search) is the next lever and needs the full
   verified-dir methodology.
+
+# SQL-INDEXES — secondary-index access path (O(N) full scan → O(log N + matches))
+
+> **SQL FEATURE + PERF PATH, SQL-LAYER ONLY.** Touches `query/sql/{Catalog,Ast,Parser,
+> Engine}.hpp` (+ `bench/sql_bench_main.cpp`, `tests/sql_index_test.cpp`). **core / sim /
+> consensus / txn / storage UNCHANGED and `query::Database` / `query::Query` UNCHANGED**
+> (git diff over those is EMPTY). Secondary indexes are extra KV pairs in the SAME store
+> plus SQL-layer planner logic; index maintenance rides the existing verified txn submit.
+> The load-bearing gate is `sql_index_test`: an indexed WHERE returns rows IDENTICAL to the
+> full-scan / reference-model answer (an index is an access path, not a semantic change).
+
+## What changed
+
+- **CREATE INDEX `<name>` ON `<t>` (`<col>`)** (single-column secondary index; multi-col is
+  OUT, fail-closed). Index entry KV: key = `"i"++be32(table_id)++":"++be32(index_id)++":"`
+  `++ encode_index_col(col_value) ++ encode_pk(pk)`, value = empty. `encode_index_col` is
+  ORDER-PRESERVING + SELF-DELIMITING (INT = the fixed-width signed key; TEXT = 0x00-escaped
+  with a 0x00 0x00 terminator), so a Database range scan over the index prefix yields
+  `(col, pk)` col-ascending — exactly an index range. PK appended ⇒ duplicate col values stay
+  distinct + sorted.
+- **Atomic maintenance**: INSERT writes the row + its index entries; DELETE tombstones row +
+  entries; UPDATE removes old + writes new entries — all in ONE committed txn (`commit_writes`),
+  so the index can never diverge from the table after a committed write.
+- **Planner access path**: `indexed_col = v` / `indexed_col BETWEEN a AND b` (incl. a term
+  under a top-level AND) ⇒ range-scan the index for the col range, point-get each row, then
+  apply the FULL filter as the RESIDUAL predicate. Falls back to full scan otherwise.
+
+## Numbers (Apple M4 Pro, macOS host, -O2 release, in-memory, N=2000 rows)
+
+A SELECTIVE WHERE on the indexed `sal` column (sal ∈ [0,1000), ~N/1000 matches per eq), the
+SAME query timed against the indexed engine (index path) vs the plain engine (full scan).
+**Checksums are IDENTICAL between the index and scan variants** — proof the index returns the
+SAME rows (a transparent access path), so the speedup is honest.
+
+| shape                          | iters   | index path | full scan  | speedup | checksum (both)    |
+|--------------------------------|---------|-----------|-----------|---------|--------------------|
+| `WHERE sal = 500` (eq)         | 20 000  | **1.73 s** | 116.24 s  | **~67×** | `41bf0b35f6919483` |
+| `WHERE sal BETWEEN 480 AND 520`| 500     | **0.27 s** | 3.10 s    | **~11×** | `1e27b637c0391073` |
+
+(Table build is ~0.02 s/engine — negligible vs the query work above; the eq run at 20 000 iters
+is query-dominated.) O(N) full scan reads all N rows + filters; the index reads ~matches rows
+(range scan + point-get). The win GROWS with N and with selectivity.
+
+## Conformance (the load-bearing gate)
+
+| test | sweep | result |
+|------|-------|--------|
+| `sql_index_test`        | 128 | ALL PASS (indexed == full-scan/reference; atomic INSERT/UPDATE/DELETE maintenance; order-preserving + residual; transparency idx==scan; teeth caught a STALE index + a dropped residual) |
+| `sql_conformance_test`  | 32  | ALL PASS (no regression) |
+| `sql_aggregates_test`   | 48  | ALL PASS (no regression) |
+| `sql_join_test`         | 40  | ALL PASS (no regression) |
+| `query_conformance_test`| 64  | ALL PASS (Database/Query surface unchanged) |
+
+Determinism: two bench runs byte-identical; index path emits rows PK-ascending (== full scan).
+**ASan + LSan: clean. UBSan: clean** (all SQL tests). Protected dirs (core/sim/consensus/txn/
+storage + Database/Query): **git diff EMPTY**.
+
+## Reproduce
+
+```
+cmake --preset release && cmake --build build/release -j6 --target lockstep_sql_bench_driver
+B=build/release/bench/lockstep_sql_bench_driver
+/usr/bin/time -p $B --rows 2000 --only "idx  eq"    # index eq
+/usr/bin/time -p $B --rows 2000 --only "scan eq"    # full-scan eq (same checksum)
+/usr/bin/time -p $B --rows 2000 --iters 500 --only "idx  rng"
+/usr/bin/time -p $B --rows 2000 --iters 500 --only "scan rng"
+cmake --preset asan && cmake --build build/asan -j6 --target lockstep_sql_index_test
+LOCKSTEP_SQL_SEEDS=128 build/asan/tests/lockstep_sql_index_test
+```

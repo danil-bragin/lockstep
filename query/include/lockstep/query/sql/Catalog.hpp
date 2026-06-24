@@ -76,14 +76,51 @@ struct Column {
     Type type = Type::Int;
 };
 
+// A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
+// is OUT, FLAG). Each index has a dense per-table id => its own key-prefix namespace
+// (disjoint from the table-row namespace, which uses the 't' prefix; indexes use 'i').
+// An index entry is a KV pair: key = index_prefix(table_id, index_id) ++
+// encode_index_col(col_value) ++ encode_pk(pk), value = empty. The order-preserving,
+// self-delimiting col encoding makes a Database range scan over the index prefix yield
+// (col_value, pk) in col-ASCENDING order — exactly what an index range access needs.
+struct Index {
+    std::string name;           // the index name (unique within the table)
+    std::uint32_t id = 0;       // dense per-table index id => the index key namespace
+    std::size_t column = 0;     // the indexed column (its schema index)
+};
+
 // A table schema: an ordered column list + the PK column index (single-column PK).
 struct Table {
     std::string name;
     std::uint32_t id = 0;  // dense table id => the key-prefix namespace
     std::vector<Column> columns;
     std::size_t pk_index = 0;  // which column is the (single) PRIMARY KEY
+    std::vector<Index> indexes;       // secondary indexes (in CREATE order)
+    std::uint32_t next_index_id = 1;  // dense index-id assignment (0 reserved)
 
     [[nodiscard]] const Column& pk() const { return columns[pk_index]; }
+
+    // Find a secondary index BY the column it covers; returns it or nullptr. (v1:
+    // single-column indexes, so at most one index per column is used by the planner —
+    // the FIRST index found on the column wins, deterministic CREATE order.)
+    [[nodiscard]] const Index* index_for_column(std::size_t col) const {
+        for (const Index& ix : indexes) {
+            if (ix.column == col) {
+                return &ix;
+            }
+        }
+        return nullptr;
+    }
+
+    // Find a secondary index by name (DROP INDEX / dup-name detection).
+    [[nodiscard]] const Index* index_by_name(const std::string& nm) const {
+        for (const Index& ix : indexes) {
+            if (ix.name == nm) {
+                return &ix;
+            }
+        }
+        return nullptr;
+    }
 
     // Find a column by name; returns its index or nullopt (unknown column).
     [[nodiscard]] std::optional<std::size_t> column_index(const std::string& col) const {
@@ -209,6 +246,88 @@ inline void put_pk_int(std::string& out, std::int64_t v) {
 // The full storage key for a row identified by its PK datum.
 [[nodiscard]] inline Key encode_key(const Table& t, const Datum& pk) {
     return table_prefix(t.id) + encode_pk(pk);
+}
+
+// ----------------------------------------------------------------------------
+// SECONDARY-INDEX KEY ENCODING (order-preserving + self-delimiting).
+//
+// An index lives in a DISJOINT key namespace from the table rows: the row namespace
+// is "t" ++ be32(table_id) ++ ":"; the index namespace is
+//   index_prefix = "i" ++ be32(table_id) ++ ":" ++ be32(index_id) ++ ":"
+// so a Database range scan over one index's prefix enumerates ONLY that index's
+// entries, key-ascending. ('i' != 't' => the table-row scan never sees index keys,
+// and vice-versa; the row scan bound table_prefix_end stays exact.)
+//
+// An index entry KEY = index_prefix ++ encode_index_col(col_value) ++ encode_pk(pk).
+// The value is EMPTY. The col value is encoded ORDER-PRESERVING and SELF-DELIMITING so
+// the variable-length PK suffix can never be confused with the col value:
+//   INT  -> put_pk_int (fixed 9 bytes, order-preserving — already self-delimiting).
+//   TEXT -> each 0x00 byte escaped as 0x00 0x01, then a 0x00 0x00 terminator. The
+//           terminator (0x00 0x00) sorts BEFORE any escaped data byte (0x00 0x01..),
+//           so byte order == lexicographic value order AND the token is unambiguously
+//           delimited from the PK suffix. (Standard order-preserving escaped encoding.)
+// => entries for one col value v share the EXACT key prefix index_prefix++col_enc(v),
+//    differing only in the PK suffix => an equality lookup is a half-open prefix scan
+//    [index_prefix++col_enc(v), successor(index_prefix++col_enc(v))); a BETWEEN [a,b]
+//    is [index_prefix++col_enc(a), successor(index_prefix++col_enc(b))).
+// ----------------------------------------------------------------------------
+
+[[nodiscard]] inline Key index_prefix(std::uint32_t table_id, std::uint32_t index_id) {
+    Key k = "i";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, index_id);
+    k.push_back(':');
+    return k;
+}
+
+// Order-preserving, self-delimiting encode of an indexed COLUMN value (NOT the PK).
+inline void put_index_col(std::string& out, const Datum& d) {
+    if (d.type == Type::Int) {
+        put_pk_int(out, d.i);  // fixed-width 9 bytes, order-preserving
+        return;
+    }
+    for (const char c : d.s) {
+        out.push_back(c);
+        if (c == '\0') {
+            out.push_back('\x01');  // escape: 0x00 -> 0x00 0x01
+        }
+    }
+    out.push_back('\0');
+    out.push_back('\0');  // terminator 0x00 0x00 (sorts before any escaped byte)
+}
+
+[[nodiscard]] inline Key encode_index_col(const Datum& d) {
+    Key out;
+    put_index_col(out, d);
+    return out;
+}
+
+// The full index ENTRY key for (col_value, pk). value is empty (the PK lives in the key).
+[[nodiscard]] inline Key encode_index_entry(std::uint32_t table_id, const Index& ix,
+                                            const Datum& col_value, const Datum& pk) {
+    Key k = index_prefix(table_id, ix.id);
+    put_index_col(k, col_value);
+    k += encode_pk(pk);
+    return k;
+}
+
+// The byte-string SUCCESSOR of `k`: the smallest key strictly greater than EVERY key
+// that has `k` as a prefix. Increment the last byte that is < 0xFF, dropping trailing
+// 0xFF bytes (carry). If `k` is all 0xFF, returns empty (== "no upper bound"); callers
+// pair this with the table/index namespace so an empty successor never under-scans in
+// practice. Used to turn a prefix into a half-open [k, successor(k)) range.
+[[nodiscard]] inline Key key_successor(const Key& k) {
+    Key out = k;
+    while (!out.empty()) {
+        const auto last = static_cast<unsigned char>(out.back());
+        if (last != 0xFF) {
+            out.back() = static_cast<char>(last + 1);
+            return out;
+        }
+        out.pop_back();  // 0xFF carries: drop it and bump the next byte
+    }
+    return out;  // all 0xFF => empty (unbounded above)
 }
 
 // Decode the PK datum from a storage key (strip the table prefix, decode the
@@ -341,6 +460,13 @@ public:
     }
 
     [[nodiscard]] const Table* find(const std::string& name) const {
+        const auto it = tables_.find(name);
+        return it == tables_.end() ? nullptr : &it->second;
+    }
+
+    // Mutable table lookup (for index DDL — CREATE/DROP INDEX edits the schema's
+    // `indexes` list). Deterministic: the catalog is an ordered map.
+    [[nodiscard]] Table* find_mut(const std::string& name) {
         const auto it = tables_.find(name);
         return it == tables_.end() ? nullptr : &it->second;
     }

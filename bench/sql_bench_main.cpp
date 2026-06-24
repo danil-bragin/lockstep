@@ -131,6 +131,17 @@ SqlEngine build_table(std::uint64_t n) {
     return eng;
 }
 
+// Build the same N-row table, then CREATE secondary indexes on `sal` (INT) and `dept`
+// (TEXT). The indexed-WHERE bench shapes then take the index access path (range-scan
+// the index for the matching col range -> point-get -> residual filter) instead of the
+// O(N) full scan — so a side-by-side index-vs-scan timing shows the access-path win.
+SqlEngine build_indexed_table(std::uint64_t n) {
+    SqlEngine eng = build_table(n);
+    (void)eng.exec("CREATE INDEX idx_sal ON emp (sal)");    // backfills N rows
+    (void)eng.exec("CREATE INDEX idx_dept ON emp (dept)");
+    return eng;
+}
+
 // One benchmark shape: a label + the SQL + how many times to repeat it.
 struct Shape {
     std::string label;
@@ -201,6 +212,21 @@ std::vector<Shape> full_shapes(std::uint64_t n) {
     };
 }
 
+// INDEX-vs-SCAN shapes: a SELECTIVE WHERE on the indexed `sal` column. The SAME query
+// is timed twice — once against the indexed engine (index access path: O(log N + matches))
+// and once against the plain engine (full scan + filter: O(N)). With the index the work
+// per query is proportional to the (few) matching rows; the scan reads all N. Run with
+// the indexed engine for the "idx" variants and the plain engine for the "scan" variants.
+std::vector<Shape> index_eq_shape(std::uint64_t /*n*/) {
+    // sal in [0,1000); an eq match averages ~N/1000 rows (selective).
+    return {{"sal=500", "SELECT id, sal FROM emp WHERE sal = 500", 20000}};
+}
+std::vector<Shape> index_range_shape(std::uint64_t /*n*/) {
+    // A narrow range (~4% of the value space) — selective vs the full scan.
+    return {{"sal BETWEEN 480 AND 520",
+             "SELECT id, sal FROM emp WHERE sal BETWEEN 480 AND 520", 5000}};
+}
+
 std::vector<Shape> smoke_shapes(std::uint64_t n) {
     return {
         {"point", "SELECT id FROM emp WHERE id = " + std::to_string(n / 2), 50},
@@ -267,6 +293,29 @@ int main(int argc, char** argv) {
         }
     }
 
+    // INDEX-vs-SCAN comparison (the secondary-index perf path). Build a SECOND engine
+    // WITH indexes on sal/dept; run the selective indexed-WHERE shapes against BOTH the
+    // indexed engine (index access path) and the plain engine (full scan + filter), so
+    // the external timer can compare per-op latency. Each line is --only-isolatable
+    // (label "idx " vs "scan"). The index reads ~matches rows; the scan reads all N.
+    SqlEngine ieng = build_indexed_table(n);
+    std::vector<std::pair<std::string, std::pair<SqlEngine*, Shape>>> cmp;
+    if (!smoke) {
+        for (const Shape& s : index_eq_shape(n)) {
+            cmp.push_back({"idx  eq   " + s.label, {&ieng, s}});
+            cmp.push_back({"scan eq   " + s.label, {&eng, s}});
+        }
+        for (const Shape& s : index_range_shape(n)) {
+            cmp.push_back({"idx  rng  " + s.label, {&ieng, s}});
+            cmp.push_back({"scan rng  " + s.label, {&eng, s}});
+        }
+    }
+    if (iters_override != 0) {
+        for (auto& c : cmp) {
+            c.second.second.iters = iters_override;
+        }
+    }
+
     std::printf("====================================================================\n");
     std::printf(" Lockstep SQL micro-bench (v2 surface) — parse/plan/execute BASELINE%s\n",
                 smoke ? "  [SMOKE]" : "");
@@ -301,6 +350,21 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(sh.iters),
                     static_cast<unsigned long long>(cs));
     }
+    // INDEX-vs-SCAN comparison block (selective WHERE on the indexed sal column).
+    if (!cmp.empty()) {
+        std::printf("------ INDEX vs FULL-SCAN (selective WHERE on indexed sal) --------\n");
+        for (const auto& [label, eng_shape] : cmp) {
+            if (!only.empty() && label.find(only) == std::string::npos) {
+                continue;
+            }
+            const std::uint64_t cs = run_shape(*eng_shape.first, eng_shape.second);
+            total_iters += eng_shape.second.iters;
+            std::printf(" %-38s iters=%-8llu checksum=%016llx\n", label.c_str(),
+                        static_cast<unsigned long long>(eng_shape.second.iters),
+                        static_cast<unsigned long long>(cs));
+        }
+    }
+
     std::printf("--------------------------------------------------------------------\n");
     std::printf(" total query executions (excl. parse-only) + parse iters = %llu\n",
                 static_cast<unsigned long long>(total_iters));
