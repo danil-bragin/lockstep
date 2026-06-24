@@ -1260,6 +1260,26 @@ if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
   set_tests_properties(prod_replicated_shards PROPERTIES TIMEOUT 240)
 endif()
 
+# --- Phase 10 OBSERVABILITY: metrics reality-check (V-METRICS-REAL) [LINUX] ---
+# P10 gate. Brings up a REAL 3-process lockstepd cluster, drives a known workload of N
+# durable submits, scrapes the new METRICS verb in Prometheus exposition format, and
+# asserts the metrics REFLECT REALITY (the teeth — a metric that doesn't track the real
+# event is a bug): (1) METRICS returns valid Prometheus text per node; (2) role/term/
+# commit_index gauges == STATUS; (3) submits_committed counter tracks the values actually
+# committed; (4) leader_changes bumps when the leader is SIGKILLed and a new one is
+# elected. PROCESS-CLEANUP: trap SIGKILLs every tracked child on every path; each
+# lockstepd self-deadlines (--run-seconds). BOUNDED throughout. Built ONLY on Linux (needs
+# lockstepd + lockstep_admin); the macOS host stays green (test absent).
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
+  add_test(
+    NAME prod_metrics_test
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_metrics_test.sh)
+  set_tests_properties(prod_metrics_test PROPERTIES TIMEOUT 180)
+endif()
+
 # --- Harness liveness invariant (orchestrator) -------------------------------
 # Every test is WALL-CLOCK BOUNDED. A non-terminating run (infinite loop /
 # livelock — e.g. a broken binary search) must surface as a CTest FAILURE, never
