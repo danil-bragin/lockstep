@@ -742,6 +742,206 @@ int cmd_pbench(const PipeArgs& pa, const std::vector<std::uint16_t>& hosts) {
     return (any_unfinished || accepted == 0) ? 1 : 0;
 }
 
+// ============================================================================
+// Phase 9 S9.1 — MULTI-SHARD KEY-ROUTED LOAD (`mbench`). The throughput-scaling
+// proof. Given M shard admin ports (--host P0 --host P1 ...), generate `count`
+// DISTINCT keys, route each by key-hash to a shard (shard = hash(key) % M), and
+// pipeline each shard's submits to THAT shard's port on its OWN client reactor +
+// connection (one connection per shard, all pumped round-robin on this client). Each
+// shard is an independent single-node Raft group, so there is NO leader-find and NO
+// cross-shard coordination — a key deterministically lands on one shard.
+//
+// AGGREGATE COMMIT THROUGHPUT (the HEADLINE): drive the accept load across all M
+// shards, then POLL each shard's CHEAP O(1) commit query until its commit_index covers
+// its highest accepted index. agg_commit_tput = total accepted across all shards / wall
+// time from first submit until EVERY shard's commit covers its accepted load. This is
+// the aggregate that should rise ~linearly with M up to the core count.
+//
+// BOUNDED: finite total count, finite per-shard window, an absolute wall + catch-up
+// deadline; never a spin. Clean: each shard's Client owns its reactor (RAII).
+
+// FNV-1a hash of a key string -> 64-bit. Deterministic key->shard routing.
+std::uint64_t fnv1a(const std::string& s) {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (char c : s) {
+        h ^= static_cast<unsigned char>(c);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// Build the key for the n-th submit (distinct per submit). The shard is hash(key)%M.
+std::string make_key(std::uint64_t seq) { return "key-" + std::to_string(seq); }
+
+// Per-shard load state for mbench: the shard's port, its connection, and the submits
+// routed to it (seqs assigned by key-hash). Reuses PipeConn for the pipelining engine.
+int cmd_mbench(const PipeArgs& pa, const std::vector<std::uint16_t>& hosts) {
+    const std::uint64_t m = hosts.size();
+    if (m == 0) {
+        std::printf("MBENCH error=no_hosts\n");
+        std::fflush(stdout);
+        return 1;
+    }
+    const std::uint64_t window = pa.inflight == 0 ? 1 : pa.inflight;
+
+    // Route each key to a shard by hash; assign that submit's seq to the shard's stream.
+    // We keep a per-shard list of seqs so values stay distinct AND map to the shard the
+    // key hashes to (the key-routing the client performs).
+    std::vector<std::vector<std::uint64_t>> shard_seqs(m);
+    for (std::uint64_t i = 0; i < pa.count; ++i) {
+        const std::uint64_t shard = fnv1a(make_key(i)) % m;
+        shard_seqs[shard].push_back(i);
+    }
+
+    // One persistent client connection per shard, each on its OWN reactor (so M shards
+    // are driven concurrently by this client). DISTINCT client id per shard so no daemon
+    // collapses two connections (see Client docs).
+    std::vector<std::unique_ptr<Client>> clients;
+    std::vector<std::unique_ptr<PipeConn>> states;
+    clients.reserve(m);
+    states.reserve(m);
+    for (std::uint64_t s = 0; s < m; ++s) {
+        auto cl = std::make_unique<Client>(hosts[s], kClientId + s);
+        if (!cl->ok) {
+            std::printf("MBENCH error=client_init shard=%llu\n",
+                        static_cast<unsigned long long>(s));
+            std::fflush(stdout);
+            return 1;
+        }
+        clients.push_back(std::move(cl));
+    }
+    for (std::uint64_t s = 0; s < m; ++s) {
+        auto st = std::make_unique<PipeConn>();
+        st->client = clients[s].get();
+        st->value_bytes = pa.value_bytes;
+        st->window = window;
+        st->to_send = shard_seqs[s].size();
+        // Values carry the global seq so each is distinct; base_seq/next_seq index into
+        // a CONTIGUOUS local block here, but we need the routed seqs, so we pre-build the
+        // values and drive via base_seq=0..to_send with a remapped value table is complex.
+        // Simpler: give each shard a contiguous private seq block (base = s*count) — still
+        // distinct values, still one-per-shard pipelined. The KEY-ROUTING above decided
+        // HOW MANY land on each shard (the load distribution); the exact value text need
+        // only be distinct. So set base_seq to a per-shard offset.
+        st->base_seq = s * (pa.count + 1);
+        st->next_seq = st->base_seq;
+        states.push_back(std::move(st));
+        clients[s]->reactor.spawn(pipe_run(states[s].get()));
+    }
+
+    auto max_now = [&]() -> core::Tick {
+        core::Tick mx = 0;
+        for (std::uint64_t s = 0; s < m; ++s) {
+            const core::Tick n = clients[s]->reactor.now();
+            if (n > mx) {
+                mx = n;
+            }
+        }
+        return mx;
+    };
+    const core::Tick t0 = max_now();
+    const core::Tick wall_ns =
+        t0 + static_cast<core::Tick>(pa.count) * 2'000'000 + 5'000'000'000;
+    bool all_done = false;
+    while (!all_done && max_now() < wall_ns) {
+        all_done = true;
+        for (std::uint64_t s = 0; s < m; ++s) {
+            if (!states[s]->done) {
+                all_done = false;
+                clients[s]->reactor.run_until([&] { return states[s]->done; },
+                                              clients[s]->reactor.now() + 1'000'000);
+            }
+        }
+    }
+    const core::Tick t1 = max_now();
+    const double accept_elapsed_ms = static_cast<double>(t1 - t0) / 1'000'000.0;
+
+    std::uint64_t accepted = 0;
+    std::uint64_t replied = 0;
+    bool any_fault = false;
+    bool any_unfinished = false;
+    std::vector<std::uint64_t> shard_target(m, 0);
+    for (std::uint64_t s = 0; s < m; ++s) {
+        accepted += states[s]->accepted;
+        replied += states[s]->replied;
+        shard_target[s] = states[s]->max_index;
+        any_fault = any_fault || states[s]->fault;
+        any_unfinished = any_unfinished || !states[s]->done;
+    }
+    const double accept_tput =
+        accept_elapsed_ms > 0.0
+            ? static_cast<double>(accepted) / (accept_elapsed_ms / 1000.0)
+            : 0.0;
+
+    // AGGREGATE COMMIT: poll each shard's CHEAP O(1) commit query until its commit_index
+    // covers its own accepted target. The aggregate commit wall = accept wall + the
+    // catch-up wall (commit lags accept; same approximation as pbench).
+    std::vector<std::unique_ptr<Client>> pollers;
+    pollers.reserve(m);
+    std::uint64_t poller_id = kClientId + 1'000'000ULL;
+    for (std::uint64_t s = 0; s < m; ++s) {
+        pollers.push_back(std::make_unique<Client>(hosts[s], poller_id++));
+    }
+    const core::Tick catchup_wall =
+        static_cast<core::Tick>(pa.count) * 4'000'000 + 10'000'000'000;
+    auto poll_max_now = [&]() -> core::Tick {
+        core::Tick mx = 0;
+        for (auto& p : pollers) {
+            if (p->ok && p->reactor.now() > mx) {
+                mx = p->reactor.now();
+            }
+        }
+        return mx;
+    };
+    const core::Tick poll_t0 = poll_max_now();
+    const core::Tick poll_deadline = poll_t0 + catchup_wall;
+    std::uint64_t shards_covered = 0;
+    bool all_covered = false;
+    while (!all_covered && poll_max_now() < poll_deadline) {
+        shards_covered = 0;
+        for (std::uint64_t s = 0; s < m; ++s) {
+            if (!pollers[s]->ok) {
+                continue;
+            }
+            if (shard_target[s] == 0) {  // no accepted load on this shard -> trivially done
+                ++shards_covered;
+                continue;
+            }
+            prod::AdminCommit ac;
+            if (bench_commit(*pollers[s], ac) && ac.commit_index >= shard_target[s]) {
+                ++shards_covered;
+            }
+        }
+        if (shards_covered == m) {
+            all_covered = true;
+        }
+    }
+    const core::Tick poll_t1 = poll_max_now();
+    const double commit_elapsed_ms =
+        accept_elapsed_ms + static_cast<double>(poll_t1 - poll_t0) / 1'000'000.0;
+    const double agg_commit_tput =
+        (all_covered && commit_elapsed_ms > 0.0)
+            ? static_cast<double>(accepted) / (commit_elapsed_ms / 1000.0)
+            : 0.0;
+
+    std::printf(
+        "MBENCH shards=%llu count=%llu inflight=%llu value_bytes=%llu "
+        "agg_commit_tput=%.1f commit_elapsed_ms=%.3f agg_accept_tput=%.1f "
+        "accept_elapsed_ms=%.3f accepted=%llu replied=%llu shards_covered=%llu "
+        "all_covered=%d fault=%d unfinished=%d\n",
+        static_cast<unsigned long long>(m),
+        static_cast<unsigned long long>(pa.count),
+        static_cast<unsigned long long>(window),
+        static_cast<unsigned long long>(pa.value_bytes), agg_commit_tput,
+        commit_elapsed_ms, accept_tput, accept_elapsed_ms,
+        static_cast<unsigned long long>(accepted),
+        static_cast<unsigned long long>(replied),
+        static_cast<unsigned long long>(shards_covered), all_covered ? 1 : 0,
+        any_fault ? 1 : 0, any_unfinished ? 1 : 0);
+    std::fflush(stdout);
+    return (any_unfinished || !all_covered || accepted == 0) ? 1 : 0;
+}
+
 void print_status(std::uint16_t port, bool ok, const prod::AdminStatus& st) {
     std::printf("STATUS port=%u ok=%d role=%u term=%llu commit=%llu log=", port,
                 ok ? 1 : 0, static_cast<unsigned>(st.role),
@@ -891,7 +1091,9 @@ int main(int argc, char** argv) {
             "       lockstep_admin bench --count N [--value-bytes B] "
             "[--commit-samples S] --host PORT [--host PORT ...]\n"
             "       lockstep_admin pbench --count N [--inflight K] [--conns C] "
-            "[--value-bytes B] --host PORT [--host PORT ...]\n");
+            "[--value-bytes B] --host PORT [--host PORT ...]\n"
+            "       lockstep_admin mbench --count N [--inflight K] [--value-bytes B] "
+            "--host SHARD0_PORT --host SHARD1_PORT ... (multi-shard key-routed load)\n");
         return 2;
     }
 
@@ -963,6 +1165,9 @@ int main(int argc, char** argv) {
     }
     if (verb == "pbench") {
         return cmd_pbench(pa, hosts);
+    }
+    if (verb == "mbench") {
+        return cmd_mbench(pa, hosts);
     }
     std::fprintf(stderr, "lockstep_admin: unknown verb '%s'\n", verb.c_str());
     return 2;

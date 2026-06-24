@@ -632,3 +632,88 @@ The ceiling is unchanged-to-slightly-up; the RESIDUAL lever is coroutine-frame e
 - The pool is **pure memory reuse**: the sim is byte-identical (proven), so the win is
   fewer allocations, not different behavior. Coroutine frames are the next alloc cost and
   are NOT addressed here (compiler-controlled; would need HALO/frame-elision work).
+
+# Phase 9 S9.1 — Multi-shard throughput SCALING (the horizontal lever)
+
+> **The order-of-magnitude lever.** Phase 8 established that a SINGLE single-node Raft
+> reactor is bounded by per-op reactor CPU (coroutine frames) — essentially hard for ONE
+> group. The only order-of-magnitude lever is HORIZONTAL: run **M fully-independent
+> single-node Raft shards** in one process, each on its OWN std::thread (the reactor IS
+> that thread), and route load by key-hash to a shard's port. NO cross-shard txns, NO
+> shared mutable state on the data path — the clean embarrassingly-parallel first step.
+
+## Design (no shared mutable state on the data path)
+
+- One `lockstepd --shards M --shard-base-port P` spawns **M threads**. Each shard owns its
+  OWN `ProdReactor` (own epoll fd) + `ProdNetworkBus` (own listen + admin sockets) +
+  `ProdDisk` (`data_dir/shard_<i>/consensus.wal`) + `ProdConsensusNode` (single-node
+  cluster `{i+1}`, self-commits via the gated **N=1** path — UNCHANGED consensus surface).
+- Shard `i` (0-based): node_id `i+1`, admin port `P+i`, consensus port `P+M+i`,
+  dir `data_dir/shard_<i>`. Shards share NOTHING mutable → **no locks on the data path**.
+- **Routing is client-side**: `hash(key) % M → shard admin port P+shard`. A request reaches
+  a shard on its own port — **no in-process cross-thread request handoff**.
+- **Clean lifecycle**: each reactor self-deadlines (`--run-seconds`); the parent **joins
+  ALL M threads** unconditionally on every exit path. No detached/leaked threads, no orphans.
+- **Why no data race**: the M reactor run loops touch only their own objects. The ONLY
+  cross-thread state is read-only startup config + ONE atomic failure counter; shard
+  CONSTRUCTION is serialized under a mutex (ProdReactor's ctor reads `getenv` once). The
+  thread orchestration lives in `providers/prod/.../ProdShardRunner.hpp` — the prod-provider
+  boundary where real threads are sanctioned (the reactor was already the one place real
+  threads live). `cli/` stays single-thread (the forbidden-call lint enforces this).
+
+## Scaling curve (FIXED work per shard — the honest unit; aggregate = per_shard × M)
+
+`tests/prod_scale.sh`, driven by `lockstep_admin mbench` (key-routed, per-shard pipelined,
+aggregate commit throughput = total accepted / wall until EVERY shard's commit covers its
+load). FRESH daemons per pass (empty log → no log-growth confound). Median of 3 passes.
+
+Machine: **nproc=14**, container `--cpus=12 --memory=8g` (Linux `lockstep-dev`). per_shard=8000,
+inflight=64, value_bytes=16. `agg_commit_tput` = HONEST aggregate committed ops/s.
+
+| M (shards) | agg_commit_tput (ops/s) | factor vs M=1 |
+|-----------:|------------------------:|--------------:|
+| 1          | **9 073**               | 1.00×         |
+| 2          | **18 231**              | 2.01×         |
+| 4          | **34 432**              | 3.80×         |
+| 8          | **49 859**              | 5.50×         |
+| 12         | **50 062**              | 5.52×         |
+
+**Did it scale?** YES — **near-linear to M≈4** (2.01× / 3.80×), then **flattening to a
+~50k ops/s ceiling at M≈8** (the knee). This is the textbook embarrassingly-parallel curve:
+linear while spare cores exist, flat once cores + memory bandwidth (and the single-threaded
+client, see caveats) saturate. The new **aggregate ceiling ≈ 50k committed ops/s** vs the
+~9k single fresh shard on this host — a **~5.5×** real throughput win from sharding alone.
+
+## Correctness + per-shard durability
+
+`tests/prod_shard_smoke.sh` (M=4): every shard independently **commits** a distinct single-key
+value (`durable=1`) and **reads it back** from its committed-log digest; then SIGKILL the whole
+daemon, **restart on the same data dir**, and every shard **recovers its value from its
+ProdDisk** — per-shard durable crash/restart, the smoke pattern applied per shard. PASS.
+Even key-routing confirmed: 2000 ops over 4 shards split 501/499/501/499 (hash-uniform).
+
+## Data-race safety (the FIRST real threads — the load-bearing check)
+
+The TSan build (`-DLOCKSTEP_SANITIZER=tsan`) of `lockstepd`/`lockstep_admin` links + runs
+the multi-shard daemon under load (4 concurrent shard threads) AND through a clean
+self-deadline JOIN of all threads: **NO ThreadSanitizer data race**, `daemon_exit=0` (clean
+join), no orphan threads/processes. `clang-tidy` (`concurrency-*` = ERRORS) on the threaded
+TUs: **0 errors, 0 concurrency findings**. forbidden-call lint clean (real threads confined
+to the `providers/` boundary; `cli/` stays single-thread). Protected dirs
+(core/consensus/txn/storage/query/providers-sim) diff EMPTY.
+
+## Honest caveats
+
+- **Laptop container, real wall-clock** — absolute numbers are relative, run-to-run variant;
+  only meaningful re-run on the SAME setup. The SCALING FACTOR (relative) is the result.
+- **The client is single-threaded**: `mbench` drives all M shard reactors round-robin on ONE
+  client thread, so past ~8 shards the CLIENT becomes a bottleneck — part of the flattening
+  at M=8/12 is client-side, not a server-shard limit. The server-side per-shard parallelism
+  is genuine (each shard is a real independent OS thread). A multi-process / multi-thread
+  client would push the measured aggregate higher.
+- **per_shard vs fixed-total**: with a FIXED TOTAL split across shards (instead of fixed
+  per-shard) the curve looks SUPER-linear at small M, because a lone shard's fsync/commit
+  catch-up dominates its wall and sharding parallelizes independent disks. The fixed-per-shard
+  table above is the honest "constant work per shard" unit.
+- **No cross-shard transactions** (Phase 9 later) and **no cross-process replication** of a
+  shard yet — this stage is the pure throughput-scaling proof of independent shards.

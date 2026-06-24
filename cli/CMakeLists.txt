@@ -63,6 +63,10 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
   # here — only the provider surfaces). Links the query lib (wire::Server) + the prod
   # providers (which pull the reactor/network/disk/clock/random).
   if(UNIX AND NOT APPLE AND TARGET lockstep_providers_prod)
+    # Phase 9 S9.1: lockstepd's MULTI-SHARD mode spawns one std::thread per shard (real
+    # threads, allowed ONLY in this prod daemon — providers/prod boundary). Link
+    # Threads::Threads so the pthread runtime is present + TSan instrumentation links.
+    find_package(Threads REQUIRED)
     add_executable(lockstepd lockstepd.cpp)
     target_link_libraries(lockstepd
       PRIVATE
@@ -74,7 +78,8 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_storage
         lockstep_runtime
         lockstep_providers_sim
-        lockstep_providers_prod)
+        lockstep_providers_prod
+        Threads::Threads)
 
     # --- Phase 7 S5b-2: lockstep_admin — the CLUSTER ADMIN CLIENT [LINUX ONLY] -
     # The leader-find client for the multi-PROCESS cluster: dials a node's admin port
