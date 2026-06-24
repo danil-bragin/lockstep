@@ -62,6 +62,32 @@ if(TARGET lockstep_storage AND TARGET lockstep_runtime
         # sweep finishes in well under a second; 90s kills any true hang fast.
         set_tests_properties(bench_smoke PROPERTIES TIMEOUT 90)
     endif()
+
+    # --- SQL micro-bench (v2 SELECT surface): parse/plan/execute BASELINE ----------
+    # A CPU-bound, IN-MEMORY micro-benchmark over the SQL v2 pipeline (parse + plan +
+    # filter/group/aggregate/sort over query::Database). Time is measured EXTERNALLY
+    # (the TU is wall-clock-free / forbidden-lint clean); it runs a FIXED amount of
+    # deterministic work + prints a result checksum (proves real, non-elided work).
+    # Built by the gate; the smoke mode runs as a cheap deterministic ctest. Needs the
+    # query lib (which pulls txn + storage + runtime + sim), NOT the storage bench
+    # harness.
+    if(TARGET lockstep_query)
+        add_executable(lockstep_sql_bench_driver sql_bench_main.cpp)
+        target_link_libraries(lockstep_sql_bench_driver
+            PRIVATE
+                lockstep_warnings
+                lockstep_sanitizers
+                lockstep_query
+                lockstep_txn
+                lockstep_storage
+                lockstep_runtime
+                lockstep_providers_sim)
+        if(BUILD_TESTING)
+            add_test(NAME sql_bench_smoke
+                     COMMAND lockstep_sql_bench_driver --smoke)
+            set_tests_properties(sql_bench_smoke PROPERTIES TIMEOUT 90)
+        endif()
+    endif()
 else()
     message(WARNING
         "lockstep_storage / runtime / providers_sim not all found; bench driver + "

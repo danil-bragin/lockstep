@@ -20,11 +20,22 @@
 //   INSERT INTO t (c, ...) VALUES (v, ...)
 //   UPDATE t SET c = v WHERE pk = v
 //   DELETE FROM t WHERE pk = v
-//   SELECT * | c, ... FROM t [WHERE pk = v | WHERE pk BETWEEN a AND b]
-//                            [AT STRICT | SNAPSHOT n | BOUNDED n | RYW n]
+//   SELECT [DISTINCT] (* | <item>, ...) FROM t
+//          [WHERE <predicate>]                 -- v2: ANY-column boolean tree
+//          [GROUP BY c, ...] [HAVING <agg-pred>]
+//          [ORDER BY c [ASC|DESC], ...] [LIMIT n [OFFSET m]]
+//          [AT STRICT | SNAPSHOT n | BOUNDED n | RYW n]
+//   <item>      ::= <column> | <agg>
+//   <agg>       ::= COUNT(*) | COUNT(c) | SUM(c) | MIN(c) | MAX(c) | AVG(c)
+//   <predicate> ::= or-expr ; or-expr ::= and-expr (OR and-expr)* ;
+//                   and-expr ::= not-expr (AND not-expr)* ;
+//                   not-expr ::= NOT not-expr | primary ;
+//                   primary  ::= '(' or-expr ')' | <column> <cmpop> <literal>
+//                              | <pk> BETWEEN a AND b
+//   <cmpop>     ::= = | != | <> | < | <= | > | >=
 // Literals: a signed integer (e.g. 42, -7) or a single-quoted string ('foo', with
 // '' as an escaped quote). Identifiers: [A-Za-z_][A-Za-z0-9_]*. A trailing ';' is
-// optional. Anything outside the subset (JOIN, GROUP BY, subquery, ...) is a clean
+// optional. Anything outside the subset (JOIN, subquery, ...) is a clean
 // "unsupported" / "expected X" error.
 
 #include <cstdint>
@@ -84,6 +95,11 @@ enum class Tok : std::uint8_t {
     RParen,   // )
     Comma,    // ,
     Eq,       // =
+    Ne,       // != or <>
+    Lt,       // <
+    Le,       // <=
+    Gt,       // >
+    Ge,       // >=
     Semi,     // ;
     Star,     // *
     End,      // end of input
@@ -138,6 +154,37 @@ public:
             case '=':
                 ++i_;
                 t.kind = Tok::Eq;
+                return t;
+            case '<':
+                ++i_;
+                if (i_ < src_.size() && src_[i_] == '=') {
+                    ++i_;
+                    t.kind = Tok::Le;  // <=
+                } else if (i_ < src_.size() && src_[i_] == '>') {
+                    ++i_;
+                    t.kind = Tok::Ne;  // <> (SQL not-equal)
+                } else {
+                    t.kind = Tok::Lt;  // <
+                }
+                return t;
+            case '>':
+                ++i_;
+                if (i_ < src_.size() && src_[i_] == '=') {
+                    ++i_;
+                    t.kind = Tok::Ge;  // >=
+                } else {
+                    t.kind = Tok::Gt;  // >
+                }
+                return t;
+            case '!':
+                ++i_;
+                if (i_ < src_.size() && src_[i_] == '=') {
+                    ++i_;
+                    t.kind = Tok::Ne;  // !=
+                    return t;
+                }
+                t.kind = Tok::Bad;
+                t.bad_msg = "expected '=' after '!' (the only '!' use is '!=')";
                 return t;
             case ';':
                 ++i_;
@@ -590,21 +637,132 @@ private:
         return std::nullopt;
     }
 
-    // SELECT * | c, ... FROM t [WHERE ...] [AT ...]
+    // A keyword that can NEVER start an identifier in a SELECT-list/expression
+    // context (so the parser stops projection/predicate parsing at a clause boundary
+    // instead of swallowing the keyword as a column name).
+    [[nodiscard]] bool at_clause_boundary() const {
+        return is_kw("from") || is_kw("where") || is_kw("group") || is_kw("having") ||
+               is_kw("order") || is_kw("limit") || is_kw("offset") || is_kw("at") ||
+               is_kw("and") || is_kw("or") || is_kw("asc") || is_kw("desc") ||
+               is_kw("by");
+    }
+
+    // Try to parse an AGGREGATE call at the cursor: NAME '(' ('*' | col) ')'.
+    // Returns: filled `agg` + advances on success; nullopt-with-false when the
+    // cursor is not an aggregate (caller falls back to a plain column).
+    [[nodiscard]] std::optional<ParseError> parse_agg(AggExpr& agg, bool& matched,
+                                                      std::string& label) {
+        matched = false;
+        if (cur_.kind != Tok::Ident) {
+            return std::nullopt;
+        }
+        const std::string fn = lower(cur_.text);
+        AggKind kind{};
+        if (fn == "count") {
+            kind = AggKind::Count;
+        } else if (fn == "sum") {
+            kind = AggKind::Sum;
+        } else if (fn == "min") {
+            kind = AggKind::Min;
+        } else if (fn == "max") {
+            kind = AggKind::Max;
+        } else if (fn == "avg") {
+            kind = AggKind::Avg;
+        } else {
+            return std::nullopt;  // not an aggregate name
+        }
+        // An aggregate name must be immediately followed by '(' to BE an aggregate;
+        // otherwise it is a (legal) column named e.g. "sum". Peek: a name not
+        // followed by '(' is treated as a column by the caller, so only commit when
+        // the next token is '('.
+        const Token saved = cur_;
+        advance();
+        if (cur_.kind != Tok::LParen) {
+            // Not an aggregate call — rewind is impossible (single-lookahead), so we
+            // report it as a column via the matched=false + an out-param the caller
+            // reads. Re-synthesize: the caller expects us NOT to have consumed. We
+            // therefore require '(' here and, if absent, surface a positioned error
+            // ONLY when this clearly looked like an aggregate. To keep the grammar
+            // unambiguous we DISALLOW a bare column named like an aggregate fn.
+            return make_err("aggregate function '" + saved.text +
+                            "' must be followed by '(' (a column may not be named "
+                            "COUNT/SUM/MIN/MAX/AVG in v2)");
+        }
+        advance();  // '('
+        if (kind == AggKind::Count && cur_.kind == Tok::Star) {
+            advance();
+            agg.kind = AggKind::CountStar;
+            label = "COUNT(*)";
+        } else {
+            std::string col;
+            if (auto e = expect_ident("a column name inside the aggregate", col)) {
+                return e;
+            }
+            agg.kind = kind;
+            agg.column = col;
+            label = upper(fn) + "(" + col + ")";
+        }
+        if (auto e = expect(Tok::RParen, "')' to close the aggregate")) {
+            return e;
+        }
+        matched = true;
+        return std::nullopt;
+    }
+
+    static std::string upper(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (const char c : s) {
+            out.push_back((c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A')
+                                                 : c);
+        }
+        return out;
+    }
+
+    // SELECT [DISTINCT] (* | item, ...) FROM t [WHERE p] [GROUP BY ..] [HAVING ..]
+    //                                          [ORDER BY ..] [LIMIT n [OFFSET m]] [AT ..]
     ParseResult parse_select() {
         advance();  // SELECT
         Statement st;
         st.kind = StmtKind::Select;
+        SelectStmt& sel = st.select;
+
+        if (is_kw("distinct")) {
+            advance();
+            sel.distinct = true;
+        }
+
         if (cur_.kind == Tok::Star) {
-            st.select.star = true;
+            sel.star = true;
             advance();
         } else {
             for (;;) {
-                std::string c;
-                if (auto e = expect_ident("a column name or '*'", c)) {
+                // An aggregate item? (NAME '(' ...)
+                AggExpr agg;
+                bool is_agg = false;
+                std::string label;
+                if (auto e = parse_agg(agg, is_agg, label)) {
                     return ParseResult{*e};
                 }
-                st.select.columns.push_back(std::move(c));
+                if (is_agg) {
+                    SelectItem item;
+                    item.kind = SelectItemKind::Aggregate;
+                    item.agg = agg;
+                    item.label = label;
+                    sel.items.push_back(std::move(item));
+                    sel.has_aggregates = true;
+                } else {
+                    std::string c;
+                    if (auto e = expect_ident("a column name, aggregate, or '*'", c)) {
+                        return ParseResult{*e};
+                    }
+                    SelectItem item;
+                    item.kind = SelectItemKind::Column;
+                    item.column = c;
+                    item.label = c;
+                    sel.items.push_back(std::move(item));
+                    sel.columns.push_back(std::move(c));  // mirror for the v1 path
+                }
                 if (cur_.kind == Tok::Comma) {
                     advance();
                     continue;
@@ -615,48 +773,314 @@ private:
         if (auto e = expect_kw("from")) {
             return ParseResult{*e};
         }
-        if (auto e = expect_ident("a table name after FROM", st.select.table)) {
+        if (auto e = expect_ident("a table name after FROM", sel.table)) {
             return ParseResult{*e};
         }
 
-        // Optional WHERE.
+        // Optional WHERE — v2 general predicate. We ALSO recognize a bare PK
+        // equality / BETWEEN and record the v1 fast-path fields (the planner uses
+        // them when they are an exact PK match).
         if (is_kw("where")) {
             advance();
-            if (auto e = expect_ident("a column name after WHERE",
-                                      st.select.where_column)) {
+            if (auto e = parse_predicate(sel.filter, /*allow_agg=*/false)) {
                 return ParseResult{*e};
             }
-            if (is_kw("between")) {
+            extract_pk_fastpath(sel);
+        }
+
+        // Optional GROUP BY <cols>.
+        if (is_kw("group")) {
+            advance();
+            if (auto e = expect_kw("by")) {
+                return ParseResult{*e};
+            }
+            for (;;) {
+                std::string c;
+                if (auto e = expect_ident("a column name in GROUP BY", c)) {
+                    return ParseResult{*e};
+                }
+                sel.group_by.push_back(std::move(c));
+                if (cur_.kind == Tok::Comma) {
+                    advance();
+                    continue;
+                }
+                break;
+            }
+        }
+
+        // Optional HAVING <agg-predicate>.
+        if (is_kw("having")) {
+            advance();
+            if (auto e = parse_predicate(sel.having, /*allow_agg=*/true)) {
+                return ParseResult{*e};
+            }
+        }
+
+        // Optional ORDER BY <col> [ASC|DESC], ...
+        if (is_kw("order")) {
+            advance();
+            if (auto e = expect_kw("by")) {
+                return ParseResult{*e};
+            }
+            for (;;) {
+                OrderKey key;
+                if (auto e = expect_ident("a column name in ORDER BY", key.column)) {
+                    return ParseResult{*e};
+                }
+                if (is_kw("asc")) {
+                    advance();
+                } else if (is_kw("desc")) {
+                    key.descending = true;
+                    advance();
+                }
+                sel.order_by.push_back(std::move(key));
+                if (cur_.kind == Tok::Comma) {
+                    advance();
+                    continue;
+                }
+                break;
+            }
+        }
+
+        // Optional LIMIT n [OFFSET m].
+        if (is_kw("limit")) {
+            advance();
+            Datum d;
+            if (auto e = expect_literal(d)) {
+                return ParseResult{*e};
+            }
+            if (d.type != Type::Int || d.i < 0) {
+                return err("LIMIT requires a non-negative integer");
+            }
+            sel.has_limit = true;
+            sel.limit = d.i;
+            if (is_kw("offset")) {
                 advance();
-                if (auto e = expect_literal(st.select.lo_value)) {
+                Datum o;
+                if (auto e = expect_literal(o)) {
                     return ParseResult{*e};
                 }
-                if (auto e = expect_kw("and")) {
-                    return ParseResult{*e};
+                if (o.type != Type::Int || o.i < 0) {
+                    return err("OFFSET requires a non-negative integer");
                 }
-                if (auto e = expect_literal(st.select.hi_value)) {
-                    return ParseResult{*e};
-                }
-                st.select.where = SelectWhereKind::Between;
-            } else {
-                if (auto e = expect(Tok::Eq, "'=' or BETWEEN in WHERE")) {
-                    return ParseResult{*e};
-                }
-                if (auto e = expect_literal(st.select.eq_value)) {
-                    return ParseResult{*e};
-                }
-                st.select.where = SelectWhereKind::Eq;
+                sel.offset = o.i;
             }
         }
 
         // Optional AT <level> — the CALL-SITE-VISIBLE D5 annotation (V-D5-SAFE).
         if (is_kw("at")) {
             advance();
-            if (auto e = parse_at_level(st.select)) {
+            if (auto e = parse_at_level(sel)) {
                 return ParseResult{*e};
             }
         }
         return ParseResult{std::move(st)};
+    }
+
+    // Map the current comparison token to a CmpOp; returns false if not a cmp op.
+    [[nodiscard]] bool cmp_op(CmpOp& out) const {
+        switch (cur_.kind) {
+            case Tok::Eq: out = CmpOp::Eq; return true;
+            case Tok::Ne: out = CmpOp::Ne; return true;
+            case Tok::Lt: out = CmpOp::Lt; return true;
+            case Tok::Le: out = CmpOp::Le; return true;
+            case Tok::Gt: out = CmpOp::Gt; return true;
+            case Tok::Ge: out = CmpOp::Ge; return true;
+            default: return false;
+        }
+    }
+
+    // Parse a boolean predicate into `pred` (a node-pool tree). `allow_agg` enables
+    // aggregate operands (HAVING); when false an aggregate leaf is a clean error.
+    [[nodiscard]] std::optional<ParseError> parse_predicate(Predicate& pred,
+                                                            bool allow_agg) {
+        std::int32_t root = -1;
+        if (auto e = parse_or(pred, allow_agg, root)) {
+            return e;
+        }
+        pred.root = root;
+        return std::nullopt;
+    }
+
+    // or-expr ::= and-expr (OR and-expr)*
+    [[nodiscard]] std::optional<ParseError> parse_or(Predicate& p, bool allow_agg,
+                                                     std::int32_t& out) {
+        if (auto e = parse_and(p, allow_agg, out)) {
+            return e;
+        }
+        while (is_kw("or")) {
+            advance();
+            std::int32_t rhs = -1;
+            if (auto e = parse_and(p, allow_agg, rhs)) {
+                return e;
+            }
+            PredNode n;
+            n.kind = PredNodeKind::Or;
+            n.left = out;
+            n.right = rhs;
+            p.nodes.push_back(std::move(n));
+            out = static_cast<std::int32_t>(p.nodes.size() - 1);
+        }
+        return std::nullopt;
+    }
+
+    // and-expr ::= not-expr (AND not-expr)*
+    [[nodiscard]] std::optional<ParseError> parse_and(Predicate& p, bool allow_agg,
+                                                      std::int32_t& out) {
+        if (auto e = parse_not(p, allow_agg, out)) {
+            return e;
+        }
+        while (is_kw("and")) {
+            advance();
+            std::int32_t rhs = -1;
+            if (auto e = parse_not(p, allow_agg, rhs)) {
+                return e;
+            }
+            PredNode n;
+            n.kind = PredNodeKind::And;
+            n.left = out;
+            n.right = rhs;
+            p.nodes.push_back(std::move(n));
+            out = static_cast<std::int32_t>(p.nodes.size() - 1);
+        }
+        return std::nullopt;
+    }
+
+    // not-expr ::= NOT not-expr | primary
+    [[nodiscard]] std::optional<ParseError> parse_not(Predicate& p, bool allow_agg,
+                                                      std::int32_t& out) {
+        if (is_kw("not")) {
+            advance();
+            std::int32_t child = -1;
+            if (auto e = parse_not(p, allow_agg, child)) {
+                return e;
+            }
+            PredNode n;
+            n.kind = PredNodeKind::Not;
+            n.left = child;
+            p.nodes.push_back(std::move(n));
+            out = static_cast<std::int32_t>(p.nodes.size() - 1);
+            return std::nullopt;
+        }
+        return parse_primary(p, allow_agg, out);
+    }
+
+    // primary ::= '(' or-expr ')' | <operand> <cmpop> <literal>
+    //           | <column> BETWEEN a AND b   (sugar for col>=a AND col<=b)
+    [[nodiscard]] std::optional<ParseError> parse_primary(Predicate& p, bool allow_agg,
+                                                          std::int32_t& out) {
+        if (cur_.kind == Tok::LParen) {
+            advance();
+            if (auto e = parse_or(p, allow_agg, out)) {
+                return e;
+            }
+            return expect(Tok::RParen, "')' to close a parenthesized predicate");
+        }
+
+        // The left operand: an aggregate (HAVING) or a column.
+        PredNode leaf;
+        leaf.kind = PredNodeKind::Cmp;
+        AggExpr agg;
+        bool is_agg = false;
+        std::string label;
+        if (allow_agg) {
+            if (auto e = parse_agg(agg, is_agg, label)) {
+                return e;
+            }
+        }
+        if (is_agg) {
+            leaf.operand = OperandKind::Agg;
+            leaf.agg = agg;
+        } else {
+            std::string col;
+            if (auto e = expect_ident("a column name in the predicate", col)) {
+                return e;
+            }
+            leaf.operand = OperandKind::Column;
+            leaf.column = col;
+        }
+
+        // BETWEEN sugar (only for a column operand): col BETWEEN a AND b.
+        if (!is_agg && is_kw("between")) {
+            advance();
+            Datum lo;
+            if (auto e = expect_literal(lo)) {
+                return e;
+            }
+            if (auto e = expect_kw("and")) {
+                return e;
+            }
+            Datum hi;
+            if (auto e = expect_literal(hi)) {
+                return e;
+            }
+            // Lower to (col >= lo) AND (col <= hi).
+            PredNode ge = leaf;
+            ge.op = CmpOp::Ge;
+            ge.literal = lo;
+            p.nodes.push_back(ge);
+            const std::int32_t gi = static_cast<std::int32_t>(p.nodes.size() - 1);
+            PredNode le = leaf;
+            le.op = CmpOp::Le;
+            le.literal = hi;
+            p.nodes.push_back(le);
+            const std::int32_t li = static_cast<std::int32_t>(p.nodes.size() - 1);
+            PredNode conj;
+            conj.kind = PredNodeKind::And;
+            conj.left = gi;
+            conj.right = li;
+            p.nodes.push_back(conj);
+            out = static_cast<std::int32_t>(p.nodes.size() - 1);
+            return std::nullopt;
+        }
+
+        CmpOp op{};
+        if (!cmp_op(op)) {
+            return make_err("expected a comparison operator (=, !=, <, <=, >, >=) or "
+                            "BETWEEN");
+        }
+        advance();
+        leaf.op = op;
+        if (auto e = expect_literal(leaf.literal)) {
+            return e;
+        }
+        p.nodes.push_back(std::move(leaf));
+        out = static_cast<std::int32_t>(p.nodes.size() - 1);
+        return std::nullopt;
+    }
+
+    // Recognize a WHERE that is EXACTLY a PK equality or PK BETWEEN over the order-
+    // preserving key, so the planner can keep the v1 point/range fast path. The PK
+    // column name is not known to the parser (no catalog), so we record a CANDIDATE
+    // here and the Engine validates it is the real PK before using the fast path.
+    //   root is a single Cmp(col = v)               => Eq candidate
+    //   root is And(Cmp(col>=lo), Cmp(col<=hi))      => Between candidate
+    // Anything else leaves where == None (the general scan+filter path runs).
+    static void extract_pk_fastpath(SelectStmt& sel) {
+        const Predicate& p = sel.filter;
+        if (!p.present()) {
+            return;
+        }
+        const PredNode& r = p.nodes[static_cast<std::size_t>(p.root)];
+        if (r.kind == PredNodeKind::Cmp && r.operand == OperandKind::Column &&
+            r.op == CmpOp::Eq) {
+            sel.where = SelectWhereKind::Eq;
+            sel.where_column = r.column;
+            sel.eq_value = r.literal;
+            return;
+        }
+        if (r.kind == PredNodeKind::And) {
+            const PredNode& l = p.nodes[static_cast<std::size_t>(r.left)];
+            const PredNode& rr = p.nodes[static_cast<std::size_t>(r.right)];
+            if (l.kind == PredNodeKind::Cmp && rr.kind == PredNodeKind::Cmp &&
+                l.operand == OperandKind::Column && rr.operand == OperandKind::Column &&
+                l.column == rr.column && l.op == CmpOp::Ge && rr.op == CmpOp::Le) {
+                sel.where = SelectWhereKind::Between;
+                sel.where_column = l.column;
+                sel.lo_value = l.literal;
+                sel.hi_value = rr.literal;
+            }
+        }
     }
 
     // AT STRICT | AT SNAPSHOT n | AT BOUNDED n | AT RYW n

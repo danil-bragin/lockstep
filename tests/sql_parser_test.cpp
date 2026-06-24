@@ -5,6 +5,7 @@
 // AST for valid input AND a clean POSITIONED error (never UB / never a thrown
 // exception) for invalid input. Deterministic: same bytes => same AST / same error.
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -152,6 +153,137 @@ void test_select() {
     expect_err("SELECT * FROM t AT FUNKY", "unknown AT level");
 }
 
+// v2: WHERE on ANY column — a general boolean predicate tree (=,!=,<,<=,>,>=,
+// AND/OR/NOT, parens, BETWEEN sugar).
+void test_where_predicate() {
+    // A non-PK column comparison parses into the general filter (NOT the PK fast
+    // path, so where == None unless it is exactly a PK eq/range).
+    const Statement s1 = ok_parse("SELECT * FROM t WHERE sal > 100");
+    CHECK(s1.select.filter.present(), "general filter present");
+    CHECK(s1.select.where == SelectWhereKind::None,
+          "a non-PK '>' is not a PK fast-path candidate");
+    CHECK(s1.select.filter.nodes.size() == 1, "single Cmp node");
+    {
+        const PredNode& n = s1.select.filter.nodes[0];
+        CHECK(n.kind == PredNodeKind::Cmp && n.column == "sal" && n.op == CmpOp::Gt &&
+                  n.literal.i == 100,
+              "sal > 100 leaf");
+    }
+
+    // AND / OR / NOT + parens build the tree.
+    const Statement s2 =
+        ok_parse("SELECT * FROM t WHERE a = 1 AND (b < 2 OR NOT c >= 3)");
+    CHECK(s2.select.filter.present(), "compound filter present");
+    {
+        const Predicate& p = s2.select.filter;
+        const PredNode& root = p.nodes[static_cast<std::size_t>(p.root)];
+        CHECK(root.kind == PredNodeKind::And, "root is AND");
+    }
+
+    // != and <> both parse to Ne.
+    const Statement s3 = ok_parse("SELECT * FROM t WHERE a != 1");
+    CHECK(s3.select.filter.nodes[0].op == CmpOp::Ne, "!= => Ne");
+    const Statement s4 = ok_parse("SELECT * FROM t WHERE a <> 1");
+    CHECK(s4.select.filter.nodes[0].op == CmpOp::Ne, "<> => Ne");
+
+    // A bare PK equality still records the v1 fast-path candidate.
+    const Statement s5 = ok_parse("SELECT * FROM t WHERE id = 5");
+    CHECK(s5.select.where == SelectWhereKind::Eq && s5.select.eq_value.i == 5,
+          "PK eq fast-path candidate recorded");
+
+    // A column BETWEEN lowers to >= AND <= (sugar) and records a range candidate.
+    const Statement s6 = ok_parse("SELECT * FROM t WHERE id BETWEEN 3 AND 9");
+    CHECK(s6.select.where == SelectWhereKind::Between && s6.select.lo_value.i == 3 &&
+              s6.select.hi_value.i == 9,
+          "BETWEEN range candidate");
+    CHECK(s6.select.filter.nodes.size() == 3, "BETWEEN sugar => Cmp,Cmp,And");
+
+    expect_err("SELECT * FROM t WHERE a >", "missing rhs literal");
+    expect_err("SELECT * FROM t WHERE (a = 1", "unclosed paren");
+    expect_err("SELECT * FROM t WHERE a ! 1", "stray '!' is not '!='");
+    expect_err("SELECT * FROM t WHERE AND a = 1", "leading AND");
+}
+
+// v2: aggregates in the SELECT list + GROUP BY + HAVING.
+void test_aggregates() {
+    const Statement s1 = ok_parse("SELECT COUNT(*) FROM t");
+    CHECK(s1.select.has_aggregates, "has aggregates");
+    CHECK(s1.select.items.size() == 1 &&
+              s1.select.items[0].kind == SelectItemKind::Aggregate &&
+              s1.select.items[0].agg.kind == AggKind::CountStar,
+          "COUNT(*) item");
+    CHECK(s1.select.items[0].label == "COUNT(*)", "COUNT(*) label");
+
+    const Statement s2 =
+        ok_parse("SELECT dept, SUM(sal), MIN(sal), MAX(sal), AVG(sal), COUNT(sal) "
+                 "FROM t GROUP BY dept");
+    CHECK(s2.select.items.size() == 6, "6 select items");
+    CHECK(s2.select.items[0].kind == SelectItemKind::Column &&
+              s2.select.items[0].column == "dept",
+          "grouped column item");
+    CHECK(s2.select.items[1].agg.kind == AggKind::Sum &&
+              s2.select.items[1].agg.column == "sal",
+          "SUM(sal)");
+    CHECK(s2.select.items[5].agg.kind == AggKind::Count, "COUNT(sal)");
+    CHECK(s2.select.group_by.size() == 1 && s2.select.group_by[0] == "dept",
+          "GROUP BY dept");
+
+    const Statement s3 = ok_parse(
+        "SELECT dept, COUNT(*) FROM t GROUP BY dept HAVING COUNT(*) > 2 AND "
+        "SUM(sal) >= 100");
+    CHECK(s3.select.having.present(), "HAVING present");
+    {
+        const Predicate& h = s3.select.having;
+        const PredNode& root = h.nodes[static_cast<std::size_t>(h.root)];
+        CHECK(root.kind == PredNodeKind::And, "HAVING root AND");
+    }
+
+    expect_err("SELECT COUNT() FROM t", "COUNT needs * or a column");
+    expect_err("SELECT SUM FROM t", "aggregate name without '('");
+    expect_err("SELECT COUNT(* FROM t", "unclosed aggregate");
+    expect_err("SELECT * FROM t GROUP BY", "GROUP BY needs a column");
+    expect_err("SELECT * FROM t GROUP dept", "GROUP without BY");
+    expect_err("SELECT * FROM t HAVING > 1", "HAVING needs a predicate");
+}
+
+// v2: ORDER BY [ASC|DESC] + LIMIT/OFFSET + DISTINCT.
+void test_order_limit_distinct() {
+    const Statement s1 =
+        ok_parse("SELECT id FROM t ORDER BY sal DESC, id ASC LIMIT 10 OFFSET 5");
+    CHECK(s1.select.order_by.size() == 2, "two order keys");
+    CHECK(s1.select.order_by[0].column == "sal" && s1.select.order_by[0].descending,
+          "ORDER BY sal DESC");
+    CHECK(s1.select.order_by[1].column == "id" && !s1.select.order_by[1].descending,
+          "ORDER BY id ASC");
+    CHECK(s1.select.has_limit && s1.select.limit == 10 && s1.select.offset == 5,
+          "LIMIT 10 OFFSET 5");
+
+    const Statement s2 = ok_parse("SELECT DISTINCT dept FROM t");
+    CHECK(s2.select.distinct, "DISTINCT");
+
+    const Statement s3 = ok_parse("SELECT * FROM t ORDER BY id LIMIT 3");
+    CHECK(!s3.select.order_by[0].descending, "default ASC");
+    CHECK(s3.select.has_limit && s3.select.limit == 3 && s3.select.offset == 0,
+          "LIMIT without OFFSET => offset 0");
+
+    // A full pipeline parses end to end.
+    const Statement s4 = ok_parse(
+        "SELECT DISTINCT dept, COUNT(*) FROM t WHERE sal > 0 GROUP BY dept "
+        "HAVING COUNT(*) >= 2 ORDER BY dept DESC LIMIT 5 OFFSET 1 AT SNAPSHOT 3");
+    CHECK(s4.select.distinct && s4.select.has_aggregates &&
+              s4.select.filter.present() && s4.select.group_by.size() == 1 &&
+              s4.select.having.present() && s4.select.order_by.size() == 1 &&
+              s4.select.has_limit && s4.select.level == q::Level::Snapshot &&
+              s4.select.snapshot_version == 3,
+          "full v2 pipeline parses with all clauses + AT level");
+
+    expect_err("SELECT * FROM t ORDER BY", "ORDER BY needs a column");
+    expect_err("SELECT * FROM t ORDER id", "ORDER without BY");
+    expect_err("SELECT * FROM t LIMIT -1", "negative LIMIT");
+    expect_err("SELECT * FROM t LIMIT 5 OFFSET -2", "negative OFFSET");
+    expect_err("SELECT * FROM t LIMIT 'x'", "non-integer LIMIT");
+}
+
 void test_misc_errors() {
     expect_err("", "empty input");
     expect_err("FROBNICATE x", "unknown statement keyword");
@@ -182,6 +314,9 @@ int main() {
     test_insert();
     test_update_delete();
     test_select();
+    test_where_predicate();
+    test_aggregates();
+    test_order_limit_distinct();
     test_misc_errors();
     test_determinism();
 
