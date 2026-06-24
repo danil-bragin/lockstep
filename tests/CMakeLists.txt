@@ -907,6 +907,47 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME query_persist_test COMMAND lockstep_query_persist_test)
+
+  # --- SQL SURFACE: parser unit tests + SQL-vs-typed-query conformance ---------
+  # A NEW layer (query/sql/*) that maps a bounded SQL subset onto the EXISTING
+  # verified surface: SELECT -> Database::run(Query<L>) get/scan/range; INSERT/
+  # UPDATE/DELETE -> a txn submit. core/sim/consensus/txn/storage UNCHANGED.
+  #
+  # sql_parser_test: the hand-written recursive-descent parser produces the
+  # expected typed AST for valid input + a clean positioned error for invalid input
+  # (deterministic; no exceptions/UB). sql_conformance_test: a seeded SQL workload
+  # produces results IDENTICAL to an independent reference model (SELECT rows +
+  # PK-ascending order + INSERT/UPDATE/DELETE effects + error reporting), a SELECT
+  # AT SNAPSHOT honors the call-site-visible D5 level, determinism is byte-identical,
+  # and the TEETH catch a wrong lowering. Links the header-only query lib (which
+  # pulls txn + storage + runtime + sim). Non-provider TU -> forbidden-lint scans it.
+  add_executable(lockstep_sql_parser_test sql_parser_test.cpp)
+  target_include_directories(lockstep_sql_parser_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_parser_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_parser_test COMMAND lockstep_sql_parser_test)
+
+  add_executable(lockstep_sql_conformance_test sql_conformance_test.cpp)
+  target_include_directories(lockstep_sql_conformance_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_conformance_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_conformance_test COMMAND lockstep_sql_conformance_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "
