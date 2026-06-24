@@ -407,3 +407,116 @@ Single-shot honest run: `lockstep_admin pbench --count N --inflight K --conns C 
   instant — stated as a baseline approximation.
 - Measured on the prod path **as built** — no consensus/core change; prod-admin + cli +
   harness only.
+
+---
+
+# S8.5 — PROFILE the commit path, then group-commit fsync — VERDICT: ALREADY group-committed
+
+> **PROFILE FIRST, then act on the DATA (S8.1/S8.2-style).** The hypothesis was that the
+> ~17k(1-node)/~15k(3-node) commit ceiling is bounded by **fsync-per-entry** on the durable
+> persist path, and that GROUP COMMIT (batch `fdatasync` across pending appends) would lift
+> it. We instrumented the real durable barrier and measured. **The data says the commit path
+> is ALREADY group-committed and is NOT fsync-bound at depth — so we did NOT add redundant
+> batching** (the brief: "do NOT implement group-commit if the data says it won't help").
+> The change is **profiling-only**: `ProdDisk` fdatasync/append counters + a daemon `DISKSTATS`
+> shutdown line. **core/sim/consensus/txn/storage/query diff EMPTY.**
+
+## The profiler (fdatasync count + latency, off the durability path)
+
+`ProdDisk` now counts `append()` calls, `sync()` (fdatasync) calls, and the summed `fdatasync`
+wall-time (a `steady_clock` delta around the syscall — prod-only, never any deterministic
+ordering). `lockstepd` prints on shutdown:
+
+```
+DISKSTATS node=N commit_index=C fdatasync_calls=S append_calls=A fsync_total_ms=.. \
+          fsync_avg_us=.. fsyncs_per_commit=S/C appends_per_fsync=A/S bytes_appended=..
+```
+
+`fsyncs_per_commit` is the headline: ≈1.0 ⇒ one fsync per committed entry (fsync-bound);
+≪1.0 ⇒ many appends already coalesced under one fsync (group commit already in effect).
+
+## PROFILE RESULTS (container, Release, `pbench` commit load, count=4000, value=16B)
+
+| config | depth | commit_tput | fdatasync calls | commit_index | **fsyncs / commit** | appends / fsync | fsync_avg µs | fsync % of wall |
+|--------|-------|-------------|-----------------|--------------|---------------------|-----------------|--------------|-----------------|
+| 1-node | 1     | 4547        | 2002            | 2001         | **1.000**           | 1.11            | 185          | ~84% (371ms/440ms) |
+| 1-node | 64    | 16855       | 65              | 4001         | **0.016**           | **68.4**        | 409          | ~11% (27ms/237ms)  |
+| 3-node | 1 (leader) | 2930   | 804             | 2001         | **0.40**            | 2.83            | 278          | ~33% |
+| 3-node | 64 (leader)| 24223  | 66              | 4001         | **0.016**           | 61.6            | 407          | ~16% (27ms/165ms) |
+
+## BOTTLENECK VERDICT: NOT fsync-bound at depth — group commit ALREADY EXISTS
+
+**The single FIFO persist worker in BOTH Raft impls already group-commits.** Its drain loop
+appends EVERY record currently queued (re-checking the queue after each `append` await), and
+only when the queue is empty does it issue ONE `sync()`. So any appends that pile up while the
+worker is awaiting the disk are swept into the same sync — a **deterministic, scheduler-turn
+boundary** ("sync everything pending right now"), exactly the group-commit rule, already in
+place since the FIFO worker was introduced. Evidence:
+
+- **At depth 64: 68 appends ride ONE fdatasync** (`fsyncs_per_commit=0.016`). A pipelined burst
+  of K in-flight submits is coalesced under a single barrier. fsync is only **~11–16% of the
+  commit wall** — the other ~85% is the single-reactor per-op work (epoll, frame decode/encode,
+  log append, promise plumbing, replication), **matching the S8.1 reactor-CPU verdict.**
+- **1/fsync-latency ≈ 1/410µs ≈ 2440 fsync/s**, but commit throughput is **16.8k commits/s** —
+  *7× ABOVE the per-entry fsync ceiling*. You CANNOT commit 16.8k ops/s with one fsync each on a
+  410µs fsync; the only way past 2440/s is that fsyncs are already batched (~68:1), which the
+  counter confirms. **If commit were fsync-bound, throughput would plateau at ~2.4k, not 17k.**
+- **Depth 1 IS fsync-bound** (1.000 fsyncs/commit, fsync = 84% of wall) — but depth 1 has NOTHING
+  to batch (one request in flight ⇒ the queue holds one record per sync by definition). The
+  depth-1 ceiling is 1/fsync-latency-and-RTT, and is the *closed-loop latency* number, NOT the
+  throughput ceiling. Pipelining (the existing batching) is what carries depth 1→64 from 4.5k to
+  17k — and it does so precisely BY amortizing the fsync the worker already coalesces.
+
+**Conclusion: adding a second group-commit mechanism would be a NO-OP** (the worker already
+coalesces the entire in-flight window under one sync) **and could only add latency** (an explicit
+accumulate-then-sync timer would force a wait the deterministic drain doesn't need). The honest,
+data-driven move is to NOT change the persist path. The real lever for a higher ceiling is the
+single-reactor per-op CPU cost (S8.1's standing finding) — NOT fsync.
+
+## The deterministic batching rule (already in both impls), and persist-before-reply
+
+- **RaftNodeA** (`RaftNodeA.hpp` persist_worker, ~L1694): drains `write_queue_` FIFO, `continue`s
+  to re-check the queue after every `append` await, then `if (want_sync_) co_await sync()` once
+  the queue is empty. `enqueue_durable` (~L1668) sets `want_sync_ = true` per mutation; ONE
+  worker (`worker_running_`) runs at a time, preserving on-disk order == logical order.
+- **RaftNodeB** (`RaftNodeB.hpp` persist_worker, ~L1686): same shape — drains the queue, then
+  `if (want_sync_) co_await sync()`. `sync_now()` (~L968) requests the barrier after the
+  enqueues for a step.
+- **Batching boundary is DETERMINISTIC in the sim**: "sync all records pending when the queue
+  drains" is a pure function of the single-thread scheduler's turn order, not a wall-clock timer.
+  The sim cross-check stays byte-identical per seed (verified: `consensus_crosscheck_test`
+  ALL CHECKS PASSED; harness/snapshot/membership OK).
+- **Persist-before-reply** is the SAME as before this stage (we changed nothing here): the spec
+  (`Consensus.tla`) models durability as an *atomic-within-a-step* precondition (e.g. "persist
+  votedFor before reply"), NOT a separately-timed barrier — so a batched physical barrier under
+  one fdatasync does not weaken it: each logical action's records are enqueued (in logical order)
+  and the durability is established by the worker the deterministic scheduler runs ahead of the
+  observable downstream effect. TLC `Consensus.cfg`: **no error, invariants hold** (288361 states,
+  depth 20). The brief's no-data-loss gate confirms it end-to-end: `prod_jepsen` (5 nodes, 4 fault
+  rounds, SIGKILL + SIGSTOP) — **acked=32 durable=32, ZERO committed-acked entries lost**, ALL 3
+  scenarios PASS; `prod_cluster_smoke` ALL PASS (kill+restart catch-up from ProdDisk).
+
+## Honest commit throughput (AFTER == baseline; no path change → no regression, no win)
+
+| config | N | depth | commit_tput (ops/s) | min | max | accept_tput (NOT commit) |
+|--------|---|-------|---------------------|-----|-----|--------------------------|
+| 1-node | 1 | 1     | 4036                | 3653| 4146| 4037 |
+| 1-node | 1 | 16    | 13696               |13654|14505| 13711 |
+| 1-node | 1 | 64    | **17245**           |17122|17550| 17270 |
+| 3-node | 3 | 1     | 1261                | 1118| 1468| 1278 |
+| 3-node | 3 | 16    | 1244 (high var)     | 793 | 3944| 1396 |
+| 3-node | 3 | 64    | **23541**           |22444|31988| 90453 |
+
+These match the S8.3 honest-commit baseline within container variance: **the ceiling is
+unchanged** (~17k 1-node, ~15–24k 3-node at depth) because the persist path was not touched —
+**group commit was already there.** `fsyncs_per_commit` before == after == 0.016 at depth 64
+(no per-entry-fsync to remove; it was already removed by the FIFO worker).
+
+## Honest caveats (S8.5)
+
+- **Laptop container, `--cpus=4`, real wall-clock** — relative regression numbers only.
+- **The "AFTER" is the unchanged path** — this stage is a PROFILE that *correctly concluded not
+  to implement* the proposed optimization, because the optimization already exists. The receipt
+  is the fsyncs-per-commit measurement (0.016 at depth) proving the coalescing.
+- Profiling counters are prod-only (`ProdDisk`/`lockstepd`); they feed NO ordering and do NOT
+  exist in the sim, so determinism + the A-vs-B cross-check are untouched.

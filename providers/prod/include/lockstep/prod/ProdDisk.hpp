@@ -57,11 +57,11 @@
 #include <sys/stat.h> // mode constants
 
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
-#include <utility>
 
 #include <lockstep/core/Error.hpp>
 #include <lockstep/core/Future.hpp>
@@ -136,6 +136,16 @@ public:
     // the next append lands exactly here. Introspection only.
     [[nodiscard]] std::uint64_t logical_len() const noexcept { return len_; }
 
+    // ---- S8.5 PROFILING counters (introspection only; off the durability path) --
+    // Single-threaded reactor owns this disk, so plain (non-atomic) counters are
+    // safe. They let the daemon report fdatasync count + total fdatasync wall-time
+    // so a profiler can answer "is the commit path fsync-bound?" (fsyncs per
+    // committed op, fsync latency) WITHOUT touching the durable byte stream.
+    [[nodiscard]] std::uint64_t append_calls() const noexcept { return append_calls_; }
+    [[nodiscard]] std::uint64_t sync_calls() const noexcept { return sync_calls_; }
+    [[nodiscard]] std::uint64_t sync_total_ns() const noexcept { return sync_total_ns_; }
+    [[nodiscard]] std::uint64_t bytes_appended() const noexcept { return bytes_appended_; }
+
     // ---- core::IDisk -----------------------------------------------------
 
     // Append `data` at the current logical end. The placement offset is written to
@@ -172,6 +182,8 @@ public:
             }
             if (result.ok()) {
                 len_ += data.size();
+                ++append_calls_;
+                bytes_appended_ += data.size();
             }
         }
         return ready(result);
@@ -226,7 +238,16 @@ public:
         if (fd_ < 0) {
             return ready(core::Error{core::ErrorCode::IoFault, "prod disk not open"});
         }
-        if (prod_fdatasync(fd_) != 0) {
+        // Time the real fdatasync (the durability barrier). PROFILING ONLY: a
+        // monotonic-clock delta around the syscall, summed; never feeds any
+        // deterministic ordering (this is the prod provider — no sim determinism).
+        const auto t0 = std::chrono::steady_clock::now();
+        const int rc = prod_fdatasync(fd_);
+        const auto t1 = std::chrono::steady_clock::now();
+        ++sync_calls_;
+        sync_total_ns_ += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        if (rc != 0) {
             return ready(core::Error{core::ErrorCode::IoFault, "prod fdatasync failed"});
         }
         // First durable sync of a NEW file: make its directory entry durable too.
@@ -260,6 +281,11 @@ private:
     bool created_ = false;  // this open created the file (dir-fsync candidate)
     bool dir_synced_ = false; // the one-time directory fsync has happened
     std::uint64_t len_ = 0; // logical end-of-device (append placement offset)
+    // S8.5 profiling counters (introspection only; not durability state).
+    std::uint64_t append_calls_ = 0;
+    std::uint64_t sync_calls_ = 0;
+    std::uint64_t sync_total_ns_ = 0;
+    std::uint64_t bytes_appended_ = 0;
 };
 
 } // namespace lockstep::prod

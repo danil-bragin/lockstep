@@ -386,6 +386,15 @@ public:
     [[nodiscard]] consensus::Index commit_index() const noexcept {
         return node_->commit_index();
     }
+
+    // ---- S8.5 disk profiling passthrough (introspection only) -----------------
+    // Surface the ProdDisk fdatasync/append counters so the daemon can report
+    // fsyncs-per-committed-op + fsync wall-time on shutdown — the data behind the
+    // "is the commit path fsync-bound?" verdict. Off the durability path.
+    [[nodiscard]] std::uint64_t disk_append_calls() const noexcept { return disk_.append_calls(); }
+    [[nodiscard]] std::uint64_t disk_sync_calls() const noexcept { return disk_.sync_calls(); }
+    [[nodiscard]] std::uint64_t disk_sync_total_ns() const noexcept { return disk_.sync_total_ns(); }
+    [[nodiscard]] std::uint64_t disk_bytes_appended() const noexcept { return disk_.bytes_appended(); }
     // COPY the committed-log values out (V-RKV1: the span is valid only until the
     // next mutation — we deep-copy here so the caller holds owned strings).
     [[nodiscard]] std::vector<std::string> committed_values() const {

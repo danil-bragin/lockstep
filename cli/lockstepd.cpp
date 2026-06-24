@@ -241,11 +241,29 @@ int main(int argc, char** argv) {
         reactor.now() + static_cast<core::Tick>(args.run_seconds) * 1'000'000'000;
     node.run_with_deadline(deadline_ns);
 
+    const unsigned long long ci =
+        static_cast<unsigned long long>(node.commit_index());
+    const unsigned long long syncs = node.disk_sync_calls();
+    const unsigned long long appends = node.disk_append_calls();
+    const unsigned long long sync_ns = node.disk_sync_total_ns();
+    // S8.5 PROFILE line: fdatasync count + avg latency + fsyncs-per-committed-op.
+    // commit_index is the count of committed entries on this node (1-based dense),
+    // so syncs/commit answers the bottleneck question directly.
+    const double avg_sync_us = syncs ? (static_cast<double>(sync_ns) / 1000.0 / static_cast<double>(syncs)) : 0.0;
+    const double syncs_per_commit = ci ? (static_cast<double>(syncs) / static_cast<double>(ci)) : 0.0;
+    const double appends_per_sync = syncs ? (static_cast<double>(appends) / static_cast<double>(syncs)) : 0.0;
     std::printf("lockstepd: node %llu shutting down — role=%s term=%llu "
                 "commit_index=%llu\n",
                 static_cast<unsigned long long>(ep.id),
                 consensus::role_name(node.role()),
                 static_cast<unsigned long long>(node.term()),
-                static_cast<unsigned long long>(node.commit_index()));
+                ci);
+    std::printf("DISKSTATS node=%llu commit_index=%llu fdatasync_calls=%llu "
+                "append_calls=%llu fsync_total_ms=%.2f fsync_avg_us=%.2f "
+                "fsyncs_per_commit=%.3f appends_per_fsync=%.3f bytes_appended=%llu\n",
+                static_cast<unsigned long long>(ep.id), ci, syncs, appends,
+                static_cast<double>(sync_ns) / 1e6, avg_sync_us,
+                syncs_per_commit, appends_per_sync,
+                static_cast<unsigned long long>(node.disk_bytes_appended()));
     return 0;
 }
