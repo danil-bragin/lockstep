@@ -26,10 +26,23 @@
 //   * table aliases (FROM t AS x, FROM t x) and multiple left-deep joins
 //     (a JOIN b ON .. JOIN c ON ..).
 //   * a column reference is now optionally QUALIFIED: <table-or-alias>.<col>.
-// secondary indexes / subqueries / multi-statement txns remain OUT (FLAG): the parser
-// REJECTS them with a clear error rather than mis-parsing.
+// v4 (this stage) ADDS explicit NULL + subqueries (the v1-v3 statements are byte-
+// unchanged when no NULL/subquery is present):
+//   * NULLABLE COLUMNS: a column is NULLABLE unless declared NOT NULL (the PK is always
+//     NOT NULL). A NULLABLE column may hold a SQL NULL; INSERT may OMIT it (=> NULL) or
+//     write the `NULL` literal. IS NULL / IS NOT NULL predicates test for NULL.
+//   * SUBQUERIES (UNCORRELATED only — a correlated subquery referencing an outer column
+//     resolves it as unknown => a clean error; FLAG, correlated is next):
+//       - scalar:   <col> <op> (SELECT <agg-or-single-col> FROM ...)   (>1 row => error)
+//       - IN/NOT IN: <col> [NOT] IN (SELECT col FROM ...)              (membership, 3VL)
+//       - EXISTS:   [NOT] EXISTS (SELECT ... )                         (row existence)
+//     A subquery carries a full nested SelectStmt (PredNode::subquery), run through the
+//     SAME SELECT pipeline — no new query surface. The three-valued NULL rules + the
+//     scalar cardinality rule are documented + model-mirrored in Engine.hpp.
+// multi-statement txns remain OUT (FLAG): the parser REJECTS them with a clear error.
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -128,11 +141,22 @@ struct AggExpr {
     std::string column;     // empty for COUNT(*)
 };
 
+// Forward declaration: a subquery node carries a nested SELECT (defined below). It is
+// held by shared_ptr so PredNode/Predicate stay copyable (a value tree) without an
+// incomplete-type member, and so the inner SELECT reuses the SAME SelectStmt shape /
+// execution pipeline (subqueries are lowered by running the inner SELECT, then applying
+// the predicate — NO new query surface).
+struct SelectStmt;
+
 enum class PredNodeKind : std::uint8_t {
-    Cmp = 0,  // a leaf: <operand> <op> <literal>
-    And = 1,  // left AND right
-    Or = 2,   // left OR right
-    Not = 3,  // NOT child (uses `left` as the child index)
+    Cmp = 0,      // a leaf: <operand> <op> <literal-or-column-or-scalar-subquery>
+    And = 1,      // left AND right
+    Or = 2,       // left OR right
+    Not = 3,      // NOT child (uses `left` as the child index)
+    // v4: explicit NULL + subqueries.
+    IsNull = 4,   // <column> IS [NOT] NULL  (negate via `is_not`)
+    InList = 5,   // <column> [NOT] IN ( SELECT ... )   (subquery membership)
+    Exists = 6,   // [NOT] EXISTS ( SELECT ... )
 };
 
 struct PredNode {
@@ -153,6 +177,21 @@ struct PredNode {
     bool rhs_is_column = false;
     std::string rhs_qualifier;
     std::string rhs_column;
+
+    // v4: a Cmp leaf whose RIGHT operand is a SCALAR SUBQUERY: `col <op> (SELECT agg)`.
+    // The subquery must return EXACTLY one row / one column at run time (>1 row is an
+    // error, like real SQL; 0 rows => the scalar is NULL => the comparison is UNKNOWN).
+    // Mutually exclusive with rhs_is_column / literal.
+    bool rhs_is_subquery = false;
+
+    // v4: IsNull (`is_not` => IS NOT NULL); InList / Exists (`is_not` => NOT IN /
+    // NOT EXISTS). For IsNull/InList the tested operand is (qualifier,column); for
+    // Exists the operand is unused (existence of the subquery's rows).
+    bool is_not = false;
+
+    // v4: the nested SELECT for InList / Exists / a scalar subquery RHS. shared_ptr so
+    // the value tree stays copyable; null for non-subquery nodes.
+    std::shared_ptr<SelectStmt> subquery;
 
     // And/Or/Not: child indices into Predicate::nodes (Not uses `left` only).
     std::int32_t left = -1;

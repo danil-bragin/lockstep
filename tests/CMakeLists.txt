@@ -1015,6 +1015,30 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME sql_index_test COMMAND lockstep_sql_index_test)
+
+  # sql_subquery_test (SQL v4): explicit NULL (nullable columns + IS [NOT] NULL +
+  # three-valued logic in WHERE/aggregates/GROUP BY) + subqueries (scalar (SELECT agg),
+  # [NOT] IN (SELECT col), [NOT] EXISTS (...)). Each is cross-checked == an INDEPENDENT
+  # reference model (ordered maps of typed cells with explicit NULLs, NO KV/Database/txn
+  # path): IS NULL / comparison-with-NULL-dropped / aggregates-skip-NULL / the NULL-in-
+  # NOT-IN UNKNOWN rule / scalar-subquery cardinality error == the model over a LARGE
+  # seeded sweep. The TEETH catch a wrong NULL rule (NULL=NULL true / NOT IN ignoring a
+  # subquery NULL) + a missed scalar-subquery cardinality error. Determinism byte-
+  # identical. Still pure sugar over the verified scan/get/range surface (subqueries
+  # reuse the SELECT pipeline; NULL is row/predicate-level).
+  add_executable(lockstep_sql_subquery_test sql_subquery_test.cpp)
+  target_include_directories(lockstep_sql_subquery_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_subquery_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_subquery_test COMMAND lockstep_sql_subquery_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "

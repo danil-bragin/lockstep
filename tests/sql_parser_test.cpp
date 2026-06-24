@@ -377,6 +377,115 @@ void test_order_limit_distinct() {
     expect_err("SELECT * FROM t LIMIT 'x'", "non-integer LIMIT");
 }
 
+// v4: explicit NULL grammar (NOT NULL constraint, NULL literal, IS [NOT] NULL) +
+// subquery grammar (scalar (SELECT ...), [NOT] IN (SELECT ...), [NOT] EXISTS (...)).
+void test_null_and_subqueries() {
+    // NOT NULL constraint + nullable default + a column nullability flag.
+    {
+        const Statement st = ok_parse(
+            "CREATE TABLE t (id INT, a INT NOT NULL, b INT, c TEXT NULL, "
+            "PRIMARY KEY (id))");
+        CHECK(st.create.columns.size() == 4, "four columns");
+        CHECK(!st.create.columns[1].nullable, "a is NOT NULL");
+        CHECK(st.create.columns[2].nullable, "b is nullable by default");
+        CHECK(st.create.columns[3].nullable, "c NULL spelling is nullable");
+    }
+    // NULL literal in INSERT VALUES + an INSERT that OMITS a column.
+    {
+        const Statement st =
+            ok_parse("INSERT INTO t (id, a, b) VALUES (1, 2, NULL)");
+        CHECK(st.insert.values.size() == 3, "three values");
+        CHECK(st.insert.values[2].is_null, "third value is a NULL literal");
+        const Statement st2 = ok_parse("INSERT INTO t (id, a) VALUES (1, 2)");
+        CHECK(st2.insert.columns.size() == 2, "omitted columns allowed by parser");
+    }
+    // IS NULL / IS NOT NULL.
+    {
+        const Statement st =
+            ok_parse("SELECT id FROM t WHERE b IS NULL");
+        const Predicate& p = st.select.filter;
+        CHECK(p.present(), "filter present");
+        CHECK(p.nodes[static_cast<std::size_t>(p.root)].kind == PredNodeKind::IsNull,
+              "IS NULL node");
+        CHECK(!p.nodes[static_cast<std::size_t>(p.root)].is_not, "IS NULL not negated");
+        const Statement st2 =
+            ok_parse("SELECT id FROM t WHERE b IS NOT NULL");
+        const Predicate& p2 = st2.select.filter;
+        CHECK(p2.nodes[static_cast<std::size_t>(p2.root)].kind == PredNodeKind::IsNull &&
+                  p2.nodes[static_cast<std::size_t>(p2.root)].is_not,
+              "IS NOT NULL node negated");
+    }
+    // A NULL literal on a comparison RHS.
+    {
+        const Statement st = ok_parse("SELECT id FROM t WHERE b = NULL");
+        const Predicate& p = st.select.filter;
+        CHECK(p.nodes[static_cast<std::size_t>(p.root)].literal.is_null,
+              "= NULL is a NULL-literal comparison (UNKNOWN at run time)");
+    }
+    // Scalar subquery RHS.
+    {
+        const Statement st = ok_parse(
+            "SELECT id FROM t WHERE a = (SELECT MAX(a) FROM t)");
+        const Predicate& p = st.select.filter;
+        const PredNode& n = p.nodes[static_cast<std::size_t>(p.root)];
+        CHECK(n.kind == PredNodeKind::Cmp && n.rhs_is_subquery && n.subquery != nullptr,
+              "scalar subquery RHS");
+        CHECK(n.subquery->has_aggregates, "inner SELECT has an aggregate");
+    }
+    // IN / NOT IN subquery.
+    {
+        const Statement st = ok_parse(
+            "SELECT id FROM t WHERE a IN (SELECT b FROM t)");
+        const Predicate& p = st.select.filter;
+        const PredNode& n = p.nodes[static_cast<std::size_t>(p.root)];
+        CHECK(n.kind == PredNodeKind::InList && !n.is_not && n.subquery != nullptr,
+              "IN subquery node");
+        const Statement st2 = ok_parse(
+            "SELECT id FROM t WHERE a NOT IN (SELECT b FROM t)");
+        const Predicate& p2 = st2.select.filter;
+        CHECK(p2.nodes[static_cast<std::size_t>(p2.root)].kind == PredNodeKind::InList &&
+                  p2.nodes[static_cast<std::size_t>(p2.root)].is_not,
+              "NOT IN subquery node");
+    }
+    // EXISTS / NOT EXISTS.
+    {
+        const Statement st = ok_parse(
+            "SELECT id FROM t WHERE EXISTS (SELECT b FROM t WHERE b = 1)");
+        const Predicate& p = st.select.filter;
+        CHECK(p.nodes[static_cast<std::size_t>(p.root)].kind == PredNodeKind::Exists,
+              "EXISTS node");
+        // NOT EXISTS arrives as a prefix-NOT wrapping the Exists node.
+        const Statement st2 = ok_parse(
+            "SELECT id FROM t WHERE NOT EXISTS (SELECT b FROM t)");
+        const Predicate& p2 = st2.select.filter;
+        const PredNode& root = p2.nodes[static_cast<std::size_t>(p2.root)];
+        CHECK(root.kind == PredNodeKind::Not, "NOT EXISTS => prefix NOT");
+        CHECK(p2.nodes[static_cast<std::size_t>(root.left)].kind == PredNodeKind::Exists,
+              "NOT wraps an Exists node");
+    }
+    // A subquery may itself carry WHERE / JOIN / GROUP BY (full SELECT grammar reused).
+    {
+        const Statement st = ok_parse(
+            "SELECT id FROM t WHERE a IN (SELECT b FROM t WHERE id > 3 "
+            "GROUP BY b HAVING COUNT(*) >= 1)");
+        const Predicate& p = st.select.filter;
+        CHECK(p.nodes[static_cast<std::size_t>(p.root)].subquery->group_by.size() == 1,
+              "subquery carries its own GROUP BY");
+    }
+
+    // ---- clean ERRORS for malformed NULL / subquery grammar ----
+    expect_err("SELECT id FROM t WHERE a IS", "IS with no NULL");
+    expect_err("SELECT id FROM t WHERE a IS NOT", "IS NOT with no NULL");
+    expect_err("SELECT id FROM t WHERE a IN (1, 2, 3)",
+               "literal IN-list is OUT (subquery only)");
+    expect_err("SELECT id FROM t WHERE a IN ()", "empty IN parens");
+    expect_err("SELECT id FROM t WHERE a IN (SELECT b FROM t",
+               "unclosed subquery paren");
+    expect_err("SELECT id FROM t WHERE EXISTS (DELETE FROM t WHERE id = 1)",
+               "EXISTS body must be a SELECT");
+    expect_err("SELECT id FROM t WHERE a NOT b", "NOT not followed by IN");
+}
+
 void test_misc_errors() {
     expect_err("", "empty input");
     expect_err("FROBNICATE x", "unknown statement keyword");
@@ -411,6 +520,7 @@ int main() {
     test_where_predicate();
     test_aggregates();
     test_order_limit_distinct();
+    test_null_and_subqueries();
     test_misc_errors();
     test_determinism();
 

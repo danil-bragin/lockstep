@@ -60,6 +60,13 @@ namespace lockstep::query::sql {
 // The two scalar column types v1 supports. (FLOAT/BLOB/NULL/multi-col PK = OUT.)
 enum class Type : std::uint8_t { Int = 0, Text = 1 };
 
+// v4: a reserved value-encoding tag byte that marks a NULL field in the stored value
+// tuple. It is DISTINCT from any real Type tag (0/1) so decode is unambiguous, and a
+// NULL field carries NO length/bytes (the column's declared type comes from the
+// schema). Non-NULL fields keep their byte-identical type_tag++be32(len)++bytes shape,
+// so a row with no NULLs encodes EXACTLY as it did pre-v4 (existing conformance holds).
+inline constexpr std::uint8_t kNullTag = 0xFE;
+
 [[nodiscard]] inline const char* type_name(Type t) noexcept {
     switch (t) {
         case Type::Int:
@@ -70,10 +77,15 @@ enum class Type : std::uint8_t { Int = 0, Text = 1 };
     return "?";
 }
 
-// A column definition: a name + its scalar type.
+// A column definition: a name + its scalar type + a NULLABILITY flag (v4: explicit
+// NULL support). A column is NULLABLE unless it is declared NOT NULL or it is the
+// PRIMARY KEY (a PK column is ALWAYS NOT NULL — see CREATE TABLE in the Engine). A
+// NULLABLE column may hold a SQL NULL: an INSERT may omit it (=> NULL) or write the
+// NULL literal; a non-nullable column REQUIRES a present value at INSERT (fail-closed).
 struct Column {
     std::string name;
     Type type = Type::Int;
+    bool nullable = false;  // v4: true => may store NULL (NOT NULL / PK => false)
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -357,6 +369,12 @@ inline void put_index_col(std::string& out, const Datum& d) {
             continue;  // the PK lives in the key, not the value
         }
         const Datum& d = row[c];
+        // v4: a NULL field is a single tag byte (no length, no payload). Decode knows
+        // the column's type from the schema, so the NULL is reconstructed typed.
+        if (d.is_null) {
+            out.push_back(static_cast<char>(kNullTag));
+            continue;
+        }
         out.push_back(static_cast<char>(d.type));
         if (d.type == Type::Int) {
             put_be32(out, 8);
@@ -381,6 +399,12 @@ inline void put_index_col(std::string& out, const Datum& d) {
     std::size_t off = 0;
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
         if (c == t.pk_index) {
+            continue;
+        }
+        // v4: a NULL field is a single kNullTag byte — reconstruct a typed NULL.
+        if (static_cast<unsigned char>(value[off]) == kNullTag) {
+            off += 1;
+            row[c] = Datum::make_null(t.columns[c].type);
             continue;
         }
         const Type ty = static_cast<Type>(static_cast<unsigned char>(value[off]));
@@ -420,6 +444,14 @@ inline void put_index_col(std::string& out, const Datum& d) {
     std::size_t off = 0;
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
         if (c == t.pk_index) {
+            continue;
+        }
+        // v4: a NULL field is a single kNullTag byte (no length/payload).
+        if (static_cast<unsigned char>(value[off]) == kNullTag) {
+            off += 1;
+            if (need[c]) {
+                row[c] = Datum::make_null(t.columns[c].type);
+            }
             continue;
         }
         const Type ty = static_cast<Type>(static_cast<unsigned char>(value[off]));
