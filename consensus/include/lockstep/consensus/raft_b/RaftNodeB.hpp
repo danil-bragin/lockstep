@@ -636,15 +636,19 @@ public:
         // SINGLE-MEMBER CONFIG SELF-COMMIT. Commitment is normally driven from
         // handle_append_entries_resp (a peer ack). With NO peers in the current config
         // (quorum() == 1 ⇔ config size 1) no ack EVER arrives, so commit_index_ would
-        // never advance past 0. Re-evaluate here so the lone leader self-commits its own
-        // entry the instant it is durable (the leader self-counts in advance_commit_index;
-        // agree == 1 >= quorum() == 1). GATED on quorum() == 1 so this branch is provably
-        // UNREACHABLE — a strict no-op, byte-identical — for any config with >= 2 members
-        // (where commitment stays ack-driven, exactly as before).
-        if (quorum() == 1) {
-            advance_commit_index();
-            apply_and_maybe_snapshot();
-        }
+        // never advance past 0. For the lone leader the entry becomes committable the
+        // instant it is DURABLE — but durability is fsync COMPLETION, not persist-ENQUEUE.
+        // S9.2 BUG (async io_uring fdatasync): advancing here, right after persist_entry()
+        // + sync_now() only ENQUEUE the record + a sync barrier, marked the entry committed
+        // while it was still page-cache-only; an abrupt crash (SIGKILL / power loss) in the
+        // enqueue->fsync window lost a COMMITTED entry ("commit implies durable" violated).
+        // Synchronous fsync masked the sub-ms gap; async io_uring widened + exposed it. FIX:
+        // the N=1 self-commit now fires at the persist worker's POST-SYNC point
+        // (advance_n1_self_commit(), called once sync() completes for the just-persisted
+        // prefix), so commit_index_ only follows the leader's own fsync. The N>=2 path is
+        // UNTOUCHED: it stays ack-driven (a follower acks only after IT persists; a quorum
+        // of durable followers makes the entry durable even if the leader's own fsync lags),
+        // so for >= 2 members nothing in submit() or the worker's hook changes — byte-identical.
         // S8.2b COALESCE the per-submit broadcast. The OLD code broadcast on EVERY
         // submit, so a depth-K pipelined burst did K full re-scans of the unacked
         // suffix x peers — O(backlog x inflight) synchronous reactor work that blocked
@@ -1560,6 +1564,18 @@ private:
         }
     }
 
+    // N=1-only: once the persist worker's sync() has made the enqueued prefix
+    // durable, the lone leader self-commits its own entries (no peer ack ever
+    // arrives in a single-member config). Leader-gated to match the original
+    // submit()-path guard. A strict no-op for quorum() >= 2.
+    void advance_n1_self_commit() {
+        if (role_ != Role::Leader || quorum() != 1) {
+            return;
+        }
+        advance_commit_index();
+        apply_and_maybe_snapshot();
+    }
+
     // ===== coroutine drivers (defined out-of-line) =====================
 
     void spawn_recv_loop();
@@ -1706,6 +1722,15 @@ inline core::Task RaftNodeB::persist_worker() {
             want_sync_ = false;
             core::Error e = co_await disk_->sync();
             (void)e;
+            // POST-SYNC N=1 SELF-COMMIT HOOK. The sync() above made the whole enqueued
+            // prefix DURABLE on this node's own disk. For a lone leader (quorum() == 1)
+            // that is exactly the condition under which its own entry is committable, so
+            // advance commit_index here — AFTER fsync, not at submit-enqueue (the S9.2
+            // durability gap). advance_commit_index() logic is UNCHANGED; only WHERE/WHEN
+            // the N=1 path calls it moved. Same scheduler thread as submit() — no new
+            // concurrency. GATED on quorum() == 1 so for ANY config with >= 2 members this
+            // is a strict no-op (commitment stays ack-driven, byte-identical to before).
+            advance_n1_self_commit();
             // A sync may have been re-requested or more records enqueued while we
             // awaited; loop to handle them.
             continue;

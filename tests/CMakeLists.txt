@@ -1059,6 +1059,34 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_consensus AND TARGET lockstep_runtime
   add_test(NAME prod_consensus_test COMMAND lockstep_prod_consensus_test)
 endif()
 
+# --- Phase 9 S9.2: N=1 commit-FOLLOWS-fsync DURABILITY TEETH [LINUX ONLY] -----
+# The teeth for the S9.2 durability fix: a 1-node Raft self-commit must advance
+# commit_index only AFTER the entry's fdatasync COMPLETES, not at persist-enqueue.
+# Builds a REAL 1-node RaftNodeA (impl A) on the prod stack (ProdReactor + ProdDisk)
+# over a StallSyncDisk that holds sync() completion so the enqueue->fsync window is
+# deterministic, then asserts: appended-but-un-fsynced ⇒ commit_index == 0 (pre-fix
+# this was 1 — a committed-yet-un-durable entry an abrupt crash would lose); after
+# fsync ⇒ commit_index == 1 (commit follows durability). Runs under BOTH the async
+# io_uring fsync (--security-opt seccomp=unconfined) and the sync-fdatasync fallback.
+# LINUX-ONLY (ProdReactor/ProdDisk are __linux__); the macOS host stays green.
+if(UNIX AND NOT APPLE AND TARGET lockstep_consensus AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_consensus_durability_teeth_test
+                 prod_consensus_durability_teeth_test.cpp)
+  target_include_directories(lockstep_prod_consensus_durability_teeth_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_consensus_durability_teeth_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME prod_consensus_durability_teeth_test
+           COMMAND lockstep_prod_consensus_durability_teeth_test)
+  set_tests_properties(prod_consensus_durability_teeth_test PROPERTIES TIMEOUT 60)
+endif()
+
 # --- Phase 7 S5b-2: REAL MULTI-PROCESS Raft CLUSTER smoke [LINUX ONLY] --------
 # P7-S5b-2 gate (briefs/phase7.md S5; THE distributed milestone). Orchestrates a REAL
 # 3-process lockstepd cluster over loopback TCP via tests/prod_cluster_smoke.sh and

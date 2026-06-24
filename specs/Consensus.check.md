@@ -144,3 +144,36 @@ always carries a chosen range). TLC re-checked the SAME four invariants over the
 state space and found **no error** (288,361 distinct states; depth 20; the
 `MaxMsgs`/`MaxLogLen`/`MaxTerm` bounds keep the extra `\E lastIndex` branching finite). The
 change is to the ACTION only; the four invariants remain verbatim.
+
+## S9.2 — N=1 commit-follows-fsync durability fix (spec already permits; more conservative)
+
+The 1-node (peerless) self-commit fast path advanced `commitIndex` at persist-ENQUEUE
+time (right after `submit()` handed the entry to the FIFO persist worker), BEFORE that
+entry's `fdatasync` completed — so a lone leader could mark an entry committed while it
+was still page-cache-only; an abrupt crash (SIGKILL / power loss) in the enqueue→fsync
+window lost a COMMITTED entry. Synchronous fsync masked the sub-ms gap; async io_uring
+fsync (S9.2) widened + exposed it. N>=2 is durable via QUORUM acks (a follower acks only
+after IT persists), so the gap was N=1-ONLY.
+
+FIX (both impls, gated on `quorum()==1`, a strict no-op for N>=2): the lone-leader
+self-commit now fires at the persist worker's POST-SYNC point — once `sync()` COMPLETES
+for the just-persisted prefix — not at enqueue. `advance_commit_index()` logic is
+UNCHANGED; only WHERE/WHEN the N=1 path calls it moved. N>=2 stays ack-driven, BYTE-
+IDENTICAL (proven: the A-vs-B cross-check + 5 conformance checkers at N=3/5 are byte-
+identical before/after; full output diff EMPTY).
+
+SPEC CONFORMANCE (no change needed). `AdvanceCommitIndex(s)` is a standalone enabled
+action: it MAY fire any time a Quorum (for N=1, the lone leader itself) stores a current-
+term entry, with no ordering constraint relative to other actions. The fix only DELAYS
+the concrete commit point to fsync completion — a SUBSET of the spec-permitted firing
+points (it never commits anything the spec forbids; commit still requires the entry on a
+quorum). It is strictly MORE conservative (commit-after-durable), so no invariant is
+weakened. TLC re-checked BOTH configs with no error:
+  - `Consensus1.cfg` (N=1): 79 distinct states, depth 9 — the four safety invariants hold.
+  - `Consensus.cfg`  (N=3): 288,361 distinct states, depth 20 — no error.
+The four invariants (ElectionSafety, LogMatching, StateMachineSafety, LeaderAppendOnly)
+remain verbatim. The prod teeth (`prod_consensus_durability_teeth_test`, io_uring +
+sync fallback) prove commit-follows-fsync: an appended-but-un-fsynced entry has
+`commit_index == 0`; after the fsync completes, `commit_index == 1` — no committed entry
+can be lost to an abrupt crash. (Pre-fix the teeth FAIL: the un-fsynced entry shows
+`commit_index == 1` — a committed-yet-un-durable entry.)
