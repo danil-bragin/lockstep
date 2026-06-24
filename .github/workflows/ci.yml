@@ -234,10 +234,14 @@ jobs:
       - name: Model-check every spec (invariants must hold)
         run: |
           set -e
-          for s in CommitOrdering Consensus Membership Sequencer Snapshot; do
+          for s in CommitOrdering Consensus Membership Sequencer Snapshot XShardCommit; do
             echo "==================== TLC: $s ===================="
             bash scripts/tlc.sh -config "specs/$s.cfg" "specs/$s.tla"
           done
+          # Consensus1.cfg is a SECOND config for Consensus.tla (the N=1 single-server
+          # case -- the N=1 self-commit fix). Its invariants must hold too.
+          echo "==================== TLC: Consensus (N=1, Consensus1.cfg) ===================="
+          bash scripts/tlc.sh -config specs/Consensus1.cfg specs/Consensus.tla
       - name: Teeth -- Membership2 (2-server jump) MUST violate QuorumOverlap
         run: |
           if bash scripts/tlc.sh -config specs/Membership2.cfg specs/Membership.tla; then
