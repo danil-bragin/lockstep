@@ -11,12 +11,19 @@
 //       (role 0=Follower 1=Candidate 2=Leader). A node that does not reply within the
 //       deadline prints ok=0 (the orchestrator treats it as down / not-yet-up).
 //
-//   submit VALUE --host PORT [--host PORT ...]
+//   submit VALUE [--no-await] --host PORT [--host PORT ...]
 //       SUBMIT VALUE to the nodes in order; on NotLeader, retry the next host until one
-//       ACCEPTS (the LEADER-FIND client). Prints:
-//         SUBMIT value=<V> accepted=<0|1> port=<P> term=<T> index=<I> leader_hint=<H>
-//       accepted=1 means the leader appended it at <index>; accepted=0 means no host in
-//       the list accepted within the per-host deadline (caller retries later).
+//       ACCEPTS (the LEADER-FIND client). S8.4 DURABLE-BY-DEFAULT: success now means the
+//       write is COMMITTED (durable on a quorum), not merely accepted. After a host
+//       accepts {term,index}, poll that node until commit_index covers the index AND the
+//       entry there is STILL our value (a stale leader's accepted-but-uncommitted entry
+//       can be overwritten / lost — accept != commit), THEN report durable=1. Prints:
+//         SUBMIT value=<V> accepted=<0|1> durable=<0|1> port=<P> term=<T> index=<I> ...
+//       durable=1 means COMMITTED (exit 0); durable=0 means accepted but NOT confirmed
+//       committed within the bounded deadline (exit nonzero — caller retries). --no-await
+//       reverts to accept-only (omits durable=; the load harness's accept measurement);
+//       the DEFAULT awaits commit so a client is told "done" only when the write is
+//       durable. The poll is BOUNDED by an absolute deadline — never an unbounded spin.
 //
 //   bench --count N [--value-bytes B] [--commit-samples S] --host PORT [--host PORT ...]
 //       Phase 7 S7 PERFORMANCE BASELINE driver. Over ONE persistent client reactor +
@@ -74,6 +81,15 @@ constexpr std::uint64_t kClientId = 9'000'000'001ULL;
 // giving up (a down / not-yet-up node yields no reply). Bounded — never an unbounded
 // spin. 1.5 s absorbs cross-process connect + reply latency while killing any hang.
 constexpr core::Tick kReqWallNs = 1'500'000'000;
+
+// S8.4 DURABLE SUBMIT — how long (absolute, BOUNDED) the durable `submit` waits for the
+// accepted entry to COMMIT (commit_index covers its index AND the value there is still
+// ours) before reporting NOT-durable (the caller retries). accept != commit: a leader
+// that crashes before a quorum replicates an accepted-but-UNcommitted entry LEGITIMATELY
+// loses it (Raft only promises COMMITTED entries survive). So a durable submit reports
+// success ONLY once the entry is COMMITTED — never merely accepted. 5 s comfortably
+// covers replication+commit on a healthy quorum yet kills any hang.
+constexpr core::Tick kDurableWallNs = 5'000'000'000;
 
 std::uint16_t parse_port(const char* s) {
     if (s == nullptr) {
@@ -763,23 +779,91 @@ int cmd_commit(const std::vector<std::uint16_t>& hosts) {
     return 0;
 }
 
+// S8.4 DURABLE CONFIRMATION — given an accepted {value, index}, decide whether it is
+// COMMITTED on `port`: poll STATUS until commit_index >= index AND the entry at that
+// 1-based index is STILL `value`. The committed-log digest STATUS returns is the FULL
+// durable log; index `idx` lives at committed[idx-1]. Three terminating outcomes (all
+// BOUNDED by the absolute `deadline` — never a spin):
+//   * COMMITTED: commit_index covers idx AND committed[idx-1] == value  -> durable.
+//   * OVERWRITTEN: commit_index covers idx but committed[idx-1] != value -> a NEW leader
+//     overwrote this stale-leader entry (spec conflict rule). NOT durable; caller retries
+//     with a fresh submit (a different index). We stop polling immediately (it can never
+//     become ours again at this index).
+//   * TIMEOUT: deadline elapsed before commit_index reached idx -> NOT durable (the entry
+//     may yet commit, but we will NOT report success on an un-confirmed write).
+// Returns true ONLY for COMMITTED. `port` is the ACCEPTING node (the leader that took the
+// entry); its own commit_index advancing to idx means a QUORUM replicated+acked it.
+enum class DurableResult : std::uint8_t { Committed, Overwritten, Timeout };
+
+DurableResult confirm_durable(std::uint16_t port, const std::string& value,
+                              std::uint64_t idx, core::Tick deadline_ns) {
+    Client c(port);
+    if (!c.ok) {
+        return DurableResult::Timeout;
+    }
+    while (c.reactor.now() < deadline_ns) {
+        prod::AdminStatus st;
+        bool ok = false;
+        bool done = false;
+        c.reactor.spawn(status_rpc(c.net(), c.admin_ep(), &st, &ok, &done));
+        c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+        if (done && ok && st.commit_index >= idx) {
+            // commit_index covers our index: the entry there is FINAL (committed entries
+            // never change). Is it still ours?
+            if (idx >= 1 && idx <= st.committed.size() && st.committed[idx - 1] == value) {
+                return DurableResult::Committed;
+            }
+            return DurableResult::Overwritten;  // a new leader overwrote our slot.
+        }
+        // not yet committed to our index: poll again (bounded by `deadline_ns`).
+    }
+    return DurableResult::Timeout;
+}
+
 // LEADER-FIND submit: try each host in order; the LEADER accepts (accepted=1), a
-// follower replies NotLeader (we try the next host). Print the outcome.
-int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts) {
+// follower replies NotLeader (we try the next host).
+//
+// S8.4 DURABLE-BY-DEFAULT: a successful response now means the write is COMMITTED (durable
+// on a quorum), not merely accepted (appended by a possibly-stale leader). After a host
+// accepts {term,index}, we POLL that node (confirm_durable) until commit_index covers the
+// index AND the entry there is STILL our value — only THEN print durable=1. On
+// timeout/overwrite/leader-change we print durable=0 (caller retries with a fresh submit).
+// `await_durable=false` (--no-await) reverts to the OLD accept-only behaviour (durable
+// omitted) for the load harness's accept measurement — but the DEFAULT awaits commit.
+int cmd_submit(const std::string& value, const std::vector<std::uint16_t>& hosts,
+               bool await_durable) {
     for (std::uint16_t port : hosts) {
         SubmitOutcome so;
         const bool replied = do_submit(port, value, so);
         if (replied && so.accepted) {
-            std::printf("SUBMIT value=%s accepted=1 port=%u term=%llu index=%llu "
-                        "leader_hint=0\n",
-                        value.c_str(), port, static_cast<unsigned long long>(so.term),
+            if (!await_durable) {
+                // accept-only mode: report the append (NOT a durability claim).
+                std::printf("SUBMIT value=%s accepted=1 port=%u term=%llu index=%llu "
+                            "leader_hint=0\n",
+                            value.c_str(), port,
+                            static_cast<unsigned long long>(so.term),
+                            static_cast<unsigned long long>(so.index));
+                std::fflush(stdout);
+                return 0;
+            }
+            // Durable-by-default: confirm the accepted entry COMMITTED (commit_index
+            // covers it AND the value is still ours) before reporting success.
+            Client probe(port);  // a stable now() baseline for the absolute deadline.
+            const core::Tick deadline = (probe.ok ? probe.reactor.now() : 0) + kDurableWallNs;
+            const DurableResult dr = confirm_durable(port, value, so.index, deadline);
+            const bool durable = (dr == DurableResult::Committed);
+            std::printf("SUBMIT value=%s accepted=1 durable=%d port=%u term=%llu "
+                        "index=%llu leader_hint=0\n",
+                        value.c_str(), durable ? 1 : 0, port,
+                        static_cast<unsigned long long>(so.term),
                         static_cast<unsigned long long>(so.index));
             std::fflush(stdout);
-            return 0;
+            return durable ? 0 : 1;  // not-durable -> nonzero (caller retries).
         }
         // NotLeader or no reply: try the next host (the leader-find retry loop).
     }
-    std::printf("SUBMIT value=%s accepted=0 port=0 term=0 index=0 leader_hint=0\n",
+    std::printf("SUBMIT value=%s accepted=0 durable=0 port=0 term=0 index=0 "
+                "leader_hint=0\n",
                 value.c_str());
     std::fflush(stdout);
     return 1;  // no host accepted (caller retries later)
@@ -802,7 +886,8 @@ int main(int argc, char** argv) {
             stderr,
             "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
             "       lockstep_admin commit --host PORT [--host PORT ...]\n"
-            "       lockstep_admin submit VALUE --host PORT [--host PORT ...]\n"
+            "       lockstep_admin submit VALUE [--no-await] --host PORT "
+            "[--host PORT ...]\n"
             "       lockstep_admin bench --count N [--value-bytes B] "
             "[--commit-samples S] --host PORT [--host PORT ...]\n"
             "       lockstep_admin pbench --count N [--inflight K] [--conns C] "
@@ -815,6 +900,7 @@ int main(int argc, char** argv) {
     std::string value;
     BenchArgs ba;
     PipeArgs pa;
+    bool await_durable = true;  // S8.4: submit is DURABLE (await commit) by default.
     int i = 2;
 
     if (verb == "submit") {
@@ -848,6 +934,9 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--conns") == 0 && i + 1 < argc) {
             pa.conns = parse_u64_opt(argv[i + 1], pa.conns);
             ++i;
+        } else if (std::strcmp(argv[i], "--no-await") == 0) {
+            // Accept-only submit (load-harness accept measurement); DEFAULT is durable.
+            await_durable = false;
         }
     }
     // pbench shares --count + --value-bytes with bench (the --count/--value-bytes flags
@@ -867,7 +956,7 @@ int main(int argc, char** argv) {
         return cmd_commit(hosts);
     }
     if (verb == "submit") {
-        return cmd_submit(value, hosts);
+        return cmd_submit(value, hosts, await_durable);
     }
     if (verb == "bench") {
         return cmd_bench(ba, hosts);

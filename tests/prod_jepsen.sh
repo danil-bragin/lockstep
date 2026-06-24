@@ -38,10 +38,16 @@
 #     same index. After heal, all live nodes converge to the SAME committed log. This
 #     is Raft State-Machine-Safety; for a total-order store it is linearizability of
 #     the replicated register sequence.
-#   - ACK DURABILITY / EXACTLY-ONCE: every submit the cluster ACKed (accepted=1 with a
-#     term+index) appears EXACTLY ONCE in the FINAL converged committed log, never
-#     lost across crashes/partitions, never duplicated. (Ack-durability = "a
-#     successful response means the write is linearized & durable".)
+#   - ACK DURABILITY / EXACTLY-ONCE (S8.4 COMMIT-BASED): every submit the cluster
+#     CONFIRMED COMMITTED (durable=1 — the DURABLE admin submit polled until commit_index
+#     covered its index AND the entry there was still our value) appears EXACTLY ONCE in
+#     the FINAL converged committed log, never lost across crashes/partitions, never
+#     duplicated. Ack-durability of a COMMITTED-acked write is EXACTLY Raft's
+#     StateMachineSafety, so it must hold under EVERY fault. (Pre-S8.4 the ack was
+#     accept-based — accepted=1, the leader merely APPENDED — which FLAKED: an
+#     accepted-but-UNcommitted entry on a leader that then crashes is LEGITIMATELY lost
+#     by Raft, NOT a safety bug. Switching the ack to COMMIT-based removes that flaw: a
+#     successful response now means the write is linearized & durable on a quorum.)
 #   - LEADER UNIQUENESS: term is monotonic non-decreasing per node over time AND no two
 #     nodes ever report divergent committed entries for the same index (the observable
 #     of "never two leaders committing in the same term"). Election-Safety surrogate.
@@ -253,19 +259,30 @@ run_scenario() {
   }
 
   # ---- submit ONE distinct value (leader-find), record the ACK in history ---
+  # S8.4 COMMIT-BASED ACK: a submit counts as ACKed only when CONFIRMED COMMITTED. The
+  # DURABLE admin submit (S8.4) returns durable=1 ONLY once the accepted entry's
+  # commit_index covers its index AND the entry there is still our value (accept !=
+  # commit). The checker keys ack-durability off durable=1 (a committed-acked submit must
+  # survive every fault — that is exactly Raft StateMachineSafety). We retry the leader-
+  # find DURABLE submit until it reports durable=1 or the bounded deadline elapses; a
+  # never-durable submit is recorded durable=0 (the checker does NOT treat it as ACKed,
+  # so its loss is NOT a violation — accept-without-commit is a legitimate Raft loss).
   submit_one() {
     local v="$1"
-    local sdl=$(( $(now_ms) + 6000 )); local out=""
+    local sdl=$(( $(now_ms) + 8000 )); local out=""
     while [ "$(now_ms)" -lt "$sdl" ]; do
+      # DEFAULT submit is durable-by-default: it internally polls until the entry COMMITS
+      # (bounded) and prints durable=1, else durable=0. Retry on not-durable until ours.
       out="$("$ADMIN" submit "$v" $all_aports 2>/dev/null | head -1)"
-      [ "$(field "$out" accepted)" = "1" ] && break
+      [ "$(field "$out" durable)" = "1" ] && break
       sleep 0.2
     done
-    local acc term idx
+    local acc dur term idx
     acc="$(field "$out" accepted)"; [ -z "$acc" ] && acc=0
+    dur="$(field "$out" durable)"; [ -z "$dur" ] && dur=0
     term="$(field "$out" term)"; [ -z "$term" ] && term=0
     idx="$(field "$out" index)"; [ -z "$idx" ] && idx=0
-    echo "SUBMIT sc=$sc value=$v accepted=$acc term=$term index=$idx" >> "$HIST"
+    echo "SUBMIT sc=$sc value=$v accepted=$acc durable=$dur term=$term index=$idx" >> "$HIST"
   }
 
   # ---- inject one seeded fault on a MINORITY victim -------------------------
@@ -436,7 +453,13 @@ check_history() {
         lastterm[nd]=t
       }
     } else if (rec=="SUBMIT") {
-      if (F["accepted"]=="1") {
+      # S8.4 COMMIT-BASED ACK: a submit is ACKed only when CONFIRMED COMMITTED (durable=1),
+      # NOT merely accepted (appended by a possibly-stale leader). accept != commit — an
+      # accepted-but-UNcommitted entry on a leader that then crashes is LEGITIMATELY lost
+      # by Raft (only committed entries are durable), so treating accepted=1 as an ack
+      # FLAKED a "lost ack" that was never committed. A COMMITTED-acked submit, by
+      # contrast, MUST survive every fault: that is exactly Raft StateMachineSafety.
+      if (F["durable"]=="1") {
         ACK_val[nsubmit_ack]=F["value"]; ACK_idx[nsubmit_ack]=F["index"]; ACK_term[nsubmit_ack]=F["term"];
         nsubmit_ack++
       }
@@ -543,9 +566,9 @@ teeth_check() {
   cat > "$bad" <<'EOF'
 STATUS sc=9 tag=start node=1 ok=1 role=2 term=1 commit=0 log=-
 STATUS sc=9 tag=start node=2 ok=1 role=0 term=1 commit=0 log=-
-SUBMIT sc=9 value=teeth-X accepted=1 term=1 index=1
-SUBMIT sc=9 value=teeth-Y accepted=1 term=1 index=2
-SUBMIT sc=9 value=teeth-LOST accepted=1 term=1 index=3
+SUBMIT sc=9 value=teeth-X accepted=1 durable=1 term=1 index=1
+SUBMIT sc=9 value=teeth-Y accepted=1 durable=1 term=1 index=2
+SUBMIT sc=9 value=teeth-LOST accepted=1 durable=1 term=1 index=3
 STATUS sc=9 tag=final node=1 ok=1 role=2 term=2 commit=2 log=teeth-X,teeth-DIVERGENT
 STATUS sc=9 tag=final node=2 ok=1 role=0 term=2 commit=2 log=teeth-X,teeth-Y
 CONVERGED sc=9 value=1
