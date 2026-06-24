@@ -1,0 +1,23 @@
+# YCSB workload: READ  (100% read — YCSB workload C shape).
+#
+# SCHEMA workload "read" = 100% read (point gets over the pre-loaded keyspace). The `load`
+# phase populates with 100% insert; the measured `run` phase is 100% read.
+#
+# Adapter overrides per cell: recordcount, operationcount, fieldlength(==value_bytes),
+# threadcount(==concurrency).
+
+recordcount=10000
+operationcount=20000
+
+fieldcount=1
+fieldlength=16
+fieldlengthdistribution=constant
+
+readproportion=1.0
+updateproportion=0.0
+insertproportion=0.0
+scanproportion=0.0
+readmodifywriteproportion=0.0
+
+requestdistribution=uniform
+measurementtype=histogram

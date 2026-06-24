@@ -1,0 +1,33 @@
+# YCSB workload: WRITE  (100% mutating ops).
+#
+# SCHEMA workload "write" = 100% insert/update. The measured `run` phase here is 100%
+# UPDATE (in-place writes over the pre-loaded keyspace); the `load` phase already did the
+# 100% INSERT population. Both are committed writes, which is the metric the SCHEMA wants.
+#
+# Knobs the adapter overrides per cell via -p:
+#   recordcount     (keyspace / load size)
+#   operationcount  (measured ops in run)
+#   fieldlength     (== value_bytes; single field => the value is ~value_bytes)
+#   threadcount     (== concurrency)
+# Everything below is the fixed, identical-across-systems shape.
+
+recordcount=10000
+operationcount=20000
+
+# Single field whose length == value_bytes. fieldcount=1 + fieldlength=N => ~N-byte value.
+fieldcount=1
+fieldlength=16
+fieldlengthdistribution=constant
+
+# 100% update, 0 reads => pure committed-write workload.
+readproportion=0.0
+updateproportion=1.0
+insertproportion=0.0
+scanproportion=0.0
+readmodifywriteproportion=0.0
+
+# Uniform key choice: no hot-spotting, so the server (not the client cache) is the bottleneck.
+requestdistribution=uniform
+
+# Latency percentiles in the summary (go-ycsb reports Avg/P50/P99/P99.9 per op type).
+measurementtype=histogram

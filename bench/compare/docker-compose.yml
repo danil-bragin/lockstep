@@ -1,0 +1,85 @@
+# Comparative-bench competitor services. ONE system is brought up at a time by run.sh
+# (compose up <svc> ... && compose down -v) so memory stays bounded. CPU/mem pins come
+# from the env the orchestrator exports per cell: BENCH_CPUS, BENCH_MEM.
+#
+# All images are official/upstream. Pulling them is a one-time download (surfaced to the
+# user — deploying these systems is exactly the requested comparison).
+services:
+
+  # --- PostgreSQL: mature single-node SQL baseline (vectors 1,2,4) -----------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+      POSTGRES_USER: bench
+    command: >
+      postgres -c fsync=on -c synchronous_commit=on
+               -c max_connections=300 -c shared_buffers=512MB
+    ports: ["55432:5432"]
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_CPUS:-4}"
+          memory: "${BENCH_MEM:-6g}"
+    tmpfs: []          # real durable storage (named volume) so fsync is honest
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  # --- etcd: single-node OR 3-node Raft KV (vectors 1,2,3) ------------------------------
+  # Single-node for the KV/scaling vectors; the 3-node HA topology lives in
+  # docker-compose.etcd3.yml (brought up only for the fault vector).
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.15
+    command: >
+      /usr/local/bin/etcd
+        --name n0 --data-dir /etcd-data
+        --listen-client-urls http://0.0.0.0:2379
+        --advertise-client-urls http://0.0.0.0:2379
+        --listen-peer-urls http://0.0.0.0:2380
+    ports: ["52379:2379"]
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_CPUS:-4}"
+          memory: "${BENCH_MEM:-6g}"
+
+  # --- CockroachDB: distributed SQL, Raft-per-range (vectors 1,2,3,4) -------------------
+  # Single-node insecure for KV/SQL/scaling; the 3-node cluster is in
+  # docker-compose.crdb3.yml for the fault + multi-core-scaling vectors.
+  cockroach:
+    image: cockroachdb/cockroach:v24.1.5
+    command: start-single-node --insecure --store=type=mem,size=2GiB
+    ports: ["52257:26257", "58080:8080"]
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_CPUS:-4}"
+          memory: "${BENCH_MEM:-6g}"
+
+  # --- TiKV (+ PD): distributed txn KV, Percolator (vectors 1,2,3) ----------------------
+  pd:
+    image: pingcap/pd:v7.5.1
+    command: >
+      --name=pd0 --data-dir=/pd
+      --client-urls=http://0.0.0.0:2379
+      --peer-urls=http://0.0.0.0:2380
+      --advertise-client-urls=http://pd:2379
+      --advertise-peer-urls=http://pd:2380
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: "2g" }   # PD is metadata only; not the SUT — kept small + constant
+  tikv:
+    image: pingcap/tikv:v7.5.1
+    command: >
+      --addr=0.0.0.0:20160 --advertise-addr=tikv:20160
+      --pd-endpoints=pd:2379 --data-dir=/tikv
+    depends_on: [pd]
+    ports: ["52160:20160"]
+    deploy:
+      resources:
+        limits:
+          cpus: "${BENCH_CPUS:-4}"
+          memory: "${BENCH_MEM:-6g}"
+
+volumes:
+  pgdata:

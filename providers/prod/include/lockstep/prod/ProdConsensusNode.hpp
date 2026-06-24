@@ -479,14 +479,20 @@ public:
     // counters, AND derive the transition counters (elections_started / leader_changes /
     // steps_down / submits_committed) by EDGE-DETECTING against the last-seen snapshot.
     // This is the "metrics READ the observables" boundary — no consensus change. Cheap:
-    // role/term/commit_index are member reads; log size is span.size(); the disk counters
-    // are member reads. NEVER walks the durable log. Call it on every admin request + on
-    // a METRICS scrape (both O(1)); the single reactor thread is the only caller.
+    // role/term/commit_index are member reads; log size uses physical_log_size() (an O(1)
+    // member read of log_.size()) — NOT log().size(), which calls rebuild_log_view() and
+    // does an O(n) clear+copy of the whole logical log on EVERY call. Because this runs on
+    // every admin request, log().size() made the leader's per-request work O(current log
+    // size) ⇒ O(n^2) over a sustained run (the comparative bench surfaced this: single-node
+    // admin throughput collapsed 12.8k→1.3k from 4k→50k ops). physical_log_size() (the
+    // retained physical suffix; bounded after snapshotting) is the right gauge source and is
+    // truly O(1). The disk counters are member reads. NEVER walks the durable log. Call it
+    // on every admin request + on a METRICS scrape (both O(1)); single reactor thread only.
     void refresh_metrics() noexcept {
         const auto role = static_cast<std::uint64_t>(node_->role());
         const std::uint64_t term = node_->current_term();
         const std::uint64_t ci = node_->commit_index();
-        const std::uint64_t lsz = node_->log().size();
+        const std::uint64_t lsz = node_->physical_log_size();
 
         // Edge-detect role/term transitions (counters are monotonic event tallies).
         const auto leader = static_cast<std::uint64_t>(consensus::Role::Leader);
