@@ -948,6 +948,28 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME sql_conformance_test COMMAND lockstep_sql_conformance_test)
+
+  # sql_aggregates_test (SQL v2): the EXTENDED SELECT surface — WHERE on ANY column
+  # (a general boolean predicate tree), aggregates (COUNT(*)/COUNT(col)/SUM/MIN/MAX/
+  # AVG) + GROUP BY + HAVING, ORDER BY [ASC|DESC] + LIMIT/OFFSET, DISTINCT. Each is
+  # cross-checked == an INDEPENDENT reference model (hand-written relational ops over
+  # a typed-row vector, NO KV/Database/txn path): SQL rows/order/group/aggregate
+  # values/errors == the model exactly. AVG over INT truncates toward zero (pinned).
+  # The TEETH catch a wrong aggregate (SUM-as-COUNT) + a dropped ORDER BY. Still pure
+  # sugar over the verified scan/get/range surface; deterministic (seeded SplitMix).
+  add_executable(lockstep_sql_aggregates_test sql_aggregates_test.cpp)
+  target_include_directories(lockstep_sql_aggregates_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_aggregates_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_aggregates_test COMMAND lockstep_sql_aggregates_test)
 else()
   message(WARNING
     "lockstep_query / txn / storage / runtime / providers_sim not all found; "

@@ -918,3 +918,68 @@ A/B a daemon on one binary: `LOCKSTEP_NO_URING=1 lockstepd …` (sync) vs `locks
   contended passes — it is real (consistent across 3 passes + compounding across shards) but it
   is NOT a multiplier. The depth-1/low-depth gains are large because fsync is on the critical
   path there.
+
+---
+
+# SQL surface (v2 SELECT) micro-bench — parse / plan / execute BASELINE
+
+> **BASELINE — NOT OPTIMIZED.** A number to *regress against* later. The SQL layer is
+> SUGAR over the verified `query::Database` scan/get/range + an in-memory
+> filter/group/aggregate/sort pipeline. No core/sim/consensus/txn/storage and no
+> `query::Database`/`Query` code was touched for the SQL v2 surface — this measures the
+> *new SQL layer's CPU cost as built*, in memory, over the existing read surface.
+
+## What was measured
+
+`bench/sql_bench_main.cpp` (`lockstep_sql_bench_driver`). A FIXED, deterministic amount
+of work per query shape over an **N=500-row** table `emp(id INT PK, dept TEXT, sal INT,
+age INT)`, in memory (the engine primes a read store; **no disk I/O on the read path**).
+So this is the SQL pipeline's CPU cost — tokenize + recursive-descent parse + plan
+(PK fast-path vs full-scan decision) + decode rows + filter / group / aggregate / sort /
+slice — **NOT** storage throughput (that is the storage / prod sections above).
+
+The driver TU is **wall-clock-free / forbidden-lint clean** (no `std::chrono`): it runs a
+fixed iter count per shape and prints a result **checksum** (proves the work is REAL — the
+optimizer cannot elide it — and DETERMINISTIC: same build ⇒ same checksum, run to run).
+Time is taken EXTERNALLY (`/usr/bin/time -p`, or the per-shape `steady_clock` harness used
+to produce the table below). Two runs of the driver print byte-identical output.
+
+## Numbers (Apple M4 Pro, macOS host, -O2 release, in-memory)
+
+Per-op latency = (total wall for `iters` repetitions) / `iters`. Table N = 500 rows.
+
+| query shape                              | iters   | per-op    | what dominates |
+|------------------------------------------|---------|-----------|----------------|
+| PARSE-only (rich GROUP BY+HAVING+ORDER)  | 100 000 | **~1.1 µs**   | tokenize + recursive descent (no exec) |
+| point  — `WHERE id = <pk>` (point get)   | 20 000  | **~2.9 µs**   | parse + a single encoded-key `Query.get` |
+| range  — `WHERE id BETWEEN a AND b`      | 2 000   | **~0.46 ms**  | PK range scan + decode ~250 rows |
+| filter — full scan + ANY-col predicate   | 2 000   | **~1.05 ms**  | scan + decode 500 rows + per-row predicate eval |
+| order  — full scan + ORDER BY + LIMIT    | 1 000   | **~1.10 ms**  | scan/decode 500 + stable_sort + slice |
+| groupby— full scan + GROUP BY + 5 aggs   | 1 000   | **~1.06 ms**  | scan/decode 500 + grouped fold (COUNT/SUM/MIN/MAX/AVG) |
+| having — GROUP BY + HAVING + ORDER BY    | 1 000   | **~1.05 ms**  | as groupby + HAVING filter + group sort |
+| distinct— full scan + DISTINCT + ORDER   | 1 000   | **~1.05 ms**  | scan/decode 500 + de-dup + sort |
+
+Stable across two runs (variance < ~5%). The point-get is ~3 orders of magnitude cheaper
+than a full-scan query: the **PK fast-path** (a single `Query.get` of the order-preserving
+encoded key) avoids decoding the whole table, while any full-scan filter/aggregate is
+linear in the row count + the decode cost. Parse is ~1 µs and is NOT the bottleneck for any
+executing query — the row decode + pipeline dominates.
+
+## Honest caveats
+
+- **In-memory, single host, real wall-clock** — absolute µs/ms are RELATIVE regression
+  baselines only; re-run on the SAME machine. The *shape* of the result (point ≪ range ≪
+  full-scan; parse ≪ exec) is the finding.
+- **N = 500 by default**, because building the table is **O(N²)**: the v1 write path
+  (`Engine::submit_write`) re-submits the WHOLE accumulated write-log as one batch per
+  INSERT (so a read-modify-write body observes prior committed state through the verified
+  executor). That is a WRITE-path cost unrelated to the SELECT pipeline measured here —
+  FLAGGED, out of scope (Database/Engine write semantics UNCHANGED). A future incremental
+  prime would remove it.
+- **Full-scan cost is row-decode-bound**, not pipeline-bound: filter/order/groupby/distinct
+  over the same 500 rows all land near ~1 ms because each first decodes 500 KV rows back to
+  typed tuples. The aggregate fold / sort / de-dup add little on top. This is the obvious
+  first optimization target (lazy / projected decode), but this stage is a BASELINE, not an
+  optimization.
+- **Not an optimization task.** No SQL fast-path beyond the existing PK point/range lowering
+  was added; the in-memory pipeline is the straightforward O(rows·predicate) implementation.
