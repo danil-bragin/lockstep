@@ -1244,6 +1244,28 @@ if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin)
   set_tests_properties(prod_cluster_smoke PROPERTIES TIMEOUT 120)
 endif()
 
+# --- TLS TRANSPORT ENCRYPTION: mTLS cluster + auth teeth [LINUX ONLY] ----------
+# Orchestrates a REAL 3-process lockstepd cluster whose ENTIRE transport (consensus peer
+# replication + admin/client) is wrapped in mTLS (providers/prod/ProdTls.hpp over OpenSSL),
+# and asserts: (1) the encrypted cluster WORKS — one leader, replicated commit over the TLS
+# wire, a client TLS round-trip; (2) TEETH — a PLAINTEXT client and a WRONG-CA client are
+# REFUSED (the encryption + mutual auth actually gate, not cosmetic), with a correct-cert
+# control proving the refusals are the auth gate not a dead node. Generates ephemeral dev
+# certs (a self-signed CA + node/client certs + a rogue CA) with the `openssl` CLI in a
+# scratch dir. PROCESS-CLEANUP: traps EXIT/INT/TERM to SIGKILL every tracked child; each
+# lockstepd self-deadlines (--run-seconds). Built ONLY on Linux + only when TLS is enabled
+# (the lockstepd/lockstep_admin Linux targets carry LOCKSTEP_TLS via OpenSSL); the macOS
+# host stays green (test absent). NOTE: needs openssl on PATH (the dev image's libssl-dev).
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin AND OpenSSL_FOUND)
+  add_test(
+    NAME prod_tls_test
+    COMMAND ${CMAKE_COMMAND} -E env
+      LOCKSTEPD=$<TARGET_FILE:lockstepd>
+      LOCKSTEP_ADMIN=$<TARGET_FILE:lockstep_admin>
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/prod_tls_test.sh)
+  set_tests_properties(prod_tls_test PROPERTIES TIMEOUT 150)
+endif()
+
 # --- Phase 7 S6: JEPSEN-STYLE PROD-CLUSTER CAPSTONE (V-PROD-CLUSTER) [LINUX] ---
 # P7-S6 gate (briefs/phase7.md S6 — THE capstone). Drives the REAL multi-process
 # lockstepd cluster (5 nodes) under a FAULT STORM — process CRASH/RESTART (SIGKILL +

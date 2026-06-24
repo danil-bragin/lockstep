@@ -155,6 +155,16 @@ struct Args {
     // Structured lifecycle logs are emitted by default (a bounded, small set of events).
     // --verbose enables debug-level events (still bounded; no per-op spam in the daemon).
     bool verbose = false;
+
+    // --- TLS TRANSPORT ENCRYPTION ---------------------------------------------
+    // TLS is OPT-IN: pass --tls-cert/--tls-key/--tls-ca to encrypt the consensus peer
+    // transport (mTLS — peers mutually authenticate with CA-signed certs) AND the admin
+    // transport (the admin client must also present a CA-signed cert). When all three are
+    // empty, the transport is PLAINTEXT (the existing non-TLS tests keep working unchanged).
+    // These are PATHS only — the cli never touches OpenSSL; the provider (ProdNetwork) does.
+    std::string tls_cert;
+    std::string tls_key;
+    std::string tls_ca;
 };
 
 std::uint64_t parse_u64(const char* s, std::uint64_t fallback) {
@@ -228,6 +238,12 @@ Args parse_args(int argc, char** argv) {
             // OBSERVABILITY: --verbose 1 enables debug-level lifecycle events (the
             // pair-based parser takes a value so a bare flag never desyncs the pairing).
             a.verbose = (parse_u64(v, 0) != 0);
+        } else if (std::strcmp(k, "--tls-cert") == 0) {
+            a.tls_cert = v;
+        } else if (std::strcmp(k, "--tls-key") == 0) {
+            a.tls_key = v;
+        } else if (std::strcmp(k, "--tls-ca") == 0) {
+            a.tls_ca = v;
         }
     }
     return a;
@@ -255,6 +271,14 @@ int run_multishard(const Args& args) {
     cfg.election_min_ms = args.election_min_ms;
     cfg.election_max_ms = args.election_max_ms;
     cfg.heartbeat_ms = args.heartbeat_ms;
+#ifdef LOCKSTEP_TLS
+    if (!args.tls_cert.empty() || !args.tls_key.empty() || !args.tls_ca.empty()) {
+        cfg.tls.enabled = true;
+        cfg.tls.cert_path = args.tls_cert;
+        cfg.tls.key_path = args.tls_key;
+        cfg.tls.ca_path = args.tls_ca;
+    }
+#endif
     return prod::run_shards(cfg);
 }
 
@@ -289,6 +313,14 @@ int run_repl_multishard(const Args& args) {
     cfg.election_min_ms = args.election_min_ms;
     cfg.election_max_ms = args.election_max_ms;
     cfg.heartbeat_ms = args.heartbeat_ms;
+#ifdef LOCKSTEP_TLS
+    if (!args.tls_cert.empty() || !args.tls_key.empty() || !args.tls_ca.empty()) {
+        cfg.tls.enabled = true;
+        cfg.tls.cert_path = args.tls_cert;
+        cfg.tls.key_path = args.tls_key;
+        cfg.tls.ca_path = args.tls_ca;
+    }
+#endif
     return prod::run_repl_shards(cfg);
 }
 
@@ -346,6 +378,30 @@ int main(int argc, char** argv) {
     const std::uint64_t admin_id = args.node_id + 1'000'000;
 
     prod::ProdNetworkBus bus(reactor);
+
+#ifdef LOCKSTEP_TLS
+    // TLS TRANSPORT: if cert+key+CA were given, wrap the WHOLE bus transport (consensus +
+    // admin) in mTLS — peers and admin clients mutually authenticate with CA-signed certs.
+    // enable_tls builds the SSL_CTX once; every connection then negotiates a real TLS
+    // handshake. A bad cert/key/CA makes enable_tls fail -> we refuse to run (NEVER silently
+    // fall back to cleartext). When the flags are absent the transport stays plaintext.
+    if (!args.tls_cert.empty() || !args.tls_key.empty() || !args.tls_ca.empty()) {
+        prod::TlsConfig tcfg;
+        tcfg.enabled = true;
+        tcfg.cert_path = args.tls_cert;
+        tcfg.key_path = args.tls_key;
+        tcfg.ca_path = args.tls_ca;
+        if (!bus.enable_tls(tcfg, prod::TlsAuth::MutualPeer)) {
+            std::fprintf(stderr,
+                         "lockstepd: failed to initialize TLS (cert=%s key=%s ca=%s)\n",
+                         args.tls_cert.c_str(), args.tls_key.c_str(), args.tls_ca.c_str());
+            return 1;
+        }
+        std::printf("lockstepd: TLS mTLS ENABLED (cert=%s ca=%s)\n",
+                    args.tls_cert.c_str(), args.tls_ca.c_str());
+        std::fflush(stdout);
+    }
+#endif
 
     // This node LISTENS on its OWN fixed consensus + admin ports so peers / the admin
     // client can dial it a priori (cross-process: ephemeral ports cannot be agreed).

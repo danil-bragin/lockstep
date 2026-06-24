@@ -85,6 +85,13 @@ struct ShardRunConfig {
     std::uint64_t election_min_ms = 8;
     std::uint64_t election_max_ms = 20;
     std::uint64_t heartbeat_ms = 4;
+
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+    // TLS TRANSPORT (opt-in): when enabled, EACH shard's reactor owns its OWN TLS contexts
+    // (single-thread-per-shard — no cross-thread SSL sharing). Paths are the same dev certs
+    // for every shard (a homogeneous cluster). Empty/disabled -> plaintext (unchanged).
+    TlsConfig tls{};
+#endif
 };
 
 namespace shard_detail {
@@ -148,6 +155,16 @@ inline void run_one_shard(const ShardRunConfig& cfg, const ShardPlan& plan,
         }
         const std::uint64_t admin_id = plan.node_id + 1'000'000;
         bus = std::make_unique<ProdNetworkBus>(reactor);
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        // Per-shard TLS: this shard's own reactor owns its own SSL contexts (no cross-thread
+        // SSL object sharing — single-thread-per-shard). A TLS init failure fails the shard.
+        if (cfg.tls.enabled && !bus->enable_tls(cfg.tls, TlsAuth::MutualPeer)) {
+            std::fprintf(stderr, "shard %llu: TLS init failed\n",
+                         static_cast<unsigned long long>(plan.index));
+            sync->failures.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+#endif
         if (!bus->add_node_on_port(plan.node_id, plan.listen_port) ||
             !bus->add_node_on_port(admin_id, plan.admin_port)) {
             std::fprintf(stderr, "shard %llu: port bind failed (listen=%u admin=%u)\n",
@@ -308,6 +325,12 @@ struct ReplShardRunConfig {
     std::uint64_t election_min_ms = 150;
     std::uint64_t election_max_ms = 300;
     std::uint64_t heartbeat_ms = 30;
+
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+    // TLS TRANSPORT (opt-in): each replica's reactor owns its own TLS contexts (single-
+    // thread-per-shard; no cross-thread SSL sharing). Empty/disabled -> plaintext.
+    TlsConfig tls{};
+#endif
 };
 
 namespace shard_detail {
@@ -364,6 +387,15 @@ inline void run_one_repl_shard(const ReplShardRunConfig& cfg, std::uint64_t shar
         }
         const std::uint64_t admin_id = node_id + 1'000'000;
         bus = std::make_unique<ProdNetworkBus>(reactor);
+#if defined(__linux__) && defined(LOCKSTEP_TLS)
+        if (cfg.tls.enabled && !bus->enable_tls(cfg.tls, TlsAuth::MutualPeer)) {
+            std::fprintf(stderr, "repl-shard %llu (proc %llu): TLS init failed\n",
+                         static_cast<unsigned long long>(shard),
+                         static_cast<unsigned long long>(cfg.proc_id));
+            sync->failures.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+#endif
         // LISTEN on this replica's own consensus + admin ports.
         if (!bus->add_node_on_port(node_id, my_listen) ||
             !bus->add_node_on_port(admin_id, my_admin)) {
