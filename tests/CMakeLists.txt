@@ -759,6 +759,44 @@ if(TARGET lockstep_txn AND TARGET lockstep_storage AND TARGET lockstep_runtime
         lockstep_providers_sim)
     add_test(NAME txn_end_to_end_test COMMAND lockstep_txn_end_to_end_test)
   endif()
+
+  # --- Phase 9 S9.3: CROSS-SHARD ATOMIC COMMIT gate (the hardest piece) --------
+  # P9-XSHARD gate (specs/XShardCommit.tla, TLC-verified clean + teeth; +
+  # Sequencer.tla C4.4 + CommitOrdering.tla Phase 5). Wires a transaction touching
+  # keys on MULTIPLE shards through the ALREADY-VERIFIED building blocks: M
+  # independent single-shard Raft clusters (S9.1 model) ORDER, under the full fault
+  # storm, the txns that touch them (a cross-shard txn lands in EACH involved
+  # shard's committed log); the per-shard committed logs feed the C4.4
+  # Sequencer::merge -> ONE global order; the S9.3 dedup (txn/CrossShard.hpp)
+  # collapses a cross-shard txn's per-shard appearances to ONE global position GATED
+  # on it being committed on ALL its shards (all-or-nothing); the Phase-5
+  # DeterministicExecutor applies each txn's whole write set ATOMICALLY at that one
+  # position (Calvin-style, NO 2PC). Asserts over a seed sweep (<=16 in-gate x
+  # cluster matrix, LOCKSTEP_XSHARD_SEEDS override): (a) ATOMICITY (XShardCommit.tla
+  # AtomicAllOrNone, re-derived independently per shard — all-or-nothing, no partial
+  # commit); (b) STRICT-SERIALIZABLE == the txn Oracle on the sequencer order +
+  # EXACTLY-ONCE + the 8-checker battery, 0 violations; (c) DETERMINISM (same seed
+  # => byte-identical global order + history); TEETH — a partial cross-shard commit
+  # AND an out-of-sequencer-order apply are CAUGHT. Reuses the verified Sequencer +
+  # DeterministicExecutor + Oracle + Checkers UNCHANGED. Links the txn lib + the
+  # real consensus lib + storage + runtime + sim. Non-provider TU -> forbidden-lint
+  # scans it. Inherits the dir-wide TIMEOUT.
+  if(TARGET lockstep_consensus AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/txn_cross_shard_test.cpp")
+    add_executable(lockstep_txn_cross_shard_test txn_cross_shard_test.cpp)
+    target_include_directories(lockstep_txn_cross_shard_test
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_txn_cross_shard_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_txn
+        lockstep_consensus
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME txn_cross_shard_test COMMAND lockstep_txn_cross_shard_test)
+  endif()
 else()
   message(WARNING
     "lockstep_txn / storage / runtime / providers_sim not all found; "
