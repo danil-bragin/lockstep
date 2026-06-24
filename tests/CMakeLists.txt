@@ -936,6 +936,32 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_
   add_test(NAME prod_reactor_test COMMAND lockstep_prod_reactor_test)
 endif()
 
+# --- Phase 9 S9.2: PROD io_uring async-fdatasync path [LINUX ONLY] ------------
+# P9-S9.2 gate. The prod io_uring ring (providers/prod/ProdUring.hpp) + the async
+# fdatasync path on ProdDisk (the reactor-bound ctor), integrated with the reactor's
+# epoll loop (the ring fd is registered; CQEs are reaped + resolve the parked promise).
+# Asserts: (A) ring setup / availability (cleanly !valid() + SYNC fallback when seccomp
+# blocks io_uring_setup — correctness never depends on the ring); (B) an async fsync
+# completion fires on its CQE (res>=0 == durable); (C) the DURABILITY BARRIER — append
+# then co_await the ASYNC sync(), and the bytes SURVIVE a close+reopen byte-identical
+# (a synced prefix is never lost; nothing is acked before the fsync CQE). io_uring is
+# LINUX-ONLY: added ONLY on Linux so the macOS host build stays green. Bounded (tiny
+# payloads + an absolute reactor-deadline wall guard so a missing CQE can NEVER hang).
+# NOTE: the async assertions engage only with --security-opt seccomp=unconfined (default
+# Docker seccomp BLOCKS io_uring_setup → the test takes the SYNC-fallback path + passes).
+if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_uring_test prod_uring_test.cpp)
+  target_include_directories(lockstep_prod_uring_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_uring_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME prod_uring_test COMMAND lockstep_prod_uring_test)
+endif()
+
 # --- Phase 7 S4b: PROD NETWORK (real TCP on the epoll reactor) [LINUX ONLY] ---
 # P7-S4b gate (briefs/phase7.md S4; real sockets on the S4a reactor). The prod
 # INetwork provider (providers/prod/ProdNetwork.hpp) moves bytes over real TCP on
@@ -1031,6 +1057,34 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_consensus AND TARGET lockstep_runtime
       lockstep_providers_sim
       lockstep_providers_prod)
   add_test(NAME prod_consensus_test COMMAND lockstep_prod_consensus_test)
+endif()
+
+# --- Phase 9 S9.2: N=1 commit-FOLLOWS-fsync DURABILITY TEETH [LINUX ONLY] -----
+# The teeth for the S9.2 durability fix: a 1-node Raft self-commit must advance
+# commit_index only AFTER the entry's fdatasync COMPLETES, not at persist-enqueue.
+# Builds a REAL 1-node RaftNodeA (impl A) on the prod stack (ProdReactor + ProdDisk)
+# over a StallSyncDisk that holds sync() completion so the enqueue->fsync window is
+# deterministic, then asserts: appended-but-un-fsynced ⇒ commit_index == 0 (pre-fix
+# this was 1 — a committed-yet-un-durable entry an abrupt crash would lose); after
+# fsync ⇒ commit_index == 1 (commit follows durability). Runs under BOTH the async
+# io_uring fsync (--security-opt seccomp=unconfined) and the sync-fdatasync fallback.
+# LINUX-ONLY (ProdReactor/ProdDisk are __linux__); the macOS host stays green.
+if(UNIX AND NOT APPLE AND TARGET lockstep_consensus AND TARGET lockstep_runtime
+   AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_prod_consensus_durability_teeth_test
+                 prod_consensus_durability_teeth_test.cpp)
+  target_include_directories(lockstep_prod_consensus_durability_teeth_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_prod_consensus_durability_teeth_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_consensus
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME prod_consensus_durability_teeth_test
+           COMMAND lockstep_prod_consensus_durability_teeth_test)
+  set_tests_properties(prod_consensus_durability_teeth_test PROPERTIES TIMEOUT 60)
 endif()
 
 # --- Phase 7 S5b-2: REAL MULTI-PROCESS Raft CLUSTER smoke [LINUX ONLY] --------

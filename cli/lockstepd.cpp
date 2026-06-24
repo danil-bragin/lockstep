@@ -91,6 +91,7 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 #include <lockstep/prod/ProdConsensusNode.hpp>
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
+#include <lockstep/prod/ProdShardRunner.hpp>  // Phase 9 S9.1 multi-shard orchestrator
 
 #include <lockstep/consensus/ConsensusNode.hpp>
 
@@ -125,6 +126,19 @@ struct Args {
     std::uint64_t election_min_ms = 150;
     std::uint64_t election_max_ms = 300;
     std::uint64_t heartbeat_ms = 30;
+
+    // --- Phase 9 S9.1 MULTI-SHARD (horizontal throughput scaling) -------------
+    // shards>1 spawns M FULLY-INDEPENDENT single-node Raft shards, each on its OWN
+    // std::thread with its OWN ProdReactor + ProdDisk (data_dir/shard_<i>) + admin
+    // port. Shards share NOTHING mutable; the client routes by key-hash to a shard's
+    // admin port. shards==1 (default) is the UNCHANGED single-shard daemon path.
+    // Shard i (0-based) uses: node_id = i+1, admin port = shard_base_port + i,
+    // consensus listen port = shard_base_port + shards + i (its own range, never
+    // colliding with any admin port), data_dir = data_dir/shard_<i>. Single-node
+    // cluster {i+1}, so each shard self-commits via the gated N=1 path — verbatim
+    // reuse of the existing consensus surface (NO consensus change).
+    std::uint64_t shards = 1;
+    std::uint16_t shard_base_port = 0;  // REQUIRED in multi-shard mode (>0)
 };
 
 std::uint64_t parse_u64(const char* s, std::uint64_t fallback) {
@@ -185,12 +199,40 @@ Args parse_args(int argc, char** argv) {
             a.election_max_ms = parse_u64(v, a.election_max_ms);
         } else if (std::strcmp(k, "--heartbeat-ms") == 0) {
             a.heartbeat_ms = parse_u64(v, a.heartbeat_ms);
+        } else if (std::strcmp(k, "--shards") == 0) {
+            a.shards = parse_u64(v, a.shards);
+        } else if (std::strcmp(k, "--shard-base-port") == 0) {
+            a.shard_base_port =
+                static_cast<std::uint16_t>(parse_u64(v, a.shard_base_port));
         }
     }
     return a;
 }
 
 constexpr core::Tick kMsToNs = 1'000'000;
+
+// Phase 9 S9.1 — MULTI-SHARD dispatch. The thread orchestration lives in
+// prod::run_shards (providers/prod, the lint-exempt real-thread boundary). This thin
+// wrapper just maps the daemon Args onto prod::ShardRunConfig. See ProdShardRunner.hpp
+// for the full design (M independent shards, per-shard reactor/disk/port, key-routing,
+// clean join-on-shutdown, no shared mutable state on the data path).
+int run_multishard(const Args& args) {
+    if (args.shard_base_port == 0) {
+        std::fprintf(stderr,
+                     "lockstepd: --shards M (M>1) requires --shard-base-port P (>0)\n");
+        return 2;
+    }
+    prod::ShardRunConfig cfg;
+    cfg.shards = args.shards;
+    cfg.base_port = args.shard_base_port;
+    cfg.data_dir = args.data_dir;
+    cfg.seed = args.seed;
+    cfg.run_seconds = args.run_seconds;
+    cfg.election_min_ms = args.election_min_ms;
+    cfg.election_max_ms = args.election_max_ms;
+    cfg.heartbeat_ms = args.heartbeat_ms;
+    return prod::run_shards(cfg);
+}
 
 }  // namespace
 
@@ -207,11 +249,23 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // Phase 9 S9.1: MULTI-SHARD mode. Entered whenever --shard-base-port is given (or
+    // --shards M>1): spawns M independent single-node Raft shards, each on its own
+    // thread/reactor/disk/port. M=1 here is the SAME multi-shard code path with one shard
+    // (so the scaling baseline measures the identical code, just one thread). The legacy
+    // single-process daemon path below (the UNCHANGED Phase 7/8 cluster member) stays the
+    // default when neither --shard-base-port nor --shards>1 is given.
+    if (args.shard_base_port != 0 || args.shards > 1) {
+        return run_multishard(args);
+    }
+
     if (args.listen_port == 0 || args.admin_port == 0 || args.peers.empty()) {
         std::fprintf(stderr,
                      "lockstepd: usage: --node-id N --listen-port P --admin-port A "
                      "--peer id:port [--peer id:port ...] --data-dir DIR [--seed S] "
-                     "[--run-seconds T]\n");
+                     "[--run-seconds T]\n"
+                     "       OR multi-shard: --shards M --shard-base-port P "
+                     "--data-dir DIR [--seed S] [--run-seconds T]\n");
         return 2;
     }
 

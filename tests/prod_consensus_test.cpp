@@ -20,14 +20,17 @@
 //       DISK (not memory — there is none). We assert the recovered log values + terms
 //       MATCH what was appended before, and read them back over the real admin socket.
 //
-// N=1 SELF-COMMIT (fixed): the consensus core now advances commit_index for a
-// peerless 1-node cluster — the lone leader self-commits its own appended entry the
-// instant it is durable (advance_commit_index() is re-evaluated after the leader's own
-// append; it self-counts and quorum()==1). This deployment is exactly what surfaced the
-// original gap (RaftNodeA only advanced commit_index on a peer AppendEntries ack, which
-// never arrives with no peers). The fix is gated on quorum()==1, so it is a strict no-op
-// for N>=2 (where commitment stays ack-driven). We now ASSERT commit_index advances to
-// the durable log length here, in addition to the durable-LOG recovery payload.
+// N=1 SELF-COMMIT (fixed): the consensus core advances commit_index for a peerless
+// 1-node cluster — the lone leader self-commits its own appended entry once it is
+// DURABLE. S9.2 FIX: "durable" is fsync COMPLETION, not persist-ENQUEUE — the
+// self-commit now fires at the persist worker's POST-SYNC point (after fdatasync
+// completes for the just-persisted prefix), so commit_index can never advance for an
+// un-fsynced entry. This deployment is exactly what surfaced the original gap (RaftNodeA
+// only advanced commit_index on a peer AppendEntries ack, which never arrives with no
+// peers; the interim fix advanced at enqueue, before fsync — losing a committed entry on
+// an abrupt crash in the enqueue->fsync window). The fix is gated on quorum()==1, a
+// strict no-op for N>=2 (where commitment stays ack-driven). We ASSERT commit_index
+// advances to the durable log length (after fsync) here, plus durable-LOG recovery.
 //
 // Everything is driven by ONE in-process ProdReactor per incarnation (the node + the
 // admin client share it — the S4b in-process model; multi-PROCESS is S5b-2). BOUNDED
@@ -224,8 +227,16 @@ int main() {
         // Pump the reactor so the durable persist worker drains (each appended entry
         // is pwrite+fdatasync'd to consensus.wal). The node's log now holds every
         // submitted entry; they are durable on the real ProdDisk file.
+        // S9.2 FIX: commit now FOLLOWS fsync (the lone-leader self-commit fires at the
+        // persist worker's POST-SYNC point, not at submit-enqueue), so commit_index may
+        // briefly LAG durable_entries() until the async fdatasync CQE arrives. Pump until
+        // commit_index has caught up to every submitted entry — i.e. until each is not
+        // just appended but fsync'd-then-committed (the durability barrier the fix adds).
         node->run_until(
-            [node, &values] { return node->durable_entries().size() >= values.size(); },
+            [node, &values] {
+                return node->durable_entries().size() >= values.size() &&
+                       node->commit_index() >= values.size();
+            },
             node->reactor().now() + kWallNs);
 
         // STATUS over the real socket: the durable LOG digest must hold our values.
@@ -249,9 +260,10 @@ int main() {
                     values_ok ? "PASS" : "FAIL");
         all = all && log_over_socket && values_ok;
 
-        // N=1 SELF-COMMIT (fixed): the lone leader self-commits its own entries with no
-        // peer ack, so commit_index advances to the durable log length. ASSERTED here —
-        // the exact deployment that surfaced the original gap now commits.
+        // N=1 SELF-COMMIT (fixed, S9.2): the lone leader self-commits its own entries
+        // with no peer ack, so commit_index advances to the durable log length — but only
+        // AFTER each entry's fdatasync COMPLETES (commit follows fsync, the durability
+        // fix). We pumped above until commit caught up, so by here commit_index == #values.
         const std::uint64_t ci = node->commit_index();
         const bool commit_ok = ci == static_cast<std::uint64_t>(values.size());
         std::printf("%s consensus/N=1-self-commit (commit_index=%llu want=%llu; lone "

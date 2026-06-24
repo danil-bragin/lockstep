@@ -67,6 +67,10 @@
 #include <lockstep/core/Future.hpp>
 #include <lockstep/core/IDisk.hpp>
 #include <lockstep/core/Scheduler.hpp>
+#include <lockstep/core/detail/SchedulerSink.hpp>
+#ifdef __linux__
+#include <lockstep/prod/ProdReactor.hpp>
+#endif
 
 namespace lockstep::prod {
 
@@ -98,21 +102,23 @@ public:
     // when provided AND this open created the file, the first sync() fsyncs it so
     // the new dirent is durable. Pass -1 to skip the dir-fsync (e.g. reopen).
     ProdDisk(core::Scheduler& sched, const std::string& path, int dir_fd = -1) noexcept
-        : sched_(&sched), dir_fd_(dir_fd) {
-        // O_CREAT|O_RDWR: append-structured but we pwrite at an explicit offset,
-        // so we do NOT use O_APPEND (which would force every write to EOF and
-        // defeat deterministic offset placement). 0644 perms.
-        const bool existed = (::access(path.c_str(), F_OK) == 0);
-        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
-        if (fd_ < 0) {
-            open_errno_ = errno;
-            return;
-        }
-        // First sync of a freshly-CREATED file should durably record its dirent.
-        created_ = !existed;
-        const off_t end = ::lseek(fd_, 0, SEEK_END);
-        len_ = (end < 0) ? 0 : static_cast<std::uint64_t>(end);
+        : sink_(&sched), dir_fd_(dir_fd) {
+        open_file(path);
     }
+
+#ifdef __linux__
+    // S9.2 — the REACTOR-DRIVEN ctor: bind to a ProdReactor so (a) Futures are minted
+    // from the reactor's SchedulerSink (the same sink the consensus core runs on) and
+    // (b) sync() can submit an ASYNC fdatasync through the reactor's io_uring ring. The
+    // ASYNC fsync's COMPLETION (the CQE) is the durability barrier — the awaiting
+    // persist worker does not resume (and the entry is not acked/committed) until the
+    // fsync completes. If the ring is unavailable (seccomp-blocked / full), sync()
+    // transparently falls back to a synchronous fdatasync: correctness is identical.
+    ProdDisk(ProdReactor& reactor, const std::string& path, int dir_fd = -1) noexcept
+        : sink_(&reactor), reactor_(&reactor), dir_fd_(dir_fd) {
+        open_file(path);
+    }
+#endif
 
     ProdDisk(const ProdDisk&) = delete;
     ProdDisk& operator=(const ProdDisk&) = delete;
@@ -238,13 +244,63 @@ public:
         if (fd_ < 0) {
             return ready(core::Error{core::ErrorCode::IoFault, "prod disk not open"});
         }
-        // Time the real fdatasync (the durability barrier). PROFILING ONLY: a
-        // monotonic-clock delta around the syscall, summed; never feeds any
-        // deterministic ordering (this is the prod provider — no sim determinism).
+        ++sync_calls_;
+#ifdef __linux__
+        // S9.2 — ASYNC fdatasync via the reactor's io_uring ring, when bound + available.
+        // The CQE is the DURABILITY BARRIER: the parked promise (hence the awaiting
+        // persist worker, hence the ack/commit) does NOT complete until the kernel
+        // confirms the data is durable. submit_fsync returns false if the ring is
+        // unusable/full this turn → we FALL BACK to the synchronous fdatasync below; the
+        // barrier is honored either way (no path acks before durability).
+        if (reactor_ != nullptr && reactor_->uring_available()) {
+            core::Promise<core::Error> p = core::make_promise<core::Error>(sink_);
+            core::Future<core::Error> f = p.get_future();
+            const auto t0 = std::chrono::steady_clock::now();
+            // Promise is move-only; the reactor's completion callback type is a
+            // std::function (copyable). Hold the promise in a shared_ptr so the lambda
+            // is copyable WITHOUT changing Promise's single-fulfillment ownership (exactly
+            // one set_value, on the CQE). The shared_ptr is released when the callback is
+            // dropped after firing (or when the reactor tears down un-reaped callbacks).
+            auto pp = std::make_shared<core::Promise<core::Error>>(std::move(p));
+            // The completion callback finishes the durable barrier: on fsync success it
+            // does the one-time dir-fsync for a fresh file (so the dirent is durable too)
+            // and resolves OK; on failure it resolves IoFault — NEVER a false durability.
+            // Capturing `this` is safe: the persist worker awaiting `f` keeps the op in
+            // flight, and the ProdDisk outlives the reactor's run (RAII teardown order).
+            const bool submitted = reactor_->submit_fsync(
+                fd_, [this, pp, t0](bool ok) {
+                    const auto t1 = std::chrono::steady_clock::now();
+                    sync_total_ns_ += static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+                            .count());
+                    if (!ok) {
+                        pp->set_value(core::Error{core::ErrorCode::IoFault,
+                                                  "prod async fdatasync failed"});
+                        return;
+                    }
+                    if (created_ && !dir_synced_ && dir_fd_ >= 0) {
+                        if (::fsync(dir_fd_) != 0) {
+                            pp->set_value(core::Error{core::ErrorCode::IoFault,
+                                                      "prod dir fsync failed"});
+                            return;
+                        }
+                    }
+                    dir_synced_ = true;
+                    pp->set_value(core::Error{});
+                });
+            if (submitted) {
+                return f;
+            }
+            // Submission failed (SQ full / enter error): fall through to synchronous
+            // fdatasync. `p`/`f` are discarded (the promise was never published to the
+            // ring); we mint a fresh ready future on the sync path below.
+        }
+#endif
+        // Synchronous fdatasync path (the conformance harness, the non-Linux host, and
+        // the io_uring-unavailable / ring-full fallback). Identical barrier semantics.
         const auto t0 = std::chrono::steady_clock::now();
         const int rc = prod_fdatasync(fd_);
         const auto t1 = std::chrono::steady_clock::now();
-        ++sync_calls_;
         sync_total_ns_ += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         if (rc != 0) {
@@ -268,13 +324,30 @@ private:
     // the caller awaits, so await_ready() is true and the awaiter resumes inline —
     // the synchronous IO is surfaced through the async interface with no suspend.
     [[nodiscard]] core::Future<core::Error> ready(core::Error e) {
-        core::Promise<core::Error> p = core::make_promise<core::Error>(sched_);
+        core::Promise<core::Error> p = core::make_promise<core::Error>(sink_);
         core::Future<core::Error> f = p.get_future();
         p.set_value(e);
         return f;
     }
 
-    core::Scheduler* sched_;
+    // Shared open path for both ctors. O_CREAT|O_RDWR: append-structured but we pwrite
+    // at an explicit offset (no O_APPEND). Adopts the current size as the logical end.
+    void open_file(const std::string& path) noexcept {
+        const bool existed = (::access(path.c_str(), F_OK) == 0);
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd_ < 0) {
+            open_errno_ = errno;
+            return;
+        }
+        created_ = !existed; // first sync of a freshly-created file durably records dirent
+        const off_t end = ::lseek(fd_, 0, SEEK_END);
+        len_ = (end < 0) ? 0 : static_cast<std::uint64_t>(end);
+    }
+
+    core::detail::SchedulerSink* sink_; // mints the op Futures (Scheduler OR ProdReactor)
+#ifdef __linux__
+    ProdReactor* reactor_ = nullptr;    // bound reactor (owns the io_uring ring); or null
+#endif
     int fd_ = -1;
     int dir_fd_ = -1;       // borrowed (not owned/closed here); -1 = none
     int open_errno_ = 0;    // errno captured if open() failed
