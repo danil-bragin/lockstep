@@ -60,6 +60,7 @@
 #include <vector>
 
 #include <lockstep/core/Future.hpp>
+#include <lockstep/core/IDisk.hpp>
 #include <lockstep/core/Scheduler.hpp>
 #include <lockstep/core/Task.hpp>
 #include <lockstep/sim/SeededRandom.hpp>
@@ -169,6 +170,172 @@ template <typename... Rs>
 using SubmitResult = txn::RunResult;
 
 // ----------------------------------------------------------------------------
+// PersistentStore — the DURABLE committed query state (Phase 7 S5a flag closure).
+//
+// THE GAP it closes: previously the query-visible committed state lived ONLY in
+// memory (a vector<WriteSet> history replayed into an EPHEMERAL WalEngine per
+// query) — a server restart lost it (only the consensus log was durable). This
+// makes the committed query state DURABLE on an injected core::IDisk, REUSING the
+// already-verified storage::WalEngine (WAL append + crash recovery): a committed
+// write-set is applied to ONE persistent engine ONCE (WAL'd + synced); queries
+// read the live engine (no per-query rebuild); on restart, reopen the SAME IDisk
+// -> WalEngine::recover() rebuilds the store -> the committed query state is back
+// WITHOUT replaying the consensus log.
+//
+// PREFIX->SEQ FIDELITY (the D5 load-bearing piece): a query at level L resolves to
+// ONE committed PREFIX p in [0, tip] (Query.hpp::resolve_prefix); the read must be
+// AS-OF that prefix's engine Snapshot Seq (e.g. a Snapshot read as-of version 1
+// returns the value before any later transfer). The engine assigns one monotonic
+// Seq per individual key-write and retains ALL MVCC versions (no GC here), so we
+// keep snap_[p] = the engine Seq after applying the first p committed write-sets.
+// snap_[0] = kNoSeq (empty prefix). This is EXACTLY the per-query snap[] the old
+// ephemeral path built — now maintained INCREMENTALLY over the persistent engine,
+// so query results are byte-identical to the re-execution model (the conformance
+// gate is the proof).
+//
+// DETERMINISM: the engine runs on a Scheduler + a fixed-seed SimDisk-or-injected
+// IDisk; the OBSERVABLE result maps committed prefixes onto engine snapshot Seqs
+// and never depends on disk latency/seed (a constant keeps the read path a pure
+// function of (applied history, query)). No pointer into a growable container
+// across a co_await (V-RKV1): each engine read is consumed into a value before the
+// next.
+//
+// SCHEDULER IDENTITY (the seam constraint): the engine + its IDisk must run on the
+// SAME Scheduler — every IDisk (SimDisk, ProdDisk) is constructed over a Scheduler
+// and drives its async completions on it. So the INJECTED backing borrows the
+// caller's Scheduler (the one the disk was built over); only the DEFAULT in-memory
+// backing owns its own Scheduler + SimDisk.
+// ----------------------------------------------------------------------------
+class PersistentStore {
+public:
+    // Default backing: an internally-owned Scheduler + fault-free SimDisk (the
+    // in-memory backing existing callers + tests get when they inject nothing). The
+    // committed state is durable across queries but the backing is volatile (matches
+    // the pre-seam behaviour for default callers).
+    PersistentStore()
+        : owned_sched_(std::make_unique<core::Scheduler>()),
+          sched_(owned_sched_.get()),
+          owned_clock_(std::make_unique<core::SimClock>(*sched_)),
+          owned_rng_(std::make_unique<sim::SeededRandom>(kStorageSeed)),
+          owned_disk_(std::make_unique<sim::SimDisk>(*sched_, *owned_clock_,
+                                                     *owned_rng_, fault_free_cfg())),
+          disk_(owned_disk_.get()),
+          engine_(std::make_unique<storage::WalEngine>(*sched_, *disk_)) {}
+
+    // Injected backing: the committed query state is a durable WalEngine over the
+    // caller's IDisk (a ProdDisk for real on-disk recovery, or a SimDisk for a
+    // deterministic crash/recovery test), driven on the caller's Scheduler (the one
+    // the disk runs on). The caller owns both lifetimes; they must outlive this
+    // store. recover() rebuilds the store from the disk image.
+    PersistentStore(core::Scheduler& sched, core::IDisk& disk)
+        : sched_(&sched),
+          disk_(&disk),
+          engine_(std::make_unique<storage::WalEngine>(*sched_, *disk_)) {}
+
+    PersistentStore(const PersistentStore&) = delete;
+    PersistentStore& operator=(const PersistentStore&) = delete;
+
+    // Apply ONE committed write-set (the p-th commit) to the persistent engine:
+    // WAL-append every key-write, sync (the durability barrier), and record the new
+    // prefix->Seq boundary. Applied EXACTLY ONCE per committed write-set (the caller
+    // dedups). Advances the live tip by one.
+    void apply_committed(const txn::WriteSet& ws) {
+        sched_->spawn(apply_task(ws));
+        sched_->run();
+    }
+
+    // The live committed tip (number of committed write-sets applied).
+    [[nodiscard]] Seq tip() const noexcept { return static_cast<Seq>(snap_.size()) - 1; }
+
+    // The engine Snapshot Seq for a committed prefix p (clamped to the live tip).
+    [[nodiscard]] storage::Seq snap_for(Seq prefix) const {
+        const std::size_t idx = (prefix < snap_.size())
+                                    ? static_cast<std::size_t>(prefix)
+                                    : (snap_.size() - 1);
+        return snap_[idx];
+    }
+
+    // Read access to the live persistent engine (queries drive reads against it).
+    [[nodiscard]] storage::Engine& engine() noexcept { return *engine_; }
+    [[nodiscard]] core::Scheduler& scheduler() noexcept { return *sched_; }
+
+    // True iff this store owns its (default in-memory) backing — i.e. NO IDisk was
+    // injected. prime() uses this to decide whether a rebuild starts a fresh default
+    // backing or reopens the SAME injected disk.
+    [[nodiscard]] bool owns_default_backing() const noexcept {
+        return owned_disk_ != nullptr;
+    }
+
+    // RECOVER the committed query state from the durable IDisk image (a restart).
+    // Reopens the engine over the SAME disk and replays the durable WAL prefix into
+    // a fresh memtable (WalEngine::recover — the verified crash-recovery path), then
+    // rebuilds the live tip from the recovered engine. After this, a live-tip query
+    // returns every committed value WITHOUT replaying the consensus log.
+    //
+    // `durable_len` is the durable WAL byte length (a SimDisk reports it via
+    // durable_len(); a ProdDisk would use the on-disk file size). PREFIX BOUNDARIES
+    // are not separately persisted, so after recovery snap_ models a single prefix
+    // step [empty, recovered-tip]: live-tip reads (the recovery guarantee) are exact;
+    // an older-prefix Snapshot read post-recovery clamps to the tip (re-priming via
+    // apply_committed restores full per-prefix fidelity for a live session).
+    void recover(std::size_t durable_len) {
+        engine_ = std::make_unique<storage::WalEngine>(*sched_, *disk_);
+        sched_->spawn(recover_task(durable_len));
+        sched_->run();
+        const storage::Seq last = engine_->last_seq();
+        snap_.assign(1, storage::kNoSeq);  // prefix 0 (empty)
+        if (last != storage::kNoSeq) {
+            snap_.push_back(last);  // a single recovered prefix at the live tip
+        }
+    }
+
+private:
+    static sim::DiskFaultConfig fault_free_cfg() {
+        sim::DiskFaultConfig dc;
+        dc.latency_min = 0;
+        dc.latency_max = 0;
+        return dc;
+    }
+
+    core::Task apply_task(const txn::WriteSet& ws) {
+        for (const auto& [k, v] : ws) {
+            (void)co_await engine_->put(k, v);
+        }
+        // Durability barrier: every key-write of this committed write-set is durable
+        // on the injected IDisk before the prefix boundary is recorded (so recovery
+        // sees a clean committed prefix, never a torn half-applied write-set).
+        (void)co_await engine_->sync();
+        const storage::Snapshot tip = co_await engine_->snapshot();
+        snap_.push_back(tip.at);
+        co_return;
+    }
+
+    core::Task recover_task(std::size_t durable_len) {
+        (void)co_await engine_->recover(durable_len);
+        co_return;
+    }
+
+    // A fixed seed for the standalone storage sim. The OBSERVABLE result must NOT
+    // depend on it (commit prefixes map onto engine snapshot Seqs). Declared first
+    // so the default ctor's member inits can read it.
+    static constexpr std::uint64_t kStorageSeed = 0x5713'5713'5713'5713ULL;
+
+    // Owned ONLY for the default in-memory backing (null when an IDisk is injected,
+    // in which case the caller's Scheduler/disk are borrowed via the pointers).
+    std::unique_ptr<core::Scheduler> owned_sched_;
+    core::Scheduler* sched_;
+    std::unique_ptr<core::SimClock> owned_clock_;
+    std::unique_ptr<sim::SeededRandom> owned_rng_;
+    std::unique_ptr<sim::SimDisk> owned_disk_;
+    core::IDisk* disk_;
+    std::unique_ptr<storage::WalEngine> engine_;
+
+    // prefix p -> engine Snapshot Seq after applying the first p write-sets.
+    // snap_[0] = kNoSeq (empty prefix); snap_.size()-1 == live tip.
+    std::vector<storage::Seq> snap_{storage::kNoSeq};
+};
+
+// ----------------------------------------------------------------------------
 // THE DATABASE / CLIENT. The single developer-facing object. It owns the txn
 // Executor (the LANDED deterministic_factory by default) and a storage::Engine
 // for the standalone read/query path. ONE-SHOT only: submit(batch) executes a
@@ -176,11 +343,30 @@ using SubmitResult = txn::RunResult;
 // ----------------------------------------------------------------------------
 class Database {
 public:
-    // Default: the real verified deterministic executor (deterministic_factory).
-    // A different factory (e.g. the oracle, for conformance) can be injected.
-    Database() : exec_factory_(txn::deterministic_factory()) {}
+    // Default: the real verified deterministic executor (deterministic_factory) and
+    // a default in-memory persistent store (an internally-owned fault-free SimDisk).
+    // Existing callers that inject no disk get this — behaviour is byte-identical to
+    // the old per-query-rebuild path, but the committed state now lives in ONE
+    // engine maintained incrementally instead of being rebuilt per query.
+    Database()
+        : exec_factory_(txn::deterministic_factory()),
+          store_(std::make_unique<PersistentStore>()) {}
     explicit Database(txn::ExecutorFactory factory)
-        : exec_factory_(std::move(factory)) {}
+        : exec_factory_(std::move(factory)),
+          store_(std::make_unique<PersistentStore>()) {}
+
+    // INJECTION SEAM (Phase 7 S5a closure): back the committed query state with a
+    // durable WalEngine over the caller's IDisk (ProdDisk for real recovery; SimDisk
+    // for a deterministic crash test), driven on the caller's Scheduler (the one the
+    // disk runs on — engine + disk MUST share a scheduler). The committed state
+    // survives + recovers on a restart over the SAME disk. The caller owns the
+    // scheduler + disk; both must outlive this DB.
+    Database(core::Scheduler& sched, core::IDisk& disk)
+        : exec_factory_(txn::deterministic_factory()),
+          store_(std::make_unique<PersistentStore>(sched, disk)) {}
+    Database(txn::ExecutorFactory factory, core::Scheduler& sched, core::IDisk& disk)
+        : exec_factory_(std::move(factory)),
+          store_(std::make_unique<PersistentStore>(sched, disk)) {}
 
     // ---- (1) submit a batch of one-shot txn functions (C6.1) ----------------
     // The TxnFns are ALREADY in their agreed global order (the seqLog the
@@ -217,37 +403,63 @@ public:
     [[nodiscard]] QueryResult run(const Query<L>& q, Seq replica_lag = 0,
                                   Seq session_last_write = 0) {
         QueryResult out;
-        core::Scheduler sched;
-        core::SimClock clock(sched);
-        sim::SeededRandom rng(kStorageSeed);
-        sim::DiskFaultConfig dc;
-        dc.latency_min = 0;
-        dc.latency_max = 0;
-        sim::SimDisk disk(sched, clock, rng, dc);
-        storage::WalEngine engine(sched, disk);
-
-        // run_query deterministically replays the primed history_ into this engine
-        // (building the versioned MVCC store), then reads the planned query AS-OF
-        // the committed prefix the call-site D5 level resolves to.
-        sched.spawn(run_query(engine, q, replica_lag, session_last_write, out));
-        sched.run();
+        // Read the LIVE persistent engine directly (no per-query rebuild). The store
+        // already holds the committed MVCC history (applied incrementally + WAL'd),
+        // and snap_for(prefix) gives the engine Snapshot Seq for any committed prefix
+        // — so a D5 read AS-OF an older prefix is exact (V-D5-SAFE preserved).
+        store_->scheduler().spawn(
+            run_query(store_->engine(), q, replica_lag, session_last_write, out));
+        store_->scheduler().run();
         return out;
     }
 
-    // Prime the standalone read-path with a committed write-set HISTORY IN ORDER:
-    // `history[p-1]` is the write-set committed by the p-th commit (commit_version
-    // p), so each entry advances the version by one — building a versioned MVCC
-    // history the D5 read path can read AS-OF a chosen committed prefix. The
-    // scheduler-local engine is rebuilt deterministically from this history on each
-    // run() (run_query replays it), so prime() just records the history + tip. A
-    // pure function of `history`. Returns the tip (== history.size()).
-    [[nodiscard]] Seq prime(const std::vector<txn::WriteSet>& history) {
-        history_ = history;
-        tip_ = static_cast<Seq>(history.size());
-        return tip_;
+    // INCREMENTAL durable apply (the new write path): apply ONE committed write-set
+    // to the persistent engine (WAL'd + synced) ONCE and advance the live tip. The
+    // caller (wire::Server) dedups, so each committed write-set lands exactly once.
+    // Returns the new live tip. This REPLACES the "re-run the whole batch + re-prime
+    // the full history per submit" model with an incrementally-maintained durable
+    // store — query results are identical (the conformance gate proves it).
+    Seq apply_committed(const txn::WriteSet& ws) {
+        store_->apply_committed(ws);
+        return store_->tip();
     }
 
-    [[nodiscard]] Seq tip() const noexcept { return tip_; }
+    // Prime the standalone read-path with a committed write-set HISTORY IN ORDER:
+    // `history[p-1]` is the write-set committed by the p-th commit. Rebuilds the
+    // persistent store from scratch (a fresh engine over the SAME backing) and
+    // applies the history incrementally — so the prefix->Seq mapping the D5 read
+    // path needs is exact. A pure function of `history`. Returns the tip.
+    //
+    // Kept for the standalone Database surface + the round-trip oracle. The wire
+    // Server now drives the incremental apply_committed() path instead (one apply
+    // per new commit) rather than re-priming the whole history each submit.
+    [[nodiscard]] Seq prime(const std::vector<txn::WriteSet>& history) {
+        if (store_->owns_default_backing()) {
+            // Default in-memory backing: rebuild from scratch over a fresh disk and
+            // apply the whole history (the standalone surface's "history is exactly
+            // this" semantics). Pure function of `history`.
+            store_ = std::make_unique<PersistentStore>();
+            for (const txn::WriteSet& ws : history) {
+                store_->apply_committed(ws);
+            }
+        } else {
+            // Injected DURABLE backing: an append-structured WAL cannot be rewound,
+            // so prime() applies only the TAIL beyond the current tip (history is a
+            // monotonic superset of what is already durably applied — the wire
+            // Server appends one commit at a time). This keeps the durable WAL a
+            // single append-only committed prefix.
+            const std::size_t have = static_cast<std::size_t>(store_->tip());
+            for (std::size_t p = have; p < history.size(); ++p) {
+                store_->apply_committed(history[p]);
+            }
+        }
+        return store_->tip();
+    }
+
+    [[nodiscard]] Seq tip() const noexcept { return store_->tip(); }
+
+    // Recover the committed query state from the durable IDisk after a restart.
+    void recover(std::size_t durable_len) { store_->recover(durable_len); }
 
 private:
     // A fixed seed for the standalone storage sim. The OBSERVABLE result must NOT
@@ -257,10 +469,9 @@ private:
 
     txn::ExecutorFactory exec_factory_;
 
-    // The standalone read-path state: the committed write-set history (replayed
-    // into a scheduler-local engine on each run) + the live tip prefix.
-    std::vector<txn::WriteSet> history_;
-    Seq tip_ = 0;
+    // The DURABLE committed query state: ONE persistent WalEngine over the injected
+    // (or default in-memory) IDisk, maintained incrementally + read live.
+    std::unique_ptr<PersistentStore> store_;
 
     // Wrap a user TxnFn into a txn::Txn: the body runs the user body over a
     // TxnContext built from the executor-presented ReadView, then yields the
@@ -281,30 +492,21 @@ private:
         return t;
     }
 
-    // Build the engine from history_ deterministically, then run the planned query
-    // at its resolved committed prefix and record results + served diagnostics.
+    // Read the LIVE persistent engine at the planned committed prefix and record
+    // results + served diagnostics. The engine already holds the committed MVCC
+    // history (applied incrementally + WAL'd); snap_for(prefix) maps a committed
+    // prefix to its engine Snapshot Seq, so an as-of-older-prefix read is exact.
     template <typename L>
     core::Task run_query(storage::Engine& engine, const Query<L>& q, Seq replica_lag,
                          Seq session_last_write, QueryResult& out) {
-        // Rebuild the versioned MVCC history into THIS scheduler-local engine.
-        std::vector<storage::Seq> snap{storage::kNoSeq};
-        for (const txn::WriteSet& ws : history_) {
-            for (const auto& [k, v] : ws) {
-                (void)co_await engine.put(k, v);
-            }
-            const storage::Snapshot tip = co_await engine.snapshot();
-            snap.push_back(tip.at);
-        }
-        const Seq tip_prefix = static_cast<Seq>(history_.size());
+        const Seq tip_prefix = store_->tip();
 
         // Resolve the level to ONE committed prefix (the planner's job).
         const Plan plan = plan_query(q, tip_prefix, replica_lag, session_last_write);
         out.level = plan.level;
         out.served_version = plan.read_prefix;
 
-        const storage::Seq snap_seq =
-            (plan.read_prefix < snap.size()) ? snap[plan.read_prefix]
-                                             : snap.back();
+        const storage::Seq snap_seq = store_->snap_for(plan.read_prefix);
 
         for (const Step& st : plan.steps) {
             if (st.kind == StepKind::Point) {

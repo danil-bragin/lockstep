@@ -37,7 +37,9 @@
 #include <vector>
 
 #include <lockstep/core/Future.hpp>
+#include <lockstep/core/IDisk.hpp>
 #include <lockstep/core/INetwork.hpp>
+#include <lockstep/core/Scheduler.hpp>
 #include <lockstep/core/Task.hpp>
 
 #include <lockstep/query/Database.hpp>
@@ -112,13 +114,26 @@ using core::Task;
 // ----------------------------------------------------------------------------
 class Server {
 public:
-    // Network-driven server (the normal mode): serve() recv-loops on `net`.
+    // Network-driven server (the normal mode): serve() recv-loops on `net`. The
+    // committed query state uses the Database's DEFAULT in-memory backing.
     explicit Server(INetwork& net) : net_(&net) {}
+
+    // Network-driven server backed by a DURABLE IDisk (Phase 7 S5a closure): the
+    // committed query state is a persistent WalEngine over `disk` driven on `dsched`
+    // (the disk's own scheduler — distinct from the network scheduler), so a restart
+    // over the SAME disk recovers it (call recover() after re-constructing).
+    Server(INetwork& net, core::Scheduler& dsched, core::IDisk& disk)
+        : net_(&net), db_(dsched, disk) {}
 
     // Dispatch-only server (no transport): for the round-trip oracle, which calls
     // dispatch() directly with no serve()/recv(). net_ stays null and is NEVER
     // dereferenced on this path.
     Server() : net_(nullptr) {}
+
+    // Dispatch-only server backed by a durable IDisk (for an in-process recovery
+    // test that drives dispatch() directly, no transport). `dsched` is the disk's
+    // scheduler.
+    Server(core::Scheduler& dsched, core::IDisk& disk) : net_(nullptr), db_(dsched, disk) {}
 
     // The recv-loop. Receives `max_msgs` frames (a bounded budget so the sim
     // quiesces — NEVER an unbounded loop), decodes+dispatches each, and replies.
@@ -152,6 +167,16 @@ public:
     [[nodiscard]] std::uint64_t rejected() const noexcept { return rejected_; }
     [[nodiscard]] std::uint64_t applied_submits() const noexcept { return applied_; }
     [[nodiscard]] Seq tip() const noexcept { return tip_; }
+
+    // RECOVER the committed query state from the durable IDisk after a restart (the
+    // server object was re-constructed over the SAME disk). Rebuilds the persistent
+    // engine from the durable WAL prefix so a Query returns every committed value
+    // WITHOUT replaying the consensus log. `durable_len` is the durable WAL byte
+    // length on the disk image. The query-visible tip is restored from the engine.
+    void recover(std::size_t durable_len) {
+        db_.recover(durable_len);
+        tip_ = db_.tip();
+    }
 
     // Direct (no-wire) dispatch — used by the round-trip oracle to compute the
     // SAME effect the wire path would, against the SAME server state. Pure fn.
@@ -208,11 +233,12 @@ private:
             r.result = ci.result;
             r.writes = ci.writes_committed;
             if (ci.status == txn::Status::Committed) {
-                // Append this txn's committed write-set to the live history so a
-                // later Query reads it (the standalone read path is primed from
-                // history_). Advances the query-visible tip by one.
-                history_.push_back(ci.writes_committed);
-                tip_ = db_.prime(history_);
+                // Apply this txn's committed write-set to the DURABLE query store
+                // EXACTLY ONCE (WAL'd + synced over the injected IDisk), advancing
+                // the query-visible tip by one. This replaces the old "re-prime the
+                // WHOLE history each submit" model with an incremental durable apply,
+                // so the committed query state survives + recovers on a restart.
+                tip_ = db_.apply_committed(ci.writes_committed);
                 ++applied_;
             } else {
                 // Aborted txns leave no effect: drop it from the live batch so a
@@ -228,7 +254,8 @@ private:
         Response r;
         r.kind = MsgKind::QueryOk;
         r.req_id = req.req_id;
-        (void)db_.prime(history_);  // rebuild the read path from the live history
+        // The durable query store is already live (committed write-sets were applied
+        // incrementally as they committed) — no per-query rebuild needed.
 
         // Re-materialize the typed Query<L> from the wire level + steps and run it
         // at the call-site-visible D5 level. The Database::run template needs the
@@ -299,7 +326,6 @@ private:
     INetwork* net_;
     Database db_;
     std::vector<TxnFn> batch_;                 // ordered committed txns (seqLog)
-    std::vector<txn::WriteSet> history_;       // the live committed history
     std::map<std::uint64_t, Response> dedup_;  // submit_key -> memoized response
     Seq tip_ = 0;
     std::uint64_t rejected_ = 0;

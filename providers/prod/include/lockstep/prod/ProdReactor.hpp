@@ -196,6 +196,9 @@ public:
             // heartbeat that has come due is sent even when the ready queue stays hot
             // under a client-I/O burst (see drain_ready_bounded / wait_and_dispatch).
             maybe_fire_due_timers();
+            // SOCKET FAIRNESS (regression fix): also service ready sockets each turn so a
+            // self-re-arming due timer can't starve epoll (see poll_fds_nonblocking).
+            poll_fds_nonblocking();
             if (!ready_.empty()) {
                 drain_ready_bounded();
                 continue;
@@ -334,6 +337,9 @@ public:
             // heartbeat due NOW is sent even while a client-I/O burst keeps refilling
             // the ready queue (this is the loop lockstepd's leader actually runs).
             maybe_fire_due_timers();
+            // SOCKET FAIRNESS (regression fix): also service ready sockets each turn so a
+            // self-re-arming due timer can't starve epoll (see poll_fds_nonblocking).
+            poll_fds_nonblocking();
             if (!ready_.empty()) {
                 drain_ready_bounded();
                 continue;
@@ -678,10 +684,23 @@ private:
 
         // epoll_wait BLOCKS (never a busy spin). Returns on the timeout, or on ready
         // socket fds (events[0..n)) for dispatch.
+        dispatch_ready_fds(timeout_ms);
+        fire_due_timers();
+    }
+
+    // Run ONE epoll_wait with `timeout_ms` and dispatch every ready fd to its handler
+    // (which SCHEDULES continuations, never resumes inline — L1). Returns the number of
+    // fds dispatched. `timeout_ms == 0` is a NON-BLOCKING poll (the socket-fairness
+    // path: service ready sockets between ready/timer turns without blocking the loop);
+    // `timeout_ms > 0` / -1 BLOCKS (the quiescent wait path in wait_and_dispatch).
+    int dispatch_ready_fds(int timeout_ms) {
+        if (handlers_.empty()) {
+            return 0;
+        }
         epoll_event events[kMaxEvents];
         const int n = ::epoll_wait(epoll_fd_, events, kMaxEvents, timeout_ms);
-        // n < 0 (EINTR) is fine: fall through, fire due timers, loop. n == 0 is the
-        // timeout. n > 0 dispatches each ready fd to its handler.
+        // n < 0 (EINTR) is fine: caller falls through / loops. n == 0 is the timeout.
+        // n > 0 dispatches each ready fd to its handler.
         for (int i = 0; i < n; ++i) {
             const int fd = events[i].data.fd;
             const std::uint32_t revents = events[i].events;
@@ -695,9 +714,23 @@ private:
                 h(revents);
             }
         }
-
-        fire_due_timers();
+        return n < 0 ? 0 : n;
     }
+
+    // SOCKET FAIRNESS (regression fix): a NON-BLOCKING epoll poll, called at the top of
+    // every run/run_until iteration alongside maybe_fire_due_timers(). Without it, a
+    // self-re-arming DUE timer — e.g. the wire ClientStub's poll loop arming
+    // delay(poll_grain) where poll_grain (a few ns/ticks) is ALWAYS already past in real
+    // wall time — fires every iteration via maybe_fire_due_timers(), re-schedules its own
+    // continuation, and keeps ready_ perpetually non-empty. Since wait_and_dispatch()
+    // (the ONLY blocking epoll call) runs only when ready_ is EMPTY, the listen/connection
+    // sockets would then NEVER be read: the server never sees the request (applied=0).
+    // Polling fds (timeout 0) here interleaves socket I/O with the hot ready/timer churn,
+    // so a request in the kernel buffer is always serviced. It is the dual of the S8.2a
+    // heartbeat-fairness fix: that keeps timers from being starved by hot fds; this keeps
+    // fds from being starved by hot (re-arming) timers. Single-threaded, completions still
+    // SCHEDULE (L1), order unchanged (same handler dispatch as wait_and_dispatch).
+    void poll_fds_nonblocking() { (void)dispatch_ready_fds(/*timeout_ms=*/0); }
 
     // FAIRNESS (S8.2a) — pop at most kReadyDrainBudget ready items, in strict FIFO
     // order (the SAME L1 resume site), then RETURN so the loop re-checks due timers.
