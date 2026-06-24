@@ -119,6 +119,14 @@ enum class AdminKind : std::uint8_t {
     SubmitOk = 3,    // rep: [SubmitOk][u64 term][u64 index]
     NotLeader = 4,   // rep: [NotLeader][u64 leader_hint]
     StatusRep = 5,   // rep: [StatusRep][u8 role][u64 term][u64 commit][u32 n][entries]
+    // S8.3: a CHEAP O(1) commit-index query. Returns ONLY {role, term, commit}, WITHOUT
+    // serializing the durable log (which the full Status path does, costing O(log size)
+    // per call). The honest-commit-throughput measurement polls THIS per submit so the
+    // hot path no longer pays the O(log) re-serialization cost as the log grows. The
+    // full-log Status path (above) is UNCHANGED — the jepsen + cluster_smoke safety
+    // checkers depend on its committed-log digest, so it stays intact.
+    StatCommit = 6,     // req: [StatCommit]
+    StatCommitRep = 7,  // rep: [StatCommitRep][u8 role][u64 term][u64 commit]
 };
 
 // A decoded STATUS reply (the client-observable cluster state across the socket).
@@ -127,6 +135,13 @@ struct AdminStatus {
     std::uint64_t term = 0;
     std::uint64_t commit_index = 0;
     std::vector<std::string> committed;  // committed-log values [1..commit_index]
+};
+
+// S8.3: a decoded CHEAP commit-index reply — just {role, term, commit_index}, NO log.
+struct AdminCommit {
+    std::uint8_t role = 0;            // consensus::Role as a byte
+    std::uint64_t term = 0;
+    std::uint64_t commit_index = 0;
 };
 
 namespace admin_detail {
@@ -220,6 +235,12 @@ struct Reader {
     admin_detail::put_u8(b, static_cast<std::uint8_t>(AdminKind::Status));
     return b;
 }
+// S8.3: the CHEAP commit-index query request (no log payload in the reply).
+[[nodiscard]] inline std::vector<std::byte> encode_stat_commit() {
+    std::vector<std::byte> b;
+    admin_detail::put_u8(b, static_cast<std::uint8_t>(AdminKind::StatCommit));
+    return b;
+}
 
 // Decode a STATUS reply payload (client side). Returns false on a malformed frame.
 [[nodiscard]] inline bool decode_status(std::span<const std::byte> payload,
@@ -238,6 +259,20 @@ struct Reader {
     for (std::uint32_t i = 0; i < cnt; ++i) {
         out.committed.push_back(r.str());
     }
+    return r.ok();
+}
+
+// S8.3: decode the CHEAP commit reply (client side). Returns false on a malformed frame.
+[[nodiscard]] inline bool decode_stat_commit(std::span<const std::byte> payload,
+                                             AdminCommit& out) {
+    admin_detail::Reader r{payload.data(), payload.size(), 0, true};
+    const auto kind = static_cast<AdminKind>(r.u8());
+    if (kind != AdminKind::StatCommitRep) {
+        return false;
+    }
+    out.role = r.u8();
+    out.term = r.u64();
+    out.commit_index = r.u64();
     return r.ok();
 }
 
@@ -454,6 +489,16 @@ private:
             for (std::uint32_t i = 0; i < n; ++i) {
                 admin_detail::put_str(rep, lg[i].value);
             }
+        } else if (kind == AdminKind::StatCommit) {
+            // S8.3 CHEAP commit-index query — O(1): role/term/commit ONLY, no log
+            // walk, no per-entry serialization. node_->commit_index() is a member read
+            // (the consensus impls track it directly), so this does NOT touch the
+            // durable log size — polling it per submit is O(1) regardless of log growth.
+            // The full-log Status branch above is left intact for the safety checkers.
+            admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::StatCommitRep));
+            admin_detail::put_u8(rep, static_cast<std::uint8_t>(node_->role()));
+            admin_detail::put_u64(rep, node_->current_term());
+            admin_detail::put_u64(rep, node_->commit_index());
         }
         return rep;
     }

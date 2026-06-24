@@ -134,6 +134,15 @@ protected core. **FLAGGED for a later phase; not fixed here** (S7 is baseline-on
 
 # S8.1 — Concurrent measurement (the REAL throughput ceiling + bottleneck)
 
+> **⚠️ HEADLINE CORRECTED BY S8.3 (see bottom).** The S8.1 `accept_tput` numbers below are
+> the **leader's local-APPEND rate**, NOT commit throughput — `submit` returns at APPEND
+> (term,index assigned) BEFORE commit. With S8.2b batching, append is cheap, so `accept_tput`
+> **inflates far past the real commit ceiling** (measured 3-node depth-64: accept_tput ~68k/s
+> but real COMMIT throughput ~15k/s — a ~4.4× gap). The S8.1 collapse-fix is real; only the
+> throughput **numbers** here were misleading. **For the honest commit-throughput headline,
+> read the S8.3 section at the end of this file.** The S8.1 text is retained as the
+> bottleneck/collapse analysis it was; its accept numbers are now clearly secondary.
+
 > **MEASUREMENT, NOT optimization.** Same container, same honesty caveats as S7. The S7
 > table above is **closed-loop, concurrency 1** — throughput == 1/latency *by construction*,
 > so it measures latency, NOT the throughput ceiling. S8.1 drives load under **concurrency**
@@ -258,3 +267,143 @@ Tunables (env): `LOAD_COUNT`, `LOAD_VALUE_BYTES`, `LOAD_DEPTHS`, `LOAD_CONNS`, `
   background `fdatasync` + (3-node) replication RTT; S7's commit-latency table still describes
   that path. A committed-throughput-under-concurrency measurement is left for after S8.2.
 - Measured on the prod path **as built** — no optimization, no hot-path change for S8.1.
+
+---
+
+# S8.3 — HONEST commit throughput (the corrected headline) + a cheap O(1) commit query
+
+> **MEASUREMENT, NOT optimization.** Same container, same honesty caveats. No
+> core/sim/consensus/txn/storage/query change (this is prod-admin + cli + harness only;
+> the protected-dirs diff is **EMPTY**). The full-log STATUS path is **UNCHANGED** — the
+> jepsen + cluster_smoke safety checkers still depend on it and still pass. This stage
+> makes the THROUGHPUT NUMBER honest: it reports real **commit** throughput, backed by a
+> new **cheap O(1) commit-index query** so polling commit progress per submit no longer
+> pays the O(log) full-STATUS cost.
+
+## Why the S8.1 `accept_tput` was misleading
+
+`submit()` returns at **ACCEPT** (the leader appends the entry, assigns term+index) —
+**BEFORE** the entry is committed (replicated to a quorum + `commit_index` advanced). With
+S8.2b batching, append is cheap, so `accept_tput` (accepted ops / wall) inflates well past
+the real commit ceiling: the leader "finishes" accepting 4000 ops in ~50 ms while only a
+fraction have actually committed, the cluster catching up over the next ~250 ms+. The
+collapse-fix from S8.2b is real and verified — only the S8.1 throughput *numbers* overstated
+the ceiling.
+
+## The cheap O(1) commit-index query (the backing for honest measurement)
+
+A new admin verb / RPC, **`StatCommit`** (request kind 6 → reply kind 7), returns **only
+`{role, term, commit_index}`** — `node_->commit_index()` is a member read (O(1)); it does
+**NOT** walk or serialize the durable log. The existing full-log **`Status`** path (which
+serializes every committed value, O(log size)) is **kept intact** — the `prod_jepsen` and
+`prod_cluster_smoke` safety checkers read its committed-log digest to check agreement +
+ack-durability, so it must stay. CLI surface:
+
+- `lockstep_admin commit --host PORT [--host PORT ...]` → `COMMIT port=P ok=1 role=R term=T commit=C`
+  (the O(1) counterpart of `status`, no `log=` digest).
+- `lockstep_admin status …` → unchanged (full `log=v1,v2,…` digest; what the checkers use).
+
+The honest-commit harness polls `StatCommit` (NOT `Status`) per progress-check, so the hot
+path is O(1) and does **not** degrade as the log grows. Measured at an 8000-entry log
+(container, incl. process-spawn overhead): cheap `commit` ≈ **715 µs/call** vs full `status`
+≈ **1981 µs/call** — the ~2.8× delta is exactly the full-log re-serialization the hot path
+now avoids (the server-side gap is larger; process spawn is a constant in both).
+
+## Honest commit-throughput method (the `pbench` extension)
+
+1. Drive the pipelined accept load (depth K) and record the highest **accepted index**
+   (`commit_target`).
+2. **Poll the cheap `StatCommit` on every host** until the cluster's `commit_index` covers
+   `commit_target`. The leader only advances `commit_index` once a **quorum has acked**, so
+   max(commit_index) across hosts reaching the target ⇒ quorum-committed.
+3. `commit_tput = accepted / (wall from first submit until commit covers all accepted)`.
+   **HEADLINE = `commit_tput`.** `accept_tput` is kept as a **clearly-labeled secondary**
+   (leader-append rate, NOT commit). Everything BOUNDED (finite count, absolute catch-up wall).
+
+`pbench` now prints: `commit_tput … commit_target … commit_reached … commit_covered=0|1 …
+accept_tput … accept_elapsed_ms …`. (Per-connection client ids were also made distinct so
+the daemon routes each connection's replies correctly — a shared id collapsed concurrent
+connections; this fixed the poller never receiving its reply.)
+
+## HONEST commit-throughput numbers (median of 3 passes, fresh cluster per pass; count=4000, value=16B, conns=1)
+
+| config | N | depth K | **commit_tput** (ops/s) | min | max | accept_tput (NOT commit) | accept-vs-commit gap | note |
+|--------|---|---------|-------------------------|-----|-----|--------------------------|----------------------|------|
+| 1-node | 1 | 1  | **3997**  | 3988 | 4165 | 3998  | ~1.0× | N=1 self-commits at append ⇒ accept≈commit (no gap) |
+| 1-node | 1 | 4  | **9068**  | 8944 | 9272 | 9072  | ~1.0× | accept≈commit |
+| 1-node | 1 | 16 | **14446** | 13814| 14484| 14500 | ~1.0× | accept≈commit |
+| 1-node | 1 | 64 | **17114** | 16081| 17605| 17146 | ~1.0× | accept≈commit; ceiling ~17k, still rising |
+| 3-node | 3 | 1  | **1166**  | 949  | 1741 | 1243  | ~1.07× | clean (`covered=1`); replication RTT bound; high variance |
+| 3-node | 3 | 4  | **~0–234**| 0    | 234  | 244   | n/a   | **UNSTABLE: `fault=1`/`covered=0` in 2 of 3 passes** (collapse persists at depth 4) |
+| 3-node | 3 | 16 | **1218**  | 708  | 3898 | 1342  | ~1.1× | clean (`covered=1`) but very high variance (708–3898) |
+| 3-node | 3 | 64 | **15412** | 12812| 16325| 68403 | **~4.4×** | clean (`covered=1`); **accept_tput ~68k MASSIVELY overstates the ~15k commit ceiling** |
+
+### The accept-vs-commit gap (the whole point)
+
+- **1-node: NO gap.** N=1 self-commits synchronously at append (gated `quorum()==1`), so
+  accept *is* commit — the S8.1 1-node accept numbers were already honest. The 1-node
+  commit ceiling is **~17k ops/s** at depth 64 (still rising).
+- **3-node depth-64: a ~4.4× gap** — `accept_tput` median **68403** vs honest
+  `commit_tput` median **15412**. THIS is the misleading inflation the lead flagged: append
+  finishes in ~50 ms, but commit (quorum replication + `commit_index` advance) takes ~250 ms.
+  **The real 3-node ceiling is ~15k commits/s at high depth, not ~68k.**
+- **3-node depth-4 is still a collapse zone** (`fault=1` / `commit_covered=0` in 2/3 passes):
+  S8.2b batching makes high depth (64) survive AND commit cleanly, but a *small* in-flight
+  window (4) on 3 nodes still occasionally thrashes leadership before catch-up. Recorded as a
+  finding, not a steady number.
+
+> **Counter-intuitive but real:** for 3-node, a LARGER in-flight window (64) commits cleanly
+> and far faster than a small one (4). Bigger batches coalesce more per `AppendEntries`,
+> relieving the single reactor — the opposite of the S8.1 pre-batching collapse curve.
+
+## STATUS-O(log) hot-path degradation: GONE on the measured path
+
+The S7-flagged degradation (each `STATUS` re-serializes the FULL durable log, so a
+per-submit poll re-pays O(log size) and throughput sags as the log grows) is **removed from
+the hot path**: the honest-commit harness polls the O(1) `StatCommit`, never the full-log
+`Status`. The full-log `Status` itself is intentionally **left O(log)** (the checkers need
+the digest) — we just stopped the measurement hot path from paying it. Evidence above:
+cheap `commit` ≈715 µs vs full `status` ≈1981 µs at an 8000-entry log.
+
+## Safety re-run (full-log STATUS intact)
+
+- `prod_cluster_smoke`: **ALL PASS** (election → replication AGREEMENT → kill+restart
+  CATCH-UP → final agreement), reading the unchanged full-log STATUS digest.
+- `prod_jepsen`: TEETH correctly FAILs the fabricated bad history; a clean run has **all
+  scenarios PASS** (ALL SAFETY PROPERTIES HELD). **FLAG:** the fault-injection scenarios are
+  **flaky run-to-run on this container** (ack-durability occasionally fails) — verified
+  **identical on the unchanged baseline tree** (git-stash), so it is **pre-existing
+  container-timing flakiness, NOT a regression from S8.3** (S8.3 touches no path jepsen uses;
+  it only `submit`s + reads the unchanged full STATUS).
+
+## Reproduce (S8.3)
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work --memory=6g --cpus=4 lockstep-dev:latest bash -lc '
+  set -e; ulimit -c 0; ulimit -s 16384
+  cmake -S . -B build/lrel -GNinja -DCMAKE_BUILD_TYPE=Release
+  cmake --build build/lrel -j6 --target lockstepd lockstep_admin
+  to(){ perl -e "my \$t=shift;my \$p=fork();if(\$p==0){setpgrp(0,0);exec @ARGV;exit 127}\$SIG{ALRM}=sub{kill q(KILL),-\$p;exit 124};alarm \$t;waitpid(\$p,0);exit(\$?>>8)" "$@"; }
+  LOAD_DEPTHS="1 4 16 64" LOAD_COUNT=4000 LOAD_REPEATS=3 RUN_SECONDS=90 to 900 bash tests/prod_load.sh
+  pgrep -x lockstepd && echo LEAKED || echo no-orphans'
+```
+
+Single-shot honest run: `lockstep_admin pbench --count N --inflight K --conns C --value-bytes B
+--host PORT [--host PORT ...]` (headline `commit_tput`; `accept_tput` secondary). Cheap query:
+`lockstep_admin commit --host PORT [...]`.
+
+## Honest caveats (S8.3)
+
+- **Laptop container, `--cpus=4`, shared host, real wall-clock** — absolute numbers are a
+  *relative* regression baseline only; re-run on the SAME setup to compare.
+- **`commit_tput` is the HEADLINE; `accept_tput` is the leader-append rate (NOT commit)** and
+  is kept only to show the gap. For 3-node at depth, the gap is large (~4.4×) — trust
+  `commit_tput`.
+- **3-node has high run-to-run variance** (depth-1: 949–1741; depth-16: 708–3898) and
+  **depth-4 is an UNSTABLE collapse zone** (`commit_covered=0`) — treat single 3-node numbers
+  as order-of-magnitude; the clean steady points are depth-1 (~1.2k) and depth-64 (~15k).
+- The commit-wall is poll-bounded (the cheap poll has its own client reactor); the
+  `commit_elapsed_ms` is accept-wall + catch-up-wall, a slight over-count of the true commit
+  instant — stated as a baseline approximation.
+- Measured on the prod path **as built** — no consensus/core change; prod-admin + cli +
+  harness only.

@@ -98,6 +98,17 @@ core::Task status_rpc(core::INetwork* cli, core::Endpoint admin, prod::AdminStat
     co_return;
 }
 
+// ---- one CHEAP commit-index round-trip (S8.3; O(1) on the server, NO log) --
+core::Task stat_commit_rpc(core::INetwork* cli, core::Endpoint admin,
+                           prod::AdminCommit* out, bool* ok, bool* done) {
+    const std::vector<std::byte> req = prod::encode_stat_commit();
+    co_await cli->send(admin, {req.data(), req.size()});
+    core::Message rep = co_await cli->recv();
+    *ok = prod::decode_stat_commit(rep.payload, *out);
+    *done = true;
+    co_return;
+}
+
 // ---- one SUBMIT round-trip (free function over stable pointers) ------------
 struct SubmitOutcome {
     bool replied = false;
@@ -129,26 +140,36 @@ core::Task submit_rpc(core::INetwork* cli, core::Endpoint admin, std::string val
 // A fresh client endpoint dialing one admin port. The admin endpoint id used for
 // dialing is synthetic (admin ports map to distinct synthetic peer ids in the client's
 // bus); each call recreates the reactor/bus so a prior connection never lingers.
+//
+// CLIENT-ID UNIQUENESS (S8.3): the daemon's admin net learns each inbound connection by
+// the connecting node's HELLO id and routes a reply via send(msg.from). If TWO client
+// connections to the SAME daemon share a node id, the daemon collapses them to ONE
+// connection and a reply for one is sent down the other — the second client never gets
+// its reply. So every concurrent client (each load conn AND each commit poller) MUST use
+// a DISTINCT id. `client_id` defaults to kClientId for the single-shot verbs; the
+// concurrent paths pass a unique id per connection.
 struct Client {
     prod::ProdReactor reactor;
     prod::ProdNetworkBus bus{reactor};
     bool ok = false;
+    std::uint64_t self_id = 0;
     std::uint64_t admin_peer_id = 0;
 
-    explicit Client(std::uint16_t admin_port) {
+    explicit Client(std::uint16_t admin_port, std::uint64_t client_id = kClientId) {
         if (!reactor.valid()) {
             return;
         }
+        self_id = client_id;
         // Synthetic peer id for the target admin endpoint (unique per port).
         admin_peer_id = 8'000'000'000ULL + admin_port;
-        if (!bus.add_node(kClientId)) {  // our own ephemeral client listen socket
+        if (!bus.add_node(self_id)) {  // our own ephemeral client listen socket
             return;
         }
         bus.add_peer(admin_peer_id, admin_port);  // record where the daemon's admin lives
         ok = true;
     }
 
-    [[nodiscard]] core::INetwork* net() { return bus.node(kClientId); }
+    [[nodiscard]] core::INetwork* net() { return bus.node(self_id); }
     [[nodiscard]] core::Endpoint admin_ep() const { return core::Endpoint{admin_peer_id}; }
 };
 
@@ -161,6 +182,19 @@ bool do_status(std::uint16_t port, prod::AdminStatus& out) {
     bool ok = false;
     bool done = false;
     c.reactor.spawn(status_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// Run the CHEAP commit query against one admin port; fill `out`. True if a reply decoded.
+bool do_commit(std::uint16_t port, prod::AdminCommit& out) {
+    Client c(port);
+    if (!c.ok) {
+        return false;
+    }
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(stat_commit_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
     c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
     return done && ok;
 }
@@ -201,6 +235,17 @@ bool bench_status(Client& c, prod::AdminStatus& out) {
     bool ok = false;
     bool done = false;
     c.reactor.spawn(status_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// One CHEAP commit-index round-trip on an EXISTING client reactor/connection (S8.3).
+// O(1) on the server (no log serialized), so polling commit progress per submit is cheap
+// and does NOT degrade as the durable log grows.
+bool bench_commit(Client& c, prod::AdminCommit& out) {
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(stat_commit_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
     c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
     return done && ok;
 }
@@ -395,6 +440,18 @@ int cmd_bench(const BenchArgs& ba, const std::vector<std::uint16_t>& hosts) {
 // loop's per-frame cost.
 //
 // BOUNDED: finite total N, finite window K, an absolute wall deadline; never a spin.
+//
+// S8.3 HONEST COMMIT THROUGHPUT (the HEADLINE). accept_tput above is the leader's LOCAL
+// APPEND rate: submit() returns at ACCEPT (term,index assigned), BEFORE the entry is
+// committed (replicated to a quorum + commit_index advanced). With S8.2b batching, append
+// is cheap, so accept_tput inflates FAR past the real commit ceiling (measured: 3-node
+// depth-64 accept_tput ~46k/s while only ~1900/4000 had committed when the load
+// "finished"). So after the accept load, pbench POLLS the new CHEAP O(1) commit-index
+// query (StatCommit — role/term/commit only, no log serialized) on every host until the
+// cluster commit_index covers the highest accepted index; commit_tput = accepted /
+// (wall until commit covers all accepted). HEADLINE = commit_tput; accept_tput kept as a
+// clearly-labeled secondary (leader-append, NOT commit). The cheap poll is O(1) so it
+// does NOT degrade with log size — the hot path no longer pays the full-log STATUS cost.
 
 struct PipeArgs {
     std::uint64_t count = 2000;        // total submits across all connections (FINITE)
@@ -413,6 +470,7 @@ struct PipeConn {
     std::uint64_t window = 1;          // K
     std::uint64_t accepted = 0;        // replies that were SubmitOk
     std::uint64_t replied = 0;         // total replies seen
+    std::uint64_t max_index = 0;       // highest log index ACCEPTED (the commit target)
     bool fault = false;                // a not-accepted / decode failure stops the conn
     bool done = false;
 };
@@ -450,6 +508,11 @@ core::Task pipe_run(PipeConn* st) {
         const auto kind = static_cast<prod::AdminKind>(r.u8());
         if (kind == prod::AdminKind::SubmitOk) {
             ++st->accepted;
+            r.u64();  // skip the reply's term field to reach the index
+            const std::uint64_t index = r.u64();
+            if (r.ok() && index > st->max_index) {
+                st->max_index = index;  // highest accepted index = the commit target
+            }
         } else {
             st->fault = true;       // NotLeader / garbage: leadership lost — stop firing.
             stop_sending = true;
@@ -484,7 +547,9 @@ int cmd_pbench(const PipeArgs& pa, const std::vector<std::uint16_t>& hosts) {
     clients.reserve(conns);
     states.reserve(conns);
     for (std::uint64_t ci = 0; ci < conns; ++ci) {
-        auto cl = std::make_unique<Client>(leader_port);
+        // DISTINCT id per load connection so the daemon routes each conn's replies back
+        // to the right connection (a shared id would collapse them — see Client docs).
+        auto cl = std::make_unique<Client>(leader_port, kClientId + ci);
         if (!cl->ok) {
             std::printf("PBENCH error=client_init\n");
             std::fflush(stdout);
@@ -549,25 +614,111 @@ int cmd_pbench(const PipeArgs& pa, const std::vector<std::uint16_t>& hosts) {
 
     std::uint64_t accepted = 0;
     std::uint64_t replied = 0;
+    std::uint64_t commit_target = 0;  // highest accepted log index across all conns
     bool any_fault = false;
     bool any_unfinished = false;
     for (std::uint64_t ci = 0; ci < conns; ++ci) {
         accepted += states[ci]->accepted;
         replied += states[ci]->replied;
+        if (states[ci]->max_index > commit_target) {
+            commit_target = states[ci]->max_index;
+        }
         any_fault = any_fault || states[ci]->fault;
         any_unfinished = any_unfinished || !states[ci]->done;
     }
-    const double tput = elapsed_ms > 0.0
+    // accept_tput = leader-LOCAL-APPEND rate (submit returns at append, BEFORE commit).
+    const double accept_tput = elapsed_ms > 0.0
                             ? static_cast<double>(accepted) / (elapsed_ms / 1000.0)
                             : 0.0;
 
+    // ----------------------------------------------------------------------
+    // S8.3 HONEST COMMIT THROUGHPUT. accept_tput above measures the leader's local
+    // APPEND rate — submit() returns when the entry is appended (term,index assigned),
+    // BEFORE it is committed (replicated to a quorum + commit_index advanced). With
+    // batching (S8.2b) append is cheap, so accept_tput inflates well past the real
+    // COMMIT ceiling. To measure HONEST commit throughput we now POLL the CHEAP O(1)
+    // commit-index query (StatCommit) on EVERY host until the cluster's commit_index
+    // COVERS the highest accepted index (commit_target). Because the leader only
+    // advances commit_index once a QUORUM has acked, the max commit_index across hosts
+    // reaching commit_target == quorum-committed. The poll is O(1) per call (no log
+    // serialized), so polling per progress-check does NOT degrade as the log grows.
+    //
+    // commit_tput = accepted / (wall time from the FIRST submit until commit covers all
+    // accepted submits). This is the HEADLINE. BOUNDED by an absolute catch-up wall.
+    double commit_tput = 0.0;
+    double commit_elapsed_ms = 0.0;
+    std::uint64_t commit_reached = 0;
+    bool commit_covered = false;
+    if (commit_target > 0) {
+        // A dedicated cheap-poll client per host (separate from the load connections).
+        // Each gets a DISTINCT id (well above the load-conn ids) so the daemon does NOT
+        // collapse a poller connection with a load connection (see Client docs).
+        std::vector<std::unique_ptr<Client>> pollers;
+        pollers.reserve(hosts.size());
+        std::uint64_t poller_id = kClientId + 1'000'000ULL;
+        for (std::uint16_t port : hosts) {
+            auto pc = std::make_unique<Client>(port, poller_id++);
+            if (pc->ok) {
+                pollers.push_back(std::move(pc));
+            }
+        }
+        // Catch-up wall: generous, scaled by count (a stall here is a finding, bounded).
+        const core::Tick catchup_wall =
+            static_cast<core::Tick>(pa.count) * 4'000'000 + 10'000'000'000;  // ~4ms/op +10s
+        core::Tick poll_t0 = 0;
+        for (auto& p : pollers) {
+            if (p->reactor.now() > poll_t0) {
+                poll_t0 = p->reactor.now();
+            }
+        }
+        const core::Tick poll_deadline = poll_t0 + catchup_wall;
+        auto poll_max_now = [&]() -> core::Tick {
+            core::Tick m = 0;
+            for (auto& p : pollers) {
+                if (p->reactor.now() > m) {
+                    m = p->reactor.now();
+                }
+            }
+            return m;
+        };
+        while (!commit_covered && poll_max_now() < poll_deadline) {
+            commit_reached = 0;
+            for (auto& p : pollers) {
+                prod::AdminCommit ac;
+                if (bench_commit(*p, ac) && ac.commit_index > commit_reached) {
+                    commit_reached = ac.commit_index;  // max == the leader's commit_index
+                }
+            }
+            if (commit_reached >= commit_target) {
+                commit_covered = true;
+                break;
+            }
+        }
+        const core::Tick commit_t1 = poll_max_now();
+        // Commit wall measured from the load's t0 (max_now baseline) to commit coverage.
+        // The poll reactors are distinct from the load reactors, so we approximate the
+        // commit-completion instant by the accept-phase wall + the poll catch-up wall.
+        commit_elapsed_ms = elapsed_ms +
+            static_cast<double>(commit_t1 - poll_t0) / 1'000'000.0;
+        commit_tput = (commit_covered && commit_elapsed_ms > 0.0)
+                          ? static_cast<double>(accepted) / (commit_elapsed_ms / 1000.0)
+                          : 0.0;
+    }
+
     std::printf(
-        "PBENCH count=%llu inflight=%llu conns=%llu value_bytes=%llu elapsed_ms=%.3f "
-        "accept_tput=%.1f accepted=%llu replied=%llu fault=%d unfinished=%d\n",
+        "PBENCH count=%llu inflight=%llu conns=%llu value_bytes=%llu "
+        "commit_tput=%.1f commit_elapsed_ms=%.3f commit_target=%llu commit_reached=%llu "
+        "commit_covered=%d accept_tput=%.1f accept_elapsed_ms=%.3f "
+        "accepted=%llu replied=%llu fault=%d unfinished=%d\n",
         static_cast<unsigned long long>(pa.count),
         static_cast<unsigned long long>(window),
         static_cast<unsigned long long>(conns),
-        static_cast<unsigned long long>(pa.value_bytes), elapsed_ms, tput,
+        static_cast<unsigned long long>(pa.value_bytes),
+        commit_tput, commit_elapsed_ms,
+        static_cast<unsigned long long>(commit_target),
+        static_cast<unsigned long long>(commit_reached),
+        commit_covered ? 1 : 0,
+        accept_tput, elapsed_ms,
         static_cast<unsigned long long>(accepted),
         static_cast<unsigned long long>(replied), any_fault ? 1 : 0,
         any_unfinished ? 1 : 0);
@@ -592,6 +743,22 @@ int cmd_status(const std::vector<std::uint16_t>& hosts) {
         prod::AdminStatus st;
         const bool ok = do_status(port, st);
         print_status(port, ok, st);
+    }
+    return 0;
+}
+
+// S8.3 CHEAP commit query — the O(1) counterpart of `status` (role/term/commit ONLY, no
+// log digest). Prints one line per host. This is the verb a commit-progress poll uses so
+// it never pays the full-log STATUS re-serialization cost.
+int cmd_commit(const std::vector<std::uint16_t>& hosts) {
+    for (std::uint16_t port : hosts) {
+        prod::AdminCommit ac;
+        const bool ok = do_commit(port, ac);
+        std::printf("COMMIT port=%u ok=%d role=%u term=%llu commit=%llu\n", port,
+                    ok ? 1 : 0, static_cast<unsigned>(ac.role),
+                    static_cast<unsigned long long>(ac.term),
+                    static_cast<unsigned long long>(ac.commit_index));
+        std::fflush(stdout);
     }
     return 0;
 }
@@ -634,6 +801,7 @@ int main(int argc, char** argv) {
         std::fprintf(
             stderr,
             "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
+            "       lockstep_admin commit --host PORT [--host PORT ...]\n"
             "       lockstep_admin submit VALUE --host PORT [--host PORT ...]\n"
             "       lockstep_admin bench --count N [--value-bytes B] "
             "[--commit-samples S] --host PORT [--host PORT ...]\n"
@@ -694,6 +862,9 @@ int main(int argc, char** argv) {
 
     if (verb == "status") {
         return cmd_status(hosts);
+    }
+    if (verb == "commit") {
+        return cmd_commit(hosts);
     }
     if (verb == "submit") {
         return cmd_submit(value, hosts);

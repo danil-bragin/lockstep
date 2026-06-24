@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# prod_load.sh — Phase 8 S8.1. THE CONCURRENT-LOAD harness. The S7 baseline
+# prod_load.sh — Phase 8 S8.1 / S8.3. THE CONCURRENT-LOAD harness. The S7 baseline
 # (prod_perf.sh) was CLOSED-LOOP (concurrency 1 -> throughput == 1/latency by
 # construction); it measured latency, NOT the real throughput ceiling. THIS harness
 # drives the `lockstep_admin pbench` verb, which keeps K requests IN FLIGHT on one
-# persistent connection (a sliding window) AND/OR drives C concurrent connections, and
-# reports the REAL throughput = total ACCEPTED ops / wall time (NOT 1/latency). It RAMPS
+# persistent connection (a sliding window) AND/OR drives C concurrent connections.
+#
+# S8.3 HONEST COMMIT THROUGHPUT (the HEADLINE): accept_tput is the leader's LOCAL-APPEND
+# rate (submit returns at append, BEFORE commit) — with S8.2b batching it inflates far
+# past the real commit ceiling. So pbench now drives the load, then POLLS a CHEAP O(1)
+# commit-index query until the cluster commit_index COVERS all accepted submits, and
+# reports commit_tput = accepted / wall-until-committed as the HEADLINE. accept_tput is
+# kept as a clearly-labeled secondary (leader-append, NOT commit). The cheap poll is O(1)
+# (no log serialized) so the hot path no longer degrades as the durable log grows. It RAMPS
 # the in-flight depth (1,4,16,64) on a 1-node cluster (isolates reactor CPU + the serve
 # loop; accept does NOT block on fsync) AND a 3-node cluster (adds real TCP replication),
 # so the SATURATION KNEE (where QPS stops rising with more in-flight) is visible and the
@@ -156,6 +163,7 @@ run_config() {
   local prev_med=""
   local knee=""
   for depth in $LOAD_DEPTHS; do
+    local -a c_tput=()
     local -a a_tput=()
     local pass
     for ((pass=1; pass<=LOAD_REPEATS; pass++)); do
@@ -172,27 +180,32 @@ run_config() {
       echo "  depth=$depth pass=$pass: $out"
       local uf; uf="$(field "$out" unfinished)"
       [ "$uf" = "1" ] && echo "  WARN: unfinished=1 (a stall) depth=$depth pass=$pass"
+      local cc; cc="$(field "$out" commit_covered)"
+      [ "$cc" = "0" ] && echo "  WARN: commit_covered=0 (commit did not reach target) depth=$depth pass=$pass"
+      # HEADLINE = commit_tput (HONEST commit throughput). accept_tput kept as secondary.
+      c_tput+=("$(field "$out" commit_tput)")
       a_tput+=("$(field "$out" accept_tput)")
     done
-    if [ "${#a_tput[@]}" = "0" ]; then
+    if [ "${#c_tput[@]}" = "0" ]; then
       echo "  depth=$depth: FAIL no successful pass"; continue
     fi
-    local m lo hi
-    m="$(median "${a_tput[@]}")"; lo="$(minof "${a_tput[@]}")"; hi="$(maxof "${a_tput[@]}")"
-    echo "  --- depth=$depth MEDIAN accept_tput = $m ops/s (min=$lo max=$hi) ---"
+    local cm clo chi am
+    cm="$(median "${c_tput[@]}")"; clo="$(minof "${c_tput[@]}")"; chi="$(maxof "${c_tput[@]}")"
+    am="$(median "${a_tput[@]}")"
+    echo "  --- depth=$depth MEDIAN commit_tput = $cm ops/s (min=$clo max=$chi)  [accept_tput median=$am, NOT commit] ---"
     RESULT_SUMMARY="$RESULT_SUMMARY
-$label|$n|$depth|$m|$lo|$hi"
+$label|$n|$depth|$cm|$clo|$chi|$am"
 
-    # KNEE detection: the first depth where tput stops rising meaningfully (<10% over the
-    # previous depth) — the saturation point. Reported, not authoritative.
+    # KNEE detection: the first depth where commit_tput stops rising meaningfully (<10%
+    # over the previous depth) — the saturation point. Reported, not authoritative.
     if [ -n "$prev_med" ] && [ -z "$knee" ]; then
       local rise
-      rise="$(awk -v a="$m" -v b="$prev_med" 'BEGIN{ if(b>0) printf "%.3f", (a-b)/b; else print "1" }')"
+      rise="$(awk -v a="$cm" -v b="$prev_med" 'BEGIN{ if(b>0) printf "%.3f", (a-b)/b; else print "1" }')"
       local below
       below="$(awk -v r="$rise" 'BEGIN{ print (r<0.10)?1:0 }')"
       [ "$below" = "1" ] && knee="$prev_depth"
     fi
-    prev_med="$m"; prev_depth="$depth"
+    prev_med="$cm"; prev_depth="$depth"
   done
   [ -n "$knee" ] && echo "  >>> $label SATURATION KNEE ~ depth $knee (tput stops rising >10%)" \
                  || echo "  >>> $label: no clear knee within tested depths (still rising or flat throughout)"
@@ -216,14 +229,15 @@ run_config "3-node" 3
 # ============================================================================
 echo
 echo "============================================================"
-echo "S8.1 CONCURRENT LOAD SUMMARY  (median of $LOAD_REPEATS passes; count=$LOAD_COUNT value_bytes=$LOAD_VALUE_BYTES conns=$LOAD_CONNS)"
+echo "S8.3 HONEST COMMIT-THROUGHPUT SUMMARY  (median of $LOAD_REPEATS passes; count=$LOAD_COUNT value_bytes=$LOAD_VALUE_BYTES conns=$LOAD_CONNS)"
 echo "machine: nproc=$NPROC mem_total_kb=$MEMKB"
-echo "accept_tput = total ACCEPTED ops / wall time (REAL throughput, NOT 1/latency)"
+echo "commit_tput = accepted ops / wall until commit_index COVERS them (HONEST, the HEADLINE)"
+echo "accept_tput = leader LOCAL-APPEND rate (submit returns at append, BEFORE commit; NOT commit)"
 echo "------------------------------------------------------------"
-printf '%-8s %4s %8s %14s %12s %12s\n' "config" "N" "depth" "tput(ops/s)" "min" "max"
-echo "$RESULT_SUMMARY" | while IFS='|' read -r lbl n depth tput lo hi; do
+printf '%-8s %4s %8s %16s %12s %12s %16s\n' "config" "N" "depth" "commit_tput" "min" "max" "accept_tput"
+echo "$RESULT_SUMMARY" | while IFS='|' read -r lbl n depth ctput clo chi atput; do
   [ -z "$lbl" ] && continue
-  printf '%-8s %4s %8s %14s %12s %12s\n' "$lbl" "$n" "$depth" "$tput" "$lo" "$hi"
+  printf '%-8s %4s %8s %16s %12s %12s %16s\n' "$lbl" "$n" "$depth" "$ctput" "$clo" "$chi" "$atput"
 done
 echo "============================================================"
 echo "[prod_load] done"
