@@ -443,6 +443,15 @@ enum class RecKind : std::uint8_t {
     // restarted node honors the config it had adopted (a removed server stays
     // removed; an added one stays added) — never regressing membership across crash.
     Config = 5,
+    // INCREMENTAL snapshot persist: instead of re-serializing the WHOLE folded state on
+    // every compaction (a full Snapshot record, O(current size) ⇒ O(n^2) of disk I/O over
+    // a long run), a SnapshotDelta carries ONLY the entries folded since the last persist
+    // — [from_base+1 .. to_base]. On replay deltas ACCUMULATE (append to the reconstructed
+    // state, advance the base), so the durable snapshot stream is append-only and each
+    // entry is written exactly once. A full Snapshot record still RESETS (used by
+    // InstallSnapshot, where a follower replaces its whole state with the leader's). The
+    // committed log is unchanged (compaction stays transparent — Snapshot.tla).
+    SnapshotDelta = 6,
 };
 
 [[nodiscard]] inline std::vector<std::byte> rec_meta(Term term,
@@ -508,6 +517,33 @@ enum class RecKind : std::uint8_t {
     wire::put_u64(body, last_included_index);
     wire::put_u32(body, static_cast<std::uint32_t>(state.size()));
     for (const LogEntry& e : state) {
+        wire::put_u64(body, e.term);
+        wire::put_str(body, e.value);
+    }
+    const std::uint32_t crc = wire::crc32(body.data(), body.size());
+    std::vector<std::uint8_t> frame;
+    wire::put_u32(frame, crc);
+    wire::put_u32(frame, static_cast<std::uint32_t>(body.size()));
+    frame.insert(frame.end(), body.begin(), body.end());
+    std::vector<std::byte> out(frame.size());
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        out[i] = static_cast<std::byte>(frame[i]);
+    }
+    return out;
+}
+
+// SNAPSHOT-DELTA durable record: [from_base, to_base] + ONLY the entries in
+// (from_base, to_base] (the increment folded since the last persisted snapshot point).
+// On replay it APPENDS to the reconstructed state and advances the base — append-only
+// compaction so each committed entry is written to the snapshot stream exactly once.
+[[nodiscard]] inline std::vector<std::byte> rec_snapshot_delta(
+    Index from_base, Index to_base, const std::vector<LogEntry>& delta) {
+    std::vector<std::uint8_t> body;
+    wire::put_u8(body, static_cast<std::uint8_t>(RecKind::SnapshotDelta));
+    wire::put_u64(body, from_base);
+    wire::put_u64(body, to_base);
+    wire::put_u32(body, static_cast<std::uint32_t>(delta.size()));
+    for (const LogEntry& e : delta) {
         wire::put_u64(body, e.term);
         wire::put_str(body, e.value);
     }
@@ -696,6 +732,7 @@ public:
         log_.clear();
         snap_base_ = 0;
         snap_state_.clear();
+        snap_persisted_base_ = 0;
         applied_index_ = 0;
         log_view_.clear();
         commit_index_ = 0;
@@ -735,6 +772,7 @@ public:
         commit_index_ = 0;
         snap_base_ = 0;
         snap_state_.clear();
+        snap_persisted_base_ = 0;
         applied_index_ = 0;
         log_view_.clear();
         votes_granted_.clear();
@@ -1353,8 +1391,10 @@ private:
             log_.clear();
             log_view_.clear();
             ++snapshots_installed_;
-            // Durable: persist the snapshot so recovery starts from it (compacted).
-            persist_snapshot();
+            // Durable: persist the FULL snapshot (RESET) — InstallSnapshot REPLACES the
+            // whole state with the leader's, so prior accumulated deltas no longer apply.
+            // Subsequent local compactions persist incrementally from this base.
+            persist_snapshot_full();
         }
 
         RaftMsg resp;
@@ -1655,8 +1695,26 @@ private:
     void persist_trunc(Index new_len) {
         enqueue_durable(rec_trunc(new_len));
     }
+    // INCREMENTAL local compaction persist: write ONLY the entries folded since the last
+    // persisted base as a SnapshotDelta. snap_state_ holds [1..snap_base_]; the new slice
+    // is (snap_persisted_base_ .. snap_base_]. O(delta), not O(snap_base_) — this is what
+    // removes the O(n^2) snapshot I/O over a long run.
     void persist_snapshot() {
+        if (snap_base_ <= snap_persisted_base_) {
+            return;  // nothing new to persist
+        }
+        const std::size_t lo = static_cast<std::size_t>(snap_persisted_base_);
+        std::vector<LogEntry> delta(snap_state_.begin() + static_cast<std::ptrdiff_t>(lo),
+                                    snap_state_.end());
+        enqueue_durable(rec_snapshot_delta(snap_persisted_base_, snap_base_, delta));
+        snap_persisted_base_ = snap_base_;
+    }
+    // FULL snapshot persist (RESET on replay). Used when InstallSnapshot replaces the whole
+    // state with the leader's — the prior accumulated deltas no longer apply, so a full
+    // record is written and replay resets to it. Subsequent local compactions are deltas.
+    void persist_snapshot_full() {
         enqueue_durable(rec_snapshot(snap_base_, snap_state_));
+        snap_persisted_base_ = snap_base_;
     }
     // C4.2: persist one config-chain entry (chain index + members) so the adopted
     // config survives a crash (Membership.tla: configs live in the durable log).
@@ -1890,6 +1948,44 @@ private:
                 rec_base = lii;
                 rec_state = std::move(st);
                 rec_log = std::move(kept);
+            } else if (kind == RecKind::SnapshotDelta) {
+                // INCREMENTAL snapshot: APPEND (from_base, to_base] to the reconstructed
+                // state + advance the base. Contiguity: from_base must == the current base
+                // (the delta picks up exactly where the prior persisted state ended).
+                const Index from_base = r.u64();
+                const Index to_base = r.u64();
+                const std::uint32_t count = r.u32();
+                if (!r.ok() || count > len || from_base != rec_base ||
+                    to_base < from_base ||
+                    static_cast<Index>(count) != to_base - from_base) {
+                    break;  // malformed / non-contiguous delta → stop at the durable prefix
+                }
+                std::vector<LogEntry> add;
+                add.reserve(count);
+                for (std::uint32_t k = 0; k < count; ++k) {
+                    LogEntry e;
+                    e.term = r.u64();
+                    e.value = r.str();
+                    add.push_back(std::move(e));
+                }
+                if (!r.ok()) {
+                    break;
+                }
+                // Append the delta to the folded state (state now covers [1..to_base]).
+                rec_state.insert(rec_state.end(),
+                                 std::make_move_iterator(add.begin()),
+                                 std::make_move_iterator(add.end()));
+                // Retain suffix entries above the new base (same rule as a full snapshot):
+                // the current suffix covers abs [rec_base+1 .. rec_base+rec_log.size()].
+                const Index cur_abs_end = rec_base + static_cast<Index>(rec_log.size());
+                std::vector<LogEntry> kept;
+                if (cur_abs_end > to_base) {
+                    const std::size_t drop = static_cast<std::size_t>(to_base - rec_base);
+                    kept.assign(rec_log.begin() + static_cast<std::ptrdiff_t>(drop),
+                                rec_log.end());
+                }
+                rec_base = to_base;
+                rec_log = std::move(kept);
             } else if (kind == RecKind::Config) {
                 // C4.2: a CONFIG record sets a chain index to a member set. Forward-
                 // only (the chain never regresses); the highest index is the adopted
@@ -1933,6 +2029,9 @@ private:
             self->voted_for_ = rec_vote;
             self->snap_base_ = rec_base;
             self->snap_state_ = std::move(rec_state);
+            // Everything reconstructed is by definition already durable, so the next local
+            // compaction persists deltas from here (not re-writing the recovered state).
+            self->snap_persisted_base_ = rec_base;
             self->log_ = std::move(rec_log);
             // The snapshotted prefix is applied by definition; recovery restores
             // appliedIndex to the snapshot point (commitIndex is re-learned via
@@ -2128,6 +2227,8 @@ private:
     std::vector<LogEntry> log_;        // retained suffix (abs idx snap_base_+1 ..)
     Index snap_base_ = 0;              // snapshot.lastIncludedIndex (= logBase[s])
     std::vector<LogEntry> snap_state_; // snapshot.state: folded entries [1..base]
+    Index snap_persisted_base_ = 0;    // base up to which snap_state_ is DURABLY persisted
+                                       // (as deltas); persist_snapshot writes (this..base]
     Index applied_index_ = 0;          // Snapshot.tla appliedIndex[s]
     // log_view_ is the FULL logical log reconstructed from (snap_state_ ++ log_),
     // returned by log() so the observable surface is UNCHANGED by compaction
