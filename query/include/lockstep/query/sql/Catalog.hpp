@@ -117,6 +117,7 @@ struct Table {
     // can skip a per-query delta scan (a pure-block read needs delta empty).
     bool columnar = false;
     bool delta_dirty = false;
+    std::uint64_t flush_gen = 0;  // bumped each flush; the decoded-block cache validity tag
 
     // STATISTICS (PERF_PLAN Phase 2) — maintained incrementally on write so the cost-based
     // planner can estimate cardinalities without a scan. row_count is exact (INSERT +1 on a

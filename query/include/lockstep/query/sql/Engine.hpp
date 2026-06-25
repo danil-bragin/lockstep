@@ -222,6 +222,8 @@ public:
     void recover(std::size_t durable_len) {
         db_.recover(durable_len);
         tip_ = db_.tip();
+        chunk_cache_.clear();  // recovered blocks may differ from any cached decode
+        zone_cache_.clear();
     }
 
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
@@ -351,6 +353,7 @@ public:
         }
         commit_writes(writes);  // ATOMIC: blocks + delta clear in one durable batch
         t->delta_dirty = false;  // delta is now empty (compacted into blocks)
+        ++t->flush_gen;          // invalidate the decoded-block + zone cache for this table
         return std::nullopt;
     }
 
@@ -659,23 +662,37 @@ private:
         return out;
     }
 
-    // Concatenate a column's chunks into one logical SoA chunk (all rows, pk-ascending).
+    // Decoded chunks of column c, CACHED by the table's flush generation: blocks change
+    // only on flush, so between flushes the decode is done ONCE and every read reuses it
+    // (kills the per-query decode that capped the columnar win). Perf-only — the cache is a
+    // pure function of the committed blocks, so results + determinism are unchanged. The
+    // cache is bumped on flush (flush_gen) and cleared on recover.
+    [[nodiscard]] const std::vector<ColumnChunk>& col_chunks_cached(const Table& t,
+                                                                    std::uint32_t c) {
+        const std::uint64_t key = (static_cast<std::uint64_t>(t.id) << 20) | c;
+        ChunkCacheEntry& slot = chunk_cache_[key];
+        if (slot.gen != t.flush_gen + 1) {  // +1 so the default 0 never matches a real gen
+            slot.gen = t.flush_gen + 1;
+            slot.chunks = read_col_chunks(t, c);
+        }
+        return slot.chunks;
+    }
+
+    // Concatenate a column's (cached) chunks into one logical SoA chunk (all rows, pk-asc).
     [[nodiscard]] ColumnChunk read_col_concat(const Table& t, std::uint32_t c) {
-        std::vector<ColumnChunk> chunks = read_col_chunks(t, c);
+        const std::vector<ColumnChunk>& chunks = col_chunks_cached(t, c);
         ColumnChunk out;
         if (chunks.empty()) {
             return out;
         }
         out.type = chunks[0].type;
-        for (ColumnChunk& ch : chunks) {
+        for (const ColumnChunk& ch : chunks) {
             out.count += ch.count;
             out.nulls.insert(out.nulls.end(), ch.nulls.begin(), ch.nulls.end());
             if (out.type == Type::Int) {
                 out.ints.insert(out.ints.end(), ch.ints.begin(), ch.ints.end());
             } else {
-                for (std::string& s : ch.texts) {
-                    out.texts.push_back(std::move(s));
-                }
+                out.texts.insert(out.texts.end(), ch.texts.begin(), ch.texts.end());
             }
         }
         return out;
@@ -685,14 +702,14 @@ private:
     // chunk. Skipped chunks are never read/decoded — the zone-map data-skipping win.
     [[nodiscard]] ColumnChunk read_col_concat_chunks(const Table& t, std::uint32_t c,
                                                      const std::vector<std::uint64_t>& chunk_ids) {
+        const std::vector<ColumnChunk>& chunks = col_chunks_cached(t, c);
         ColumnChunk out;
         bool first = true;
         for (const std::uint64_t j : chunk_ids) {
-            const ReadResult cb = read_committed(block_key(t.id, c, j));
-            if (!cb.has_value() || is_tombstone(*cb)) {
+            if (j >= chunks.size()) {
                 continue;
             }
-            ColumnChunk ch = decode_column_block(*cb);
+            const ColumnChunk& ch = chunks[j];
             if (first) {
                 out.type = ch.type;
                 first = false;
@@ -702,9 +719,7 @@ private:
             if (out.type == Type::Int) {
                 out.ints.insert(out.ints.end(), ch.ints.begin(), ch.ints.end());
             } else {
-                for (std::string& s : ch.texts) {
-                    out.texts.push_back(std::move(s));
-                }
+                out.texts.insert(out.texts.end(), ch.texts.begin(), ch.texts.end());
             }
         }
         return out;
@@ -778,13 +793,17 @@ private:
         return z;
     }
 
-    // Load the table's zone map (empty if none flushed).
-    [[nodiscard]] std::vector<std::vector<ColZone>> load_zones(const Table& t) {
-        const ReadResult zv = read_committed(zone_key(t.id));
-        if (!zv.has_value() || is_tombstone(*zv)) {
-            return {};
+    // Load the table's zone map (empty if none flushed), CACHED by flush generation.
+    [[nodiscard]] const std::vector<std::vector<ColZone>>& load_zones(const Table& t) {
+        ZoneCacheEntry& slot = zone_cache_[t.id];
+        if (slot.gen != t.flush_gen + 1) {
+            slot.gen = t.flush_gen + 1;
+            const ReadResult zv = read_committed(zone_key(t.id));
+            slot.zones = (zv.has_value() && !is_tombstone(*zv))
+                             ? decode_zone_map(*zv)
+                             : std::vector<std::vector<ColZone>>{};
         }
-        return decode_zone_map(*zv);
+        return slot.zones;
     }
 
     // Can chunk j be SKIPPED given the conjunctive filter? Skippable if ANY conjunct on an
@@ -837,7 +856,7 @@ private:
     [[nodiscard]] std::optional<std::vector<Datum>> read_block_row(const Table& t,
                                                                    const Datum& pk) {
         const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
-        const std::vector<ColumnChunk> pk_chunks = read_col_chunks(t, pkc_id);
+        const std::vector<ColumnChunk>& pk_chunks = col_chunks_cached(t, pkc_id);
         for (std::size_t j = 0; j < pk_chunks.size(); ++j) {
             const auto idx = chunk_find_pk(pk_chunks[j], pk);
             if (!idx) {
@@ -849,12 +868,12 @@ private:
                     row[c] = pk;
                     continue;
                 }
-                const ReadResult cb = read_committed(
-                    block_key(t.id, static_cast<std::uint32_t>(c), static_cast<std::uint64_t>(j)));
-                if (!cb.has_value()) {
-                    return std::nullopt;  // corrupt/missing column chunk (defensive)
+                const std::vector<ColumnChunk>& cch =
+                    col_chunks_cached(t, static_cast<std::uint32_t>(c));
+                if (j >= cch.size()) {
+                    return std::nullopt;  // missing column chunk (defensive)
                 }
-                row[c] = decode_column_block(*cb).at(*idx);
+                row[c] = cch[j].at(*idx);
             }
             return row;
         }
@@ -935,36 +954,31 @@ private:
         const Table& t, const SelectStmt& sel, const std::vector<bool>& need,
         bool pk_between, std::vector<std::vector<Datum>>& base) {
         const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
-        const std::vector<ColumnChunk> pk_chunks = read_col_chunks(t, pkc_id);
+        const std::vector<ColumnChunk>& pk_chunks = col_chunks_cached(t, pkc_id);
+        const std::size_t nch = pk_chunks.size();
         // ZONE-MAP skipping (Phase 4): if the WHERE flattens to INT conjuncts, skip any chunk
         // whose per-column [min,max] proves no row matches — without decoding its blocks.
         std::vector<VecTerm> vterms;
         const bool zone_filter = sel.filter.present() && vectorize_ &&
                                  try_extract_conjuncts(sel.filter, sel.filter.root, t, vterms);
-        const std::vector<std::vector<ColZone>> zones = zone_filter ? load_zones(t)
-                                                                     : std::vector<std::vector<ColZone>>{};
-        for (std::size_t j = 0; j < pk_chunks.size(); ++j) {
+        const std::vector<std::vector<ColZone>> zones =
+            zone_filter ? load_zones(t) : std::vector<std::vector<ColZone>>{};
+        for (std::size_t j = 0; j < nch; ++j) {
             const ColumnChunk& pkc = pk_chunks[j];
-            // DATA SKIPPING: a pk-bounded query skips any chunk whose pk range can't match —
-            // its (wide) column chunks are never read or decoded.
-            if (pk_between &&
-                chunk_pk_disjoint(pkc, sel.lo_value, sel.hi_value)) {
+            // DATA SKIPPING: a pk-bounded query skips any chunk whose pk range can't match;
+            // a non-pk INT filter skips via the zone map. Skipped chunks aren't materialised.
+            if (pk_between && chunk_pk_disjoint(pkc, sel.lo_value, sel.hi_value)) {
                 continue;
             }
             if (zone_filter && j < zones.size() && chunk_skippable(zones[j], vterms)) {
-                continue;  // a non-pk INT filter proves this chunk matches nothing
+                continue;
             }
-            std::vector<ColumnChunk> cols(t.columns.size());  // needed col chunks for chunk j
+            // Hoist this chunk's needed-column chunk pointers (cache lookups are stable).
+            std::vector<const ColumnChunk*> cc(t.columns.size(), nullptr);
             for (std::size_t c = 0; c < t.columns.size(); ++c) {
-                if (c == t.pk_index || !need[c]) {
-                    continue;
+                if (c != t.pk_index && need[c]) {
+                    cc[c] = &col_chunks_cached(t, static_cast<std::uint32_t>(c))[j];
                 }
-                const ReadResult cb = read_committed(block_key(
-                    t.id, static_cast<std::uint32_t>(c), static_cast<std::uint64_t>(j)));
-                if (!cb.has_value()) {
-                    return std::string("columnar block missing column chunk");
-                }
-                cols[c] = decode_column_block(*cb);
             }
             for (std::uint32_t i = 0; i < pkc.count; ++i) {
                 const Datum pk = pkc.type == Type::Int ? Datum::make_int(pkc.ints[i])
@@ -976,10 +990,9 @@ private:
                 std::vector<Datum> row(t.columns.size());
                 row[t.pk_index] = pk;  // always set (merge key); projection drops if unneeded
                 for (std::size_t c = 0; c < t.columns.size(); ++c) {
-                    if (c == t.pk_index || !need[c]) {
-                        continue;
+                    if (cc[c] != nullptr) {
+                        row[c] = cc[c]->at(i);
                     }
-                    row[c] = cols[c].at(i);
                 }
                 base.push_back(std::move(row));
             }
@@ -4122,6 +4135,20 @@ private:
     PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run
     bool vectorize_ = true;            // vectorized filter fast path (test-toggleable)
     bool columnar_default_ = false;    // new tables use the columnar layout when set
+
+    // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change
+    // only on flush). Perf-only: a pure function of the committed blocks, so results +
+    // determinism are unchanged. Cleared on recover().
+    struct ChunkCacheEntry {
+        std::uint64_t gen = 0;
+        std::vector<ColumnChunk> chunks;
+    };
+    std::map<std::uint64_t, ChunkCacheEntry> chunk_cache_;  // key = (table_id<<20 | col_id)
+    struct ZoneCacheEntry {
+        std::uint64_t gen = 0;
+        std::vector<std::vector<ColZone>> zones;
+    };
+    std::map<std::uint32_t, ZoneCacheEntry> zone_cache_;  // key = table_id
 };
 
 }  // namespace lockstep::query::sql
