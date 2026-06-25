@@ -180,6 +180,43 @@ void run_seed(std::uint64_t seed) {
     both(col, row, "SELECT id, sal FROM emp WHERE sal = 250 AND dept = 'ops'", "indexed-residual");
 }
 
+// MULTI-CHUNK gate: a table larger than kChunkRows (1024) so flushed columns span several
+// chunks (block_no 0..K-1). Exercises the chunked read paths (block_base_rows per-chunk + pk-
+// range data skipping, read_block_row chunk search, vectorized agg concat), and a re-flush
+// after DELETEs that SHRINKS the table (stale trailing chunks must be tombstoned). All must
+// stay byte-identical to row-mode.
+void run_large() {
+    SqlEngine col;
+    col.set_columnar_default(true);
+    SqlEngine row;
+    const std::string ddl =
+        "CREATE TABLE big (id INT, grp INT, val INT, PRIMARY KEY (id))";
+    both(col, row, ddl, "large-create");
+    const std::size_t N = 2600;  // > 2*kChunkRows => 3 chunks/column
+    for (std::size_t i = 0; i < N; ++i) {
+        const std::string sql = "INSERT INTO big (id, grp, val) VALUES (" + std::to_string(i) +
+                                ", " + std::to_string(i % 7) + ", " + std::to_string((i * 13) % 500) + ")";
+        both(col, row, sql, "large-insert");
+    }
+    check(!col.flush_columnar("big").has_value(), "large flush #1");  // -> 3 chunks/column
+    // Multi-chunk reads: full scan, projection, pk BETWEEN (data skipping across chunks),
+    // scalar aggregate, GROUP BY — all spanning chunk boundaries.
+    both(col, row, "SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM big", "large-agg");
+    both(col, row, "SELECT grp, COUNT(*), SUM(val) FROM big GROUP BY grp", "large-groupby");
+    both(col, row, "SELECT id, val FROM big WHERE id BETWEEN 1500 AND 1520", "large-pk-skip");
+    both(col, row, "SELECT id, val FROM big WHERE id BETWEEN 1020 AND 1030", "large-pk-skip2");
+    both(col, row, "SELECT id, val FROM big WHERE val > 400", "large-filter");
+    both(col, row, "SELECT id FROM big WHERE id = 2049", "large-pk-eq");
+    // DELETE a big swathe, re-flush -> the table shrinks below 2 chunks; stale chunks retired.
+    for (std::size_t i = 1000; i < N; ++i) {
+        both(col, row, "DELETE FROM big WHERE id = " + std::to_string(i), "large-delete");
+    }
+    check(!col.flush_columnar("big").has_value(), "large flush #2 (shrink)");
+    both(col, row, "SELECT COUNT(*), SUM(val) FROM big", "large-agg-after-shrink");
+    both(col, row, "SELECT id, val FROM big WHERE id BETWEEN 1500 AND 1520", "large-skip-after-shrink");
+    both(col, row, "SELECT id, grp, val FROM big", "large-scan-after-shrink");
+}
+
 }  // namespace
 
 int main() {
@@ -190,6 +227,7 @@ int main() {
     for (std::uint64_t s = 0; s < seeds; ++s) {
         run_seed(s * 0x9E37ULL + 1);
     }
+    run_large();
     if (g_fail == 0) {
         std::printf("sql_columnar_test: ALL PASS (columnar == row-mode across the workload)\n");
     }

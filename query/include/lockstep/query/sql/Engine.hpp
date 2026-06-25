@@ -286,15 +286,32 @@ public:
         if (auto e = columnar_build_rows(*t, full, all, rows)) {
             return e;
         }
+        // Pack each column into ceil(N/kChunkRows) pk-ascending chunks (block_no 0..K-1).
+        // Tombstone any STALE chunk a prior flush left beyond the new chunk count (the table
+        // shrank). All in one atomic commit, so a crash leaves the pre- or post-flush state.
+        const std::size_t nrows = rows.size();
+        const std::uint64_t nchunks =
+            (nrows + kChunkRows - 1) / kChunkRows;  // 0 rows => 0 chunks
+        const std::uint64_t old_nchunks =
+            read_col_chunks(*t, static_cast<std::uint32_t>(t->pk_index)).size();
         std::vector<std::pair<Key, Value>> writes;
         for (std::size_t c = 0; c < t->columns.size(); ++c) {
-            std::vector<Datum> cells;
-            cells.reserve(rows.size());
-            for (const std::vector<Datum>& row : rows) {
-                cells.push_back(row[c]);
+            for (std::uint64_t j = 0; j < nchunks; ++j) {
+                const std::size_t lo = static_cast<std::size_t>(j) * kChunkRows;
+                const std::size_t hi = std::min(lo + kChunkRows, nrows);
+                std::vector<Datum> cells;
+                cells.reserve(hi - lo);
+                for (std::size_t r = lo; r < hi; ++r) {
+                    cells.push_back(rows[r][c]);
+                }
+                writes.emplace_back(
+                    block_key(t->id, static_cast<std::uint32_t>(c), j),
+                    encode_column_block(t->columns[c].type, cells));
             }
-            writes.emplace_back(block_key(t->id, static_cast<std::uint32_t>(c), 0),
-                                encode_column_block(t->columns[c].type, cells));
+            for (std::uint64_t j = nchunks; j < old_nchunks; ++j) {
+                writes.emplace_back(block_key(t->id, static_cast<std::uint32_t>(c), j),
+                                    tombstone_marker());  // retire a stale chunk
+            }
         }
         std::vector<storage::KeyValue> delta;  // clear the delta: tombstone every 'd' key
         {
@@ -588,16 +605,64 @@ private:
         return std::string("unsupported consistency level");
     }
 
-    // Build the post-scan `rows` for a COLUMNAR table: scan the pk-column family for the
-    // live PK list (+ order), then scan EACH needed column family and zip by position
-    // (families are pk-aligned — every live row writes every family at the same commit,
-    // so the i-th live entry of every family is the same row). Only NEEDED columns are
-    // scanned: the projection-pushdown win (a wide unreferenced column's family is never
-    // read). Needed columns are decoded into rows_out; unneeded stay Datum{}.
-    // Does the table have flushed blocks? Probe the pk-column's block (block_no 0).
+    // ~rows-per-chunk for flushed column blocks: bounds block size + is the unit of
+    // pk-range DATA SKIPPING. A column is stored as ceil(N/kChunkRows) chunks (block_no
+    // 0..K-1), each a contiguous pk-ascending slice; the chunks are pk-disjoint + ascending.
+    static constexpr std::uint32_t kChunkRows = 1024;
+
+    // Does the table have flushed blocks? Probe the pk-column's first chunk (block_no 0).
     [[nodiscard]] bool has_blocks(const Table& t) {
         return read_committed(block_key(t.id, static_cast<std::uint32_t>(t.pk_index), 0))
             .has_value();
+    }
+
+    // Decode ALL flushed chunks of column c (block_no 0..K-1, pk-ascending), in order.
+    [[nodiscard]] std::vector<ColumnChunk> read_col_chunks(const Table& t, std::uint32_t c) {
+        std::vector<storage::KeyValue> kvs;
+        Query<Strict> q;
+        q.scan(block_col_prefix(t.id, c), block_col_prefix_end(t.id, c));
+        collect(db_.run(q), kvs);
+        std::vector<ColumnChunk> out;
+        out.reserve(kvs.size());
+        for (const storage::KeyValue& kv : kvs) {
+            if (!is_tombstone(kv.second)) {
+                out.push_back(decode_column_block(kv.second));
+            }
+        }
+        return out;
+    }
+
+    // Concatenate a column's chunks into one logical SoA chunk (all rows, pk-ascending).
+    [[nodiscard]] ColumnChunk read_col_concat(const Table& t, std::uint32_t c) {
+        std::vector<ColumnChunk> chunks = read_col_chunks(t, c);
+        ColumnChunk out;
+        if (chunks.empty()) {
+            return out;
+        }
+        out.type = chunks[0].type;
+        for (ColumnChunk& ch : chunks) {
+            out.count += ch.count;
+            out.nulls.insert(out.nulls.end(), ch.nulls.begin(), ch.nulls.end());
+            if (out.type == Type::Int) {
+                out.ints.insert(out.ints.end(), ch.ints.begin(), ch.ints.end());
+            } else {
+                for (std::string& s : ch.texts) {
+                    out.texts.push_back(std::move(s));
+                }
+            }
+        }
+        return out;
+    }
+
+    // A pk-ascending chunk's [first,last] pk range is DISJOINT from [lo,hi] (data skipping).
+    [[nodiscard]] static bool chunk_pk_disjoint(const ColumnChunk& pc, const Datum& lo,
+                                                const Datum& hi) {
+        if (pc.count == 0) {
+            return true;
+        }
+        const Datum first = pc.at(0);
+        const Datum last = pc.at(pc.count - 1);
+        return last.less_than(lo) || hi.less_than(first);  // last<lo || hi<first
     }
 
     // Locate a pk within a (pk-ascending) pk-column chunk by binary search.
@@ -623,30 +688,29 @@ private:
     // DELETE / index fetch, where the full row is needed).
     [[nodiscard]] std::optional<std::vector<Datum>> read_block_row(const Table& t,
                                                                    const Datum& pk) {
-        const ReadResult pkb =
-            read_committed(block_key(t.id, static_cast<std::uint32_t>(t.pk_index), 0));
-        if (!pkb.has_value() || is_tombstone(*pkb)) {
-            return std::nullopt;  // no blocks
-        }
-        const ColumnChunk pkc = decode_column_block(*pkb);
-        const auto idx = chunk_find_pk(pkc, pk);
-        if (!idx) {
-            return std::nullopt;  // pk not in the blocks
-        }
-        std::vector<Datum> row(t.columns.size());
-        for (std::size_t c = 0; c < t.columns.size(); ++c) {
-            if (c == t.pk_index) {
-                row[c] = pk;
-                continue;
+        const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
+        const std::vector<ColumnChunk> pk_chunks = read_col_chunks(t, pkc_id);
+        for (std::size_t j = 0; j < pk_chunks.size(); ++j) {
+            const auto idx = chunk_find_pk(pk_chunks[j], pk);
+            if (!idx) {
+                continue;  // pk not in this chunk (chunks are pk-disjoint) — try the next
             }
-            const ReadResult cb =
-                read_committed(block_key(t.id, static_cast<std::uint32_t>(c), 0));
-            if (!cb.has_value()) {
-                return std::nullopt;  // corrupt/missing column block (defensive)
+            std::vector<Datum> row(t.columns.size());
+            for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                if (c == t.pk_index) {
+                    row[c] = pk;
+                    continue;
+                }
+                const ReadResult cb = read_committed(
+                    block_key(t.id, static_cast<std::uint32_t>(c), static_cast<std::uint64_t>(j)));
+                if (!cb.has_value()) {
+                    return std::nullopt;  // corrupt/missing column chunk (defensive)
+                }
+                row[c] = decode_column_block(*cb).at(*idx);
             }
-            row[c] = decode_column_block(*cb).at(*idx);
+            return row;
         }
-        return row;
+        return std::nullopt;  // no blocks, or pk absent
     }
 
     // Build the post-scan `rows` for a COLUMNAR table by MERGING the flushed column blocks
@@ -723,39 +787,44 @@ private:
         const Table& t, const SelectStmt& sel, const std::vector<bool>& need,
         bool pk_between, std::vector<std::vector<Datum>>& base) {
         const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
-        const ReadResult pkb = read_committed(block_key(t.id, pkc_id, 0));
-        if (!pkb.has_value() || is_tombstone(*pkb)) {
-            return std::nullopt;  // no blocks (pre-flush)
-        }
-        const ColumnChunk pkc = decode_column_block(*pkb);
-        std::vector<ColumnChunk> cols(t.columns.size());  // decoded needed col blocks
-        for (std::size_t c = 0; c < t.columns.size(); ++c) {
-            if (c == t.pk_index || !need[c]) {
+        const std::vector<ColumnChunk> pk_chunks = read_col_chunks(t, pkc_id);
+        for (std::size_t j = 0; j < pk_chunks.size(); ++j) {
+            const ColumnChunk& pkc = pk_chunks[j];
+            // DATA SKIPPING: a pk-bounded query skips any chunk whose pk range can't match —
+            // its (wide) column chunks are never read or decoded.
+            if (pk_between &&
+                chunk_pk_disjoint(pkc, sel.lo_value, sel.hi_value)) {
                 continue;
             }
-            const ReadResult cb =
-                read_committed(block_key(t.id, static_cast<std::uint32_t>(c), 0));
-            if (!cb.has_value()) {
-                return std::string("columnar block missing column");
-            }
-            cols[c] = decode_column_block(*cb);
-        }
-        base.reserve(pkc.count);
-        for (std::uint32_t i = 0; i < pkc.count; ++i) {
-            const Datum pk = pkc.type == Type::Int ? Datum::make_int(pkc.ints[i])
-                                                   : Datum::make_text(pkc.texts[i]);
-            if (pk_between && (pk.less_than(sel.lo_value) || sel.hi_value.less_than(pk))) {
-                continue;
-            }
-            std::vector<Datum> row(t.columns.size());
-            row[t.pk_index] = pk;  // always set (merge key); projection drops it if unneeded
+            std::vector<ColumnChunk> cols(t.columns.size());  // needed col chunks for chunk j
             for (std::size_t c = 0; c < t.columns.size(); ++c) {
                 if (c == t.pk_index || !need[c]) {
                     continue;
                 }
-                row[c] = cols[c].at(i);
+                const ReadResult cb = read_committed(block_key(
+                    t.id, static_cast<std::uint32_t>(c), static_cast<std::uint64_t>(j)));
+                if (!cb.has_value()) {
+                    return std::string("columnar block missing column chunk");
+                }
+                cols[c] = decode_column_block(*cb);
             }
-            base.push_back(std::move(row));
+            for (std::uint32_t i = 0; i < pkc.count; ++i) {
+                const Datum pk = pkc.type == Type::Int ? Datum::make_int(pkc.ints[i])
+                                                       : Datum::make_text(pkc.texts[i]);
+                if (pk_between &&
+                    (pk.less_than(sel.lo_value) || sel.hi_value.less_than(pk))) {
+                    continue;
+                }
+                std::vector<Datum> row(t.columns.size());
+                row[t.pk_index] = pk;  // always set (merge key); projection drops if unneeded
+                for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                    if (c == t.pk_index || !need[c]) {
+                        continue;
+                    }
+                    row[c] = cols[c].at(i);
+                }
+                base.push_back(std::move(row));
+            }
         }
         return std::nullopt;
     }
@@ -893,6 +962,9 @@ private:
                 }
             }
         }
+        // Decode needed columns as ONE concatenated SoA chunk each (all chunks merged). An
+        // ungrouped/grouped aggregate scans the whole column, so concat is simplest; the
+        // pk-range data skipping lives in the projection path (block_base_rows).
         std::vector<ColumnChunk> cols(t.columns.size());
         std::uint32_t count = 0;
         bool count_set = false;
@@ -900,22 +972,12 @@ private:
             if (!need[c]) {
                 continue;
             }
-            const ReadResult cb =
-                read_committed(block_key(t.id, static_cast<std::uint32_t>(c), 0));
-            if (!cb.has_value()) {
-                return std::nullopt;
-            }
-            cols[c] = decode_column_block(*cb);
+            cols[c] = read_col_concat(t, static_cast<std::uint32_t>(c));
             count = cols[c].count;
             count_set = true;
         }
-        if (!count_set) {  // COUNT(*) only, no filter/group — read the pk block for the count
-            const ReadResult pkb =
-                read_committed(block_key(t.id, static_cast<std::uint32_t>(t.pk_index), 0));
-            if (!pkb.has_value()) {
-                return std::nullopt;
-            }
-            count = decode_column_block(*pkb).count;
+        if (!count_set) {  // COUNT(*) only, no filter/group — the pk column gives the count
+            count = read_col_concat(t, static_cast<std::uint32_t>(t.pk_index)).count;
         }
         // Build groups: ordered map keyed by the group-column tuple (group_key_field == the
         // exact key exec_aggregate uses => identical group order). Value = (member indices,
