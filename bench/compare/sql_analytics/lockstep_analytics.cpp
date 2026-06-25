@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
     // (the vectorizable-conjunct extractor conservatively skips nullable columns).
     (void)eng.exec(
         "CREATE TABLE events (id INT, uid INT, cat INT NOT NULL, amount INT NOT NULL, "
-        "region TEXT, ts INT NOT NULL, PRIMARY KEY (id))");
+        "region TEXT NOT NULL, ts INT NOT NULL, PRIMARY KEY (id))");
 
     auto t_load = std::chrono::steady_clock::now();
     for (std::uint64_t i = 0; i < N; ++i) {

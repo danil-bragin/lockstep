@@ -1944,57 +1944,29 @@ private:
         if (!count_set) {  // COUNT(*) only, no filter/group — the pk column gives the count
             count = decode_col(static_cast<std::uint32_t>(t.pk_index)).count;
         }
-        // Build groups: ordered map keyed by the group-column tuple (group_key_field == the
-        // exact key exec_aggregate uses => identical group order). Value = (member indices,
-        // group-key datums). The filter selects which rows enter a group. NB: the aggregates
-        // are folded in a SECOND pass via compute_agg_soa — TIGHT per-column folds the
-        // compiler vectorises; a 1-pass branchy running-accumulator measured SLOWER here.
-        std::map<std::vector<std::string>,
-                 std::pair<std::vector<std::uint32_t>, std::vector<Datum>>>
-            groups;
-        std::vector<std::string> key;  // REUSED across rows (clear keeps capacity) — avoids a
-        key.reserve(gcols.size());     // per-row vector heap allocation (200k-1M of them).
-        for (std::uint32_t r = 0; r < count; ++r) {
-            if (has_filter) {
-                bool ok = true;
-                for (const VecTerm& vt : vterms) {
-                    if (!apply_cmp(vt.op, cmp_datum(cols[vt.col].at(r), vt.lit))) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (!ok) {
-                    continue;
+        // A row filter shared by both group paths.
+        auto passes = [&](std::uint32_t rr) {
+            for (const VecTerm& vt : vterms) {
+                if (!apply_cmp(vt.op, cmp_datum(cols[vt.col].at(rr), vt.lit))) {
+                    return false;
                 }
             }
-            key.clear();
-            for (const std::size_t g : gcols) {
-                key.push_back(group_key_field(cols[g].at(r)));
-            }
-            auto& slot = groups[key];
-            if (slot.second.empty() && !gcols.empty()) {
-                slot.second.reserve(gcols.size());
-                for (const std::size_t g : gcols) {
-                    slot.second.push_back(cols[g].at(r));
-                }
-            }
-            slot.first.push_back(r);
-        }
-        // Ungrouped over zero rows still yields ONE row (SELECT COUNT(*) => 0).
-        if (gcols.empty() && groups.empty()) {
-            groups[std::vector<std::string>{}];
-        }
+            return true;
+        };
         ExecResult r;
-        for (const auto& [key, slot] : groups) {
-            (void)key;
+        // Emit ONE group's result row (HAVING-filtered): aggregates fold via compute_agg_soa
+        // (TIGHT per-column second pass; a 1-pass branchy running-accumulator measured SLOWER).
+        // Appends to r.rows; returns an error string, or nullopt (emitted OR skipped by HAVING).
+        auto emit_group = [&](const std::vector<Datum>& keyd,
+                              const std::vector<std::uint32_t>& idxs) -> std::optional<std::string> {
             if (has_having) {
                 bool keep = true;
-                if (auto e = having_eval_soa(sel.having, sel.having.root, t, cols, slot.first,
-                                             gcols, slot.second, keep)) {
-                    return ExecResult::failure(*e);
+                if (auto e = having_eval_soa(sel.having, sel.having.root, t, cols, idxs, gcols,
+                                             keyd, keep)) {
+                    return e;
                 }
                 if (!keep) {
-                    continue;  // group fails HAVING
+                    return std::nullopt;
                 }
             }
             ResultRow out;
@@ -2004,17 +1976,99 @@ private:
                     Datum d;
                     for (std::size_t j = 0; j < gcols.size(); ++j) {
                         if (gcols[j] == ci) {
-                            d = slot.second[j];
+                            d = keyd[j];
                             break;
                         }
                     }
                     out.cells.emplace_back(item.label, d);
                 } else {
-                    out.cells.emplace_back(item.label,
-                                           compute_agg_soa(item.agg, t, cols, slot.first));
+                    out.cells.emplace_back(item.label, compute_agg_soa(item.agg, t, cols, idxs));
                 }
             }
             r.rows.push_back(std::move(out));
+            return std::nullopt;
+        };
+        // RAW-INT-KEY fast path: a single NOT NULL INT group column keys the map by the raw
+        // int64 — no per-row group_key_field STRING + no vector<string> key. The map is ordered
+        // by int, which equals the order-preserving group_key_field order, so output order is
+        // byte-identical. (The common GROUP BY <int col> analytical shape.)
+        if (gcols.size() == 1 && t.columns[gcols[0]].type == Type::Int &&
+            !t.columns[gcols[0]].nullable) {
+            const std::size_t gc = gcols[0];
+            std::map<std::int64_t, std::pair<std::vector<std::uint32_t>, std::vector<Datum>>> ig;
+            for (std::uint32_t rr = 0; rr < count; ++rr) {
+                if (has_filter && !passes(rr)) {
+                    continue;
+                }
+                auto& slot = ig[cols[gc].ints[rr]];
+                if (slot.second.empty()) {
+                    slot.second.push_back(Datum::make_int(cols[gc].ints[rr]));
+                }
+                slot.first.push_back(rr);
+            }
+            for (const auto& [k, slot] : ig) {
+                (void)k;
+                if (auto e = emit_group(slot.second, slot.first)) {
+                    return ExecResult::failure(*e);
+                }
+            }
+        } else if (gcols.size() == 1 && t.columns[gcols[0]].type == Type::Text &&
+                   !t.columns[gcols[0]].nullable) {
+            // RAW-STRING-KEY fast path: a single NOT NULL TEXT group column keys the map by the
+            // raw text value — no group_key_field re-encode + no vector<string> wrapper. Ordered
+            // by the raw bytes == group_key_field order for non-null TEXT (the type/null prefix
+            // is constant), so output order is byte-identical.
+            const std::size_t gc = gcols[0];
+            std::map<std::string, std::pair<std::vector<std::uint32_t>, std::vector<Datum>>> tg;
+            for (std::uint32_t rr = 0; rr < count; ++rr) {
+                if (has_filter && !passes(rr)) {
+                    continue;
+                }
+                auto& slot = tg[cols[gc].texts[rr]];
+                if (slot.second.empty()) {
+                    slot.second.push_back(Datum::make_text(cols[gc].texts[rr]));
+                }
+                slot.first.push_back(rr);
+            }
+            for (const auto& [k, slot] : tg) {
+                (void)k;
+                if (auto e = emit_group(slot.second, slot.first)) {
+                    return ExecResult::failure(*e);
+                }
+            }
+        } else {
+            // GENERAL path: group-key tuple (group_key_field). Key buffer reused across rows.
+            std::map<std::vector<std::string>,
+                     std::pair<std::vector<std::uint32_t>, std::vector<Datum>>>
+                groups;
+            std::vector<std::string> key;
+            key.reserve(gcols.size());
+            for (std::uint32_t rr = 0; rr < count; ++rr) {
+                if (has_filter && !passes(rr)) {
+                    continue;
+                }
+                key.clear();
+                for (const std::size_t g : gcols) {
+                    key.push_back(group_key_field(cols[g].at(rr)));
+                }
+                auto& slot = groups[key];
+                if (slot.second.empty() && !gcols.empty()) {
+                    slot.second.reserve(gcols.size());
+                    for (const std::size_t g : gcols) {
+                        slot.second.push_back(cols[g].at(rr));
+                    }
+                }
+                slot.first.push_back(rr);
+            }
+            if (gcols.empty() && groups.empty()) {  // ungrouped over zero rows => ONE row
+                groups[std::vector<std::string>{}];
+            }
+            for (const auto& [k, slot] : groups) {
+                (void)k;
+                if (auto e = emit_group(slot.second, slot.first)) {
+                    return ExecResult::failure(*e);
+                }
+            }
         }
         apply_distinct(sel, r.rows);
         if (auto e = apply_order_by_labels(sel, r.rows)) {

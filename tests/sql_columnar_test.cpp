@@ -322,14 +322,19 @@ void run_text_zones() {
     SqlEngine col;
     col.set_columnar_default(true);
     SqlEngine row;
-    both(col, row, "CREATE TABLE tz (id INT, tag TEXT, v INT, PRIMARY KEY (id))", "tz-create");
+    both(col, row,
+         "CREATE TABLE tz (id INT, tag TEXT NOT NULL, bkt TEXT NOT NULL, v INT, PRIMARY KEY (id))",
+         "tz-create");
     auto pad = [](int i) {
         std::string s = std::to_string(i);
         return std::string(6 - s.size(), '0') + s;  // zero-padded => lexicographic == numeric
     };
+    const char* bkts[] = {"north", "south", "east", "west", "central"};
     for (int i = 0; i < 3000; ++i) {
-        both(col, row, "INSERT INTO tz (id, tag, v) VALUES (" + std::to_string(i) + ", 't" +
-                           pad(i) + "', " + std::to_string(i % 400) + ")", "tz-ins");
+        both(col, row,
+             "INSERT INTO tz (id, tag, bkt, v) VALUES (" + std::to_string(i) + ", 't" + pad(i) +
+                 "', '" + bkts[i % 5] + "', " + std::to_string(i % 400) + ")",
+             "tz-ins");
     }
     check(!col.flush_columnar("tz").has_value(), "tz flush");
     both(col, row, "SELECT COUNT(*), SUM(v) FROM tz WHERE tag > 't002500'", "tz-gt");
@@ -338,6 +343,10 @@ void run_text_zones() {
     both(col, row, "SELECT id, tag FROM tz WHERE tag >= 't002990'", "tz-ge");
     both(col, row, "SELECT COUNT(*) FROM tz WHERE tag = 'zzz_absent'", "tz-allskip");
     both(col, row, "SELECT tag, COUNT(*) FROM tz WHERE tag > 't002000' GROUP BY tag", "tz-groupby");
+    // NOT NULL TEXT group column => the raw-string-key GROUP BY fast path.
+    both(col, row, "SELECT bkt, COUNT(*), SUM(v), MIN(v), MAX(v) FROM tz GROUP BY bkt", "tz-gb-bkt");
+    both(col, row, "SELECT bkt, COUNT(*) FROM tz WHERE v > 200 GROUP BY bkt", "tz-gb-bkt-filt");
+    both(col, row, "SELECT tag, SUM(v) FROM tz GROUP BY tag ORDER BY tag DESC LIMIT 5", "tz-gb-tag");
 }
 
 }  // namespace

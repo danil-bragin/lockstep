@@ -40,7 +40,7 @@ done
 # Load the SAME deterministic data (formula matches lockstep_analytics.cpp). No secondary index.
 docker exec pg_analytics psql -U bench -d bench -q -c "
   DROP TABLE IF EXISTS events;
-  CREATE TABLE events (id INT PRIMARY KEY, uid INT, cat INT NOT NULL, amount INT NOT NULL, region TEXT, ts INT NOT NULL);
+  CREATE TABLE events (id INT PRIMARY KEY, uid INT, cat INT NOT NULL, amount INT NOT NULL, region TEXT NOT NULL, ts INT NOT NULL);
   INSERT INTO events SELECT i, i%10000, i%8, ((i::bigint*2654435761)%1000)::int,
     (ARRAY['north','south','east','west','central'])[(i%5)+1], i FROM generate_series(0,$N-1) i;
   ANALYZE events;" >/dev/null
