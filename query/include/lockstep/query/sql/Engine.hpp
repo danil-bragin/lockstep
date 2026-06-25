@@ -157,6 +157,7 @@
 #include <vector>
 
 #include <lockstep/query/Database.hpp>
+#include <lockstep/query/ParallelExecutor.hpp>
 #include <lockstep/query/Query.hpp>
 #include <lockstep/query/sql/Ast.hpp>
 #include <lockstep/query/sql/Catalog.hpp>
@@ -271,6 +272,12 @@ public:
     // Deterministic (count-based, not time). The append fast path keeps a monotonic-pk
     // stream's auto-flushes O(delta).
     void set_auto_flush(std::uint64_t rows) { auto_flush_rows_ = rows; }
+
+    // MORSEL PARALLELISM seam. Inject a providers/prod thread-pool executor to fold a columnar
+    // aggregate's chunks across cores; null (default) = serial. The RESULT is byte-identical
+    // either way (partials merged in a FIXED chunk order), so determinism + the sim are
+    // unaffected — only wall-clock changes. Threads live in the injected impl, never here.
+    void set_parallel_executor(IParallelExecutor* ex) { parallel_executor_ = ex; }
 
     // FLUSH a columnar table's row 'd' delta into column blocks (LSM compaction): read the
     // merged live rows, pack each column into a block (block_no 0, overwrite), and clear
@@ -1474,93 +1481,156 @@ private:
     // made a large scan cache-bound + super-linear. SIMD per chunk (NOT NULL => no null
     // branch). Byte-identical to compute_agg_full over the concatenation; same partial-merge
     // shape morsel parallelism will use.
-    [[nodiscard]] Datum compute_agg_chunked(const AggExpr& a, const Table& t) {
-        const std::uint32_t pkc = static_cast<std::uint32_t>(t.pk_index);
-        if (a.kind == AggKind::CountStar) {
-            std::int64_t n = 0;
-            for (const ColumnChunk& ch : col_chunks_cached(t, pkc)) {
-                n += ch.count;
-            }
-            return Datum::make_int(n);
-        }
-        const std::size_t ci = *t.column_index(a.column);
-        const std::vector<ColumnChunk>& chunks =
-            col_chunks_cached(t, static_cast<std::uint32_t>(ci));
-        const Type ty = t.columns[ci].type;
-        const bool no_nulls = !t.columns[ci].nullable;
-        std::int64_t total = 0;
-        for (const ColumnChunk& ch : chunks) {
-            total += ch.count;
-        }
+    // One partition's running fold of ONE aggregate (no shared state — each parallel worker
+    // owns its own). Merged across partitions in a FIXED order, so the final value is identical
+    // regardless of how the chunks were split or scheduled.
+    struct AggPartial {
+        std::int64_t total = 0;  // Σ ch.count over this partition's chunks
+        std::int64_t n = 0;      // non-null count (Count nullable / SUM / AVG)
+        std::int64_t sum = 0;    // Σ values (SUM / AVG)
+        bool any = false;        // saw a non-null value (MIN / MAX)
+        std::int64_t ibest = 0;  // running MIN/MAX for the Int+NOT NULL fast path
+        Datum dbest;             // running MIN/MAX for the generic (text / nullable) path
+    };
+
+    // Fold chunks [lo,hi) of one column into a partial. Loop bodies match the old single-pass
+    // folds exactly (Int+NOT NULL stays a tight, branch-free, auto-vectorizable loop).
+    [[nodiscard]] AggPartial fold_agg_range(const std::vector<ColumnChunk>& chunks,
+                                            std::size_t lo, std::size_t hi, const AggExpr& a,
+                                            Type ty, bool no_nulls) {
+        AggPartial p;
+        for (std::size_t k = lo; k < hi; ++k) p.total += chunks[k].count;
+        if (a.kind == AggKind::CountStar) return p;
         if (a.kind == AggKind::Count) {
-            if (no_nulls) {
-                return Datum::make_int(total);
+            if (no_nulls) { p.n = p.total; return p; }
+            for (std::size_t k = lo; k < hi; ++k) {
+                const ColumnChunk& ch = chunks[k];
+                for (std::uint32_t r = 0; r < ch.count; ++r) if (!ch.nulls[r]) ++p.n;
             }
-            std::int64_t c = 0;
-            for (const ColumnChunk& ch : chunks) {
-                for (std::uint32_t r = 0; r < ch.count; ++r) {
-                    if (!ch.nulls[r]) ++c;
-                }
-            }
-            return Datum::make_int(c);
-        }
-        if (total == 0) {
-            return Datum::make_int(0);  // empty (compute_agg_full count==0 parity)
+            return p;
         }
         if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
             if (ty == Type::Int && no_nulls) {
-                bool any = false;
-                std::int64_t best = 0;
-                for (const ColumnChunk& ch : chunks) {
+                for (std::size_t k = lo; k < hi; ++k) {
+                    const ColumnChunk& ch = chunks[k];
                     if (a.kind == AggKind::Min) {
                         for (std::uint32_t r = 0; r < ch.count; ++r) {
-                            if (!any || ch.ints[r] < best) { best = ch.ints[r]; any = true; }
+                            if (!p.any || ch.ints[r] < p.ibest) { p.ibest = ch.ints[r]; p.any = true; }
                         }
                     } else {
                         for (std::uint32_t r = 0; r < ch.count; ++r) {
-                            if (!any || ch.ints[r] > best) { best = ch.ints[r]; any = true; }
+                            if (!p.any || ch.ints[r] > p.ibest) { p.ibest = ch.ints[r]; p.any = true; }
                         }
                     }
                 }
-                return Datum::make_int(best);
+                return p;
             }
-            Datum best;
-            bool any = false;
-            for (const ColumnChunk& ch : chunks) {
+            for (std::size_t k = lo; k < hi; ++k) {
+                const ColumnChunk& ch = chunks[k];
                 for (std::uint32_t r = 0; r < ch.count; ++r) {
                     if (ch.nulls[r]) continue;
                     const Datum v = ch.at(r);
-                    if (!any) { best = v; any = true; }
+                    if (!p.any) { p.dbest = v; p.any = true; }
                     else {
-                        const int c = cmp_datum(v, best);
+                        const int c = cmp_datum(v, p.dbest);
                         if ((a.kind == AggKind::Min && c < 0) ||
-                            (a.kind == AggKind::Max && c > 0)) best = v;
+                            (a.kind == AggKind::Max && c > 0)) p.dbest = v;
                     }
                 }
             }
-            return any ? best : Datum::make_null(ty);
+            return p;
         }
-        std::int64_t sum = 0;  // SUM / AVG
-        std::int64_t n = 0;
-        for (const ColumnChunk& ch : chunks) {
+        for (std::size_t k = lo; k < hi; ++k) {  // SUM / AVG
+            const ColumnChunk& ch = chunks[k];
             if (no_nulls) {
-                for (std::uint32_t r = 0; r < ch.count; ++r) sum += ch.ints[r];
-                n += ch.count;
+                for (std::uint32_t r = 0; r < ch.count; ++r) p.sum += ch.ints[r];
+                p.n += ch.count;
             } else {
                 for (std::uint32_t r = 0; r < ch.count; ++r) {
                     if (ch.nulls[r]) continue;
-                    sum += ch.ints[r];
-                    ++n;
+                    p.sum += ch.ints[r];
+                    ++p.n;
                 }
             }
         }
-        if (n == 0) {
-            return a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
+        return p;
+    }
+
+    // Combine partition partials in a FIXED order (0..W-1). SUM/COUNT are integer-exact (order
+    // independent); MIN/MAX are associative+commutative — so the merged value is byte-identical
+    // to the serial single-pass fold.
+    [[nodiscard]] AggPartial merge_partials(const std::vector<AggPartial>& ps, const AggExpr& a,
+                                            Type ty, bool no_nulls) {
+        AggPartial m;
+        const bool int_minmax =
+            (a.kind == AggKind::Min || a.kind == AggKind::Max) && ty == Type::Int && no_nulls;
+        for (const AggPartial& p : ps) {
+            m.total += p.total;
+            m.n += p.n;
+            m.sum += p.sum;
+            if (!p.any) continue;
+            if (int_minmax) {
+                if (!m.any || (a.kind == AggKind::Min ? p.ibest < m.ibest : p.ibest > m.ibest)) {
+                    m.ibest = p.ibest; m.any = true;
+                }
+            } else if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
+                if (!m.any) { m.dbest = p.dbest; m.any = true; }
+                else {
+                    const int c = cmp_datum(p.dbest, m.dbest);
+                    if ((a.kind == AggKind::Min && c < 0) ||
+                        (a.kind == AggKind::Max && c > 0)) m.dbest = p.dbest;
+                }
+            }
         }
-        if (a.kind == AggKind::Sum) {
-            return Datum::make_int(sum);
+        return m;
+    }
+
+    // Turn a merged partial into the result Datum — mirrors the serial fold's tail exactly
+    // (including the count==0 short-circuit that returns int 0 even for AVG).
+    [[nodiscard]] Datum finalize_agg(const AggPartial& m, const AggExpr& a, Type ty,
+                                     bool no_nulls) {
+        if (a.kind == AggKind::CountStar) return Datum::make_int(m.total);
+        if (a.kind == AggKind::Count) return Datum::make_int(no_nulls ? m.total : m.n);
+        if (m.total == 0) return Datum::make_int(0);
+        if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
+            if (ty == Type::Int && no_nulls) return Datum::make_int(m.ibest);
+            return m.any ? m.dbest : Datum::make_null(ty);
         }
-        return Datum::make_int(sum / n);
+        if (m.n == 0) return a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
+        if (a.kind == AggKind::Sum) return Datum::make_int(m.sum);
+        return Datum::make_int(m.sum / m.n);
+    }
+
+    [[nodiscard]] Datum compute_agg_chunked(const AggExpr& a, const Table& t) {
+        std::uint32_t col = static_cast<std::uint32_t>(t.pk_index);
+        Type ty = Type::Int;
+        bool no_nulls = true;
+        if (a.kind != AggKind::CountStar) {
+            const std::size_t ci = *t.column_index(a.column);
+            col = static_cast<std::uint32_t>(ci);
+            ty = t.columns[ci].type;
+            no_nulls = !t.columns[ci].nullable;
+        }
+        // Decode + cache the chunks ONCE on this thread before any fan-out — the workers then
+        // only READ the cached (const) chunk vector, never mutate the cache concurrently.
+        const std::vector<ColumnChunk>& chunks = col_chunks_cached(t, col);
+        std::int64_t total_rows = 0;
+        for (const ColumnChunk& ch : chunks) total_rows += ch.count;
+
+        const std::size_t W = parallel_executor_ ? parallel_executor_->workers() : 1;
+        const std::size_t nparts = std::min<std::size_t>(W, chunks.size());
+        if (nparts > 1 && total_rows >= kParallelMinRows) {
+            std::vector<AggPartial> partials(nparts);
+            const std::size_t per = (chunks.size() + nparts - 1) / nparts;
+            parallel_executor_->parallel_for(nparts, [&](std::size_t w) {
+                const std::size_t lo = w * per;
+                const std::size_t hi = std::min(chunks.size(), lo + per);
+                if (lo < hi) partials[w] = fold_agg_range(chunks, lo, hi, a, ty, no_nulls);
+            });
+            return finalize_agg(merge_partials(partials, a, ty, no_nulls), a, ty, no_nulls);
+        }
+        return finalize_agg(fold_agg_range(chunks, 0, chunks.size(), a, ty, no_nulls), a, ty,
+                            no_nulls);
     }
 
     // Fold ONE aggregate over the WHOLE column [0,count) — CONTIGUOUS (no index gather), so
@@ -5001,6 +5071,12 @@ private:
         std::vector<std::vector<ColZone>> zones;
     };
     std::map<std::uint32_t, ZoneCacheEntry> zone_cache_;  // key = table_id
+
+    // Morsel-parallel executor (null = serial default). Only ever wraps independent per-partition
+    // folds whose merge is order-fixed, so the result stays deterministic.
+    IParallelExecutor* parallel_executor_ = nullptr;
+    // Below this row count a parallel split costs more (thread dispatch) than it saves.
+    static constexpr std::int64_t kParallelMinRows = 50000;
 };
 
 }  // namespace lockstep::query::sql

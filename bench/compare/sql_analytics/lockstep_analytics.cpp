@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <string>
 
+#include <lockstep/prod/ProdParallelExecutor.hpp>
 #include <lockstep/query/sql/Engine.hpp>
 
 using namespace lockstep::query::sql;
@@ -43,9 +44,20 @@ int main(int argc, char** argv) {
     if (argc > 2) {
         iters = std::atoi(argv[2]);
     }
+    std::size_t workers = 1;  // argv[3]: morsel-parallel worker threads (1 = serial)
+    if (argc > 3) {
+        workers = static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10));
+        if (workers < 1) workers = 1;
+    }
 
     SqlEngine eng;
     eng.set_columnar_default(true);
+    // Morsel parallelism: fold the scalar-aggregate fast path across `workers` cores. The pool
+    // lives for the whole bench; the RESULT is byte-identical to serial (fixed-order merge).
+    lockstep::prod::ProdParallelExecutor pexec(workers);
+    if (workers > 1) {
+        eng.set_parallel_executor(&pexec);
+    }
     // Filter columns NOT NULL so the vectorized-aggregate + zone-skip fast path applies
     // (the vectorizable-conjunct extractor conservatively skips nullable columns).
     (void)eng.exec(
@@ -83,9 +95,9 @@ int main(int argc, char** argv) {
             chk += eng.exec(q.sql).rows.size();
         }
         const double ms = now_ms_since(t0);
-        std::printf("{\"sys\":\"lockstep\",\"q\":\"%s\",\"iters\":%d,\"ms_total\":%.2f,"
+        std::printf("{\"sys\":\"lockstep\",\"w\":%zu,\"q\":\"%s\",\"iters\":%d,\"ms_total\":%.2f,"
                     "\"ms_each\":%.4f,\"chk\":%llu}\n",
-                    q.name, iters, ms, ms / iters, (unsigned long long)chk);
+                    workers, q.name, iters, ms, ms / iters, (unsigned long long)chk);
     }
     return 0;
 }

@@ -1211,6 +1211,27 @@ if(UNIX AND NOT APPLE AND TARGET lockstep_runtime AND TARGET lockstep_providers_
   add_test(NAME prod_reactor_test COMMAND lockstep_prod_reactor_test)
 endif()
 
+# sql_parallel_agg_test: the MORSEL-PARALLELISM determinism gate. The columnar scalar-aggregate
+# fast path folds its chunks across ProdParallelExecutor worker threads; this asserts the parallel
+# result is BYTE-IDENTICAL to the serial fold for every worker count / type / size (the fixed-order
+# merge makes parallelism a pure wall-clock optimization). Links providers_prod (the threads live
+# there); TSan in the full gate proves the pool dispatch/merge race-free. Linux-only (prod-threaded).
+if(UNIX AND NOT APPLE AND TARGET lockstep_query AND TARGET lockstep_providers_prod)
+  add_executable(lockstep_sql_parallel_agg_test sql_parallel_agg_test.cpp)
+  target_include_directories(lockstep_sql_parallel_agg_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_parallel_agg_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_prod)
+  add_test(NAME sql_parallel_agg_test COMMAND lockstep_sql_parallel_agg_test)
+endif()
+
 # --- Phase 9 S9.2: PROD io_uring async-fdatasync path [LINUX ONLY] ------------
 # P9-S9.2 gate. The prod io_uring ring (providers/prod/ProdUring.hpp) + the async
 # fdatasync path on ProdDisk (the reactor-bound ctor), integrated with the reactor's
