@@ -645,18 +645,29 @@ public:
         };
         std::vector<std::pair<Key, Best>> merged;  // sorted-by-Key (deterministic)
         auto offer = [&](const Key& k, Seq s, const Value& v, bool tomb, bool vl) {
-            std::size_t i = 0;
-            while (i < merged.size() && merged[i].first < k) {
-                ++i;
+            // Keep `merged` key-ascending and find the slot by BINARY search, not a
+            // linear walk. The memtable feeds keys already ascending, so the old
+            // `while (merged[i].first < k) ++i` walked the ENTIRE vector on every
+            // offer → O(N) per key → O(N^2) to build a range scan (the dominant cost
+            // a SQL full-scan profile surfaced: ~7us/row, growing with N). lower_bound
+            // lands on the SAME slot the linear walk computed, so the insert position,
+            // the key-equality branch, and the seq-tiebreak (>=) are byte-identical;
+            // this is purely the search made logarithmic (the same fix find() got).
+            // Fast path: an ascending feed appends at the end in O(1).
+            if (merged.empty() || merged.back().first < k) {
+                merged.emplace_back(k, Best{s, v, tomb, vl, true});
+                return;
             }
-            if (i < merged.size() && merged[i].first == k) {
-                if (s >= merged[i].second.seq) {
-                    merged[i].second = Best{s, v, tomb, vl, true};
+            auto it = std::lower_bound(
+                merged.begin(), merged.end(), k,
+                [](const std::pair<Key, Best>& e, const Key& key) { return e.first < key; });
+            if (it != merged.end() && it->first == k) {
+                if (s >= it->second.seq) {
+                    it->second = Best{s, v, tomb, vl, true};
                 }
                 return;
             }
-            merged.insert(merged.begin() + static_cast<std::ptrdiff_t>(i),
-                          std::pair<Key, Best>{k, Best{s, v, tomb, vl, true}});
+            merged.insert(it, std::pair<Key, Best>{k, Best{s, v, tomb, vl, true}});
         };
 
         auto in_range = [&](const Key& k) {
