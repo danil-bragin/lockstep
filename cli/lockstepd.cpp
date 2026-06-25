@@ -93,6 +93,7 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 #include <lockstep/prod/ProdLog.hpp>  // Phase 10 OBSERVABILITY — structured lifecycle log
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
+#include <lockstep/prod/ProdServerNode.hpp>  // keyed-KV wire::Server daemon (--wire-server)
 #include <lockstep/prod/ProdShardRunner.hpp>  // Phase 9 S9.1 multi-shard orchestrator
 
 #include <lockstep/consensus/ConsensusNode.hpp>
@@ -152,6 +153,10 @@ struct Args {
     // process agrees a priori). cluster_size<=1 keeps the S9.1 single-node shard path.
     std::uint64_t proc_id = 1;
     std::uint64_t cluster_size = 1;
+    // KEYED-KV WIRE SERVER mode (--wire-server): host a single-node wire::Server (Put/Get/
+    // Query keyed transactional KV with READS) on --admin-port, instead of the consensus
+    // admin protocol. Lets a wire client benchmark the real read+write keyed path.
+    bool wire_server = false;
     // CROSS-MACHINE replicated shards: dial host per process id (proc_hosts[q-1] = proc q's
     // IP). Empty => 127.0.0.1 (single-host, the default). Set via --proc-host ID:HOST.
     std::vector<std::string> proc_hosts;
@@ -267,6 +272,8 @@ Args parse_args(int argc, char** argv) {
             a.proc_id = parse_u64(v, a.proc_id);
         } else if (std::strcmp(k, "--cluster-size") == 0) {
             a.cluster_size = parse_u64(v, a.cluster_size);
+        } else if (std::strcmp(k, "--wire-server") == 0) {
+            a.wire_server = (parse_u64(v, 0) != 0);
         } else if (std::strcmp(k, "--proc-host") == 0) {
             // --proc-host ID:HOST — record process ID's dial IP for cross-machine repl shards.
             const char* colon = (v != nullptr) ? std::strchr(v, ':') : nullptr;
@@ -395,6 +402,46 @@ int run_repl_multishard(const Args& args) {
     return prod::run_repl_shards(cfg);
 }
 
+// --wire-server: host a single-node keyed-KV wire::Server (Put/Get/Query + reads) on
+// --admin-port. A wire client (lockstep_kvbench) drives the REAL read+write keyed path —
+// the bench's read-heavy / read-mix vectors that the consensus admin path (write-only
+// value append) cannot represent. Binds the listen socket on LOCKSTEP_BIND_ADDR (0.0.0.0
+// for cross-machine). Runs the reactor to the --run-seconds deadline.
+int run_wire_server(const Args& args) {
+    if (args.admin_port == 0) {
+        std::fprintf(stderr, "lockstepd --wire-server: --admin-port P required\n");
+        return 2;
+    }
+    prod::ProdReactor reactor;
+    if (!reactor.valid()) {
+        std::fprintf(stderr, "lockstepd --wire-server: failed to create epoll reactor\n");
+        return 1;
+    }
+    prod::ProdNetworkBus bus(reactor);
+    const std::uint64_t sid = args.node_id == 0 ? 1 : args.node_id;
+    if (!bus.add_node_on_port(sid, args.admin_port)) {
+        std::fprintf(stderr, "lockstepd --wire-server: bind failed on port %u\n",
+                     static_cast<unsigned>(args.admin_port));
+        return 1;
+    }
+    prod::ProdServerConfig cfg;
+    cfg.node_id = sid;
+    cfg.seed = args.seed;
+    cfg.data_dir = args.data_dir;
+    prod::ProdServerNode node(reactor, bus, cfg);
+    if (!node.valid()) {
+        std::fprintf(stderr, "lockstepd --wire-server: failed to assemble server node\n");
+        return 1;
+    }
+    // A large recv budget so the bounded serve loop covers a full bench run without
+    // re-spawn; the reactor deadline is the real bound.
+    node.start(1'000'000'000);
+    const core::Tick deadline =
+        reactor.now() + static_cast<core::Tick>(args.run_seconds) * 1'000'000'000LL;
+    reactor.run_until([] { return false; }, deadline);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -420,6 +467,9 @@ int main(int argc, char** argv) {
     // (with --shard-base-port + --shards M): this process hosts M shard-replicas, each
     // shard an N-node Raft group across the N processes. Takes precedence over the S9.1
     // single-node multi-shard path below.
+    if (args.wire_server) {
+        return run_wire_server(args);
+    }
     if (args.cluster_size > 1 && (args.shard_base_port != 0 || args.shards >= 1)) {
         return run_repl_multishard(args);
     }

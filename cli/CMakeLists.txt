@@ -97,6 +97,21 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_runtime
         lockstep_providers_sim
         lockstep_providers_prod)
+
+    # --- lockstep_kvbench — keyed-KV load driver for lockstepd --wire-server [LINUX ONLY] -
+    # Drives Connection.put / Connection.get over the wire stub (the REAL read+write keyed
+    # path). Same link set as prod_server_test (the query wire client + prod providers).
+    add_executable(lockstep_kvbench lockstep_kvbench.cpp)
+    target_link_libraries(lockstep_kvbench
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_query
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim
+        lockstep_providers_prod)
   endif()
 
 else()
