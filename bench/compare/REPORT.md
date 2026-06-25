@@ -40,9 +40,20 @@ ceiling by ~65×. This is the bench's whole point: it found a real defect the in
      snapshot/membership conformance, prod_consensus durable crash/restart, prod_cluster_smoke
      catch-up, prod_jepsen acked=32 durable=32 (zero loss under SIGKILL/SIGSTOP).
 
-2. **The on-box bench is now client-bound.** Single-node is so fast post-fix that the
-   single-threaded `lockstep_admin` caps the measurement at ~120k. The server's real ceiling +
-   sharded scaling must be shown with a multi-client / multi-container driver — the next step.
+2. **The ~116k bench number UNDERSTATES Lockstep — driver asymmetry.** go-ycsb drives the
+   competitors with a **64-thread** client; Lockstep's `lockstep_admin` is **single-threaded**
+   (64 in-flight on one connection), which caps the measurement at ~118k regardless of server
+   headroom. Running M concurrent client processes against ONE single-node daemon (a fair,
+   multi-threaded-equivalent driver — `server_ceiling.sh`) reveals the true single-node server
+   ceiling: **M=1 ~124k → M=4 ~195k → M=6 ~366k** (6 server cores; high run-to-run variance on
+   this shared laptop). So the fair single-node figure is **~200–370k**, 3–5× the competitors'
+   single-node write throughput — the apples-to-apples table below is conservative for Lockstep
+   by a 2–3× driver handicap.
+
+3. **Per-op heap churn cut −19%** (direction-2, first cut): durable-record framing went from 3
+   vectors + a per-byte copy to one reserved allocation; allocs/op 26→21, byte-identical
+   (cross-check green). Measured on the load-independent allocs/op counter (throughput here is
+   too noisy for the delta). Further cuts (inbound/reply buffers, persist-worker frame) remain.
 
 3. **Cross-machine works for real** — not theory. 2- and 5-container clusters validated
    (consensus + agreement + HA across container boundaries over TCP).
