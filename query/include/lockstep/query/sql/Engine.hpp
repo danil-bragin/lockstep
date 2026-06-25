@@ -1749,7 +1749,9 @@ private:
         }
         // Build groups: ordered map keyed by the group-column tuple (group_key_field == the
         // exact key exec_aggregate uses => identical group order). Value = (member indices,
-        // group-key datums). The filter selects which rows enter a group.
+        // group-key datums). The filter selects which rows enter a group. NB: the aggregates
+        // are folded in a SECOND pass via compute_agg_soa — TIGHT per-column folds the
+        // compiler vectorises; a 1-pass branchy running-accumulator measured SLOWER here.
         std::map<std::vector<std::string>,
                  std::pair<std::vector<std::uint32_t>, std::vector<Datum>>>
             groups;
