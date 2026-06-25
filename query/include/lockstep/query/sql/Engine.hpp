@@ -745,12 +745,78 @@ private:
         return std::nullopt;
     }
 
-    // A4: fold an ungrouped SUM/COUNT/MIN/MAX/AVG over the SoA column blocks directly — no
-    // AoS row materialisation. nullopt => not applicable (caller falls back to the generic
-    // AoS path, which the conformance gate cross-checks this against). Replicates
-    // compute_agg's ungrouped semantics EXACTLY (NULL handling, empty-group=0, AVG trunc).
-    [[nodiscard]] std::optional<ExecResult> columnar_vectorized_scalar_agg(
-        const Table& t, const SelectStmt& sel) {
+    // Fold ONE aggregate over a SoA index subset (a group's member rows, or the whole
+    // selection for an ungrouped query). Replicates compute_agg's semantics EXACTLY: NULL
+    // skipping, empty-group=0, all-NULL group => SUM 0 / MIN/MAX/AVG typed NULL, AVG int
+    // truncation toward zero.
+    [[nodiscard]] Datum compute_agg_soa(const AggExpr& a, const Table& t,
+                                        const std::vector<ColumnChunk>& cols,
+                                        const std::vector<std::uint32_t>& idxs) {
+        if (a.kind == AggKind::CountStar) {
+            return Datum::make_int(static_cast<std::int64_t>(idxs.size()));
+        }
+        const std::size_t ci = *t.column_index(a.column);
+        const ColumnChunk& cc = cols[ci];
+        const Type ty = t.columns[ci].type;
+        if (a.kind == AggKind::Count) {
+            std::int64_t cnt = 0;
+            for (const std::uint32_t r : idxs) {
+                if (!cc.nulls[r]) {
+                    ++cnt;
+                }
+            }
+            return Datum::make_int(cnt);
+        }
+        if (idxs.empty()) {
+            return Datum::make_int(0);  // synthetic empty group (compute_agg parity)
+        }
+        if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
+            Datum best;
+            bool any = false;
+            for (const std::uint32_t r : idxs) {
+                if (cc.nulls[r]) {
+                    continue;
+                }
+                const Datum v = cc.at(r);
+                if (!any) {
+                    best = v;
+                    any = true;
+                } else {
+                    const int c = cmp_datum(v, best);
+                    if ((a.kind == AggKind::Min && c < 0) ||
+                        (a.kind == AggKind::Max && c > 0)) {
+                        best = v;
+                    }
+                }
+            }
+            return any ? best : Datum::make_null(ty);
+        }
+        std::int64_t sum = 0;  // SUM / AVG over INT (validated INT)
+        std::int64_t n = 0;
+        for (const std::uint32_t r : idxs) {
+            if (cc.nulls[r]) {
+                continue;
+            }
+            sum += cc.ints[r];
+            ++n;
+        }
+        if (n == 0) {
+            return a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
+        }
+        if (a.kind == AggKind::Sum) {
+            return Datum::make_int(sum);
+        }
+        return Datum::make_int(sum / n);  // AVG: trunc toward zero
+    }
+
+    // A4: compute an aggregate query (scalar OR GROUP BY, no HAVING) DIRECTLY over the SoA
+    // column blocks — decode the needed columns, build groups from the group columns' SoA
+    // (an ordered map keyed exactly as exec_aggregate, so group order is byte-identical),
+    // fold each aggregate over each group's member indices. NO AoS row materialisation.
+    // nullopt => not applicable (caller falls back to the generic AoS path, which the
+    // conformance gate cross-checks this against).
+    [[nodiscard]] std::optional<ExecResult> columnar_vectorized_agg(const Table& t,
+                                                                    const SelectStmt& sel) {
         if (t.delta_dirty || !has_blocks(t)) {
             return std::nullopt;  // delta non-empty (generic merge) or pre-flush (no blocks)
         }
@@ -760,21 +826,53 @@ private:
             (!vectorize_ || !try_extract_conjuncts(sel.filter, sel.filter.root, t, vterms))) {
             return std::nullopt;  // non-vectorizable predicate — generic path
         }
-        if (auto e = validate_aggs(sel, t)) {
-            return ExecResult::failure(*e);  // identical error to the generic path
+        // Resolve + validate GROUP BY columns and plain SELECT columns (identical errors to
+        // exec_aggregate, so the gate's error cases match too).
+        std::vector<std::size_t> gcols;
+        for (const std::string& gc : sel.group_by) {
+            const auto idx = t.column_index(gc);
+            if (!idx) {
+                return ExecResult::failure("unknown GROUP BY column '" + gc +
+                                           "' in table '" + t.name + "'");
+            }
+            gcols.push_back(*idx);
         }
         for (const SelectItem& item : sel.items) {
-            if (item.kind == SelectItemKind::Column) {
-                return std::nullopt;  // plain col w/ aggregate — let the generic path error
+            if (item.kind != SelectItemKind::Column) {
+                continue;
+            }
+            const auto idx = t.column_index(item.column);
+            if (!idx) {
+                return ExecResult::failure("unknown column '" + item.column +
+                                           "' in table '" + t.name + "'");
+            }
+            bool grouped = false;
+            for (const std::size_t g : gcols) {
+                if (g == *idx) {
+                    grouped = true;
+                    break;
+                }
+            }
+            if (!grouped) {
+                return ExecResult::failure(
+                    "column '" + item.column +
+                    "' must appear in GROUP BY or be used in an aggregate "
+                    "(non-grouped non-aggregate column)");
             }
         }
-        // Decode the needed column blocks: filter columns + aggregate target columns.
+        if (auto e = validate_aggs(sel, t)) {
+            return ExecResult::failure(*e);
+        }
+        // Decode the needed column blocks: filter + group + aggregate-target columns.
         std::vector<bool> need(t.columns.size(), false);
         for (const VecTerm& vt : vterms) {
             need[vt.col] = true;
         }
+        for (const std::size_t g : gcols) {
+            need[g] = true;
+        }
         for (const SelectItem& item : sel.items) {
-            if (item.agg.kind != AggKind::CountStar) {
+            if (item.kind != SelectItemKind::Column && item.agg.kind != AggKind::CountStar) {
                 if (const auto idx = t.column_index(item.agg.column)) {
                     need[*idx] = true;
                 }
@@ -796,7 +894,7 @@ private:
             count = cols[c].count;
             count_set = true;
         }
-        if (!count_set) {  // COUNT(*) with no filter/target — read the pk block for the count
+        if (!count_set) {  // COUNT(*) only, no filter/group — read the pk block for the count
             const ReadResult pkb =
                 read_committed(block_key(t.id, static_cast<std::uint32_t>(t.pk_index), 0));
             if (!pkb.has_value()) {
@@ -804,11 +902,14 @@ private:
             }
             count = decode_column_block(*pkb).count;
         }
-        // Selection vector (filter). Without a filter, all rows are selected (idx == row).
-        std::vector<std::uint32_t> sidx;
-        if (has_filter) {
-            sidx.reserve(count);
-            for (std::uint32_t r = 0; r < count; ++r) {
+        // Build groups: ordered map keyed by the group-column tuple (group_key_field == the
+        // exact key exec_aggregate uses => identical group order). Value = (member indices,
+        // group-key datums). The filter selects which rows enter a group.
+        std::map<std::vector<std::string>,
+                 std::pair<std::vector<std::uint32_t>, std::vector<Datum>>>
+            groups;
+        for (std::uint32_t r = 0; r < count; ++r) {
+            if (has_filter) {
                 bool ok = true;
                 for (const VecTerm& vt : vterms) {
                     if (!apply_cmp(vt.op, cmp_datum(cols[vt.col].at(r), vt.lit))) {
@@ -816,80 +917,51 @@ private:
                         break;
                     }
                 }
-                if (ok) {
-                    sidx.push_back(r);
+                if (!ok) {
+                    continue;
                 }
             }
+            std::vector<std::string> key;
+            key.reserve(gcols.size());
+            for (const std::size_t g : gcols) {
+                key.push_back(group_key_field(cols[g].at(r)));
+            }
+            auto& slot = groups[key];
+            if (slot.second.empty() && !gcols.empty()) {
+                slot.second.reserve(gcols.size());
+                for (const std::size_t g : gcols) {
+                    slot.second.push_back(cols[g].at(r));
+                }
+            }
+            slot.first.push_back(r);
         }
-        const std::size_t nsel = has_filter ? sidx.size() : count;
-        auto at = [&](std::size_t i) -> std::uint32_t {
-            return has_filter ? sidx[i] : static_cast<std::uint32_t>(i);
-        };
-        ResultRow out;
-        for (const SelectItem& item : sel.items) {
-            const AggExpr& a = item.agg;
-            Datum d;
-            if (a.kind == AggKind::CountStar) {
-                d = Datum::make_int(static_cast<std::int64_t>(nsel));
-            } else {
-                const std::size_t ci = *t.column_index(a.column);
-                const ColumnChunk& cc = cols[ci];
-                const Type ty = t.columns[ci].type;
-                if (a.kind == AggKind::Count) {
-                    std::int64_t cnt = 0;
-                    for (std::size_t i = 0; i < nsel; ++i) {
-                        if (!cc.nulls[at(i)]) {
-                            ++cnt;
-                        }
-                    }
-                    d = Datum::make_int(cnt);
-                } else if (nsel == 0) {
-                    d = Datum::make_int(0);  // synthetic empty group (compute_agg parity)
-                } else if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
-                    Datum best;
-                    bool any = false;
-                    for (std::size_t i = 0; i < nsel; ++i) {
-                        const std::uint32_t r = at(i);
-                        if (cc.nulls[r]) {
-                            continue;
-                        }
-                        const Datum v = cc.at(r);
-                        if (!any) {
-                            best = v;
-                            any = true;
-                        } else {
-                            const int c = cmp_datum(v, best);
-                            if ((a.kind == AggKind::Min && c < 0) ||
-                                (a.kind == AggKind::Max && c > 0)) {
-                                best = v;
-                            }
-                        }
-                    }
-                    d = any ? best : Datum::make_null(ty);
-                } else {  // SUM / AVG over INT (validated INT)
-                    std::int64_t sum = 0;
-                    std::int64_t n = 0;
-                    for (std::size_t i = 0; i < nsel; ++i) {
-                        const std::uint32_t r = at(i);
-                        if (cc.nulls[r]) {
-                            continue;
-                        }
-                        sum += cc.ints[r];
-                        ++n;
-                    }
-                    if (n == 0) {
-                        d = a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
-                    } else if (a.kind == AggKind::Sum) {
-                        d = Datum::make_int(sum);
-                    } else {
-                        d = Datum::make_int(sum / n);  // AVG: trunc toward zero
-                    }
-                }
-            }
-            out.cells.emplace_back(item.label, d);
+        // Ungrouped over zero rows still yields ONE row (SELECT COUNT(*) => 0).
+        if (gcols.empty() && groups.empty()) {
+            groups[std::vector<std::string>{}];
         }
         ExecResult r;
-        r.rows.push_back(std::move(out));
+        for (const auto& [key, slot] : groups) {
+            (void)key;
+            ResultRow out;
+            for (const SelectItem& item : sel.items) {
+                if (item.kind == SelectItemKind::Column) {
+                    const std::size_t ci = *t.column_index(item.column);
+                    Datum d;
+                    for (std::size_t j = 0; j < gcols.size(); ++j) {
+                        if (gcols[j] == ci) {
+                            d = slot.second[j];
+                            break;
+                        }
+                    }
+                    out.cells.emplace_back(item.label, d);
+                } else {
+                    out.cells.emplace_back(item.label,
+                                           compute_agg_soa(item.agg, t, cols, slot.first));
+                }
+            }
+            r.rows.push_back(std::move(out));
+        }
+        apply_distinct(sel, r.rows);
         if (auto e = apply_order_by_labels(sel, r.rows)) {
             return ExecResult::failure(*e);
         }
@@ -1384,9 +1456,8 @@ private:
         // SUM/COUNT/MIN/MAX/AVG DIRECTLY over the SoA column blocks (no AoS row
         // materialisation, the measured win). nullopt => not applicable, fall through to
         // the generic AoS path (which the conformance gate cross-checks this against).
-        if (t->columnar && sel.has_aggregates && sel.group_by.empty() &&
-            !sel.having.present() && !sel.distinct) {
-            if (auto fast = columnar_vectorized_scalar_agg(*t, sel)) {
+        if (t->columnar && sel.has_aggregates && !sel.having.present()) {
+            if (auto fast = columnar_vectorized_agg(*t, sel)) {
                 return std::move(*fast);
             }
         }

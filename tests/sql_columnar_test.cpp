@@ -164,6 +164,15 @@ void run_seed(std::uint64_t seed) {
     both(col, row, "SELECT COUNT(dept), MIN(dept), MAX(dept) FROM emp", "agg-text-nullable");
     both(col, row, "SELECT COUNT(*), SUM(sal) FROM emp WHERE sal > 999999", "agg-empty-sel");
     both(col, row, "SELECT AVG(age), MIN(age), MAX(age) FROM emp WHERE age > 30", "agg-age");
+    // A4 vectorized GROUP BY over SoA blocks (delta clean) — hash-aggregate per group,
+    // must equal row-mode. Covers grouped aggregates, a filtered GROUP BY, and ORDER BY.
+    both(col, row,
+         "SELECT dept, COUNT(*), SUM(sal), MIN(sal), MAX(sal), AVG(sal) FROM emp GROUP BY dept",
+         "groupby-postflush");
+    both(col, row, "SELECT dept, COUNT(*), SUM(sal) FROM emp WHERE sal > 300 GROUP BY dept",
+         "groupby-filtered");
+    both(col, row, "SELECT dept, SUM(sal) FROM emp GROUP BY dept ORDER BY dept DESC",
+         "groupby-order");
 
     both(col, row, "CREATE INDEX idx_sal ON emp (sal)", "create-index");
     both(col, row, "SELECT id, sal FROM emp WHERE sal = 250", "indexed-eq");
