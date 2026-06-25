@@ -110,6 +110,12 @@ struct Table {
     std::vector<Index> indexes;       // secondary indexes (in CREATE order)
     std::uint32_t next_index_id = 1;  // dense index-id assignment (0 reserved)
 
+    // COLUMNAR layout (PERF_PLAN columnar rollout): when true, each (row, column) is its
+    // own KV under the 'c' namespace (col_key) instead of one row KV under 't'. A
+    // projection then scans ONLY the needed column families. Opt-in at CREATE; the
+    // durable KV core is unchanged (a row's N column KVs commit in one atomic batch).
+    bool columnar = false;
+
     // STATISTICS (PERF_PLAN Phase 2) — maintained incrementally on write so the cost-based
     // planner can estimate cardinalities without a scan. row_count is exact (INSERT +1 on a
     // new PK, DELETE -1 on a present row, UPDATE no change). Per-column min/max (INT) track the

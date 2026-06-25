@@ -242,6 +242,10 @@ public:
     // TEST/BENCH-ONLY: toggle the vectorized filter fast path (for A/B measurement). A pure
     // config flag (deterministic per setting); the default is on.
     void set_vectorize(bool v) { vectorize_ = v; }
+    // When true, every subsequently CREATEd table uses the COLUMNAR layout (col_key per
+    // (row,column) in the 'c' namespace). Existing tables are unaffected. A/B + the
+    // columnar conformance gate run the SAME workload with this on vs off.
+    void set_columnar_default(bool v) { columnar_default_ = v; }
 
 private:
     // --- CREATE TABLE ---------------------------------------------------------
@@ -269,6 +273,7 @@ private:
         // regardless of any NOT NULL spelling in the DDL.
         t.columns[t.pk_index].nullable = false;
         t.col_stats.assign(t.columns.size(), Table::ColStat{});  // per-column stats (Phase 2)
+        t.columnar = columnar_default_;  // columnar layout opt-in (engine default at CREATE)
         (void)catalog_.create(std::move(t));
         return ExecResult{};
     }
@@ -312,6 +317,31 @@ private:
         // BACKFILL: scan every live row and write its index entry. Read through the
         // verified scan path (a full table scan), then commit one index-entry write per
         // row through the verified executor (one txn per row — atomic, ordered).
+        if (t->columnar) {
+            // Columnar: enumerate live PKs from the pk-column family, assemble each row
+            // from its column families (point-gets), then write its index entry.
+            std::vector<storage::KeyValue> anchor;
+            {
+                Query<Strict> q;
+                q.scan(col_prefix(table_id, static_cast<std::uint32_t>(pk_index)),
+                       col_prefix_end(table_id, static_cast<std::uint32_t>(pk_index)));
+                collect(db_.run(q), anchor);
+            }
+            for (const storage::KeyValue& kv : anchor) {
+                if (is_tombstone(kv.second)) {
+                    continue;
+                }
+                const Datum pk = decode_pk_from_col_key(*t, kv.first);
+                const auto row = read_columnar_row(*t, pk);
+                if (!row) {
+                    continue;
+                }
+                const Key ikey =
+                    encode_index_entry(table_id, ix, (*row)[ix.column], (*row)[pk_index]);
+                commit_writes({{ikey, std::string{}}});
+            }
+            return ExecResult{};
+        }
         std::vector<storage::KeyValue> kvs;
         {
             Query<Strict> q;
@@ -416,6 +446,177 @@ private:
     }
 
     // --- INSERT ---------------------------------------------------------------
+    // ===== COLUMNAR layout helpers (write + read over the 'c' namespace) =======
+
+    // The key whose presence means "a row with this PK exists" — the row key (row mode)
+    // or the pk-column family entry (columnar). For dup-PK detect + existing-row probe.
+    [[nodiscard]] Key existence_key(const Table& t, const Datum& pk) const {
+        return t.columnar ? col_key(t.id, static_cast<std::uint32_t>(t.pk_index), pk)
+                          : encode_key(t, pk);
+    }
+
+    // Emit the storage write(s) that MATERIALISE a row. Row mode: one {row_key, value}.
+    // Columnar: one {col_key, col_value} per column (incl. the PK column, whose family
+    // doubles as the existence anchor). The caller commits them in ONE batch, so the
+    // row is atomic regardless of layout (the durable core's write batch is the unit).
+    void emit_row_writes(const Table& t, const std::vector<Datum>& row,
+                         std::vector<std::pair<Key, Value>>& writes) const {
+        const Datum& pk = row[t.pk_index];
+        if (t.columnar) {
+            for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                writes.emplace_back(col_key(t.id, static_cast<std::uint32_t>(c), pk),
+                                    encode_col_value(row[c]));
+            }
+        } else {
+            writes.emplace_back(encode_key(t, pk), encode_value(t, row));
+        }
+    }
+
+    // Emit the tombstone write(s) that RETIRE a row (one per column family in columnar).
+    void emit_row_tombstones(const Table& t, const Datum& pk,
+                             std::vector<std::pair<Key, Value>>& writes) const {
+        if (t.columnar) {
+            for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                writes.emplace_back(col_key(t.id, static_cast<std::uint32_t>(c), pk),
+                                    tombstone_marker());
+            }
+        } else {
+            writes.emplace_back(encode_key(t, pk), tombstone_marker());
+        }
+    }
+
+    // Read a columnar row by PK (one point-get per column family). nullopt if no live
+    // family entry exists (row absent/deleted). PK is taken from the arg (authoritative).
+    // Used by UPDATE/DELETE (need the full old row for index upkeep) + the index fetch.
+    [[nodiscard]] std::optional<std::vector<Datum>> read_columnar_row(const Table& t,
+                                                                      const Datum& pk) {
+        std::vector<Datum> row(t.columns.size());
+        bool any = false;
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            const ReadResult v =
+                read_committed(col_key(t.id, static_cast<std::uint32_t>(c), pk));
+            if (!v.has_value() || is_tombstone(*v)) {
+                continue;
+            }
+            row[c] = decode_col_value(t.columns[c].type, *v);
+            any = true;
+        }
+        if (!any) {
+            return std::nullopt;
+        }
+        row[t.pk_index] = pk;  // authoritative PK from the key
+        return row;
+    }
+
+    // Range-scan ONE key range [lo,hi) at the statement's D5 level (the column-family
+    // scan primitive; mirrors run_select_at_level's level dispatch for a raw range).
+    [[nodiscard]] std::optional<std::string> scan_range_at_level(
+        const SelectStmt& sel, const Key& lo, const Key& hi,
+        std::vector<storage::KeyValue>& kvs) {
+        switch (sel.level) {
+            case Level::StrictSerializable: {
+                Query<Strict> q;
+                q.scan(lo, hi);
+                collect(db_.run(q), kvs);
+                return std::nullopt;
+            }
+            case Level::Snapshot: {
+                Query<Snapshot> q = snapshot_query(sel.snapshot_version);
+                q.scan(lo, hi);
+                collect(db_.run(q), kvs);
+                return std::nullopt;
+            }
+            case Level::BoundedStaleness: {
+                Query<Bounded> q = bounded_query(sel.max_lag);
+                q.scan(lo, hi);
+                collect(db_.run(q, /*replica_lag=*/0), kvs);
+                return std::nullopt;
+            }
+            case Level::ReadYourWrites: {
+                Query<RYW> q = ryw_query(sel.session);
+                q.scan(lo, hi);
+                collect(db_.run(q, /*replica_lag=*/0, /*session_last_write=*/tip_), kvs);
+                return std::nullopt;
+            }
+        }
+        return std::string("unsupported consistency level");
+    }
+
+    // Build the post-scan `rows` for a COLUMNAR table: scan the pk-column family for the
+    // live PK list (+ order), then scan EACH needed column family and zip by position
+    // (families are pk-aligned — every live row writes every family at the same commit,
+    // so the i-th live entry of every family is the same row). Only NEEDED columns are
+    // scanned: the projection-pushdown win (a wide unreferenced column's family is never
+    // read). Needed columns are decoded into rows_out; unneeded stay Datum{}.
+    // `pk_between` (with sel.lo_value/hi_value) restricts every family scan to the PK
+    // sub-range [lo, hi] — the columnar PK-fast BETWEEN path (the pk suffix is order-
+    // preserving, so a family's [col_prefix++pk_lo, col_prefix++pk_hi++) covers it).
+    [[nodiscard]] std::optional<std::string> columnar_build_rows(
+        const Table& t, const SelectStmt& sel, const std::vector<bool>& need,
+        std::vector<std::vector<Datum>>& rows_out, bool pk_between = false) {
+        auto fam_lo = [&](std::uint32_t c) {
+            Key k = col_prefix(t.id, c);
+            if (pk_between) {
+                k += encode_pk(sel.lo_value);
+            }
+            return k;
+        };
+        auto fam_hi = [&](std::uint32_t c) {
+            if (pk_between) {
+                Key k = col_prefix(t.id, c) + encode_pk(sel.hi_value);
+                k.push_back('\0');  // inclusive upper bound -> half-open
+                return k;
+            }
+            return col_prefix_end(t.id, c);
+        };
+        const std::uint32_t pkc = static_cast<std::uint32_t>(t.pk_index);
+        std::vector<storage::KeyValue> anchor;  // pk-column family enumerates live rows
+        if (auto e = scan_range_at_level(sel, fam_lo(pkc), fam_hi(pkc), anchor)) {
+            return e;
+        }
+        std::vector<Datum> pks;
+        pks.reserve(anchor.size());
+        for (const storage::KeyValue& kv : anchor) {
+            if (is_tombstone(kv.second)) {
+                continue;
+            }
+            pks.push_back(decode_pk_from_col_key(t, kv.first));
+        }
+        std::vector<std::vector<Datum>> rows(pks.size(),
+                                             std::vector<Datum>(t.columns.size()));
+        if (need[t.pk_index]) {
+            for (std::size_t i = 0; i < pks.size(); ++i) {
+                rows[i][t.pk_index] = pks[i];
+            }
+        }
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            if (c == t.pk_index || !need[c]) {
+                continue;
+            }
+            std::vector<storage::KeyValue> fam;
+            if (auto e = scan_range_at_level(sel, fam_lo(static_cast<std::uint32_t>(c)),
+                                             fam_hi(static_cast<std::uint32_t>(c)), fam)) {
+                return e;
+            }
+            std::size_t i = 0;
+            for (const storage::KeyValue& kv : fam) {
+                if (is_tombstone(kv.second)) {
+                    continue;
+                }
+                if (i >= rows.size()) {
+                    return std::string("columnar family misaligned (extra column entry)");
+                }
+                rows[i][c] = decode_col_value(t.columns[c].type, kv.second);
+                ++i;
+            }
+            if (i != rows.size()) {
+                return std::string("columnar family misaligned (missing column entry)");
+            }
+        }
+        rows_out = std::move(rows);
+        return std::nullopt;
+    }
+
     ExecResult exec_insert(const InsertStmt& ins) {
         const Table* t = catalog_.find(ins.table);
         if (t == nullptr) {
@@ -456,22 +657,23 @@ private:
             row[c] = Datum::make_null(t->columns[c].type);  // omitted nullable => NULL
         }
         const Datum& pk = row[t->pk_index];
-        const Key key = encode_key(*t, pk);
-        const Value enc = encode_value(*t, row);
 
         // INCREMENTAL write path (see commit_write): the read-modify-write DECISION
         // (dup-PK detect) runs in the Engine over the VERIFIED read path (the live
         // committed store), so we never re-submit the whole prior write-log. The
-        // committed state is read with read_committed(key); the resulting write (or
-        // no-op) is committed through the verified executor + applied incrementally.
-        const ReadResult existing = read_committed(key);
+        // committed state is probed via the existence key (the row key, or — in columnar
+        // mode — the pk-column family anchor); the resulting writes commit through the
+        // verified executor + apply incrementally.
+        const ReadResult existing = read_committed(existence_key(*t, pk));
         if (existing.has_value() && !is_tombstone(*existing)) {
             return ExecResult::failure("duplicate primary key in table '" + ins.table +
                                        "' (row already exists)");
         }
-        // ATOMIC: the row write + every secondary-index entry for the new row commit in
-        // ONE txn (the index can never lag the row after a committed INSERT).
-        std::vector<std::pair<Key, Value>> writes{{key, enc}};
+        // ATOMIC: the row materialisation (one KV in row mode, one per column family in
+        // columnar) + every secondary-index entry commit in ONE txn (the index/columns
+        // can never lag the row after a committed INSERT).
+        std::vector<std::pair<Key, Value>> writes;
+        emit_row_writes(*t, row, writes);
         index_writes_for_row(*t, row, /*tombstone=*/false, writes);
         commit_writes(writes);
         if (Table* mt = catalog_.find_mut(ins.table)) {
@@ -529,24 +731,39 @@ private:
         if (auto e = coerce(t->columns[*set_idx], up.set_value, sv)) {
             return ExecResult::failure(*e);
         }
-        const Key key = encode_key(*t, pk);
         const std::size_t col = *set_idx;
-        // INCREMENTAL: read the prior committed value over the verified read path,
-        // decode + set the column in the Engine, then commit the new value.
-        const ReadResult existing = read_committed(key);
-        if (!existing.has_value() || is_tombstone(*existing)) {
-            ExecResult r;
-            r.affected = 0;  // no row to update
-            return r;
+        // INCREMENTAL: read the prior committed row over the verified read path (row KV
+        // in row mode, or assembled from the column families in columnar), set the
+        // column in the Engine, then commit the new row.
+        std::vector<Datum> old_row;
+        if (t->columnar) {
+            auto r = read_columnar_row(*t, pk);
+            if (!r) {
+                ExecResult er;
+                er.affected = 0;  // no row to update
+                return er;
+            }
+            old_row = std::move(*r);
+        } else {
+            const Key key = encode_key(*t, pk);
+            const ReadResult existing = read_committed(key);
+            if (!existing.has_value() || is_tombstone(*existing)) {
+                ExecResult r;
+                r.affected = 0;  // no row to update
+                return r;
+            }
+            old_row = decode_row(*t, key, *existing);
         }
-        std::vector<Datum> old_row = decode_row(*t, key, *existing);
         std::vector<Datum> row = old_row;
         row[col] = sv;
         // ATOMIC: row write + index maintenance in ONE txn. For each secondary index,
         // remove the OLD entry (old col value) and write the NEW entry (new col value);
         // an index whose column is unchanged just rewrites the SAME entry key (idempotent
         // — empty re-write). The row + all index deltas land in one committed write-set.
-        std::vector<std::pair<Key, Value>> writes{{key, encode_value(*t, row)}};
+        // (Columnar rewrites all column families for the row — correct + atomic; a
+        // single-column write optimisation can come later.)
+        std::vector<std::pair<Key, Value>> writes;
+        emit_row_writes(*t, row, writes);
         index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
         index_writes_for_row(*t, row, /*tombstone=*/false, writes);
         commit_writes(writes);
@@ -570,18 +787,31 @@ private:
         if (auto e = coerce(t->pk(), del.where_value, pk)) {
             return ExecResult::failure(*e);
         }
-        const Key key = encode_key(*t, pk);
-        // INCREMENTAL: read the prior committed value; if a live row exists, commit
-        // a tombstone (the verified executor + incremental apply path do the write).
-        const ReadResult existing = read_committed(key);
-        if (!existing.has_value() || is_tombstone(*existing)) {
-            ExecResult r;
-            r.affected = 0;  // nothing to delete
-            return r;
+        // INCREMENTAL: read the prior committed row; if a live row exists, commit a
+        // tombstone (the verified executor + incremental apply path do the write).
+        std::vector<Datum> old_row;
+        if (t->columnar) {
+            auto r = read_columnar_row(*t, pk);
+            if (!r) {
+                ExecResult er;
+                er.affected = 0;  // nothing to delete
+                return er;
+            }
+            old_row = std::move(*r);
+        } else {
+            const Key key = encode_key(*t, pk);
+            const ReadResult existing = read_committed(key);
+            if (!existing.has_value() || is_tombstone(*existing)) {
+                ExecResult r;
+                r.affected = 0;  // nothing to delete
+                return r;
+            }
+            old_row = decode_row(*t, key, *existing);
         }
-        // ATOMIC: tombstone the row + every secondary-index entry in ONE txn.
-        const std::vector<Datum> old_row = decode_row(*t, key, *existing);
-        std::vector<std::pair<Key, Value>> writes{{key, tombstone_marker()}};
+        // ATOMIC: tombstone the row (every column family in columnar) + every secondary-
+        // index entry in ONE txn.
+        std::vector<std::pair<Key, Value>> writes;
+        emit_row_tombstones(*t, pk, writes);
         index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
         commit_writes(writes);
         if (Table* mt = catalog_.find_mut(del.table)) {
@@ -873,13 +1103,34 @@ private:
         bool filter_applied = false;
         if (used_index) {
             // Index scan: range-scan the index for the PKs, point-get each row; the full
-            // predicate still runs as the residual filter in (2).
+            // predicate still runs as the residual filter in (2). (read_via_index assembles
+            // columnar rows from their column families when t is columnar.)
             if (auto err = read_via_index(*t, sel, ap.index, need, rows)) {
                 return ExecResult::failure(*err);
             }
+        } else if (t->columnar) {
+            // COLUMNAR seq/PK-fast read: scan ONLY the needed column families (projection
+            // pushdown), zip by pk. PK-fast Eq is a single row assembly; PK-fast BETWEEN
+            // bounds the family scans; otherwise a full scan + the residual filter in (2).
+            if (pk_fast && sel.where == SelectWhereKind::Eq) {
+                Datum pk;
+                if (auto e = coerce(t->pk(), sel.eq_value, pk)) {
+                    return ExecResult::failure(*e);
+                }
+                if (auto row = read_columnar_row(*t, pk)) {
+                    rows.push_back(std::move(*row));
+                }
+            } else if (auto err = columnar_build_rows(
+                           *t, sel, need, rows,
+                           /*pk_between=*/pk_fast && sel.where == SelectWhereKind::Between)) {
+                return ExecResult::failure(*err);
+            }
+            if (plan_stats_ != nullptr) {
+                plan_stats_->scanned = rows.size();
+            }
         }
 
-        if (!used_index) {
+        if (!used_index && !t->columnar) {
             std::vector<storage::KeyValue> kvs;
             if (auto err = run_select_at_level(*t, sel, pk_fast, kvs)) {
                 return ExecResult::failure(*err);
@@ -2299,6 +2550,15 @@ private:
                 continue;
             }
             const Datum pk = decode_index_entry_pk(t, plan.index->id, ikv.first);
+            if (t.columnar) {
+                // Columnar: assemble the row from its column families (point-gets).
+                auto row = read_columnar_row(t, pk);
+                if (!row) {
+                    continue;  // index entry with no live row (defensive)
+                }
+                fetched.emplace_back(pk, std::move(*row));
+                continue;
+            }
             const Key rkey = encode_key(t, pk);
             const ReadResult rv = point_get_at_level(sel, rkey);
             if (!rv.has_value() || is_tombstone(*rv)) {
@@ -3234,6 +3494,7 @@ private:
     std::uint64_t next_txn_id_ = 1;
     PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run
     bool vectorize_ = true;            // vectorized filter fast path (test-toggleable)
+    bool columnar_default_ = false;    // new tables use the columnar layout when set
 };
 
 }  // namespace lockstep::query::sql

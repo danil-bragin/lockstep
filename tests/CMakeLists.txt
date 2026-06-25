@@ -967,6 +967,24 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_columnar_codec_test COMMAND lockstep_sql_columnar_codec_test)
 
+  # sql_columnar_test: the COLUMNAR layout end-to-end conformance gate. Runs an IDENTICAL
+  # seeded workload (INSERT/NULL/UPDATE/DELETE/projection/PK-fast/filter/aggregate/index)
+  # on a columnar engine and a row-mode engine; asserts byte-identical output for every
+  # statement. Row-mode is already proven == the reference model, so columnar == reference.
+  add_executable(lockstep_sql_columnar_test sql_columnar_test.cpp)
+  target_include_directories(lockstep_sql_columnar_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_columnar_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_columnar_test COMMAND lockstep_sql_columnar_test)
+
   # sql_aggregates_test (SQL v2): the EXTENDED SELECT surface — WHERE on ANY column
   # (a general boolean predicate tree), aggregates (COUNT(*)/COUNT(col)/SUM/MIN/MAX/
   # AVG) + GROUP BY + HAVING, ORDER BY [ASC|DESC] + LIMIT/OFFSET, DISTINCT. Each is
