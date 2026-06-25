@@ -715,7 +715,9 @@ public:
                     out.emplace_back(k, *v);
                 }
             } else {
-                out.emplace_back(merged[i].first, merged[i].second.value);
+                // `merged` is not read again after this materialise loop — move its
+                // key + value out instead of copying (one fewer string alloc/copy per row).
+                out.emplace_back(std::move(merged[i].first), std::move(merged[i].second.value));
             }
         }
         p.set_value(std::move(out));

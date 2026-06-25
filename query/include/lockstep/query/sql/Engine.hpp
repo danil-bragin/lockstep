@@ -2466,15 +2466,24 @@ private:
 
     // Flatten a QueryResult (a point and/or a range) into KV pairs. A point read
     // yields one KV iff present; a scan yields its rows (already key-ascending).
-    static void collect(const QueryResult& qr, std::vector<storage::KeyValue>& kvs) {
-        for (const PointResult& p : qr.points) {
+    // Takes the QueryResult BY RVALUE (every caller passes a db_.run(...) temporary) so
+    // the range rows are MOVED into kvs, not copied — db_.run already moved the storage
+    // scan vector into rr.rows, so this keeps the whole read path move-only (no per-row
+    // string copy from the scan result into the SQL layer).
+    static void collect(QueryResult&& qr, std::vector<storage::KeyValue>& kvs) {
+        for (PointResult& p : qr.points) {
             if (p.value.has_value()) {
-                kvs.emplace_back(p.key, *p.value);
+                kvs.emplace_back(std::move(p.key), std::move(*p.value));
             }
         }
-        for (const RangeResult& rr : qr.ranges) {
-            for (const storage::KeyValue& kv : rr.rows) {
-                kvs.push_back(kv);
+        for (RangeResult& rr : qr.ranges) {
+            if (kvs.empty()) {
+                kvs = std::move(rr.rows);  // the common single-range case: steal the vector
+            } else {
+                kvs.reserve(kvs.size() + rr.rows.size());
+                for (storage::KeyValue& kv : rr.rows) {
+                    kvs.push_back(std::move(kv));
+                }
             }
         }
     }

@@ -527,13 +527,13 @@ private:
                 r.lo = st.key;
                 r.hi = st.hi;
                 r.hi_unbounded = st.hi_unbounded;
-                const std::vector<storage::KeyValue> rows =
+                std::vector<storage::KeyValue> rows =
                     co_await engine.scan(r, storage::Snapshot{snap_seq});
                 RangeResult rr;
                 rr.lo = st.key;
                 rr.hi = st.hi;
                 rr.hi_unbounded = st.hi_unbounded;
-                rr.rows = rows;
+                rr.rows = std::move(rows);  // move the whole vector, never copy it
                 out.ranges.push_back(std::move(rr));
             }
         }
