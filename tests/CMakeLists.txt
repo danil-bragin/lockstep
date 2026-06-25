@@ -1003,6 +1003,25 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_columnar_test COMMAND lockstep_sql_columnar_test)
 
+  # sql_columnar_durability_test: the columnar crash/recovery gate (A5). Proves the
+  # committed columnar state (blocks + delta) survives a crash + recovery byte-for-byte
+  # over a deterministic SimDisk — projection/aggregate/GROUP BY identical post-recovery,
+  # flush atomicity (one commit batch), determinism. Columnar is a new storage path;
+  # durability is sacrosanct.
+  add_executable(lockstep_sql_columnar_durability_test sql_columnar_durability_test.cpp)
+  target_include_directories(lockstep_sql_columnar_durability_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_columnar_durability_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_columnar_durability_test COMMAND lockstep_sql_columnar_durability_test)
+
   # sql_aggregates_test (SQL v2): the EXTENDED SELECT surface — WHERE on ANY column
   # (a general boolean predicate tree), aggregates (COUNT(*)/COUNT(col)/SUM/MIN/MAX/
   # AVG) + GROUP BY + HAVING, ORDER BY [ASC|DESC] + LIMIT/OFFSET, DISTINCT. Each is

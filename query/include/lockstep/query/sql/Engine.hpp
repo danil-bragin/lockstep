@@ -209,6 +209,21 @@ class SqlEngine {
 public:
     SqlEngine() = default;
 
+    // DURABLE backing (crash/recovery testing + a real durable server): the committed
+    // query state is a WalEngine over the injected IDisk (a SimDisk for a deterministic
+    // crash test, a ProdDisk for real on-disk recovery). The CATALOG (schemas) is NOT
+    // durable here — the caller re-establishes DDL (a separately-durable/replayed concern,
+    // FLAGGED); this seam proves the DATA path (rows, columnar blocks + delta) survives.
+    SqlEngine(core::Scheduler& sched, core::IDisk& disk) : db_(sched, disk) {}
+
+    // Recover the committed query state from the durable disk image (after a crash). The
+    // in-memory catalog is unchanged (the caller keeps/replays the schema); reads then see
+    // the recovered rows / columnar blocks + delta.
+    void recover(std::size_t durable_len) {
+        db_.recover(durable_len);
+        tip_ = db_.tip();
+    }
+
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
     ExecResult exec(const std::string& sql) {
         ParseResult pr = parse_sql(sql);
