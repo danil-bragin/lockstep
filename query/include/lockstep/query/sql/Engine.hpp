@@ -642,9 +642,10 @@ private:
     [[nodiscard]] std::optional<std::string> columnar_build_rows(
         const Table& t, const SelectStmt& sel, const std::vector<bool>& need,
         std::vector<std::vector<Datum>>& rows_out, bool pk_between = false) {
-        std::map<Key, std::vector<Datum>> merged;  // key = encode_pk(pk) (pk-ascending)
-        // Base: flushed blocks (A3.2 fills block_base_rows; empty pre-flush).
-        if (auto e = block_base_rows(t, sel, need, pk_between, merged)) {
+        // Base: flushed blocks, pk-ascending, NEEDED columns only (SoA decode). Empty
+        // pre-flush.
+        std::vector<std::vector<Datum>> base;
+        if (auto e = block_base_rows(t, sel, need, pk_between, base)) {
             return e;
         }
         // Overlay: the row 'd' delta. A live value overwrites/inserts; a del-marker drops.
@@ -658,6 +659,17 @@ private:
         std::vector<storage::KeyValue> delta;
         if (auto e = scan_range_at_level(sel, lo, hi, delta)) {
             return e;
+        }
+        // FAST PATH: no delta (the common just-flushed analytics read) — the block base IS
+        // the answer, already pk-ascending. No map, no per-row encode_pk/node alloc.
+        if (delta.empty()) {
+            rows_out = std::move(base);
+            return std::nullopt;
+        }
+        // Else MERGE: seed the ordered map from the block base, then apply the delta.
+        std::map<Key, std::vector<Datum>> merged;  // key = encode_pk(pk) (pk-ascending)
+        for (std::vector<Datum>& row : base) {
+            merged[encode_pk(row[t.pk_index])] = std::move(row);
         }
         for (const storage::KeyValue& kv : delta) {
             if (is_tombstone(kv.second)) {
@@ -680,12 +692,14 @@ private:
         return std::nullopt;
     }
 
-    // Populate `merged` (keyed by encode_pk, pk-ascending) from the flushed column blocks
-    // for the NEEDED columns over the pk range — the projection-pushdown read: decode the
-    // pk block + only the needed column blocks (SoA), zip by position. Empty if no blocks.
+    // Build `base` (pk-ascending) from the flushed column blocks for the NEEDED columns
+    // over the pk range — the projection-pushdown read: decode the pk block + ONLY the
+    // needed column blocks (SoA), zip by position. The pk slot is ALWAYS set (the caller
+    // uses it as the merge key); downstream projection ignores columns not in `need`.
+    // Empty if no blocks (pre-flush).
     [[nodiscard]] std::optional<std::string> block_base_rows(
         const Table& t, const SelectStmt& sel, const std::vector<bool>& need,
-        bool pk_between, std::map<Key, std::vector<Datum>>& merged) {
+        bool pk_between, std::vector<std::vector<Datum>>& base) {
         const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
         const ReadResult pkb = read_committed(block_key(t.id, pkc_id, 0));
         if (!pkb.has_value() || is_tombstone(*pkb)) {
@@ -704,6 +718,7 @@ private:
             }
             cols[c] = decode_column_block(*cb);
         }
+        base.reserve(pkc.count);
         for (std::uint32_t i = 0; i < pkc.count; ++i) {
             const Datum pk = pkc.type == Type::Int ? Datum::make_int(pkc.ints[i])
                                                    : Datum::make_text(pkc.texts[i]);
@@ -711,16 +726,14 @@ private:
                 continue;
             }
             std::vector<Datum> row(t.columns.size());
-            if (need[t.pk_index]) {
-                row[t.pk_index] = pk;
-            }
+            row[t.pk_index] = pk;  // always set (merge key); projection drops it if unneeded
             for (std::size_t c = 0; c < t.columns.size(); ++c) {
                 if (c == t.pk_index || !need[c]) {
                     continue;
                 }
                 row[c] = cols[c].at(i);
             }
-            merged[encode_pk(pk)] = std::move(row);
+            base.push_back(std::move(row));
         }
         return std::nullopt;
     }
