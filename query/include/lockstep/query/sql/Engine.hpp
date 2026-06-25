@@ -1633,6 +1633,45 @@ private:
                             no_nulls);
     }
 
+    // Parallel GROUP BY grouping pass: split the row range [0,count) into W partitions, build a
+    // partial group map per partition (each worker its own — no shared state), then merge into
+    // `dst` in partition order 0..W-1. Because partitions are ascending row ranges and each
+    // collects ascending row indices, the merged per-group index vector is byte-identical to the
+    // serial single-pass order; the group keys land in `dst` (an ordered std::map) in the same
+    // order too. So the emitted rows are identical to serial regardless of the split. Only the
+    // CPU-heavy grouping (a map insert per row) is parallelized; emit_group stays serial.
+    // Caller guarantees count >= kParallelMinRows and an injected multi-worker executor.
+    template <class MapT, class Passes, class KeyOf, class KeyDatumOf>
+    void build_groups_parallel(MapT& dst, std::uint32_t count, bool has_filter, Passes passes,
+                               KeyOf key_of, KeyDatumOf key_datum_of) {
+        std::size_t nparts = std::min<std::size_t>(parallel_executor_->workers(), count);
+        if (nparts < 2) nparts = 2;
+        std::vector<MapT> parts(nparts);
+        const std::uint32_t per = static_cast<std::uint32_t>((count + nparts - 1) / nparts);
+        parallel_executor_->parallel_for(nparts, [&](std::size_t w) {
+            const std::uint32_t lo = static_cast<std::uint32_t>(w) * per;
+            const std::uint32_t hi = std::min<std::uint32_t>(count, lo + per);
+            MapT& m = parts[w];
+            for (std::uint32_t rr = lo; rr < hi; ++rr) {
+                if (has_filter && !passes(rr)) continue;
+                auto& slot = m[key_of(rr)];
+                if (slot.second.empty()) slot.second = key_datum_of(rr);
+                slot.first.push_back(rr);
+            }
+        });
+        for (std::size_t w = 0; w < nparts; ++w) {
+            for (auto& [k, slot] : parts[w]) {
+                auto& d = dst[k];
+                if (d.second.empty()) d.second = std::move(slot.second);
+                if (d.first.empty()) {
+                    d.first = std::move(slot.first);
+                } else {
+                    d.first.insert(d.first.end(), slot.first.begin(), slot.first.end());
+                }
+            }
+        }
+    }
+
     // Fold ONE aggregate over the WHOLE column [0,count) — CONTIGUOUS (no index gather), so
     // the SUM/MIN/MAX loops auto-vectorize (SIMD) at -O2. For a NOT NULL column there is no
     // per-element null branch (the branch that otherwise defeats vectorization). Used by the
@@ -2030,10 +2069,15 @@ private:
         // Emit ONE group's result row (HAVING-filtered): aggregates fold via compute_agg_soa
         // (TIGHT per-column second pass; a 1-pass branchy running-accumulator measured SLOWER).
         // Appends to r.rows; returns an error string, or nullopt (emitted OR skipped by HAVING).
-        auto emit_group = [&](const std::vector<Datum>& keyd,
-                              const std::vector<std::uint32_t>& idxs) -> std::optional<std::string> {
+        // Compute ONE group's result row into `out` (HAVING-filtered via `keep`). Reads only
+        // shared CONST state (cols / sel / catalog) + writes its own `out`, so groups can be
+        // folded in PARALLEL across workers (compute_agg_soa / having_eval_soa mutate no engine
+        // state). Returns an error string, or nullopt (keep=false => the group is dropped).
+        auto compute_group_row = [&](const std::vector<Datum>& keyd,
+                                     const std::vector<std::uint32_t>& idxs, ResultRow& out,
+                                     bool& keep) -> std::optional<std::string> {
+            keep = true;
             if (has_having) {
-                bool keep = true;
                 if (auto e = having_eval_soa(sel.having, sel.having.root, t, cols, idxs, gcols,
                                              keyd, keep)) {
                     return e;
@@ -2042,7 +2086,6 @@ private:
                     return std::nullopt;
                 }
             }
-            ResultRow out;
             for (const SelectItem& item : sel.items) {
                 if (item.kind == SelectItemKind::Column) {
                     const std::size_t ci = *t.column_index(item.column);
@@ -2058,32 +2101,94 @@ private:
                     out.cells.emplace_back(item.label, compute_agg_soa(item.agg, t, cols, idxs));
                 }
             }
-            r.rows.push_back(std::move(out));
+            return std::nullopt;
+        };
+        // Emit all groups (in the supplied order — the ordered-map order, so output is sorted by
+        // key). The per-group FOLD is the dominant GROUP BY cost (a gather over each group's row
+        // indices), so parallelize it ACROSS groups when an executor is set and there is real
+        // work: each worker folds a block of groups into its own slot; kept rows are appended in
+        // the original order and the lowest-index error wins — byte-identical to serial.
+        using GroupRef =
+            std::pair<const std::vector<Datum>*, const std::vector<std::uint32_t>*>;
+        auto emit_all = [&](const std::vector<GroupRef>& refs) -> std::optional<std::string> {
+            const bool par_fold = parallel_executor_ != nullptr &&
+                                  parallel_executor_->workers() > 1 && refs.size() > 1 &&
+                                  static_cast<std::int64_t>(count) >= kParallelMinRows;
+            if (!par_fold) {
+                for (const GroupRef& ref : refs) {
+                    ResultRow out;
+                    bool keep = true;
+                    if (auto e = compute_group_row(*ref.first, *ref.second, out, keep)) return e;
+                    if (keep) r.rows.push_back(std::move(out));
+                }
+                return std::nullopt;
+            }
+            std::vector<ResultRow> outs(refs.size());
+            std::vector<unsigned char> keep(refs.size(), 0);
+            std::vector<std::optional<std::string>> errs(refs.size());
+            const std::size_t nparts =
+                std::min<std::size_t>(parallel_executor_->workers(), refs.size());
+            const std::size_t per = (refs.size() + nparts - 1) / nparts;
+            parallel_executor_->parallel_for(nparts, [&](std::size_t w) {
+                const std::size_t lo = w * per;
+                const std::size_t hi = std::min(refs.size(), lo + per);
+                for (std::size_t i = lo; i < hi; ++i) {
+                    bool k = true;
+                    if (auto e = compute_group_row(*refs[i].first, *refs[i].second, outs[i], k)) {
+                        errs[i] = std::move(e);
+                    } else if (k) {
+                        keep[i] = 1;
+                    }
+                }
+            });
+            for (const auto& e : errs) {
+                if (e) return e;  // lowest-index error (deterministic)
+            }
+            for (std::size_t i = 0; i < refs.size(); ++i) {
+                if (keep[i]) r.rows.push_back(std::move(outs[i]));
+            }
             return std::nullopt;
         };
         // RAW-INT-KEY fast path: a single NOT NULL INT group column keys the map by the raw
         // int64 — no per-row group_key_field STRING + no vector<string> key. The map is ordered
         // by int, which equals the order-preserving group_key_field order, so output order is
         // byte-identical. (The common GROUP BY <int col> analytical shape.)
+        // Parallelize the grouping pass when an executor is injected and there are enough rows
+        // to amortize dispatch — partial group maps merged in a fixed order (byte-identical).
+        const bool par_group =
+            parallel_executor_ != nullptr && parallel_executor_->workers() > 1 &&
+            static_cast<std::int64_t>(count) >= kParallelMinRows;
         if (gcols.size() == 1 && t.columns[gcols[0]].type == Type::Int &&
             !t.columns[gcols[0]].nullable) {
             const std::size_t gc = gcols[0];
             std::map<std::int64_t, std::pair<std::vector<std::uint32_t>, std::vector<Datum>>> ig;
-            for (std::uint32_t rr = 0; rr < count; ++rr) {
-                if (has_filter && !passes(rr)) {
-                    continue;
+            if (par_group) {
+                build_groups_parallel(
+                    ig, count, has_filter, passes,
+                    [&](std::uint32_t rr) { return cols[gc].ints[rr]; },
+                    [&](std::uint32_t rr) {
+                        return std::vector<Datum>{Datum::make_int(cols[gc].ints[rr])};
+                    });
+            } else {
+                for (std::uint32_t rr = 0; rr < count; ++rr) {
+                    if (has_filter && !passes(rr)) {
+                        continue;
+                    }
+                    auto& slot = ig[cols[gc].ints[rr]];
+                    if (slot.second.empty()) {
+                        slot.second.push_back(Datum::make_int(cols[gc].ints[rr]));
+                    }
+                    slot.first.push_back(rr);
                 }
-                auto& slot = ig[cols[gc].ints[rr]];
-                if (slot.second.empty()) {
-                    slot.second.push_back(Datum::make_int(cols[gc].ints[rr]));
-                }
-                slot.first.push_back(rr);
             }
+            std::vector<GroupRef> refs;
+            refs.reserve(ig.size());
             for (const auto& [k, slot] : ig) {
                 (void)k;
-                if (auto e = emit_group(slot.second, slot.first)) {
-                    return ExecResult::failure(*e);
-                }
+                refs.emplace_back(&slot.second, &slot.first);
+            }
+            if (auto e = emit_all(refs)) {
+                return ExecResult::failure(*e);
             }
         } else if (gcols.size() == 1 && t.columns[gcols[0]].type == Type::Text &&
                    !t.columns[gcols[0]].nullable) {
@@ -2093,54 +2198,82 @@ private:
             // is constant), so output order is byte-identical.
             const std::size_t gc = gcols[0];
             std::map<std::string, std::pair<std::vector<std::uint32_t>, std::vector<Datum>>> tg;
-            for (std::uint32_t rr = 0; rr < count; ++rr) {
-                if (has_filter && !passes(rr)) {
-                    continue;
+            if (par_group) {
+                build_groups_parallel(
+                    tg, count, has_filter, passes,
+                    [&](std::uint32_t rr) { return cols[gc].texts[rr]; },
+                    [&](std::uint32_t rr) {
+                        return std::vector<Datum>{Datum::make_text(cols[gc].texts[rr])};
+                    });
+            } else {
+                for (std::uint32_t rr = 0; rr < count; ++rr) {
+                    if (has_filter && !passes(rr)) {
+                        continue;
+                    }
+                    auto& slot = tg[cols[gc].texts[rr]];
+                    if (slot.second.empty()) {
+                        slot.second.push_back(Datum::make_text(cols[gc].texts[rr]));
+                    }
+                    slot.first.push_back(rr);
                 }
-                auto& slot = tg[cols[gc].texts[rr]];
-                if (slot.second.empty()) {
-                    slot.second.push_back(Datum::make_text(cols[gc].texts[rr]));
-                }
-                slot.first.push_back(rr);
             }
+            std::vector<GroupRef> refs;
+            refs.reserve(tg.size());
             for (const auto& [k, slot] : tg) {
                 (void)k;
-                if (auto e = emit_group(slot.second, slot.first)) {
-                    return ExecResult::failure(*e);
-                }
+                refs.emplace_back(&slot.second, &slot.first);
+            }
+            if (auto e = emit_all(refs)) {
+                return ExecResult::failure(*e);
             }
         } else {
             // GENERAL path: group-key tuple (group_key_field). Key buffer reused across rows.
             std::map<std::vector<std::string>,
                      std::pair<std::vector<std::uint32_t>, std::vector<Datum>>>
                 groups;
-            std::vector<std::string> key;
-            key.reserve(gcols.size());
-            for (std::uint32_t rr = 0; rr < count; ++rr) {
-                if (has_filter && !passes(rr)) {
-                    continue;
+            auto key_of = [&](std::uint32_t rr) {
+                std::vector<std::string> key;
+                key.reserve(gcols.size());
+                for (const std::size_t g : gcols) key.push_back(group_key_field(cols[g].at(rr)));
+                return key;
+            };
+            auto key_datum_of = [&](std::uint32_t rr) {
+                std::vector<Datum> kd;
+                if (!gcols.empty()) {
+                    kd.reserve(gcols.size());
+                    for (const std::size_t g : gcols) kd.push_back(cols[g].at(rr));
                 }
-                key.clear();
-                for (const std::size_t g : gcols) {
-                    key.push_back(group_key_field(cols[g].at(rr)));
-                }
-                auto& slot = groups[key];
-                if (slot.second.empty() && !gcols.empty()) {
-                    slot.second.reserve(gcols.size());
-                    for (const std::size_t g : gcols) {
-                        slot.second.push_back(cols[g].at(rr));
+                return kd;
+            };
+            // gcols.empty() (ungrouped + filter/having here) => one '{}' group; build_groups_
+            // parallel handles it (all rows share the empty key), but a parallel split of zero
+            // surviving rows leaves `groups` empty, the same as serial — the guard below re-adds
+            // the single empty group either way.
+            if (par_group) {
+                build_groups_parallel(groups, count, has_filter, passes, key_of, key_datum_of);
+            } else {
+                for (std::uint32_t rr = 0; rr < count; ++rr) {
+                    if (has_filter && !passes(rr)) {
+                        continue;
                     }
+                    auto& slot = groups[key_of(rr)];
+                    if (slot.second.empty() && !gcols.empty()) {
+                        slot.second = key_datum_of(rr);
+                    }
+                    slot.first.push_back(rr);
                 }
-                slot.first.push_back(rr);
             }
             if (gcols.empty() && groups.empty()) {  // ungrouped over zero rows => ONE row
                 groups[std::vector<std::string>{}];
             }
+            std::vector<GroupRef> refs;
+            refs.reserve(groups.size());
             for (const auto& [k, slot] : groups) {
                 (void)k;
-                if (auto e = emit_group(slot.second, slot.first)) {
-                    return ExecResult::failure(*e);
-                }
+                refs.emplace_back(&slot.second, &slot.first);
+            }
+            if (auto e = emit_all(refs)) {
+                return ExecResult::failure(*e);
             }
         }
         apply_distinct(sel, r.rows);

@@ -45,8 +45,10 @@ std::string render(const ExecResult& r) {
     return out;
 }
 
-// The ungrouped + unfiltered scalar aggregates that hit compute_agg_chunked (the parallel path).
+// Queries that hit a parallelized path: (a) ungrouped scalar aggregates -> compute_agg_chunked;
+// (b) GROUP BY -> build_groups_parallel (int-key / text-key / general / filtered / nullable / HAVING).
 const std::vector<std::string> kQueries = {
+    // -- scalar aggregate fast path --
     "SELECT COUNT(*) FROM t",
     "SELECT SUM(amount) FROM t",
     "SELECT MIN(amount), MAX(amount) FROM t",
@@ -54,6 +56,14 @@ const std::vector<std::string> kQueries = {
     "SELECT MIN(region), MAX(region) FROM t",      // TEXT min/max (generic Datum path)
     "SELECT COUNT(opt), SUM(opt), MIN(opt), MAX(opt) FROM t",  // NULLABLE int (null branch)
     "SELECT COUNT(*), SUM(amount), MIN(region), MAX(opt) FROM t",  // mixed
+    // -- GROUP BY parallel grouping --
+    "SELECT cat, COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM t GROUP BY cat",  // int key
+    "SELECT region, COUNT(*), SUM(amount) FROM t GROUP BY region",                      // text key
+    "SELECT cat, region, COUNT(*), SUM(amount) FROM t GROUP BY cat, region",            // general
+    "SELECT cat, COUNT(*), SUM(amount) FROM t WHERE amount > 50000 GROUP BY cat",       // filtered
+    "SELECT opt, COUNT(*), SUM(amount) FROM t GROUP BY opt",                  // nullable -> general
+    "SELECT cat, COUNT(*) FROM t GROUP BY cat HAVING SUM(amount) > 0",                  // HAVING
+    "SELECT cat, COUNT(*) FROM t WHERE region = 'east' GROUP BY cat",        // filtered text pred
 };
 
 // Build a columnar table of N rows, flush to blocks, return the engine. opt is NULL on every
@@ -61,13 +71,14 @@ const std::vector<std::string> kQueries = {
 // min/max); amount is a scrambled int.
 void load(SqlEngine& e, std::size_t n) {
     e.set_columnar_default(true);
-    e.exec("CREATE TABLE t (id INT, amount INT NOT NULL, region TEXT NOT NULL, opt INT, "
-           "PRIMARY KEY (id))");
+    e.exec("CREATE TABLE t (id INT, amount INT NOT NULL, cat INT NOT NULL, region TEXT NOT NULL, "
+           "opt INT, PRIMARY KEY (id))");
     const char* regs[] = {"north", "south", "east", "west", "central"};
     for (std::size_t i = 0; i < n; ++i) {
         const std::int64_t amount = static_cast<std::int64_t>((i * 2654435761ULL) % 100000);
-        std::string sql = "INSERT INTO t (id, amount, region, opt) VALUES (" + std::to_string(i) +
-                          ", " + std::to_string(amount) + ", '" + regs[i % 5] + "', " +
+        std::string sql = "INSERT INTO t (id, amount, cat, region, opt) VALUES (" +
+                          std::to_string(i) + ", " + std::to_string(amount) + ", " +
+                          std::to_string(i % 8) + ", '" + regs[i % 5] + "', " +
                           ((i % 4 == 0) ? std::string("NULL") : std::to_string((i * 7) % 5000)) +
                           ")";
         const ExecResult r = e.exec(sql);
