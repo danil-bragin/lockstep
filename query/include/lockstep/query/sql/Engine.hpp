@@ -574,6 +574,150 @@ private:
         std::size_t output = 0;        // final rows returned
     };
 
+    // EXPLICIT PHYSICAL PLAN TREE (PERF_PLAN Phase 1). A SELECT is a tree of operators; the
+    // planner BUILDS it (build_plan), EXPLAIN walks it, and later phases rewrite it (cost
+    // model) + re-implement the operators (vectorization). Today the executor (exec_select)
+    // still runs the equivalent linear pipeline; the tree is the planner-visible structure +
+    // the EXPLAIN source. `actual` (from a PlanStats run) annotates the node under ANALYZE.
+    struct PlanNode {
+        enum class Kind {
+            SeqScan, PkPointGet, PkRangeScan, IndexScan,  // access paths (leaves)
+            Filter, Project, HashAggregate, Having, Distinct, Sort, Limit,  // unary
+            HashJoin, NestedLoopJoin  // binary
+        };
+        Kind kind = Kind::SeqScan;
+        std::string detail;                    // table / index / key description
+        std::vector<PlanNode> children;        // inputs (0 for a scan, 1 unary, 2 join)
+        std::int64_t actual = -1;              // ANALYZE: actual rows out (-1 = not measured)
+    };
+
+    static const char* op_name(PlanNode::Kind k) {
+        switch (k) {
+            case PlanNode::Kind::SeqScan: return "Seq Scan";
+            case PlanNode::Kind::PkPointGet: return "PK Point Get";
+            case PlanNode::Kind::PkRangeScan: return "PK Range Scan";
+            case PlanNode::Kind::IndexScan: return "Index Scan";
+            case PlanNode::Kind::Filter: return "Filter";
+            case PlanNode::Kind::Project: return "Project";
+            case PlanNode::Kind::HashAggregate: return "HashAggregate";
+            case PlanNode::Kind::Having: return "Having";
+            case PlanNode::Kind::Distinct: return "Distinct";
+            case PlanNode::Kind::Sort: return "Sort";
+            case PlanNode::Kind::Limit: return "Limit";
+            case PlanNode::Kind::HashJoin: return "Hash Join";
+            case PlanNode::Kind::NestedLoopJoin: return "Nested Loop Join";
+        }
+        return "?";
+    }
+
+    // Wrap a child under a parent operator (parent takes the existing tree as its input).
+    static PlanNode wrap(PlanNode::Kind k, std::string detail, PlanNode child) {
+        PlanNode p;
+        p.kind = k;
+        p.detail = std::move(detail);
+        p.children.push_back(std::move(child));
+        return p;
+    }
+
+    // Build the physical plan tree for a single-table SELECT (mirrors exec_select's choices).
+    PlanNode build_plan_single(const SelectStmt& sel, const Table& t) {
+        const bool pk_fast = sel.where != SelectWhereKind::None &&
+                             sel.where_column == t.pk().name && predicate_is_pure_pk(sel, t);
+        PlanNode node;
+        if (pk_fast && sel.where == SelectWhereKind::Eq) {
+            node.kind = PlanNode::Kind::PkPointGet;
+            node.detail = t.name + " (" + t.pk().name + " = const)";
+        } else if (pk_fast && sel.where == SelectWhereKind::Between) {
+            node.kind = PlanNode::Kind::PkRangeScan;
+            node.detail = t.name + " (" + t.pk().name + " BETWEEN)";
+        } else if (!pk_fast && sel.filter.present()) {
+            if (auto plan = choose_index_access(sel, t)) {
+                node.kind = PlanNode::Kind::IndexScan;
+                node.detail = "using " + plan->index->name +
+                              (plan->is_eq ? " (= const)" : " (range)") + " on " + t.name;
+            } else {
+                node.kind = PlanNode::Kind::SeqScan;
+                node.detail = t.name;
+            }
+        } else {
+            node.kind = PlanNode::Kind::SeqScan;
+            node.detail = t.name;
+        }
+        // Residual WHERE filter (unless the whole WHERE was a pure-PK fast path).
+        if (sel.filter.present() && !pk_fast) {
+            node = wrap(PlanNode::Kind::Filter, "WHERE residual predicate", std::move(node));
+        }
+        if (sel.has_aggregates || !sel.group_by.empty()) {
+            node = wrap(PlanNode::Kind::HashAggregate,
+                        sel.group_by.empty() ? "scalar aggregate"
+                                             : "GROUP BY " +
+                                                   std::to_string(sel.group_by.size()) + " col(s)",
+                        std::move(node));
+            if (sel.having.present()) {
+                node = wrap(PlanNode::Kind::Having, "filter groups", std::move(node));
+            }
+        }
+        if (sel.distinct) {
+            node = wrap(PlanNode::Kind::Distinct, "", std::move(node));
+        }
+        if (!sel.order_by.empty()) {
+            node = wrap(PlanNode::Kind::Sort,
+                        "ORDER BY " + std::to_string(sel.order_by.size()) +
+                            " key(s) (stable, PK tie-break)",
+                        std::move(node));
+        }
+        if (sel.has_limit) {
+            node = wrap(PlanNode::Kind::Limit,
+                        std::to_string(sel.limit) +
+                            (sel.offset > 0 ? " offset " + std::to_string(sel.offset) : ""),
+                        std::move(node));
+        }
+        return node;
+    }
+
+    // Render the plan tree as EXPLAIN text rows (Postgres-style indented, root first).
+    void render_plan(const PlanNode& n, int depth, bool analyze,
+                     const std::function<void(const std::string&)>& emit) const {
+        std::string indent(static_cast<std::size_t>(depth) * 2, ' ');
+        std::string s = indent + op_name(n.kind);
+        if (!n.detail.empty()) {
+            s += ": " + n.detail;
+        }
+        if (analyze && n.actual >= 0) {
+            s += "  (actual rows=" + std::to_string(n.actual) + ")";
+        }
+        emit(s);
+        for (const PlanNode& c : n.children) {
+            render_plan(c, depth + 1, analyze, emit);
+        }
+    }
+
+    // Attach ANALYZE actuals from a PlanStats run onto the matching nodes (scan/filter/group/
+    // output). Walks the unary chain bottom-up: the scan leaf gets `scanned`, the Filter gets
+    // `after_filter`, the HashAggregate gets `groups`, the topmost node gets `output`.
+    void annotate_actuals(PlanNode& n, const PlanStats& st) const {
+        // Recurse to the leaf first.
+        for (PlanNode& c : n.children) {
+            annotate_actuals(c, st);
+        }
+        switch (n.kind) {
+            case PlanNode::Kind::SeqScan:
+            case PlanNode::Kind::PkPointGet:
+            case PlanNode::Kind::PkRangeScan:
+            case PlanNode::Kind::IndexScan:
+                n.actual = static_cast<std::int64_t>(st.scanned);
+                break;
+            case PlanNode::Kind::Filter:
+                n.actual = static_cast<std::int64_t>(st.after_filter);
+                break;
+            case PlanNode::Kind::HashAggregate:
+                n.actual = static_cast<std::int64_t>(st.groups);
+                break;
+            default:
+                break;
+        }
+    }
+
     // EXPLAIN [ANALYZE] <select>: return the chosen PLAN (access path + pipeline stages) as
     // text rows. ANALYZE additionally RUNS the query and appends DETERMINISTIC actual counts
     // (rows scanned/filtered, groups, output) — the transparency surface for finding
@@ -605,66 +749,30 @@ private:
             }
             st.output = run_res.rows.size();
         }
-        auto act = [&](const std::string& field, std::size_t n) -> std::string {
-            return sel.explain_analyze ? "  (actual " + field + "=" + std::to_string(n) + ")"
-                                       : std::string{};
-        };
-
-        // Innermost: the access path. Re-derive the planner's choice (PK point/range, index
-        // range, or full scan) for description — same predicates exec_select uses.
+        // Build the explicit plan TREE + render it (root first, indented). Single-table goes
+        // through build_plan_single; a join is described at a coarse grain for now (Phase 1
+        // tree-ifies joins next).
         if (sel.is_join()) {
-            line("Join (" + std::to_string(sel.from.size()) + " tables, left-deep)" +
-                 act("rows", st.output));
-            line("  -> per-table Seq Scan + hash/nested-loop join (see PERF_PLAN Phase 1)");
+            PlanNode jn;
+            jn.kind = PlanNode::Kind::HashJoin;
+            jn.detail = std::to_string(sel.from.size()) + " tables (left-deep)";
+            jn.actual = sel.explain_analyze ? static_cast<std::int64_t>(st.output) : -1;
+            for (const JoinEntry& je : sel.from) {
+                PlanNode leaf;
+                leaf.kind = PlanNode::Kind::SeqScan;
+                leaf.detail = je.table + (je.alias != je.table ? " " + je.alias : "");
+                jn.children.push_back(std::move(leaf));
+            }
+            render_plan(jn, 0, sel.explain_analyze,
+                        [&](const std::string& s) { line(s); });
         } else {
-            const bool pk_fast = sel.where != SelectWhereKind::None &&
-                                 sel.where_column == t->pk().name &&
-                                 predicate_is_pure_pk(sel, *t);
-            std::string scan;
-            if (pk_fast && sel.where == SelectWhereKind::Eq) {
-                scan = "PK Point Get on " + sel.table + " (" + t->pk().name + " = const)";
-            } else if (pk_fast && sel.where == SelectWhereKind::Between) {
-                scan = "PK Range Scan on " + sel.table + " (" + t->pk().name + " BETWEEN)";
-            } else if (!pk_fast && sel.filter.present()) {
-                if (auto plan = choose_index_access(sel, *t)) {
-                    scan = "Index Scan using " + plan->index->name +
-                           (plan->is_eq ? " (= const)" : " (range)") + " on " + sel.table +
-                           " + point-get rows";
-                } else {
-                    scan = "Seq Scan on " + sel.table;
-                }
-            } else {
-                scan = "Seq Scan on " + sel.table;
+            PlanNode root = build_plan_single(sel, *t);
+            if (sel.explain_analyze) {
+                annotate_actuals(root, st);
+                root.actual = static_cast<std::int64_t>(st.output);  // top node = final output
             }
-            line(scan + act("scanned_rows", st.scanned));
-        }
-
-        // The stages above the scan, innermost-first in execution order.
-        if (sel.filter.present() &&
-            !(sel.where != SelectWhereKind::None && !sel.is_join() && t != nullptr &&
-              sel.where_column == t->pk().name && predicate_is_pure_pk(sel, *t))) {
-            line("  Filter: WHERE residual predicate" + act("rows", st.after_filter));
-        }
-        if (sel.has_aggregates || !sel.group_by.empty()) {
-            line("  HashAggregate: " +
-                 (sel.group_by.empty() ? std::string("scalar aggregate")
-                                       : "GROUP BY " + std::to_string(sel.group_by.size()) +
-                                             " col(s)") +
-                 act("groups", st.groups));
-            if (sel.having.present()) {
-                line("  Having: filter groups");
-            }
-        }
-        if (sel.distinct) {
-            line("  Distinct");
-        }
-        if (!sel.order_by.empty()) {
-            line("  Sort: ORDER BY " + std::to_string(sel.order_by.size()) +
-                 " key(s) (stable, PK tie-break)");
-        }
-        if (sel.has_limit) {
-            line("  Limit: " + std::to_string(sel.limit) +
-                 (sel.offset > 0 ? " offset " + std::to_string(sel.offset) : ""));
+            render_plan(root, 0, sel.explain_analyze,
+                        [&](const std::string& s) { line(s); });
         }
         line("Level: " + level_name(sel.level) +
              (sel.explain_analyze
