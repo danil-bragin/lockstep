@@ -282,6 +282,39 @@ void run_autoflush() {
     both(col, row, "SELECT id, val FROM s WHERE id = 1500", "af-point");
 }
 
+// MULTI-RUN OVERLAY gate: repeated non-append flushes build overlay runs; once kMaxOverlays(4)
+// runs accumulate the next flush COMPACTS them into the base. Reads must equal row-mode at every
+// stage (overlapping runs, tombstones from deletes, re-inserts, compaction).
+void run_overlays() {
+    SqlEngine col;
+    col.set_columnar_default(true);
+    SqlEngine row;
+    both(col, row, "CREATE TABLE o (id INT, a INT, b TEXT, PRIMARY KEY (id))", "ov-create");
+    for (int i = 0; i < 200; ++i) {
+        both(col, row, "INSERT INTO o (id, a, b) VALUES (" + std::to_string(i) + ", " +
+                           std::to_string(i) + ", 'x" + std::to_string(i % 10) + "')", "ov-ins");
+    }
+    check(!col.flush_columnar("o").has_value(), "ov base flush");  // base run 0
+    // 6 rounds of update+delete+insert, each flushed -> overlay runs; round 5+ compacts.
+    for (int rnd = 0; rnd < 6; ++rnd) {
+        for (int k = 0; k < 15; ++k) {
+            const int id = (rnd * 7 + k * 11) % 200;
+            both(col, row, "UPDATE o SET a = " + std::to_string(1000 + rnd * 100 + k) +
+                               " WHERE id = " + std::to_string(id), "ov-upd");
+        }
+        both(col, row, "DELETE FROM o WHERE id = " + std::to_string(rnd * 13), "ov-del");
+        both(col, row, "INSERT INTO o (id, a, b) VALUES (" + std::to_string(300 + rnd) + ", " +
+                           std::to_string(rnd) + ", 're')", "ov-reins");
+        check(!col.flush_columnar("o").has_value(), "ov flush round");
+        // Read after each flush — base + overlays merge (or post-compaction base).
+        both(col, row, "SELECT COUNT(*), SUM(a) FROM o", "ov-agg");
+        both(col, row, "SELECT id, a, b FROM o WHERE id BETWEEN 50 AND 60", "ov-range");
+        both(col, row, "SELECT b, COUNT(*) FROM o GROUP BY b", "ov-groupby");
+        both(col, row, "SELECT id, a FROM o WHERE a > 1000", "ov-filter");
+    }
+    both(col, row, "SELECT id, a, b FROM o", "ov-final-scan");
+}
+
 }  // namespace
 
 int main() {
@@ -294,6 +327,7 @@ int main() {
     }
     run_large();
     run_autoflush();
+    run_overlays();
     if (g_fail == 0) {
         std::printf("sql_columnar_test: ALL PASS (columnar == row-mode across the workload)\n");
     }

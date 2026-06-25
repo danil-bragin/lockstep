@@ -296,6 +296,15 @@ public:
         if (try_incremental_flush(*t)) {
             return std::nullopt;
         }
+        // NON-APPEND: write the delta as an OVERLAY RUN (no base rewrite) unless there are
+        // already too many runs — then fall through to a full COMPACTING flush.
+        if (create_overlay_run(*t)) {
+            return std::nullopt;
+        }
+        // FULL COMPACTION: read the merged live rows (base + overlays + delta) and rewrite
+        // the base (run 0), then retire all overlay runs + their tombstones + the manifest.
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>> old_overlays =
+            load_manifest(*t);
         SelectStmt full;
         full.table = table;
         full.level = Level::StrictSerializable;
@@ -367,7 +376,23 @@ public:
         for (const storage::KeyValue& kv : delta) {
             writes.emplace_back(kv.first, tombstone_marker());
         }
-        commit_writes(writes);  // ATOMIC: blocks + delta clear in one durable batch
+        // COMPACTION cleanup: the merged rows are now in the base, so retire every overlay
+        // run (all its column chunks), its tombstone list, and the manifest — all in this
+        // atomic commit, so a crash leaves either the pre- or the post-compaction state.
+        for (const auto& [run, nch] : old_overlays) {
+            for (std::size_t c = 0; c < t->columns.size(); ++c) {
+                for (std::uint64_t j = 0; j < nch; ++j) {
+                    writes.emplace_back(
+                        overlay_key(t->id, run, static_cast<std::uint32_t>(c), j),
+                        tombstone_marker());
+                }
+            }
+            writes.emplace_back(overlay_tomb_key(t->id, run), tombstone_marker());
+        }
+        if (!old_overlays.empty()) {
+            writes.emplace_back(overlay_manifest_key(t->id), tombstone_marker());
+        }
+        commit_writes(writes);  // ATOMIC: base + delta clear + overlay retire, one batch
         t->delta_dirty = false;  // delta is now empty (compacted into blocks)
         t->delta_count = 0;
         ++t->flush_gen;          // invalidate the decoded-block + zone cache for this table
@@ -382,6 +407,9 @@ public:
     // the delta cleared, in ONE atomic commit. The chunks stay pk-disjoint + ascending, so
     // every read path is unchanged. Anything not pure-append => false => the full flush runs.
     [[nodiscard]] bool try_incremental_flush(Table& t) {
+        if (has_overlays(t)) {
+            return false;  // base is the OLDEST run — an append must become a NEW overlay run
+        }
         const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
         // The chunk count comes from the (cached, small) zone map; the max flushed pk from
         // decoding ONLY the last pk chunk. No full-column decode => the flush stays O(delta).
@@ -412,15 +440,23 @@ public:
         std::vector<std::vector<Datum>> newrows;  // pk-ascending (delta keys are pk-ordered)
         newrows.reserve(delta.size());
         const std::vector<bool> all(t.columns.size(), true);
+        bool any_live = false;
         for (const storage::KeyValue& kv : delta) {
+            if (is_tombstone(kv.second)) {
+                continue;  // a cleared-delta marker from a prior flush — skip
+            }
             if (is_row_del_marker(kv.second)) {
                 return false;  // a delete — not a pure append
             }
+            any_live = true;
             const Datum pk = decode_pk_from_delta_key(t, kv.first);
             if (!max_pk.less_than(pk)) {
                 return false;  // pk <= max flushed pk — would overwrite / mis-order
             }
             newrows.push_back(decode_row_projected(t, encode_key(t, pk), kv.second, all));
+        }
+        if (!any_live) {
+            return false;  // only cleared markers — nothing to append (let flush no-op/full)
         }
         const std::size_t nnew = newrows.size();
         const std::uint64_t nnewchunks = (nnew + kChunkRows - 1) / kChunkRows;
@@ -469,6 +505,86 @@ public:
             zones.push_back(std::move(zr));
         }
         writes.emplace_back(zone_key(t.id), encode_zone_map(zones, t.columns.size()));
+        for (const storage::KeyValue& kv : delta) {
+            writes.emplace_back(kv.first, tombstone_marker());  // clear the delta
+        }
+        commit_writes(writes);
+        t.delta_dirty = false;
+        t.delta_count = 0;
+        ++t.flush_gen;
+        return true;
+    }
+
+    static constexpr std::size_t kMaxOverlays = 4;  // compact (full flush) past this many runs
+
+    // Non-append flush WITHOUT rewriting the base: write the delta as a new OVERLAY RUN
+    // (live rows as chunks + deleted pks as a tombstone list) + extend the manifest, in one
+    // atomic commit. O(delta). Returns false (=> the caller does a full compacting flush) if
+    // there is no base yet, or there are already kMaxOverlays runs (time to compact).
+    [[nodiscard]] bool create_overlay_run(Table& t) {
+        if (load_zones(t).empty()) {
+            return false;  // no base (run 0) — let the full flush build it
+        }
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> manifest = load_manifest(t);
+        if (manifest.size() >= kMaxOverlays) {
+            return false;  // too many runs — compact instead
+        }
+        std::uint32_t run = 1;
+        for (const auto& [r, n] : manifest) {
+            (void)n;
+            if (r >= run) {
+                run = r + 1;
+            }
+        }
+        std::vector<storage::KeyValue> delta;
+        {
+            Query<Strict> q;
+            q.scan(row_delta_prefix(t.id), row_delta_prefix_end(t.id));
+            collect(db_.run(q), delta);
+        }
+        if (delta.empty()) {
+            return false;
+        }
+        std::vector<std::vector<Datum>> liverows;  // pk-ascending (delta keys are pk-ordered)
+        std::vector<Key> tombs;
+        const std::vector<bool> all(t.columns.size(), true);
+        for (const storage::KeyValue& kv : delta) {
+            if (is_tombstone(kv.second)) {
+                continue;  // a cleared-delta marker (a prior flush wrote it) — not a row
+            }
+            const Datum pk = decode_pk_from_delta_key(t, kv.first);
+            if (is_row_del_marker(kv.second)) {
+                tombs.push_back(encode_pk(pk));
+            } else {
+                std::vector<Datum> row =
+                    decode_row_projected(t, encode_key(t, pk), kv.second, all);
+                row[t.pk_index] = pk;
+                liverows.push_back(std::move(row));
+            }
+        }
+        if (liverows.empty() && tombs.empty()) {
+            return false;  // only cleared markers — nothing to overlay
+        }
+        const std::size_t nlive = liverows.size();
+        const std::uint64_t nchunks = (nlive + kChunkRows - 1) / kChunkRows;
+        std::vector<std::pair<Key, Value>> writes;
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            for (std::uint64_t j = 0; j < nchunks; ++j) {
+                const std::size_t lo = static_cast<std::size_t>(j) * kChunkRows;
+                const std::size_t hi = std::min(lo + kChunkRows, nlive);
+                std::vector<Datum> cells;
+                cells.reserve(hi - lo);
+                for (std::size_t rr = lo; rr < hi; ++rr) {
+                    cells.push_back(liverows[rr][c]);
+                }
+                writes.emplace_back(
+                    overlay_key(t.id, run, static_cast<std::uint32_t>(c), j),
+                    encode_column_block(t.columns[c].type, cells));
+            }
+        }
+        writes.emplace_back(overlay_tomb_key(t.id, run), encode_tombs(tombs));
+        manifest.emplace_back(run, nchunks);
+        writes.emplace_back(overlay_manifest_key(t.id), encode_manifest(manifest));
         for (const storage::KeyValue& kv : delta) {
             writes.emplace_back(kv.first, tombstone_marker());  // clear the delta
         }
@@ -727,12 +843,59 @@ private:
         const ReadResult dv = read_committed(row_delta_key(t, pk));
         if (dv.has_value() && !is_tombstone(*dv)) {
             if (is_row_del_marker(*dv)) {
-                return std::nullopt;  // delta delete shadows any block row
+                return std::nullopt;  // delta delete shadows any overlay/block row
             }
             return decode_row(t, encode_key(t, pk), *dv);  // live delta row (row codec)
         }
-        // Not in the delta — look in the flushed blocks (A3.2). No blocks yet => absent.
-        return read_block_row(t, pk);
+        // Not in the delta — check the overlay runs NEWEST->OLDEST (a run's tombstone or
+        // live row shadows older runs + the base), then the base blocks.
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>> manifest = load_manifest(t);
+        const Key ek = encode_pk(pk);
+        for (auto it = manifest.rbegin(); it != manifest.rend(); ++it) {
+            const std::uint32_t run = it->first;
+            bool tombstoned = false;
+            for (const Key& tk : load_tombs(t, run)) {
+                if (tk == ek) {
+                    tombstoned = true;
+                    break;
+                }
+            }
+            if (tombstoned) {
+                return std::nullopt;  // deleted in this run
+            }
+            if (auto row = read_overlay_row(t, run, pk)) {
+                return row;
+            }
+        }
+        return read_block_row(t, pk);  // base blocks (no overlay had it)
+    }
+
+    // Assemble a full row for `pk` from a specific overlay run (nullopt if not present).
+    [[nodiscard]] std::optional<std::vector<Datum>> read_overlay_row(const Table& t,
+                                                                     std::uint32_t run,
+                                                                     const Datum& pk) {
+        const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
+        const std::vector<ColumnChunk> pk_chunks = overlay_run_chunks(t, run, pkc_id);
+        for (std::size_t j = 0; j < pk_chunks.size(); ++j) {
+            const auto idx = chunk_find_pk(pk_chunks[j], pk);
+            if (!idx) {
+                continue;
+            }
+            std::vector<Datum> row(t.columns.size());
+            for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                if (c == t.pk_index) {
+                    row[c] = pk;
+                    continue;
+                }
+                const std::vector<ColumnChunk> cch =
+                    overlay_run_chunks(t, run, static_cast<std::uint32_t>(c));
+                if (j < cch.size()) {
+                    row[c] = cch[j].at(*idx);
+                }
+            }
+            return row;
+        }
+        return std::nullopt;
     }
 
     // Range-scan ONE key range [lo,hi) at the statement's D5 level (the column-family
@@ -857,6 +1020,118 @@ private:
             }
         }
         return out;
+    }
+
+    // ===== MULTI-RUN LSM OVERLAYS (cheap non-append flush) ==========================
+    // Base = run 0 = the 'B' blocks. An overlay run holds the rows changed by a non-append
+    // flush; reads merge base + overlays (newest run wins per pk) + the live delta.
+
+    // Manifest = the active overlay runs (run_id, chunk count), recency order (ascending id).
+    [[nodiscard]] static std::string encode_manifest(
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>>& runs) {
+        std::string out;
+        put_be32(out, static_cast<std::uint32_t>(runs.size()));
+        for (const auto& [r, n] : runs) {
+            put_be32(out, r);
+            put_be64(out, n);
+        }
+        return out;
+    }
+    [[nodiscard]] static std::vector<std::pair<std::uint32_t, std::uint64_t>> decode_manifest(
+        const std::string& v) {
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> out;
+        std::size_t off = 0;
+        const std::uint32_t c = get_be32(v, off);
+        off += 4;
+        for (std::uint32_t i = 0; i < c; ++i) {
+            const std::uint32_t r = get_be32(v, off);
+            off += 4;
+            const std::uint64_t n = get_be64(v, off);
+            off += 8;
+            out.emplace_back(r, n);
+        }
+        return out;
+    }
+    [[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint64_t>> load_manifest(
+        const Table& t) {
+        const ReadResult mv = read_committed(overlay_manifest_key(t.id));
+        if (!mv.has_value() || is_tombstone(*mv) || mv->empty()) {
+            return {};
+        }
+        return decode_manifest(*mv);
+    }
+    [[nodiscard]] bool has_overlays(const Table& t) { return !load_manifest(t).empty(); }
+
+    // Tombstone list = the encoded pks deleted in a run (sorted, for a binary-search set).
+    [[nodiscard]] static std::string encode_tombs(const std::vector<Key>& pks) {
+        std::string out;
+        put_be32(out, static_cast<std::uint32_t>(pks.size()));
+        for (const Key& p : pks) {
+            put_be32(out, static_cast<std::uint32_t>(p.size()));
+            out += p;
+        }
+        return out;
+    }
+    [[nodiscard]] std::vector<Key> load_tombs(const Table& t, std::uint32_t run) {
+        const ReadResult tv = read_committed(overlay_tomb_key(t.id, run));
+        std::vector<Key> out;
+        if (!tv.has_value() || is_tombstone(*tv) || tv->empty()) {
+            return out;
+        }
+        std::size_t off = 0;
+        const std::uint32_t c = get_be32(*tv, off);
+        off += 4;
+        for (std::uint32_t i = 0; i < c; ++i) {
+            const std::uint32_t l = get_be32(*tv, off);
+            off += 4;
+            out.push_back(tv->substr(off, l));
+            off += l;
+        }
+        return out;
+    }
+
+    // Decode one overlay run's chunks for column c (all chunks of that run, pk-ascending).
+    [[nodiscard]] std::vector<ColumnChunk> overlay_run_chunks(const Table& t, std::uint32_t run,
+                                                             std::uint32_t c) {
+        std::vector<storage::KeyValue> kvs;
+        Query<Strict> q;
+        q.scan(overlay_run_col_prefix(t.id, run, c), overlay_run_col_prefix_end(t.id, run, c));
+        collect(db_.run(q), kvs);
+        std::vector<ColumnChunk> out;
+        for (const storage::KeyValue& kv : kvs) {
+            if (!is_tombstone(kv.second)) {
+                out.push_back(decode_column_block(kv.second));
+            }
+        }
+        return out;
+    }
+
+    // Materialise one overlay run's live rows (NEEDED cols + the pk always), pk-ascending.
+    [[nodiscard]] std::vector<std::vector<Datum>> overlay_run_rows(
+        const Table& t, std::uint32_t run, const std::vector<bool>& need) {
+        const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
+        const std::vector<ColumnChunk> pk_chunks = overlay_run_chunks(t, run, pkc_id);
+        std::vector<std::vector<ColumnChunk>> colch(t.columns.size());
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            if (c != t.pk_index && need[c]) {
+                colch[c] = overlay_run_chunks(t, run, static_cast<std::uint32_t>(c));
+            }
+        }
+        std::vector<std::vector<Datum>> rows;
+        for (std::size_t j = 0; j < pk_chunks.size(); ++j) {
+            const ColumnChunk& pc = pk_chunks[j];
+            for (std::uint32_t i = 0; i < pc.count; ++i) {
+                std::vector<Datum> row(t.columns.size());
+                row[t.pk_index] = pc.at(i);
+                for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                    if (c != t.pk_index && need[c] && j < colch[c].size()) {
+                        row[c] = colch[c][j].at(i);
+                    }
+                }
+                rows.push_back(std::move(row));
+            }
+        }
+        return rows;
     }
 
     // A pk-ascending chunk's [first,last] pk range is DISJOINT from [lo,hi] (data skipping).
@@ -1029,51 +1304,62 @@ private:
         if (auto e = block_base_rows(t, sel, need, pk_between, base)) {
             return e;
         }
-        // FAST PATH: a clean delta (no writes since the last flush) — the blocks ARE the
-        // answer, already pk-ascending. Skip the delta scan + merge entirely.
-        if (!t.delta_dirty) {
+        // Active overlay runs (a non-append flush appends rows here instead of rewriting the
+        // base). FAST PATH: a single run (no overlays) + clean delta — base IS the answer.
+        const std::vector<std::pair<std::uint32_t, std::uint64_t>> manifest = load_manifest(t);
+        if (!t.delta_dirty && manifest.empty()) {
             rows_out = std::move(base);
             return std::nullopt;
         }
-        // Overlay: the row 'd' delta. A live value overwrites/inserts; a del-marker drops.
-        Key lo = row_delta_prefix(t.id);
-        Key hi = row_delta_prefix_end(t.id);
-        if (pk_between) {
-            lo = row_delta_prefix(t.id) + encode_pk(sel.lo_value);
-            hi = row_delta_prefix(t.id) + encode_pk(sel.hi_value);
-            hi.push_back('\0');  // inclusive upper bound -> half-open
-        }
-        std::vector<storage::KeyValue> delta;
-        if (auto e = scan_range_at_level(sel, lo, hi, delta)) {
-            return e;
-        }
-        // FAST PATH: no delta (the common just-flushed analytics read) — the block base IS
-        // the answer, already pk-ascending. No map, no per-row encode_pk/node alloc.
-        if (delta.empty()) {
-            rows_out = std::move(base);
-            return std::nullopt;
-        }
-        // Else MERGE: seed the ordered map from the block base, then apply the delta.
+        // MERGE: seed an ordered map from base, apply each overlay run (oldest->newest; a
+        // live row overwrites, a tombstone drops the pk), then the live 'd' delta (newest).
         std::map<Key, std::vector<Datum>> merged;  // key = encode_pk(pk) (pk-ascending)
         for (std::vector<Datum>& row : base) {
             merged[encode_pk(row[t.pk_index])] = std::move(row);
         }
-        for (const storage::KeyValue& kv : delta) {
-            if (is_tombstone(kv.second)) {
-                continue;  // (scan already drops these; defensive)
+        for (const auto& [run, nch] : manifest) {
+            (void)nch;
+            std::vector<std::vector<Datum>> rrows = overlay_run_rows(t, run, need);
+            for (std::vector<Datum>& row : rrows) {
+                merged[encode_pk(row[t.pk_index])] = std::move(row);
             }
-            const Datum pk = decode_pk_from_delta_key(t, kv.first);
-            const Key mk = encode_pk(pk);
-            if (is_row_del_marker(kv.second)) {
-                merged.erase(mk);  // delta delete shadows the block row
-                continue;
+            for (const Key& tk : load_tombs(t, run)) {
+                merged.erase(tk);  // a run's tombstone shadows older runs + base
             }
-            std::vector<Datum> row = decode_row_projected(t, encode_key(t, pk), kv.second, need);
-            merged[mk] = std::move(row);
         }
+        if (t.delta_dirty) {
+            std::vector<storage::KeyValue> delta;
+            if (auto e = scan_range_at_level(sel, row_delta_prefix(t.id),
+                                             row_delta_prefix_end(t.id), delta)) {
+                return e;
+            }
+            for (const storage::KeyValue& kv : delta) {
+                if (is_tombstone(kv.second)) {
+                    continue;
+                }
+                const Datum pk = decode_pk_from_delta_key(t, kv.first);
+                const Key mk = encode_pk(pk);
+                if (is_row_del_marker(kv.second)) {
+                    merged.erase(mk);
+                    continue;
+                }
+                std::vector<Datum> row =
+                    decode_row_projected(t, encode_key(t, pk), kv.second, need);
+                row[t.pk_index] = pk;  // ensure pk set (merge key + pk-between filter)
+                merged[mk] = std::move(row);
+            }
+        }
+        // Emit pk-ascending. Base was pre-filtered by pk_between; overlay/delta rows are not,
+        // so re-apply the pk range at output.
         rows_out.reserve(merged.size());
         for (auto& [k, row] : merged) {
             (void)k;
+            if (pk_between) {
+                const Datum& pk = row[t.pk_index];
+                if (pk.less_than(sel.lo_value) || sel.hi_value.less_than(pk)) {
+                    continue;
+                }
+            }
             rows_out.push_back(std::move(row));
         }
         return std::nullopt;
@@ -1306,8 +1592,11 @@ private:
     // conformance gate cross-checks this against).
     [[nodiscard]] std::optional<ExecResult> columnar_vectorized_agg(const Table& t,
                                                                     const SelectStmt& sel) {
-        if (t.delta_dirty || !has_blocks(t)) {
-            return std::nullopt;  // delta non-empty (generic merge) or pre-flush (no blocks)
+        if (t.delta_dirty || !has_blocks(t) || has_overlays(t)) {
+            // delta non-empty, pre-flush, or overlay runs present => the generic merge path
+            // (columnar_build_rows merges base+overlays+delta). The fast SoA path is the
+            // single-run clean-delta case (restored by compaction).
+            return std::nullopt;
         }
         std::vector<VecTerm> vterms;
         const bool has_filter = sel.filter.present();

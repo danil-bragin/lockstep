@@ -438,6 +438,61 @@ inline const std::string& row_del_marker() {
     k.push_back(';');  // ':' + 1 — exclusive upper bound of this column's blocks
     return k;
 }
+// MULTI-RUN LSM OVERLAY keys. Base = run 0 = the 'B' blocks (unchanged). A non-append flush
+// writes an OVERLAY RUN instead of rewriting the base: live rows as chunks under 'R', deleted
+// pks as a tombstone list under 'T', and the active-run list in a manifest under 'M'. Reads
+// merge base + overlay runs (newest run wins per pk; a tombstone drops it) + the live delta;
+// compaction folds everything back into run 0 and clears the overlays. Namespaces R/T/M are
+// disjoint from t/i/d/B/c/Z.
+[[nodiscard]] inline Key overlay_key(std::uint32_t table_id, std::uint32_t run,
+                                     std::uint32_t col_id, std::uint64_t chunk) {
+    Key k = "R";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, run);
+    k.push_back(':');
+    put_be32(k, col_id);
+    k.push_back(':');
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        k.push_back(static_cast<char>((chunk >> shift) & 0xFF));
+    }
+    return k;
+}
+[[nodiscard]] inline Key overlay_run_col_prefix(std::uint32_t table_id, std::uint32_t run,
+                                                std::uint32_t col_id) {
+    Key k = "R";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, run);
+    k.push_back(':');
+    put_be32(k, col_id);
+    k.push_back(':');
+    return k;
+}
+[[nodiscard]] inline Key overlay_run_col_prefix_end(std::uint32_t table_id, std::uint32_t run,
+                                                    std::uint32_t col_id) {
+    Key k = "R";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, run);
+    k.push_back(':');
+    put_be32(k, col_id);
+    k.push_back(';');
+    return k;
+}
+[[nodiscard]] inline Key overlay_tomb_key(std::uint32_t table_id, std::uint32_t run) {
+    Key k = "T";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, run);
+    return k;
+}
+[[nodiscard]] inline Key overlay_manifest_key(std::uint32_t table_id) {
+    Key k = "M";
+    put_be32(k, table_id);
+    return k;
+}
+
 // ZONE-MAP key (Phase 4 data skipping; namespace 'Z', disjoint from t/i/d/B/c). One KV per
 // columnar table holds every chunk's per-INT-column [min,max] so a WHERE col CMP literal can
 // SKIP chunks that can't match WITHOUT decoding their column blocks. Maintained on flush.
