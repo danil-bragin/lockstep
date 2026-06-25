@@ -254,6 +254,34 @@ void run_large() {
     both(col, row, "SELECT id, grp, val FROM big", "large-scan-after-shrink");
 }
 
+// AUTO-FLUSH gate: a columnar engine with set_auto_flush(threshold) self-flushes during the
+// write stream (no manual flush_columnar). Must stay byte-identical to a row-mode engine. The
+// monotonic inserts hit the incremental-append fast path; updates/deletes trigger a full flush.
+void run_autoflush() {
+    SqlEngine col;
+    col.set_columnar_default(true);
+    col.set_auto_flush(500);  // flush every ~500 delta writes
+    SqlEngine row;
+    const std::string ddl = "CREATE TABLE s (id INT, grp INT, val INT, PRIMARY KEY (id))";
+    both(col, row, ddl, "af-create");
+    for (std::size_t i = 0; i < 3000; ++i) {  // monotonic => incremental-append auto-flushes
+        both(col, row,
+             "INSERT INTO s (id, grp, val) VALUES (" + std::to_string(i) + ", " +
+                 std::to_string(i % 5) + ", " + std::to_string((i * 7) % 400) + ")",
+             "af-insert");
+    }
+    both(col, row, "SELECT COUNT(*), SUM(val) FROM s", "af-agg");
+    both(col, row, "SELECT grp, COUNT(*), SUM(val) FROM s GROUP BY grp", "af-groupby");
+    both(col, row, "SELECT id, val FROM s WHERE id BETWEEN 1500 AND 1510", "af-pk");
+    both(col, row, "SELECT id, val FROM s WHERE val > 390", "af-filter");
+    // Updates + deletes (trigger full auto-flushes) — still byte-identical to row-mode.
+    for (std::size_t i = 0; i < 600; ++i) {
+        both(col, row, "UPDATE s SET val = 999 WHERE id = " + std::to_string(i * 3), "af-update");
+    }
+    both(col, row, "SELECT COUNT(*), SUM(val) FROM s WHERE val = 999", "af-after-update");
+    both(col, row, "SELECT id, val FROM s WHERE id = 1500", "af-point");
+}
+
 }  // namespace
 
 int main() {
@@ -265,6 +293,7 @@ int main() {
         run_seed(s * 0x9E37ULL + 1);
     }
     run_large();
+    run_autoflush();
     if (g_fail == 0) {
         std::printf("sql_columnar_test: ALL PASS (columnar == row-mode across the workload)\n");
     }

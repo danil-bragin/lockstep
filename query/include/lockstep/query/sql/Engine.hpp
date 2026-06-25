@@ -266,6 +266,12 @@ public:
     // columnar conformance gate run the SAME workload with this on vs off.
     void set_columnar_default(bool v) { columnar_default_ = v; }
 
+    // Auto-flush a columnar table once its delta exceeds `rows` live writes (0 = off,
+    // manual flush only). Makes columnar self-managing — no explicit flush_columnar needed.
+    // Deterministic (count-based, not time). The append fast path keeps a monotonic-pk
+    // stream's auto-flushes O(delta).
+    void set_auto_flush(std::uint64_t rows) { auto_flush_rows_ = rows; }
+
     // FLUSH a columnar table's row 'd' delta into column blocks (LSM compaction): read the
     // merged live rows, pack each column into a block (block_no 0, overwrite), and clear
     // the delta — ALL in ONE atomic commit (the durable batch), so a crash leaves either
@@ -363,6 +369,7 @@ public:
         }
         commit_writes(writes);  // ATOMIC: blocks + delta clear in one durable batch
         t->delta_dirty = false;  // delta is now empty (compacted into blocks)
+        t->delta_count = 0;
         ++t->flush_gen;          // invalidate the decoded-block + zone cache for this table
         return std::nullopt;
     }
@@ -467,8 +474,21 @@ public:
         }
         commit_writes(writes);
         t.delta_dirty = false;
+        t.delta_count = 0;
         ++t.flush_gen;
         return true;
+    }
+
+    // Auto-flush a columnar table once its delta passes the threshold (self-managing). Called
+    // after each columnar write; a no-op when auto-flush is off or the delta is small.
+    void maybe_auto_flush(const std::string& table) {
+        if (auto_flush_rows_ == 0) {
+            return;
+        }
+        Table* mt = catalog_.find_mut(table);
+        if (mt != nullptr && mt->columnar && mt->delta_count >= auto_flush_rows_) {
+            (void)flush_columnar(table);
+        }
     }
 
 private:
@@ -1534,6 +1554,7 @@ private:
         if (Table* mt = catalog_.find_mut(ins.table)) {
             if (mt->columnar) {
                 mt->delta_dirty = true;  // the delta now has a live entry (until next flush)
+                ++mt->delta_count;
             }
             ++mt->row_count;  // a committed INSERT adds exactly one new row (dup PK is rejected)
             // Grow per-column INT min/max (skip NULLs). Stats may lag a DELETE of an extreme —
@@ -1555,6 +1576,7 @@ private:
                 }
             }
         }
+        maybe_auto_flush(ins.table);
         ExecResult r;
         r.affected = 1;
         return r;
@@ -1628,7 +1650,9 @@ private:
         if (t->columnar) {
             if (Table* mt = catalog_.find_mut(up.table)) {
                 mt->delta_dirty = true;
+                ++mt->delta_count;
             }
+            maybe_auto_flush(up.table);
         }
         ExecResult r;
         r.affected = 1;
@@ -1680,11 +1704,13 @@ private:
         if (Table* mt = catalog_.find_mut(del.table)) {
             if (mt->columnar) {
                 mt->delta_dirty = true;  // a del-marker now lives in the delta
+                ++mt->delta_count;
             }
             if (mt->row_count > 0) {
                 --mt->row_count;  // a committed DELETE removes exactly one present row
             }
         }
+        maybe_auto_flush(del.table);
         ExecResult r;
         r.affected = 1;
         return r;
@@ -4365,6 +4391,7 @@ private:
     PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run
     bool vectorize_ = true;            // vectorized filter fast path (test-toggleable)
     bool columnar_default_ = false;    // new tables use the columnar layout when set
+    std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change
     // only on flush). Perf-only: a pure function of the committed blocks, so results +
