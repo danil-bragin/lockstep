@@ -224,6 +224,7 @@ public:
         db_.recover(durable_len);
         tip_ = db_.tip();
         chunk_cache_.clear();  // recovered blocks may differ from any cached decode
+        concat_cache_.clear();
         zone_cache_.clear();
     }
 
@@ -956,23 +957,31 @@ private:
     }
 
     // Concatenate a column's (cached) chunks into one logical SoA chunk (all rows, pk-asc).
-    [[nodiscard]] ColumnChunk read_col_concat(const Table& t, std::uint32_t c) {
+    // CACHED (flush_gen-tagged): the build runs once per flush, then every aggregate/GROUP BY
+    // query over the column reuses it instead of re-concatenating ~8MB/Mrow each time.
+    [[nodiscard]] const ColumnChunk& read_col_concat(const Table& t, std::uint32_t c) {
+        const std::uint64_t key = (static_cast<std::uint64_t>(t.id) << 20) | c;
+        ConcatCacheEntry& slot = concat_cache_[key];
+        if (slot.gen == t.flush_gen + 1) {  // +1 so the default 0 never matches a real gen
+            return slot.col;
+        }
+        slot.gen = t.flush_gen + 1;
         const std::vector<ColumnChunk>& chunks = col_chunks_cached(t, c);
         ColumnChunk out;
-        if (chunks.empty()) {
-            return out;
-        }
-        out.type = chunks[0].type;
-        for (const ColumnChunk& ch : chunks) {
-            out.count += ch.count;
-            out.nulls.insert(out.nulls.end(), ch.nulls.begin(), ch.nulls.end());
-            if (out.type == Type::Int) {
-                out.ints.insert(out.ints.end(), ch.ints.begin(), ch.ints.end());
-            } else {
-                out.texts.insert(out.texts.end(), ch.texts.begin(), ch.texts.end());
+        if (!chunks.empty()) {
+            out.type = chunks[0].type;
+            for (const ColumnChunk& ch : chunks) {
+                out.count += ch.count;
+                out.nulls.insert(out.nulls.end(), ch.nulls.begin(), ch.nulls.end());
+                if (out.type == Type::Int) {
+                    out.ints.insert(out.ints.end(), ch.ints.begin(), ch.ints.end());
+                } else {
+                    out.texts.insert(out.texts.end(), ch.texts.begin(), ch.texts.end());
+                }
             }
         }
-        return out;
+        slot.col = std::move(out);
+        return slot.col;
     }
 
     // Concatenate ONLY the given chunk ids of column c (zone-map survivors) into one SoA
@@ -5199,6 +5208,15 @@ private:
         std::vector<ColumnChunk> chunks;
     };
     std::map<std::uint64_t, ChunkCacheEntry> chunk_cache_;  // key = (table_id<<20 | col_id)
+    // Cached full-column flat concat (all chunks of a column merged, pk-asc). The GROUP BY /
+    // aggregate path decodes whole columns; without this it re-concatenated them from the cached
+    // chunks on EVERY query (a fresh 8MB/Mrow build). Pure function of the committed blocks, so
+    // flush_gen-tagged + cleared on recover like chunk_cache_ — results + determinism unchanged.
+    struct ConcatCacheEntry {
+        std::uint64_t gen = 0;
+        ColumnChunk col;
+    };
+    std::map<std::uint64_t, ConcatCacheEntry> concat_cache_;  // key = (table_id<<20 | col_id)
     struct ZoneCacheEntry {
         std::uint64_t gen = 0;
         std::vector<std::vector<ColZone>> zones;
