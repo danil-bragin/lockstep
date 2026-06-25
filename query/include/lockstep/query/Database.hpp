@@ -299,7 +299,11 @@ private:
 
     core::Task apply_task(const txn::WriteSet& ws) {
         for (const auto& [k, v] : ws) {
-            (void)co_await engine_->put(k, v);
+            if (v == delete_sentinel()) {
+                (void)co_await engine_->del(k);  // real storage tombstone (scan-dropped + GC'd)
+            } else {
+                (void)co_await engine_->put(k, v);
+            }
         }
         // Durability barrier: every key-write of this committed write-set is durable
         // on the injected IDisk before the prefix boundary is recorded (so recovery

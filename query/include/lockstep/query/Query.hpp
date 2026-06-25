@@ -55,6 +55,16 @@ using Value = txn::Value;
 using Seq = txn::Seq;
 using SessionId = txn::SessionId;
 using Level = txn::Level;
+
+// A reserved WriteSet value meaning "DELETE this key": apply_committed turns it into a REAL
+// storage del() (a memtable tombstone the scan drops + compaction GCs) instead of a live
+// value that accumulates forever (the SQL tombstone-marker convention). A 1-byte 0xFF — no
+// real encoded SQL value/marker is a 1-byte 0xFF (column tags are 0x00/0x01/0xFE; the
+// columnar del-marker is 0x01; blocks/manifests are multi-byte), so there is no collision.
+inline const Value& delete_sentinel() {
+    static const Value s(1, static_cast<char>(0xFF));
+    return s;
+}
 inline constexpr Seq kNoSeq = txn::kNoSeq;
 
 // ----------------------------------------------------------------------------
