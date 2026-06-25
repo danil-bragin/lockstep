@@ -59,6 +59,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,34 @@ std::uint16_t parse_port(const char* s) {
         return 0;
     }
     return static_cast<std::uint16_t>(v);
+}
+
+// Cross-machine: optional dial host per admin port (port -> IP). A --host arg "HOST:PORT"
+// registers HOST for PORT; a bare "PORT" leaves the default 127.0.0.1. Keyed on PORT because
+// the admin/consensus port scheme is globally unique across processes, so the existing
+// uint16 port plumbing stays unchanged — only the Client connect resolves the host here.
+std::map<std::uint16_t, std::string> g_dial_hosts;
+
+std::string dial_host_for(std::uint16_t port) {
+    const auto it = g_dial_hosts.find(port);
+    return (it != g_dial_hosts.end() && !it->second.empty()) ? it->second
+                                                             : std::string("127.0.0.1");
+}
+
+// Parse a --host argument: "HOST:PORT" (records HOST for PORT) or "PORT". Returns the port.
+std::uint16_t parse_host_arg(const char* s) {
+    if (s == nullptr) {
+        return 0;
+    }
+    const char* colon = std::strrchr(s, ':');
+    if (colon != nullptr && colon != s) {
+        const std::uint16_t p = parse_port(colon + 1);
+        if (p != 0) {
+            g_dial_hosts[p] = std::string(s, colon);
+        }
+        return p;
+    }
+    return parse_port(s);
 }
 
 // ---- one STATUS round-trip (free function over stable pointers) ------------
@@ -217,7 +246,8 @@ struct Client {
         if (!bus.add_node(self_id)) {  // our own ephemeral client listen socket
             return;
         }
-        bus.add_peer(admin_peer_id, admin_port);  // record where the daemon's admin lives
+        // record where the daemon's admin lives (host from --host HOST:PORT, else loopback)
+        bus.add_peer(admin_peer_id, dial_host_for(admin_port), admin_port);
         ok = true;
     }
 
@@ -1321,7 +1351,7 @@ int main(int argc, char** argv) {
 
     for (; i < argc; ++i) {
         if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
-            const std::uint16_t p = parse_port(argv[i + 1]);
+            const std::uint16_t p = parse_host_arg(argv[i + 1]);  // "HOST:PORT" or "PORT"
             if (p != 0) {
                 hosts.push_back(p);
             }
