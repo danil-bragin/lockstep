@@ -229,7 +229,22 @@ void run_large() {
     both(col, row, "SELECT seq, COUNT(*) FROM big WHERE seq > 1500 GROUP BY seq", "large-zone-groupby");
     both(col, row, "SELECT COUNT(*) FROM big WHERE seq > 99999", "large-zone-allskip");
     both(col, row, "SELECT grp, COUNT(*), SUM(val) FROM big WHERE val > 250 GROUP BY grp", "large-zone-noskip");
-    // DELETE a big swathe, re-flush -> the table shrinks below 2 chunks; stale chunks retired.
+    // INCREMENTAL APPEND: insert ids ABOVE the current max (monotonic), flush -> the
+    // append fast path adds NEW chunks without rewriting existing blocks. Result must match
+    // row-mode (the differential catches a wrong append / zone / order).
+    for (std::size_t i = N; i < N + 1500; ++i) {
+        const std::string sql = "INSERT INTO big (id, grp, seq, val) VALUES (" +
+                                std::to_string(i) + ", " + std::to_string(i % 7) + ", " +
+                                std::to_string(i) + ", " + std::to_string((i * 13) % 500) + ")";
+        both(col, row, sql, "large-append-insert");
+    }
+    check(!col.flush_columnar("big").has_value(), "large incremental append flush");
+    both(col, row, "SELECT COUNT(*), SUM(val), MIN(seq), MAX(seq) FROM big", "large-append-agg");
+    both(col, row, "SELECT id, seq FROM big WHERE seq > 3500", "large-append-zone");
+    both(col, row, "SELECT id, val FROM big WHERE id BETWEEN 3000 AND 3010", "large-append-pk");
+    both(col, row, "SELECT grp, COUNT(*) FROM big GROUP BY grp", "large-append-groupby");
+
+    // DELETE a big swathe, re-flush -> the table shrinks; full flush retires stale chunks.
     for (std::size_t i = 1000; i < N; ++i) {
         both(col, row, "DELETE FROM big WHERE id = " + std::to_string(i), "large-delete");
     }

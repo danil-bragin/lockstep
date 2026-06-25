@@ -280,6 +280,16 @@ public:
         if (!t->columnar) {
             return std::nullopt;  // nothing to flush
         }
+        if (!t->delta_dirty) {
+            return std::nullopt;  // no writes since the last flush — nothing to compact
+        }
+        // INCREMENTAL APPEND fast path: if the delta is purely NEW rows whose pks are all
+        // GREATER than every flushed pk (the streaming / monotonic-id case — no
+        // update/delete/mid-insert), APPEND them as new chunks instead of rewriting the
+        // whole table. O(delta) not O(rows); the existing column blocks are untouched.
+        if (try_incremental_flush(*t)) {
+            return std::nullopt;
+        }
         SelectStmt full;
         full.table = table;
         full.level = Level::StrictSerializable;
@@ -355,6 +365,110 @@ public:
         t->delta_dirty = false;  // delta is now empty (compacted into blocks)
         ++t->flush_gen;          // invalidate the decoded-block + zone cache for this table
         return std::nullopt;
+    }
+
+    // Incremental APPEND flush (true if handled). Pure-append case only: the table already
+    // has blocks, the delta is non-empty + ALL live (no del-markers), and EVERY delta pk is
+    // strictly greater than the max flushed pk (no overwrite / mid-insert / delete). Packs
+    // the delta into NEW chunks appended after the existing ones — the existing column
+    // blocks are UNTOUCHED (O(delta), not O(rows)); only the small zone map is rewritten +
+    // the delta cleared, in ONE atomic commit. The chunks stay pk-disjoint + ascending, so
+    // every read path is unchanged. Anything not pure-append => false => the full flush runs.
+    [[nodiscard]] bool try_incremental_flush(Table& t) {
+        const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
+        // The chunk count comes from the (cached, small) zone map; the max flushed pk from
+        // decoding ONLY the last pk chunk. No full-column decode => the flush stays O(delta).
+        const std::vector<std::vector<ColZone>>& zmap = load_zones(t);
+        const std::uint64_t old_nchunks = zmap.size();
+        if (old_nchunks == 0) {
+            return false;  // no blocks yet — let the full flush build the initial blocks
+        }
+        const ReadResult lastb = read_committed(block_key(t.id, pkc_id, old_nchunks - 1));
+        if (!lastb.has_value() || is_tombstone(*lastb)) {
+            return false;
+        }
+        const ColumnChunk last_pkc = decode_column_block(*lastb);
+        if (last_pkc.count == 0) {
+            return false;
+        }
+        const Datum max_pk = last_pkc.at(last_pkc.count - 1);
+
+        std::vector<storage::KeyValue> delta;
+        {
+            Query<Strict> q;
+            q.scan(row_delta_prefix(t.id), row_delta_prefix_end(t.id));
+            collect(db_.run(q), delta);
+        }
+        if (delta.empty()) {
+            return false;
+        }
+        std::vector<std::vector<Datum>> newrows;  // pk-ascending (delta keys are pk-ordered)
+        newrows.reserve(delta.size());
+        const std::vector<bool> all(t.columns.size(), true);
+        for (const storage::KeyValue& kv : delta) {
+            if (is_row_del_marker(kv.second)) {
+                return false;  // a delete — not a pure append
+            }
+            const Datum pk = decode_pk_from_delta_key(t, kv.first);
+            if (!max_pk.less_than(pk)) {
+                return false;  // pk <= max flushed pk — would overwrite / mis-order
+            }
+            newrows.push_back(decode_row_projected(t, encode_key(t, pk), kv.second, all));
+        }
+        const std::size_t nnew = newrows.size();
+        const std::uint64_t nnewchunks = (nnew + kChunkRows - 1) / kChunkRows;
+        std::vector<std::pair<Key, Value>> writes;
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            for (std::uint64_t j = 0; j < nnewchunks; ++j) {
+                const std::size_t lo = static_cast<std::size_t>(j) * kChunkRows;
+                const std::size_t hi = std::min(lo + kChunkRows, nnew);
+                std::vector<Datum> cells;
+                cells.reserve(hi - lo);
+                for (std::size_t rr = lo; rr < hi; ++rr) {
+                    cells.push_back(newrows[rr][c]);
+                }
+                writes.emplace_back(
+                    block_key(t.id, static_cast<std::uint32_t>(c), old_nchunks + j),
+                    encode_column_block(t.columns[c].type, cells));
+            }
+        }
+        std::vector<std::vector<ColZone>> zones = zmap;  // existing (copy) + append new chunks
+        if (zones.size() != old_nchunks) {
+            return false;  // zone map out of sync — fall back to a full flush
+        }
+        for (std::uint64_t j = 0; j < nnewchunks; ++j) {
+            const std::size_t lo = static_cast<std::size_t>(j) * kChunkRows;
+            const std::size_t hi = std::min(lo + kChunkRows, nnew);
+            std::vector<ColZone> zr(t.columns.size());
+            for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                if (t.columns[c].type != Type::Int) {
+                    continue;
+                }
+                ColZone& cz = zr[c];
+                for (std::size_t rr = lo; rr < hi; ++rr) {
+                    const Datum& d = newrows[rr][c];
+                    if (d.is_null) {
+                        continue;
+                    }
+                    if (!cz.has) {
+                        cz.has = true;
+                        cz.lo = cz.hi = d.i;
+                    } else {
+                        cz.lo = std::min(cz.lo, d.i);
+                        cz.hi = std::max(cz.hi, d.i);
+                    }
+                }
+            }
+            zones.push_back(std::move(zr));
+        }
+        writes.emplace_back(zone_key(t.id), encode_zone_map(zones, t.columns.size()));
+        for (const storage::KeyValue& kv : delta) {
+            writes.emplace_back(kv.first, tombstone_marker());  // clear the delta
+        }
+        commit_writes(writes);
+        t.delta_dirty = false;
+        ++t.flush_gen;
+        return true;
     }
 
 private:
