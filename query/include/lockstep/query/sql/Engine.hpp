@@ -347,22 +347,9 @@ public:
             const std::size_t lo = static_cast<std::size_t>(j) * kChunkRows;
             const std::size_t hi = std::min(lo + kChunkRows, nrows);
             for (std::size_t c = 0; c < t->columns.size(); ++c) {
-                if (t->columns[c].type != Type::Int) {
-                    continue;
-                }
                 ColZone& cz = zones[static_cast<std::size_t>(j)][c];
                 for (std::size_t r = lo; r < hi; ++r) {
-                    const Datum& d = rows[r][c];
-                    if (d.is_null) {
-                        continue;
-                    }
-                    if (!cz.has) {
-                        cz.has = true;
-                        cz.lo = cz.hi = d.i;
-                    } else {
-                        cz.lo = std::min(cz.lo, d.i);
-                        cz.hi = std::max(cz.hi, d.i);
-                    }
+                    zone_add(cz, rows[r][c]);
                 }
             }
         }
@@ -484,22 +471,8 @@ public:
             const std::size_t hi = std::min(lo + kChunkRows, nnew);
             std::vector<ColZone> zr(t.columns.size());
             for (std::size_t c = 0; c < t.columns.size(); ++c) {
-                if (t.columns[c].type != Type::Int) {
-                    continue;
-                }
-                ColZone& cz = zr[c];
                 for (std::size_t rr = lo; rr < hi; ++rr) {
-                    const Datum& d = newrows[rr][c];
-                    if (d.is_null) {
-                        continue;
-                    }
-                    if (!cz.has) {
-                        cz.has = true;
-                        cz.lo = cz.hi = d.i;
-                    } else {
-                        cz.lo = std::min(cz.lo, d.i);
-                        cz.hi = std::max(cz.hi, d.i);
-                    }
+                    zone_add(zr[c], newrows[rr][c]);
                 }
             }
             zones.push_back(std::move(zr));
@@ -1155,16 +1128,21 @@ private:
         Datum lit;
     };
 
-    // Per-chunk, per-column value range. INT columns only; `has` false => non-INT, or the
-    // column is all-NULL in this chunk (a comparison then matches nothing => the chunk is
-    // skippable for a conjunct on that column).
+    // Per-chunk, per-column value range. `has` false => non-zoned, or the column is all-NULL
+    // in this chunk (a comparison then matches nothing => the chunk is skippable). INT zones
+    // use lo/hi; TEXT zones use tlo/thi (lexicographic min/max).
     struct ColZone {
         bool has = false;
+        bool is_text = false;
         std::int64_t lo = 0;
         std::int64_t hi = 0;
+        std::string tlo;
+        std::string thi;
     };
 
-    // Encode a zone map: [be32 nchunks][be32 ncols] then per (chunk,col) [u8 has][be64 lo][be64 hi].
+    // Encode a zone map: [be32 nchunks][be32 ncols] then per (chunk,col) [u8 flags]; if has,
+    // INT => [be64 lo][be64 hi], TEXT => [be32 lolen][lo][be32 hilen][hi]. flags bit0=has,
+    // bit1=is_text. Variable length (TEXT min/max are strings).
     [[nodiscard]] static std::string encode_zone_map(
         const std::vector<std::vector<ColZone>>& z, std::size_t ncols) {
         std::string out;
@@ -1172,9 +1150,20 @@ private:
         put_be32(out, static_cast<std::uint32_t>(ncols));
         for (const std::vector<ColZone>& chunk : z) {
             for (const ColZone& cz : chunk) {
-                out.push_back(cz.has ? '\x01' : '\x00');
-                put_be64(out, static_cast<std::uint64_t>(cz.lo));
-                put_be64(out, static_cast<std::uint64_t>(cz.hi));
+                const unsigned flags = (cz.has ? 1u : 0u) | (cz.is_text ? 2u : 0u);
+                out.push_back(static_cast<char>(flags));
+                if (!cz.has) {
+                    continue;
+                }
+                if (cz.is_text) {
+                    put_be32(out, static_cast<std::uint32_t>(cz.tlo.size()));
+                    out += cz.tlo;
+                    put_be32(out, static_cast<std::uint32_t>(cz.thi.size()));
+                    out += cz.thi;
+                } else {
+                    put_be64(out, static_cast<std::uint64_t>(cz.lo));
+                    put_be64(out, static_cast<std::uint64_t>(cz.hi));
+                }
             }
         }
         return out;
@@ -1190,12 +1179,27 @@ private:
         for (std::uint32_t j = 0; j < nch; ++j) {
             for (std::uint32_t c = 0; c < nc; ++c) {
                 ColZone cz;
-                cz.has = static_cast<unsigned char>(v[off]) != 0;
+                const unsigned flags = static_cast<unsigned char>(v[off]);
                 off += 1;
-                cz.lo = static_cast<std::int64_t>(get_be64(v, off));
-                off += 8;
-                cz.hi = static_cast<std::int64_t>(get_be64(v, off));
-                off += 8;
+                cz.has = (flags & 1u) != 0;
+                cz.is_text = (flags & 2u) != 0;
+                if (cz.has) {
+                    if (cz.is_text) {
+                        const std::uint32_t ll = get_be32(v, off);
+                        off += 4;
+                        cz.tlo = v.substr(off, ll);
+                        off += ll;
+                        const std::uint32_t hl = get_be32(v, off);
+                        off += 4;
+                        cz.thi = v.substr(off, hl);
+                        off += hl;
+                    } else {
+                        cz.lo = static_cast<std::int64_t>(get_be64(v, off));
+                        off += 8;
+                        cz.hi = static_cast<std::int64_t>(get_be64(v, off));
+                        off += 8;
+                    }
+                }
                 z[j][c] = cz;
             }
         }
@@ -1215,27 +1219,72 @@ private:
         return slot.zones;
     }
 
-    // Can chunk j be SKIPPED given the conjunctive filter? Skippable if ANY conjunct on an
-    // INT column proves NO row in the chunk can satisfy it (AND semantics: one unsatisfiable
-    // conjunct => the whole AND fails for every row). Conservative: unknown => don't skip.
+    // Fold one cell into a chunk's column zone (INT lo/hi or TEXT tlo/thi; NULL skipped).
+    static void zone_add(ColZone& cz, const Datum& d) {
+        if (d.is_null) {
+            return;
+        }
+        if (d.type == Type::Int) {
+            cz.is_text = false;
+            if (!cz.has) {
+                cz.has = true;
+                cz.lo = cz.hi = d.i;
+            } else {
+                cz.lo = std::min(cz.lo, d.i);
+                cz.hi = std::max(cz.hi, d.i);
+            }
+        } else {
+            cz.is_text = true;
+            if (!cz.has) {
+                cz.has = true;
+                cz.tlo = cz.thi = d.s;
+            } else {
+                if (d.s < cz.tlo) {
+                    cz.tlo = d.s;
+                }
+                if (d.s > cz.thi) {
+                    cz.thi = d.s;
+                }
+            }
+        }
+    }
+
+    // Can chunk j be SKIPPED given the conjunctive filter? Skippable if ANY conjunct proves NO
+    // row in the chunk can satisfy it (AND semantics: one unsatisfiable conjunct => the whole
+    // AND fails for every row). INT + TEXT (lexicographic). Conservative: unknown => no skip.
     [[nodiscard]] static bool chunk_skippable(const std::vector<ColZone>& zrow,
                                               const std::vector<VecTerm>& vterms) {
         for (const VecTerm& vt : vterms) {
-            if (vt.lit.type != Type::Int || vt.lit.is_null || vt.col >= zrow.size()) {
-                continue;  // zone skipping is INT-only
+            if (vt.lit.is_null || vt.col >= zrow.size()) {
+                continue;
             }
             const ColZone& cz = zrow[vt.col];
-            const std::int64_t x = vt.lit.i;
-            if (!cz.has) {
-                return true;  // INT col all-NULL in this chunk => the conjunct matches nothing
-            }
-            switch (vt.op) {
-                case CmpOp::Gt: if (cz.hi <= x) return true; break;
-                case CmpOp::Ge: if (cz.hi < x) return true; break;
-                case CmpOp::Lt: if (cz.lo >= x) return true; break;
-                case CmpOp::Le: if (cz.lo > x) return true; break;
-                case CmpOp::Eq: if (x < cz.lo || x > cz.hi) return true; break;
-                case CmpOp::Ne: break;  // != almost always has a match — never skip
+            if (vt.lit.type == Type::Int && !cz.is_text) {
+                if (!cz.has) {
+                    return true;  // INT col all-NULL in chunk => the conjunct matches nothing
+                }
+                const std::int64_t x = vt.lit.i;
+                switch (vt.op) {
+                    case CmpOp::Gt: if (cz.hi <= x) return true; break;
+                    case CmpOp::Ge: if (cz.hi < x) return true; break;
+                    case CmpOp::Lt: if (cz.lo >= x) return true; break;
+                    case CmpOp::Le: if (cz.lo > x) return true; break;
+                    case CmpOp::Eq: if (x < cz.lo || x > cz.hi) return true; break;
+                    case CmpOp::Ne: break;
+                }
+            } else if (vt.lit.type == Type::Text && cz.is_text) {
+                if (!cz.has) {
+                    return true;  // TEXT col all-NULL in chunk => the conjunct matches nothing
+                }
+                const std::string& x = vt.lit.s;  // lexicographic min/max
+                switch (vt.op) {
+                    case CmpOp::Gt: if (cz.thi <= x) return true; break;
+                    case CmpOp::Ge: if (cz.thi < x) return true; break;
+                    case CmpOp::Lt: if (cz.tlo >= x) return true; break;
+                    case CmpOp::Le: if (cz.tlo > x) return true; break;
+                    case CmpOp::Eq: if (x < cz.tlo || x > cz.thi) return true; break;
+                    case CmpOp::Ne: break;
+                }
             }
         }
         return false;

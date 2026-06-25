@@ -315,6 +315,31 @@ void run_overlays() {
     both(col, row, "SELECT id, a, b FROM o", "ov-final-scan");
 }
 
+// TEXT ZONE-MAP gate: a monotonic zero-padded TEXT column => chunks have disjoint lexicographic
+// ranges => a WHERE tag <op> 'literal' exercises TEXT zone skipping. Must equal row-mode whether
+// chunks are skipped or not.
+void run_text_zones() {
+    SqlEngine col;
+    col.set_columnar_default(true);
+    SqlEngine row;
+    both(col, row, "CREATE TABLE tz (id INT, tag TEXT, v INT, PRIMARY KEY (id))", "tz-create");
+    auto pad = [](int i) {
+        std::string s = std::to_string(i);
+        return std::string(6 - s.size(), '0') + s;  // zero-padded => lexicographic == numeric
+    };
+    for (int i = 0; i < 3000; ++i) {
+        both(col, row, "INSERT INTO tz (id, tag, v) VALUES (" + std::to_string(i) + ", 't" +
+                           pad(i) + "', " + std::to_string(i % 400) + ")", "tz-ins");
+    }
+    check(!col.flush_columnar("tz").has_value(), "tz flush");
+    both(col, row, "SELECT COUNT(*), SUM(v) FROM tz WHERE tag > 't002500'", "tz-gt");
+    both(col, row, "SELECT id, v FROM tz WHERE tag = 't001234'", "tz-eq");
+    both(col, row, "SELECT COUNT(*) FROM tz WHERE tag < 't000500'", "tz-lt");
+    both(col, row, "SELECT id, tag FROM tz WHERE tag >= 't002990'", "tz-ge");
+    both(col, row, "SELECT COUNT(*) FROM tz WHERE tag = 'zzz_absent'", "tz-allskip");
+    both(col, row, "SELECT tag, COUNT(*) FROM tz WHERE tag > 't002000' GROUP BY tag", "tz-groupby");
+}
+
 }  // namespace
 
 int main() {
@@ -328,6 +353,7 @@ int main() {
     run_large();
     run_autoflush();
     run_overlays();
+    run_text_zones();
     if (g_fail == 0) {
         std::printf("sql_columnar_test: ALL PASS (columnar == row-mode across the workload)\n");
     }
