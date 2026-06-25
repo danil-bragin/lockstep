@@ -112,9 +112,17 @@ struct Table {
 
     // STATISTICS (PERF_PLAN Phase 2) — maintained incrementally on write so the cost-based
     // planner can estimate cardinalities without a scan. row_count is exact (INSERT +1 on a
-    // new PK, DELETE -1 on a present row, UPDATE no change). Deterministic (a pure function
-    // of the committed write sequence). Future: per-column n_distinct / min / max / histogram.
+    // new PK, DELETE -1 on a present row, UPDATE no change). Per-column min/max (INT) track the
+    // OBSERVED value range (grow-only — a DELETE of an extreme leaves a slightly-wide range,
+    // fine for an estimate). Deterministic (a pure function of the committed write sequence).
+    // Future: n_distinct (HLL) + equi-depth histograms for eq selectivity.
     std::size_t row_count = 0;
+    struct ColStat {
+        bool seen = false;       // any INT value observed
+        std::int64_t lo = 0;     // observed min
+        std::int64_t hi = 0;     // observed max
+    };
+    std::vector<ColStat> col_stats;  // one per column (sized at CREATE; INT columns only)
 
     [[nodiscard]] const Column& pk() const { return columns[pk_index]; }
 

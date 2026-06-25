@@ -264,6 +264,7 @@ private:
         // could never be addressed by the order-preserving key encoding). Force it
         // regardless of any NOT NULL spelling in the DDL.
         t.columns[t.pk_index].nullable = false;
+        t.col_stats.assign(t.columns.size(), Table::ColStat{});  // per-column stats (Phase 2)
         (void)catalog_.create(std::move(t));
         return ExecResult{};
     }
@@ -471,6 +472,24 @@ private:
         commit_writes(writes);
         if (Table* mt = catalog_.find_mut(ins.table)) {
             ++mt->row_count;  // a committed INSERT adds exactly one new row (dup PK is rejected)
+            // Grow per-column INT min/max (skip NULLs). Stats may lag a DELETE of an extreme —
+            // acceptable for a cost estimate (a slightly-wide range under-estimates selectivity).
+            if (mt->col_stats.size() == row.size()) {
+                for (std::size_t c = 0; c < row.size(); ++c) {
+                    if (row[c].type != Type::Int || row[c].is_null) {
+                        continue;
+                    }
+                    Table::ColStat& cs = mt->col_stats[c];
+                    if (!cs.seen) {
+                        cs.seen = true;
+                        cs.lo = row[c].i;
+                        cs.hi = row[c].i;
+                    } else {
+                        cs.lo = row[c].i < cs.lo ? row[c].i : cs.lo;
+                        cs.hi = row[c].i > cs.hi ? row[c].i : cs.hi;
+                    }
+                }
+            }
         }
         ExecResult r;
         r.affected = 1;
@@ -2024,6 +2043,32 @@ private:
     std::size_t est_eq_matches(std::size_t n) const { return n / 100 + 1; }
     std::size_t est_range_matches(std::size_t n) const { return (n * 3) / 10 + 1; }
 
+    // Range selectivity from per-column min/max (Phase 2 stats) when available: the fraction
+    // of the observed [min,max] the query's [lo,hi] covers, times row_count. Falls back to the
+    // 30% heuristic when there are no INT stats. This is what fixes the visibly-wrong range
+    // estimate (e.g. BETWEEN 0 AND 1900 over [0,2000) is ~95%, not 30%).
+    std::size_t est_range_rows(const Table& t, std::size_t col, const Datum& lo_d,
+                               const Datum& hi_d) const {
+        if (col < t.col_stats.size() && t.col_stats[col].seen && lo_d.type == Type::Int &&
+            hi_d.type == Type::Int) {
+            const Table::ColStat& cs = t.col_stats[col];
+            const std::int64_t span = cs.hi - cs.lo;
+            if (span <= 0) {
+                return t.row_count == 0 ? 1 : t.row_count;  // single observed value
+            }
+            const std::int64_t lo = lo_d.i > cs.lo ? lo_d.i : cs.lo;
+            const std::int64_t hi = hi_d.i < cs.hi ? hi_d.i : cs.hi;
+            if (hi < lo) {
+                return 1;
+            }
+            const double frac = static_cast<double>(hi - lo + 1) /
+                                static_cast<double>(span + 1);
+            const auto r = static_cast<std::size_t>(frac * static_cast<double>(t.row_count));
+            return r < 1 ? 1 : r;
+        }
+        return est_range_matches(t.row_count);
+    }
+
     AccessPath choose_access_path(const SelectStmt& sel, const Table& t) {
         AccessPath ap;
         const bool pk_fast = sel.where != SelectWhereKind::None &&
@@ -2036,7 +2081,8 @@ private:
             if (auto plan = choose_index_access(sel, t)) {
                 const std::size_t n = t.row_count;
                 const std::size_t matches =
-                    plan->is_eq ? est_eq_matches(n) : est_range_matches(n);
+                    plan->is_eq ? est_eq_matches(n)
+                                : est_range_rows(t, plan->index->column, plan->lo, plan->hi);
                 constexpr std::size_t kFetch = 3;  // point-get cost per matched row
                 const std::size_t idx_cost = ilog2(n) + matches * kFetch;
                 const std::size_t seq_cost = n;
@@ -2059,8 +2105,9 @@ private:
             case AccessPath::Kind::PkRange:
                 return est_range_matches(t.row_count);
             case AccessPath::Kind::Index:
-                return ap.index.is_eq ? est_eq_matches(t.row_count)
-                                      : est_range_matches(t.row_count);
+                return ap.index.is_eq
+                           ? est_eq_matches(t.row_count)
+                           : est_range_rows(t, ap.index.index->column, ap.index.lo, ap.index.hi);
             case AccessPath::Kind::Seq:
                 return t.row_count;
         }
