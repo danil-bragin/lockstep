@@ -1469,6 +1469,89 @@ private:
         return std::nullopt;
     }
 
+    // Fold ONE aggregate over the WHOLE column [0,count) — CONTIGUOUS (no index gather), so
+    // the SUM/MIN/MAX loops auto-vectorize (SIMD) at -O2. For a NOT NULL column there is no
+    // per-element null branch (the branch that otherwise defeats vectorization). Used by the
+    // ungrouped, unfiltered aggregate fast path; byte-identical to compute_agg_soa over
+    // idxs=[0,count).
+    [[nodiscard]] Datum compute_agg_full(const AggExpr& a, const Table& t,
+                                         const std::vector<ColumnChunk>& cols,
+                                         std::uint32_t count) {
+        if (a.kind == AggKind::CountStar) {
+            return Datum::make_int(static_cast<std::int64_t>(count));
+        }
+        const std::size_t ci = *t.column_index(a.column);
+        const ColumnChunk& cc = cols[ci];
+        const Type ty = t.columns[ci].type;
+        const bool no_nulls = !t.columns[ci].nullable;  // NOT NULL => skip the null branch
+        if (a.kind == AggKind::Count) {
+            if (no_nulls) {
+                return Datum::make_int(static_cast<std::int64_t>(count));
+            }
+            std::int64_t c = 0;
+            for (std::uint32_t r = 0; r < count; ++r) {
+                if (!cc.nulls[r]) {
+                    ++c;
+                }
+            }
+            return Datum::make_int(c);
+        }
+        if (count == 0) {
+            return Datum::make_int(0);
+        }
+        if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
+            if (ty == Type::Int && no_nulls) {  // tight SIMD min/max over the raw int64 array
+                std::int64_t best = cc.ints[0];
+                if (a.kind == AggKind::Min) {
+                    for (std::uint32_t r = 1; r < count; ++r) {
+                        if (cc.ints[r] < best) best = cc.ints[r];
+                    }
+                } else {
+                    for (std::uint32_t r = 1; r < count; ++r) {
+                        if (cc.ints[r] > best) best = cc.ints[r];
+                    }
+                }
+                return Datum::make_int(best);
+            }
+            Datum best;  // nullable or TEXT — per-element with the null check
+            bool any = false;
+            for (std::uint32_t r = 0; r < count; ++r) {
+                if (cc.nulls[r]) continue;
+                const Datum v = cc.at(r);
+                if (!any) { best = v; any = true; }
+                else {
+                    const int c = cmp_datum(v, best);
+                    if ((a.kind == AggKind::Min && c < 0) || (a.kind == AggKind::Max && c > 0)) {
+                        best = v;
+                    }
+                }
+            }
+            return any ? best : Datum::make_null(ty);
+        }
+        // SUM / AVG over INT
+        std::int64_t sum = 0;
+        std::int64_t n = 0;
+        if (no_nulls) {
+            for (std::uint32_t r = 0; r < count; ++r) {  // contiguous => auto-vectorized
+                sum += cc.ints[r];
+            }
+            n = count;
+        } else {
+            for (std::uint32_t r = 0; r < count; ++r) {
+                if (cc.nulls[r]) continue;
+                sum += cc.ints[r];
+                ++n;
+            }
+        }
+        if (n == 0) {
+            return a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
+        }
+        if (a.kind == AggKind::Sum) {
+            return Datum::make_int(sum);
+        }
+        return Datum::make_int(sum / n);  // AVG: trunc toward zero
+    }
+
     // Fold ONE aggregate over a SoA index subset (a group's member rows, or the whole
     // selection for an ungrouped query). Replicates compute_agg's semantics EXACTLY: NULL
     // skipping, empty-group=0, all-NULL group => SUM 0 / MIN/MAX/AVG typed NULL, AVG int
@@ -1746,6 +1829,24 @@ private:
         }
         if (!count_set) {  // COUNT(*) only, no filter/group — the pk column gives the count
             count = decode_col(static_cast<std::uint32_t>(t.pk_index)).count;
+        }
+        // SIMD FAST PATH: an UNGROUPED, UNFILTERED scalar aggregate folds each column over the
+        // whole CONTIGUOUS [0,count) array (compute_agg_full auto-vectorizes; no group map, no
+        // index gather). The common analytical SELECT SUM/COUNT/MIN/MAX FROM t.
+        if (gcols.empty() && !has_filter && !has_having) {
+            ResultRow out;
+            for (const SelectItem& item : sel.items) {
+                out.cells.emplace_back(item.label, compute_agg_full(item.agg, t, cols, count));
+            }
+            ExecResult rr;
+            rr.rows.push_back(std::move(out));
+            apply_distinct(sel, rr.rows);
+            if (auto e = apply_order_by_labels(sel, rr.rows)) {
+                return ExecResult::failure(*e);
+            }
+            apply_limit(sel, rr.rows);
+            rr.affected = rr.rows.size();
+            return rr;
         }
         // Build groups: ordered map keyed by the group-column tuple (group_key_field == the
         // exact key exec_aggregate uses => identical group order). Value = (member indices,
