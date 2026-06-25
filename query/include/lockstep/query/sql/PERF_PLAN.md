@@ -58,6 +58,27 @@ allows (portable + deterministic). This amortizes the per-row coroutine/dispatch
 and is where we beat Postgres on analytics. Determinism preserved (batch boundaries are a pure
 function of input; results order-identical).
 
+### Phase 3C — COLUMNAR STORAGE ENGINE (option A — the chosen path to the 43% ceiling + SoA win)
+The naive per-cell-KV columnar (Phase 3B) was correct but SLOWER (per-scan + per-cell-KV
+overhead). The real win needs columnar BLOCKS (struct-of-arrays chunks), proven:
+- **SoA filter/agg/project = 2.92x** vs AoS (vector<vector<Datum>>) on 100k rows (CPU-bound,
+  cache + branchless).
+- **End-to-end block-decode + SoA scan = 5.37x** vs row decode + AoS, INCLUDING decode — bulk
+  block decode beats N per-row vector<Datum> allocs.
+DESIGN (durability-controlled): the durable KV core (WAL framing/CRC, fsync, recovery prefix,
+jepsen acked==durable) is UNCHANGED — a columnar block is a KV VALUE written through the SAME
+verified commit path. Block layout = one column's chunk of ~1024 rows in SoA
+([u8 type][be32 count][null bitmap][INT: count×be64 | TEXT: arena+offsets]); deterministic,
+byte-exact, platform-independent. Rollout (each gated, durability re-verified):
+  * A2 (DONE): `query/sql/ColumnBlock.hpp` — encode/decode SoA block + isolated round-trip +
+    determinism gate (`tests/sql_column_block_test.cpp`). Foundation; nothing wired yet.
+  * A3: block STORAGE — key=(table,col,block_no), value=block; LSM-style flush of a row-ish
+    memtable delta into immutable columnar blocks (reuses the WAL; flush atomicity + recovery
+    under jepsen). Single-row INSERT/UPDATE = delta + periodic flush.
+  * A4: block READ — scan reads ONLY needed columns' blocks → SoA → vectorized operators
+    (filter/agg/project), zip by row position. Conformance == row-mode + the measured win.
+  * A5: MVCC over blocks (snapshot reads) + the full durability re-gate (jepsen fault storm).
+
 ### Phase 4 — data skipping + encoding
 Zone maps (min/max per storage block) → skip blocks that can't match a predicate. Dictionary/RLE
 for TEXT columns. Late materialization (carry PKs/row-ids through filters/joins, fetch wide columns

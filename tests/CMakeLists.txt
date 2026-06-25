@@ -967,6 +967,24 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_columnar_codec_test COMMAND lockstep_sql_columnar_codec_test)
 
+  # sql_column_block_test: the DURABLE columnar SoA-block codec gate (pure functions).
+  # Proves the byte-exact block serialisation (round-trip INT/TEXT/NULL + determinism +
+  # empty/all-null) BEFORE the columnar storage engine's write/read/flush path is wired,
+  # so a format bug can't reach the durable core. Foundation of columnar option A.
+  add_executable(lockstep_sql_column_block_test sql_column_block_test.cpp)
+  target_include_directories(lockstep_sql_column_block_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_column_block_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_column_block_test COMMAND lockstep_sql_column_block_test)
+
   # sql_columnar_test: the COLUMNAR layout end-to-end conformance gate. Runs an IDENTICAL
   # seeded workload (INSERT/NULL/UPDATE/DELETE/projection/PK-fast/filter/aggregate/index)
   # on a columnar engine and a row-mode engine; asserts byte-identical output for every
