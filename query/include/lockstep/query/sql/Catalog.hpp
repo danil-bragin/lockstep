@@ -110,6 +110,12 @@ struct Table {
     std::vector<Index> indexes;       // secondary indexes (in CREATE order)
     std::uint32_t next_index_id = 1;  // dense index-id assignment (0 reserved)
 
+    // STATISTICS (PERF_PLAN Phase 2) — maintained incrementally on write so the cost-based
+    // planner can estimate cardinalities without a scan. row_count is exact (INSERT +1 on a
+    // new PK, DELETE -1 on a present row, UPDATE no change). Deterministic (a pure function
+    // of the committed write sequence). Future: per-column n_distinct / min / max / histogram.
+    std::size_t row_count = 0;
+
     [[nodiscard]] const Column& pk() const { return columns[pk_index]; }
 
     // Find a secondary index BY the column it covers; returns it or nullptr. (v1:

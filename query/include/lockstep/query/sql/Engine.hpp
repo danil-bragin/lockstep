@@ -469,6 +469,9 @@ private:
         std::vector<std::pair<Key, Value>> writes{{key, enc}};
         index_writes_for_row(*t, row, /*tombstone=*/false, writes);
         commit_writes(writes);
+        if (Table* mt = catalog_.find_mut(ins.table)) {
+            ++mt->row_count;  // a committed INSERT adds exactly one new row (dup PK is rejected)
+        }
         ExecResult r;
         r.affected = 1;
         return r;
@@ -558,6 +561,11 @@ private:
         std::vector<std::pair<Key, Value>> writes{{key, tombstone_marker()}};
         index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
         commit_writes(writes);
+        if (Table* mt = catalog_.find_mut(del.table)) {
+            if (mt->row_count > 0) {
+                --mt->row_count;  // a committed DELETE removes exactly one present row
+            }
+        }
         ExecResult r;
         r.affected = 1;
         return r;
@@ -588,6 +596,7 @@ private:
         Kind kind = Kind::SeqScan;
         std::string detail;                    // table / index / key description
         std::vector<PlanNode> children;        // inputs (0 for a scan, 1 unary, 2 join)
+        std::int64_t est = -1;                 // cost-model ESTIMATED rows out (-1 = n/a)
         std::int64_t actual = -1;              // ANALYZE: actual rows out (-1 = not measured)
     };
 
@@ -643,9 +652,12 @@ private:
                 node.detail = t.name;
                 break;
         }
+        node.est = static_cast<std::int64_t>(est_path_rows(ap, t));
         // Residual WHERE filter (unless the whole WHERE was a pure-PK fast path).
         if (sel.filter.present() && !ap.pk_fast()) {
+            const std::int64_t child_est = node.est;
             node = wrap(PlanNode::Kind::Filter, "WHERE residual predicate", std::move(node));
+            node.est = child_est >= 0 ? child_est / 2 : -1;  // ~50% residual selectivity
         }
         if (sel.has_aggregates || !sel.group_by.empty()) {
             node = wrap(PlanNode::Kind::HashAggregate,
@@ -682,6 +694,9 @@ private:
         std::string s = indent + op_name(n.kind);
         if (!n.detail.empty()) {
             s += ": " + n.detail;
+        }
+        if (n.est >= 0) {
+            s += "  (est rows=" + std::to_string(n.est) + ")";
         }
         if (analyze && n.actual >= 0) {
             s += "  (actual rows=" + std::to_string(n.actual) + ")";
@@ -1993,6 +2008,22 @@ private:
         }
     };
 
+    // COST MODEL (PERF_PLAN Phase 2). Deterministic integer estimates from row_count + simple
+    // selectivity heuristics (no histogram yet): an eq term is assumed SELECTIVE (~rowcount/100,
+    // ≥1), a range ~30%. Cost units are "row touches": a seq scan touches every row (N); an
+    // index scan touches log2(N) + matches·kFetch (a point-get per match). The planner picks
+    // the cheaper of {index, seq} for a non-PK filter — so a NON-selective index (matches ≈ N)
+    // correctly loses to a seq scan, the classic cost-based win the old "always index" rule
+    // missed. PK access is always cheapest (point=1, range=estimate). Same rows either way
+    // (an access path is transparent — sql_index proves idx==scan), so this is conformance-safe.
+    static std::size_t ilog2(std::size_t n) {
+        std::size_t b = 0;
+        while (n > 1) { n >>= 1U; ++b; }
+        return b;
+    }
+    std::size_t est_eq_matches(std::size_t n) const { return n / 100 + 1; }
+    std::size_t est_range_matches(std::size_t n) const { return (n * 3) / 10 + 1; }
+
     AccessPath choose_access_path(const SelectStmt& sel, const Table& t) {
         AccessPath ap;
         const bool pk_fast = sel.where != SelectWhereKind::None &&
@@ -2003,11 +2034,37 @@ private:
             ap.kind = AccessPath::Kind::PkRange;
         } else if (!pk_fast && sel.filter.present()) {
             if (auto plan = choose_index_access(sel, t)) {
-                ap.kind = AccessPath::Kind::Index;
-                ap.index = *plan;
+                const std::size_t n = t.row_count;
+                const std::size_t matches =
+                    plan->is_eq ? est_eq_matches(n) : est_range_matches(n);
+                constexpr std::size_t kFetch = 3;  // point-get cost per matched row
+                const std::size_t idx_cost = ilog2(n) + matches * kFetch;
+                const std::size_t seq_cost = n;
+                // Use the index only when it is cheaper than a full scan (or the table is
+                // tiny / stats absent — preserve the historical index preference there).
+                if (n <= 1 || idx_cost < seq_cost) {
+                    ap.kind = AccessPath::Kind::Index;
+                    ap.index = *plan;
+                }
             }
         }
         return ap;
+    }
+
+    // Estimated rows OUT of a single-table access path (for EXPLAIN's estimated-vs-actual).
+    std::size_t est_path_rows(const AccessPath& ap, const Table& t) const {
+        switch (ap.kind) {
+            case AccessPath::Kind::PkPoint:
+                return 1;
+            case AccessPath::Kind::PkRange:
+                return est_range_matches(t.row_count);
+            case AccessPath::Kind::Index:
+                return ap.index.is_eq ? est_eq_matches(t.row_count)
+                                      : est_range_matches(t.row_count);
+            case AccessPath::Kind::Seq:
+                return t.row_count;
+        }
+        return t.row_count;
     }
 
     // Scan the WHERE predicate for an `indexed_col = v` or `indexed_col BETWEEN a AND b`
