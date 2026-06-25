@@ -1064,7 +1064,107 @@ private:
         return Datum::make_int(sum / n);  // AVG: trunc toward zero
     }
 
-    // A4: compute an aggregate query (scalar OR GROUP BY, no HAVING) DIRECTLY over the SoA
+    // Is the HAVING predicate SoA-evaluable (only And/Or/Not + Cmp with an Agg or grouped-
+    // column LHS and a literal RHS)? If so, collect its referenced columns into `need` so
+    // their blocks are decoded. Returns false => the caller bails to the generic AoS path
+    // (subquery RHS / IS NULL / IN / EXISTS in HAVING are rare — not vectorized here).
+    [[nodiscard]] bool having_soa_ok(const Predicate& p, std::int32_t node, const Table& t,
+                                     std::vector<bool>& need) {
+        if (node < 0) {
+            return true;
+        }
+        const PredNode& n = p.nodes[static_cast<std::size_t>(node)];
+        switch (n.kind) {
+            case PredNodeKind::And:
+            case PredNodeKind::Or:
+                return having_soa_ok(p, n.left, t, need) &&
+                       having_soa_ok(p, n.right, t, need);
+            case PredNodeKind::Not:
+                return having_soa_ok(p, n.left, t, need);
+            case PredNodeKind::Cmp:
+                break;
+            default:
+                return false;  // IS NULL / IN / EXISTS in HAVING — not vectorized
+        }
+        if (n.rhs_is_subquery) {
+            return false;  // scalar-subquery RHS — not vectorized
+        }
+        if (n.operand == OperandKind::Agg) {
+            if (n.agg.kind != AggKind::CountStar) {
+                if (const auto idx = t.column_index(n.agg.column)) {
+                    need[*idx] = true;
+                }
+            }
+        } else if (const auto idx = t.column_index(n.column)) {
+            need[*idx] = true;
+        }
+        return true;
+    }
+
+    // Evaluate the (SoA-evaluable) HAVING predicate for one group: Agg operands fold via
+    // compute_agg_soa over the group's member indices; a column operand reads the group key.
+    [[nodiscard]] std::optional<std::string> having_eval_soa(
+        const Predicate& p, std::int32_t node, const Table& t,
+        const std::vector<ColumnChunk>& cols, const std::vector<std::uint32_t>& idxs,
+        const std::vector<std::size_t>& gcols, const std::vector<Datum>& keyd, bool& truth) {
+        if (node < 0) {
+            truth = true;
+            return std::nullopt;
+        }
+        const PredNode& n = p.nodes[static_cast<std::size_t>(node)];
+        if (n.kind == PredNodeKind::And) {
+            bool l = false;
+            if (auto e = having_eval_soa(p, n.left, t, cols, idxs, gcols, keyd, l)) return e;
+            if (!l) { truth = false; return std::nullopt; }
+            return having_eval_soa(p, n.right, t, cols, idxs, gcols, keyd, truth);
+        }
+        if (n.kind == PredNodeKind::Or) {
+            bool l = false;
+            if (auto e = having_eval_soa(p, n.left, t, cols, idxs, gcols, keyd, l)) return e;
+            if (l) { truth = true; return std::nullopt; }
+            return having_eval_soa(p, n.right, t, cols, idxs, gcols, keyd, truth);
+        }
+        if (n.kind == PredNodeKind::Not) {
+            bool c = false;
+            if (auto e = having_eval_soa(p, n.left, t, cols, idxs, gcols, keyd, c)) return e;
+            truth = !c;
+            return std::nullopt;
+        }
+        // Cmp leaf.
+        Datum lhs;
+        if (n.operand == OperandKind::Agg) {
+            lhs = compute_agg_soa(n.agg, t, cols, idxs);
+        } else {
+            const auto idx = t.column_index(n.column);
+            if (!idx) {
+                return std::string("unknown column '" + n.column + "' in HAVING");
+            }
+            bool found = false;
+            for (std::size_t j = 0; j < gcols.size(); ++j) {
+                if (gcols[j] == *idx) {
+                    lhs = keyd[j];
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return std::string("non-grouped column '" + n.column + "' in HAVING");
+            }
+        }
+        const Datum& rhs = n.literal;
+        if (lhs.is_null || rhs.is_null) {
+            truth = false;
+            return std::nullopt;
+        }
+        if (lhs.type != rhs.type) {
+            return std::string("type mismatch in HAVING");
+        }
+        truth = apply_cmp(n.op, cmp_datum(lhs, rhs));
+        return std::nullopt;
+    }
+
+    // A4: compute an aggregate query (scalar OR GROUP BY, optional SoA-evaluable HAVING)
+    // DIRECTLY over the SoA
     // column blocks — decode the needed columns, build groups from the group columns' SoA
     // (an ordered map keyed exactly as exec_aggregate, so group order is byte-identical),
     // fold each aggregate over each group's member indices. NO AoS row materialisation.
@@ -1132,6 +1232,12 @@ private:
                     need[*idx] = true;
                 }
             }
+        }
+        // HAVING: bail to the generic AoS path if not SoA-evaluable; else add its columns
+        // to `need` (so their blocks are decoded) and evaluate it per group below.
+        const bool has_having = sel.having.present();
+        if (has_having && !having_soa_ok(sel.having, sel.having.root, t, need)) {
+            return std::nullopt;
         }
         // ZONE-MAP data skipping: with an INT filter, fold the aggregate over ONLY the
         // chunks whose [min,max] can match — skipped chunks are never read/decoded. (This
@@ -1209,6 +1315,16 @@ private:
         ExecResult r;
         for (const auto& [key, slot] : groups) {
             (void)key;
+            if (has_having) {
+                bool keep = true;
+                if (auto e = having_eval_soa(sel.having, sel.having.root, t, cols, slot.first,
+                                             gcols, slot.second, keep)) {
+                    return ExecResult::failure(*e);
+                }
+                if (!keep) {
+                    continue;  // group fails HAVING
+                }
+            }
             ResultRow out;
             for (const SelectItem& item : sel.items) {
                 if (item.kind == SelectItemKind::Column) {
@@ -1723,7 +1839,7 @@ private:
         // SUM/COUNT/MIN/MAX/AVG DIRECTLY over the SoA column blocks (no AoS row
         // materialisation, the measured win). nullopt => not applicable, fall through to
         // the generic AoS path (which the conformance gate cross-checks this against).
-        if (t->columnar && sel.has_aggregates && !sel.having.present()) {
+        if (t->columnar && sel.has_aggregates) {
             if (auto fast = columnar_vectorized_agg(*t, sel)) {
                 return std::move(*fast);
             }

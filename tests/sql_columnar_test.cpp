@@ -173,6 +173,16 @@ void run_seed(std::uint64_t seed) {
          "groupby-filtered");
     both(col, row, "SELECT dept, SUM(sal) FROM emp GROUP BY dept ORDER BY dept DESC",
          "groupby-order");
+    // A4 vectorized HAVING over SoA groups (delta clean) — must equal row-mode.
+    both(col, row, "SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 2",
+         "having-count");
+    both(col, row, "SELECT dept, SUM(sal) FROM emp GROUP BY dept HAVING SUM(sal) > 100",
+         "having-sum");
+    both(col, row,
+         "SELECT dept, COUNT(*), SUM(sal) FROM emp GROUP BY dept "
+         "HAVING COUNT(*) > 1 AND SUM(sal) > 50",
+         "having-and");
+    both(col, row, "SELECT COUNT(*) FROM emp HAVING COUNT(*) > 0", "having-scalar");
 
     both(col, row, "CREATE INDEX idx_sal ON emp (sal)", "create-index");
     both(col, row, "SELECT id, sal FROM emp WHERE sal = 250", "indexed-eq");
