@@ -70,28 +70,37 @@ for q in scan_agg groupby_cat groupby_region filtered_agg zone_skip; do
 done
 docker rm -f pg_analytics >/dev/null 2>&1 || true
 
+# ---- DuckDB: the real columnar competitor, pinned cpu 0, single thread --------------------
+echo "-- running duckdb (pinned cpu $PIN, threads=1) --"
+docker run --rm --cpuset-cpus="$PIN" -v "$ROOT":/work -w /work python:3.12-slim \
+  bash -c "pip install -q duckdb 2>/dev/null && taskset -c $PIN python3 bench/compare/sql_analytics/duck_bench.py $N $ITERS" \
+  2>/dev/null | grep -o '{"sys":"duckdb".*}' | tee "$OUT/duckdb.jsonl"
+
 # ---- compare --------------------------------------------------------------------------------
 echo ""
 echo "== COMPARISON (ms per query, lower = faster) =="
-python3 - "$OUT/lockstep.jsonl" "$OUT/postgres.jsonl" <<'PY'
+python3 - "$OUT/lockstep.jsonl" "$OUT/postgres.jsonl" "$OUT/duckdb.jsonl" <<'PY'
 import json, sys
 def load(p):
     d={}
-    for line in open(p):
+    try: f=open(p)
+    except: return d
+    for line in f:
         line=line.strip()
         if not line: continue
         try: o=json.loads(line)
         except: continue
         d[o["q"]]=float(o["ms_each"])
     return d
-ls=load(sys.argv[1]); pg=load(sys.argv[2])
-print(f"{'query':<18}{'lockstep_ms':>13}{'postgres_ms':>13}{'speedup':>10}")
+ls=load(sys.argv[1]); pg=load(sys.argv[2]); dk=load(sys.argv[3])
+print(f"{'query':<18}{'lockstep':>10}{'postgres':>10}{'duckdb':>10}{'vs_pg':>8}{'vs_duck':>9}")
 for q in ["scan_agg","groupby_cat","groupby_region","filtered_agg","zone_skip"]:
-    l=ls.get(q); p=pg.get(q)
-    if l is None or p is None:
-        print(f"{q:<18}{'?' if l is None else f'{l:.3f}':>13}{'?' if p is None else f'{p:.3f}':>13}{'':>10}")
-        continue
-    sp = p/l if l>0 else 0
-    print(f"{q:<18}{l:>13.3f}{p:>13.3f}{sp:>9.2f}x")
+    l=ls.get(q); p=pg.get(q); d=dk.get(q)
+    ls_s = f"{l:.3f}" if l is not None else "?"
+    pg_s = f"{p:.3f}" if p is not None else "?"
+    dk_s = f"{d:.3f}" if d is not None else "?"
+    vpg = f"{p/l:.2f}x" if (l and p) else ""
+    vdk = f"{d/l:.2f}x" if (l and d) else ""
+    print(f"{q:<18}{ls_s:>10}{pg_s:>10}{dk_s:>10}{vpg:>8}{vdk:>9}")
 PY
 rm -rf "$OUT"

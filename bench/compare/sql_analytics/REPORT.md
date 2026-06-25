@@ -5,20 +5,28 @@ to the same single CPU** (cpu 0), in-memory (Postgres `fsync=off`, table fully c
 `ANALYZE`), **no secondary indexes** on either side (raw analytical scan/aggregate). Run via
 `bench/compare/sql_analytics/run_analytics.sh [N] [iters]`.
 
-## Result (N = 200,000 rows, ms per query, lower = faster)
+## Result (N = 200,000 rows, ms per query, lower = faster) — 3-way: Lockstep vs Postgres vs DuckDB
 
-| query            | Lockstep columnar | Postgres 16 | speedup |
-|------------------|------------------:|------------:|--------:|
-| scan_agg         |            2.45   |     13.29   | **5.4×** |
-| groupby_cat      |            5.90   |     19.42   | **3.3×** |
-| groupby_region   |            7.78   |     22.36   | **2.9×** |
-| filtered_agg     |            1.32   |      8.82   | **6.7×** |
-| zone_skip        |            0.17   |      8.37   | **50×**  |
+| query          | Lockstep | Postgres | DuckDB | vs Postgres | vs DuckDB |
+|----------------|---------:|---------:|-------:|------------:|----------:|
+| scan_agg       |    0.58  |   12.94  |  0.46  | **22.5×**   | 0.79×     |
+| groupby_cat    |    5.86  |   18.53  |  0.51  | **3.2×**    | 0.09×     |
+| groupby_region |    7.85  |   22.50  |  2.25  | **2.9×**    | 0.29×     |
+| filtered_agg   |    1.34  |    8.97  |  0.22  | **6.7×**    | 0.16×     |
+| zone_skip      |    0.16  |    8.35  |  0.089 | **52×**     | 0.55×     |
 
-Lockstep columnar beats Postgres on **every** analytical shape, **2.9×–50×**. The win grows with
-N (scan_agg was 4.3× at 50k, 5.4× at 200k) — the SoA vectorized scan scales better than Postgres's
-row-at-a-time executor. `zone_skip` (a range predicate on a monotonic column) is **50×**: the
-zone-map data skipping reads only the ~5% of chunks that can match, while Postgres full-scans.
+(`vs Postgres` / `vs DuckDB` = competitor_ms / lockstep_ms; >1 = Lockstep faster.)
+
+**vs Postgres 16 (row store):** Lockstep wins on EVERY shape, **2.9×–52×**. scan_agg jumped to 22×
+after the SIMD contiguous-fold fast path; zone_skip is 52× (zone-map skips ~95% of chunks while
+Postgres full-scans). The Postgres win grows with N (SoA scales better than row-at-a-time).
+
+**vs DuckDB (the columnar leader, single-thread):** an HONEST baseline — DuckDB is faster on every
+query. Lockstep is COMPETITIVE on scan_agg (0.79×, ~1.3× behind — the SIMD fold closed most of the
+gap) and zone_skip (0.55×). The big gap is GROUP BY (0.09× on groupby_cat — DuckDB's mature
+vectorized hash-aggregate vs Lockstep's ordered-map + per-column fold). GROUP BY is the clear next
+lever to approach DuckDB; a proper vectorized hash-aggregate (the naive map-swap + running-
+accumulator both measured slower — see commit 29cbd34) is the real fix.
 
 ## The queries (run on both verbatim)
 - `scan_agg`       — `SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM events`
