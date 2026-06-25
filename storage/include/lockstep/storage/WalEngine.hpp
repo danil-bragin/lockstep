@@ -644,7 +644,12 @@ public:
             bool present = false;
         };
         std::vector<std::pair<Key, Best>> merged;  // sorted-by-Key (deterministic)
-        auto offer = [&](const Key& k, Seq s, const Value& v, bool tomb, bool vl) {
+        // `v` is taken BY VALUE so the caller can std::move its (owned) value in and we
+        // move it onward into `merged` — one fewer value copy per offered key vs taking a
+        // const ref and copying into Best. (We must NOT hold a pointer into the memtable
+        // here: scan_task co_awaits in the materialise loop and a concurrent insert can
+        // realloc the memtable — V-RKV1 — so the merge holds owned copies, just move-only.)
+        auto offer = [&](const Key& k, Seq s, Value v, bool tomb, bool vl) {
             // Keep `merged` key-ascending and find the slot by BINARY search, not a
             // linear walk. The memtable feeds keys already ascending, so the old
             // `while (merged[i].first < k) ++i` walked the ENTIRE vector on every
@@ -655,7 +660,7 @@ public:
             // this is purely the search made logarithmic (the same fix find() got).
             // Fast path: an ascending feed appends at the end in O(1).
             if (merged.empty() || merged.back().first < k) {
-                merged.emplace_back(k, Best{s, v, tomb, vl, true});
+                merged.emplace_back(k, Best{s, std::move(v), tomb, vl, true});
                 return;
             }
             auto it = std::lower_bound(
@@ -663,11 +668,11 @@ public:
                 [](const std::pair<Key, Best>& e, const Key& key) { return e.first < key; });
             if (it != merged.end() && it->first == k) {
                 if (s >= it->second.seq) {
-                    it->second = Best{s, v, tomb, vl, true};
+                    it->second = Best{s, std::move(v), tomb, vl, true};
                 }
                 return;
             }
-            merged.insert(it, std::pair<Key, Best>{k, Best{s, v, tomb, vl, true}});
+            merged.insert(it, std::pair<Key, Best>{k, Best{s, std::move(v), tomb, vl, true}});
         };
 
         auto in_range = [&](const Key& k) {
@@ -684,17 +689,17 @@ public:
             if (!in_range(kv.key)) {
                 continue;
             }
-            const Memtable::Hit h = mem_.lookup_hit(kv.key, at);
+            Memtable::Hit h = mem_.lookup_hit(kv.key, at);
             if (h.covered) {
-                offer(kv.key, h.seq, h.value, h.tombstone, h.vlog);
+                offer(kv.key, h.seq, std::move(h.value), h.tombstone, h.vlog);
             }
         }
         for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
             std::vector<std::pair<Key, SSTableReader::ScanCand>> acc;
             const Key hi = range.hi_unbounded ? Key{} : range.hi;
             sst->scan_into(range.lo, hi, at, range.hi_unbounded, acc);
-            for (const auto& c : acc) {
-                offer(c.first, c.second.seq, c.second.value, c.second.tombstone,
+            for (auto& c : acc) {
+                offer(c.first, c.second.seq, std::move(c.second.value), c.second.tombstone,
                       c.second.vlog);
             }
         }
