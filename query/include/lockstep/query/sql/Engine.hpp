@@ -619,32 +619,32 @@ private:
         return p;
     }
 
-    // Build the physical plan tree for a single-table SELECT (mirrors exec_select's choices).
+    // Build the physical plan tree for a single-table SELECT (uses the shared access-path
+    // chooser, so EXPLAIN's plan == the executed plan).
     PlanNode build_plan_single(const SelectStmt& sel, const Table& t) {
-        const bool pk_fast = sel.where != SelectWhereKind::None &&
-                             sel.where_column == t.pk().name && predicate_is_pure_pk(sel, t);
+        const AccessPath ap = choose_access_path(sel, t);
         PlanNode node;
-        if (pk_fast && sel.where == SelectWhereKind::Eq) {
-            node.kind = PlanNode::Kind::PkPointGet;
-            node.detail = t.name + " (" + t.pk().name + " = const)";
-        } else if (pk_fast && sel.where == SelectWhereKind::Between) {
-            node.kind = PlanNode::Kind::PkRangeScan;
-            node.detail = t.name + " (" + t.pk().name + " BETWEEN)";
-        } else if (!pk_fast && sel.filter.present()) {
-            if (auto plan = choose_index_access(sel, t)) {
+        switch (ap.kind) {
+            case AccessPath::Kind::PkPoint:
+                node.kind = PlanNode::Kind::PkPointGet;
+                node.detail = t.name + " (" + t.pk().name + " = const)";
+                break;
+            case AccessPath::Kind::PkRange:
+                node.kind = PlanNode::Kind::PkRangeScan;
+                node.detail = t.name + " (" + t.pk().name + " BETWEEN)";
+                break;
+            case AccessPath::Kind::Index:
                 node.kind = PlanNode::Kind::IndexScan;
-                node.detail = "using " + plan->index->name +
-                              (plan->is_eq ? " (= const)" : " (range)") + " on " + t.name;
-            } else {
+                node.detail = "using " + ap.index.index->name +
+                              (ap.index.is_eq ? " (= const)" : " (range)") + " on " + t.name;
+                break;
+            case AccessPath::Kind::Seq:
                 node.kind = PlanNode::Kind::SeqScan;
                 node.detail = t.name;
-            }
-        } else {
-            node.kind = PlanNode::Kind::SeqScan;
-            node.detail = t.name;
+                break;
         }
         // Residual WHERE filter (unless the whole WHERE was a pure-PK fast path).
-        if (sel.filter.present() && !pk_fast) {
+        if (sel.filter.present() && !ap.pk_fast()) {
             node = wrap(PlanNode::Kind::Filter, "WHERE residual predicate", std::move(node));
         }
         if (sel.has_aggregates || !sel.group_by.empty()) {
@@ -818,30 +818,19 @@ private:
         // call-site-visible D5 level. The fast path is taken only when the WHERE is
         // EXACTLY a PK eq / PK BETWEEN over the REAL PK column; the rest of the
         // general predicate (if any) is applied as a row filter in (2).
-        const bool pk_fast =
-            sel.where != SelectWhereKind::None && sel.where_column == t->pk().name &&
-            predicate_is_pure_pk(sel, *t);
-
-        // SECONDARY-INDEX ACCESS PATH (the new planner choice). When the PK fast path
-        // does NOT apply but the WHERE has an `indexed_col = v` or `indexed_col BETWEEN
-        // a AND b` term (a top-level Cmp, or a top-level AND containing one) on a column
-        // that has a secondary index, range-scan the INDEX for the matching col range to
-        // collect the PKs, then POINT-GET each row. The FULL filter still runs as a row
-        // filter (the RESIDUAL PREDICATE) in step (2) — the index narrows WHICH rows are
-        // read, never WHICH rows are returned. Falls back to a full scan when no usable
-        // index. PLANNER CHOICE (documented): prefer the index whenever an indexed eq/
-        // range term exists (an index scan is O(log N + matches), strictly cheaper than
-        // the O(N) full scan when the term is selective; for an eq on a unique-ish column
-        // it reads ~1 row). The simple rule: first usable indexed term wins.
+        // THE EXECUTOR FOLLOWS THE PLAN. The access path comes from the SHARED chooser —
+        // the same call build_plan_single (EXPLAIN) uses — so what EXPLAIN shows is exactly
+        // what runs, and Phase 2's cost-based chooser will steer execution automatically.
+        const AccessPath ap = choose_access_path(sel, *t);
+        const bool pk_fast = ap.pk_fast();
         std::vector<bool> need = needed_columns(*t, sel);
         std::vector<std::vector<Datum>> rows;
-        bool used_index = false;
-        if (!pk_fast && sel.filter.present()) {
-            if (auto plan = choose_index_access(sel, *t)) {
-                if (auto err = read_via_index(*t, sel, *plan, need, rows)) {
-                    return ExecResult::failure(*err);
-                }
-                used_index = true;
+        const bool used_index = ap.kind == AccessPath::Kind::Index;
+        if (used_index) {
+            // Index scan: range-scan the index for the PKs, point-get each row; the full
+            // predicate still runs as the residual filter in (2).
+            if (auto err = read_via_index(*t, sel, ap.index, need, rows)) {
+                return ExecResult::failure(*err);
             }
         }
 
@@ -1991,6 +1980,35 @@ private:
         Datum lo;   // BETWEEN lower (inclusive)
         Datum hi;   // BETWEEN upper (inclusive)
     };
+
+    // THE SHARED ACCESS-PATH CHOICE. Both the executor (exec_select) AND the plan builder
+    // (build_plan_single, for EXPLAIN) call this single function, so the plan EXPLAIN shows
+    // is EXACTLY the plan that runs. Phase 2 makes this COST-BASED (statistics-driven); today
+    // it is the rule-based choice extracted verbatim from the old inline logic (byte-identical).
+    struct AccessPath {
+        enum class Kind : std::uint8_t { PkPoint, PkRange, Index, Seq } kind = Kind::Seq;
+        IndexPlan index;  // valid iff kind == Index
+        [[nodiscard]] bool pk_fast() const {
+            return kind == Kind::PkPoint || kind == Kind::PkRange;
+        }
+    };
+
+    AccessPath choose_access_path(const SelectStmt& sel, const Table& t) {
+        AccessPath ap;
+        const bool pk_fast = sel.where != SelectWhereKind::None &&
+                             sel.where_column == t.pk().name && predicate_is_pure_pk(sel, t);
+        if (pk_fast && sel.where == SelectWhereKind::Eq) {
+            ap.kind = AccessPath::Kind::PkPoint;
+        } else if (pk_fast && sel.where == SelectWhereKind::Between) {
+            ap.kind = AccessPath::Kind::PkRange;
+        } else if (!pk_fast && sel.filter.present()) {
+            if (auto plan = choose_index_access(sel, t)) {
+                ap.kind = AccessPath::Kind::Index;
+                ap.index = *plan;
+            }
+        }
+        return ap;
+    }
 
     // Scan the WHERE predicate for an `indexed_col = v` or `indexed_col BETWEEN a AND b`
     // term usable as an index access path. We look at the predicate ROOT: a single Cmp
