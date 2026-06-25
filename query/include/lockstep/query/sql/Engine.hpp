@@ -1469,6 +1469,100 @@ private:
         return std::nullopt;
     }
 
+    // Fold ONE ungrouped aggregate PER CHUNK and merge the partials — each chunk's array is
+    // cache-resident (~8KB), so this avoids the 8MB whole-column concat (read_col_concat) that
+    // made a large scan cache-bound + super-linear. SIMD per chunk (NOT NULL => no null
+    // branch). Byte-identical to compute_agg_full over the concatenation; same partial-merge
+    // shape morsel parallelism will use.
+    [[nodiscard]] Datum compute_agg_chunked(const AggExpr& a, const Table& t) {
+        const std::uint32_t pkc = static_cast<std::uint32_t>(t.pk_index);
+        if (a.kind == AggKind::CountStar) {
+            std::int64_t n = 0;
+            for (const ColumnChunk& ch : col_chunks_cached(t, pkc)) {
+                n += ch.count;
+            }
+            return Datum::make_int(n);
+        }
+        const std::size_t ci = *t.column_index(a.column);
+        const std::vector<ColumnChunk>& chunks =
+            col_chunks_cached(t, static_cast<std::uint32_t>(ci));
+        const Type ty = t.columns[ci].type;
+        const bool no_nulls = !t.columns[ci].nullable;
+        std::int64_t total = 0;
+        for (const ColumnChunk& ch : chunks) {
+            total += ch.count;
+        }
+        if (a.kind == AggKind::Count) {
+            if (no_nulls) {
+                return Datum::make_int(total);
+            }
+            std::int64_t c = 0;
+            for (const ColumnChunk& ch : chunks) {
+                for (std::uint32_t r = 0; r < ch.count; ++r) {
+                    if (!ch.nulls[r]) ++c;
+                }
+            }
+            return Datum::make_int(c);
+        }
+        if (total == 0) {
+            return Datum::make_int(0);  // empty (compute_agg_full count==0 parity)
+        }
+        if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
+            if (ty == Type::Int && no_nulls) {
+                bool any = false;
+                std::int64_t best = 0;
+                for (const ColumnChunk& ch : chunks) {
+                    if (a.kind == AggKind::Min) {
+                        for (std::uint32_t r = 0; r < ch.count; ++r) {
+                            if (!any || ch.ints[r] < best) { best = ch.ints[r]; any = true; }
+                        }
+                    } else {
+                        for (std::uint32_t r = 0; r < ch.count; ++r) {
+                            if (!any || ch.ints[r] > best) { best = ch.ints[r]; any = true; }
+                        }
+                    }
+                }
+                return Datum::make_int(best);
+            }
+            Datum best;
+            bool any = false;
+            for (const ColumnChunk& ch : chunks) {
+                for (std::uint32_t r = 0; r < ch.count; ++r) {
+                    if (ch.nulls[r]) continue;
+                    const Datum v = ch.at(r);
+                    if (!any) { best = v; any = true; }
+                    else {
+                        const int c = cmp_datum(v, best);
+                        if ((a.kind == AggKind::Min && c < 0) ||
+                            (a.kind == AggKind::Max && c > 0)) best = v;
+                    }
+                }
+            }
+            return any ? best : Datum::make_null(ty);
+        }
+        std::int64_t sum = 0;  // SUM / AVG
+        std::int64_t n = 0;
+        for (const ColumnChunk& ch : chunks) {
+            if (no_nulls) {
+                for (std::uint32_t r = 0; r < ch.count; ++r) sum += ch.ints[r];
+                n += ch.count;
+            } else {
+                for (std::uint32_t r = 0; r < ch.count; ++r) {
+                    if (ch.nulls[r]) continue;
+                    sum += ch.ints[r];
+                    ++n;
+                }
+            }
+        }
+        if (n == 0) {
+            return a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
+        }
+        if (a.kind == AggKind::Sum) {
+            return Datum::make_int(sum);
+        }
+        return Datum::make_int(sum / n);
+    }
+
     // Fold ONE aggregate over the WHOLE column [0,count) — CONTIGUOUS (no index gather), so
     // the SUM/MIN/MAX loops auto-vectorize (SIMD) at -O2. For a NOT NULL column there is no
     // per-element null branch (the branch that otherwise defeats vectorization). Used by the
@@ -1794,6 +1888,26 @@ private:
         if (has_having && !having_soa_ok(sel.having, sel.having.root, t, need)) {
             return std::nullopt;
         }
+        // SIMD FAST PATH: an UNGROUPED, UNFILTERED scalar aggregate folds each column PER CHUNK
+        // (cache-resident, SIMD) + merges partials — no group map, no index gather, and NO 8MB
+        // whole-column concat (decoded only via the cached chunks). The common analytical
+        // SELECT SUM/COUNT/MIN/MAX FROM t. Placed BEFORE the column decode so the concat is
+        // never built for this path.
+        if (gcols.empty() && !has_filter && !has_having) {
+            ResultRow out;
+            for (const SelectItem& item : sel.items) {
+                out.cells.emplace_back(item.label, compute_agg_chunked(item.agg, t));
+            }
+            ExecResult rr;
+            rr.rows.push_back(std::move(out));
+            apply_distinct(sel, rr.rows);
+            if (auto e = apply_order_by_labels(sel, rr.rows)) {
+                return ExecResult::failure(*e);
+            }
+            apply_limit(sel, rr.rows);
+            rr.affected = rr.rows.size();
+            return rr;
+        }
         // ZONE-MAP data skipping: with an INT filter, fold the aggregate over ONLY the
         // chunks whose [min,max] can match — skipped chunks are never read/decoded. (This
         // is where a FILTERED aggregate wins: row-mode has no fast path for a non-pk filter,
@@ -1829,24 +1943,6 @@ private:
         }
         if (!count_set) {  // COUNT(*) only, no filter/group — the pk column gives the count
             count = decode_col(static_cast<std::uint32_t>(t.pk_index)).count;
-        }
-        // SIMD FAST PATH: an UNGROUPED, UNFILTERED scalar aggregate folds each column over the
-        // whole CONTIGUOUS [0,count) array (compute_agg_full auto-vectorizes; no group map, no
-        // index gather). The common analytical SELECT SUM/COUNT/MIN/MAX FROM t.
-        if (gcols.empty() && !has_filter && !has_having) {
-            ResultRow out;
-            for (const SelectItem& item : sel.items) {
-                out.cells.emplace_back(item.label, compute_agg_full(item.agg, t, cols, count));
-            }
-            ExecResult rr;
-            rr.rows.push_back(std::move(out));
-            apply_distinct(sel, rr.rows);
-            if (auto e = apply_order_by_labels(sel, rr.rows)) {
-                return ExecResult::failure(*e);
-            }
-            apply_limit(sel, rr.rows);
-            rr.affected = rr.rows.size();
-            return rr;
         }
         // Build groups: ordered map keyed by the group-column tuple (group_key_field == the
         // exact key exec_aggregate uses => identical group order). Value = (member indices,
