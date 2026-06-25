@@ -313,6 +313,33 @@ public:
                                     tombstone_marker());  // retire a stale chunk
             }
         }
+        // ZONE MAP (Phase 4): per-chunk per-INT-column [min,max] for data skipping.
+        std::vector<std::vector<ColZone>> zones(
+            static_cast<std::size_t>(nchunks), std::vector<ColZone>(t->columns.size()));
+        for (std::uint64_t j = 0; j < nchunks; ++j) {
+            const std::size_t lo = static_cast<std::size_t>(j) * kChunkRows;
+            const std::size_t hi = std::min(lo + kChunkRows, nrows);
+            for (std::size_t c = 0; c < t->columns.size(); ++c) {
+                if (t->columns[c].type != Type::Int) {
+                    continue;
+                }
+                ColZone& cz = zones[static_cast<std::size_t>(j)][c];
+                for (std::size_t r = lo; r < hi; ++r) {
+                    const Datum& d = rows[r][c];
+                    if (d.is_null) {
+                        continue;
+                    }
+                    if (!cz.has) {
+                        cz.has = true;
+                        cz.lo = cz.hi = d.i;
+                    } else {
+                        cz.lo = std::min(cz.lo, d.i);
+                        cz.hi = std::max(cz.hi, d.i);
+                    }
+                }
+            }
+        }
+        writes.emplace_back(zone_key(t->id), encode_zone_map(zones, t->columns.size()));
         std::vector<storage::KeyValue> delta;  // clear the delta: tombstone every 'd' key
         {
             Query<Strict> q;
@@ -654,6 +681,35 @@ private:
         return out;
     }
 
+    // Concatenate ONLY the given chunk ids of column c (zone-map survivors) into one SoA
+    // chunk. Skipped chunks are never read/decoded — the zone-map data-skipping win.
+    [[nodiscard]] ColumnChunk read_col_concat_chunks(const Table& t, std::uint32_t c,
+                                                     const std::vector<std::uint64_t>& chunk_ids) {
+        ColumnChunk out;
+        bool first = true;
+        for (const std::uint64_t j : chunk_ids) {
+            const ReadResult cb = read_committed(block_key(t.id, c, j));
+            if (!cb.has_value() || is_tombstone(*cb)) {
+                continue;
+            }
+            ColumnChunk ch = decode_column_block(*cb);
+            if (first) {
+                out.type = ch.type;
+                first = false;
+            }
+            out.count += ch.count;
+            out.nulls.insert(out.nulls.end(), ch.nulls.begin(), ch.nulls.end());
+            if (out.type == Type::Int) {
+                out.ints.insert(out.ints.end(), ch.ints.begin(), ch.ints.end());
+            } else {
+                for (std::string& s : ch.texts) {
+                    out.texts.push_back(std::move(s));
+                }
+            }
+        }
+        return out;
+    }
+
     // A pk-ascending chunk's [first,last] pk range is DISJOINT from [lo,hi] (data skipping).
     [[nodiscard]] static bool chunk_pk_disjoint(const ColumnChunk& pc, const Datum& lo,
                                                 const Datum& hi) {
@@ -663,6 +719,98 @@ private:
         const Datum first = pc.at(0);
         const Datum last = pc.at(pc.count - 1);
         return last.less_than(lo) || hi.less_than(first);  // last<lo || hi<first
+    }
+
+    // ===== ZONE MAPS (Phase 4 data skipping for NON-pk INT-column filters) ==========
+
+    // VECTORIZED FILTER (Phase 3) — a single comparison term `col <op> literal`. (Defined
+    // here so the zone-map skip predicate + the vectorized scan/agg paths can all see it.)
+    struct VecTerm {
+        std::size_t col = 0;
+        CmpOp op = CmpOp::Eq;
+        Datum lit;
+    };
+
+    // Per-chunk, per-column value range. INT columns only; `has` false => non-INT, or the
+    // column is all-NULL in this chunk (a comparison then matches nothing => the chunk is
+    // skippable for a conjunct on that column).
+    struct ColZone {
+        bool has = false;
+        std::int64_t lo = 0;
+        std::int64_t hi = 0;
+    };
+
+    // Encode a zone map: [be32 nchunks][be32 ncols] then per (chunk,col) [u8 has][be64 lo][be64 hi].
+    [[nodiscard]] static std::string encode_zone_map(
+        const std::vector<std::vector<ColZone>>& z, std::size_t ncols) {
+        std::string out;
+        put_be32(out, static_cast<std::uint32_t>(z.size()));
+        put_be32(out, static_cast<std::uint32_t>(ncols));
+        for (const std::vector<ColZone>& chunk : z) {
+            for (const ColZone& cz : chunk) {
+                out.push_back(cz.has ? '\x01' : '\x00');
+                put_be64(out, static_cast<std::uint64_t>(cz.lo));
+                put_be64(out, static_cast<std::uint64_t>(cz.hi));
+            }
+        }
+        return out;
+    }
+    [[nodiscard]] static std::vector<std::vector<ColZone>> decode_zone_map(const std::string& v) {
+        std::vector<std::vector<ColZone>> z;
+        std::size_t off = 0;
+        const std::uint32_t nch = get_be32(v, off);
+        off += 4;
+        const std::uint32_t nc = get_be32(v, off);
+        off += 4;
+        z.assign(nch, std::vector<ColZone>(nc));
+        for (std::uint32_t j = 0; j < nch; ++j) {
+            for (std::uint32_t c = 0; c < nc; ++c) {
+                ColZone cz;
+                cz.has = static_cast<unsigned char>(v[off]) != 0;
+                off += 1;
+                cz.lo = static_cast<std::int64_t>(get_be64(v, off));
+                off += 8;
+                cz.hi = static_cast<std::int64_t>(get_be64(v, off));
+                off += 8;
+                z[j][c] = cz;
+            }
+        }
+        return z;
+    }
+
+    // Load the table's zone map (empty if none flushed).
+    [[nodiscard]] std::vector<std::vector<ColZone>> load_zones(const Table& t) {
+        const ReadResult zv = read_committed(zone_key(t.id));
+        if (!zv.has_value() || is_tombstone(*zv)) {
+            return {};
+        }
+        return decode_zone_map(*zv);
+    }
+
+    // Can chunk j be SKIPPED given the conjunctive filter? Skippable if ANY conjunct on an
+    // INT column proves NO row in the chunk can satisfy it (AND semantics: one unsatisfiable
+    // conjunct => the whole AND fails for every row). Conservative: unknown => don't skip.
+    [[nodiscard]] static bool chunk_skippable(const std::vector<ColZone>& zrow,
+                                              const std::vector<VecTerm>& vterms) {
+        for (const VecTerm& vt : vterms) {
+            if (vt.lit.type != Type::Int || vt.lit.is_null || vt.col >= zrow.size()) {
+                continue;  // zone skipping is INT-only
+            }
+            const ColZone& cz = zrow[vt.col];
+            const std::int64_t x = vt.lit.i;
+            if (!cz.has) {
+                return true;  // INT col all-NULL in this chunk => the conjunct matches nothing
+            }
+            switch (vt.op) {
+                case CmpOp::Gt: if (cz.hi <= x) return true; break;
+                case CmpOp::Ge: if (cz.hi < x) return true; break;
+                case CmpOp::Lt: if (cz.lo >= x) return true; break;
+                case CmpOp::Le: if (cz.lo > x) return true; break;
+                case CmpOp::Eq: if (x < cz.lo || x > cz.hi) return true; break;
+                case CmpOp::Ne: break;  // != almost always has a match — never skip
+            }
+        }
+        return false;
     }
 
     // Locate a pk within a (pk-ascending) pk-column chunk by binary search.
@@ -788,6 +936,13 @@ private:
         bool pk_between, std::vector<std::vector<Datum>>& base) {
         const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
         const std::vector<ColumnChunk> pk_chunks = read_col_chunks(t, pkc_id);
+        // ZONE-MAP skipping (Phase 4): if the WHERE flattens to INT conjuncts, skip any chunk
+        // whose per-column [min,max] proves no row matches — without decoding its blocks.
+        std::vector<VecTerm> vterms;
+        const bool zone_filter = sel.filter.present() && vectorize_ &&
+                                 try_extract_conjuncts(sel.filter, sel.filter.root, t, vterms);
+        const std::vector<std::vector<ColZone>> zones = zone_filter ? load_zones(t)
+                                                                     : std::vector<std::vector<ColZone>>{};
         for (std::size_t j = 0; j < pk_chunks.size(); ++j) {
             const ColumnChunk& pkc = pk_chunks[j];
             // DATA SKIPPING: a pk-bounded query skips any chunk whose pk range can't match —
@@ -795,6 +950,9 @@ private:
             if (pk_between &&
                 chunk_pk_disjoint(pkc, sel.lo_value, sel.hi_value)) {
                 continue;
+            }
+            if (zone_filter && j < zones.size() && chunk_skippable(zones[j], vterms)) {
+                continue;  // a non-pk INT filter proves this chunk matches nothing
             }
             std::vector<ColumnChunk> cols(t.columns.size());  // needed col chunks for chunk j
             for (std::size_t c = 0; c < t.columns.size(); ++c) {
@@ -962,9 +1120,28 @@ private:
                 }
             }
         }
-        // Decode needed columns as ONE concatenated SoA chunk each (all chunks merged). An
-        // ungrouped/grouped aggregate scans the whole column, so concat is simplest; the
-        // pk-range data skipping lives in the projection path (block_base_rows).
+        // ZONE-MAP data skipping: with an INT filter, fold the aggregate over ONLY the
+        // chunks whose [min,max] can match — skipped chunks are never read/decoded. (This
+        // is where a FILTERED aggregate wins: row-mode has no fast path for a non-pk filter,
+        // so it full-scans.) Without a filter / zone map, concat all chunks.
+        std::vector<std::vector<ColZone>> zones;
+        std::vector<std::uint64_t> survivors;
+        bool use_survivors = false;
+        if (has_filter && !vterms.empty()) {
+            zones = load_zones(t);
+            if (!zones.empty()) {
+                for (std::uint64_t j = 0; j < zones.size(); ++j) {
+                    if (!chunk_skippable(zones[j], vterms)) {
+                        survivors.push_back(j);
+                    }
+                }
+                use_survivors = true;
+            }
+        }
+        auto decode_col = [&](std::uint32_t c) {
+            return use_survivors ? read_col_concat_chunks(t, c, survivors)
+                                 : read_col_concat(t, c);
+        };
         std::vector<ColumnChunk> cols(t.columns.size());
         std::uint32_t count = 0;
         bool count_set = false;
@@ -972,12 +1149,12 @@ private:
             if (!need[c]) {
                 continue;
             }
-            cols[c] = read_col_concat(t, static_cast<std::uint32_t>(c));
+            cols[c] = decode_col(static_cast<std::uint32_t>(c));
             count = cols[c].count;
             count_set = true;
         }
         if (!count_set) {  // COUNT(*) only, no filter/group — the pk column gives the count
-            count = read_col_concat(t, static_cast<std::uint32_t>(t.pk_index)).count;
+            count = decode_col(static_cast<std::uint32_t>(t.pk_index)).count;
         }
         // Build groups: ordered map keyed by the group-column tuple (group_key_field == the
         // exact key exec_aggregate uses => identical group order). Value = (member indices,
@@ -3289,13 +3466,6 @@ private:
         }
         return false;
     }
-
-    // VECTORIZED FILTER (Phase 3) — a single comparison term `col <op> literal`.
-    struct VecTerm {
-        std::size_t col = 0;
-        CmpOp op = CmpOp::Eq;
-        Datum lit;
-    };
 
     // Try to flatten the WHERE predicate into a pure conjunction of `not_null_col <op>
     // literal` terms. Returns false (→ interpreter fallback) for ANYTHING else: OR / NOT /

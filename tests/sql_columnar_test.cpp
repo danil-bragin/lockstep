@@ -190,12 +190,16 @@ void run_large() {
     col.set_columnar_default(true);
     SqlEngine row;
     const std::string ddl =
-        "CREATE TABLE big (id INT, grp INT, val INT, PRIMARY KEY (id))";
+        "CREATE TABLE big (id INT, grp INT, seq INT, val INT, PRIMARY KEY (id))";
     both(col, row, ddl, "large-create");
     const std::size_t N = 2600;  // > 2*kChunkRows => 3 chunks/column
     for (std::size_t i = 0; i < N; ++i) {
-        const std::string sql = "INSERT INTO big (id, grp, val) VALUES (" + std::to_string(i) +
-                                ", " + std::to_string(i % 7) + ", " + std::to_string((i * 13) % 500) + ")";
+        // seq is MONOTONIC (== insert order) so chunks have DISJOINT seq ranges => a
+        // WHERE seq <op> X exercises ZONE-MAP chunk skipping; grp/val are low-card/random
+        // (no skip) so the skip path is checked against both skippable + non-skippable.
+        const std::string sql = "INSERT INTO big (id, grp, seq, val) VALUES (" +
+                                std::to_string(i) + ", " + std::to_string(i % 7) + ", " +
+                                std::to_string(i) + ", " + std::to_string((i * 13) % 500) + ")";
         both(col, row, sql, "large-insert");
     }
     check(!col.flush_columnar("big").has_value(), "large flush #1");  // -> 3 chunks/column
@@ -207,6 +211,14 @@ void run_large() {
     both(col, row, "SELECT id, val FROM big WHERE id BETWEEN 1020 AND 1030", "large-pk-skip2");
     both(col, row, "SELECT id, val FROM big WHERE val > 400", "large-filter");
     both(col, row, "SELECT id FROM big WHERE id = 2049", "large-pk-eq");
+    // ZONE-MAP skipping on the monotonic non-pk `seq` column (chunks skippable) — result
+    // must match row-mode whether chunks are skipped or not.
+    both(col, row, "SELECT COUNT(*), SUM(val) FROM big WHERE seq > 2000", "large-zone-agg");
+    both(col, row, "SELECT COUNT(*), SUM(val) FROM big WHERE seq > 1000 AND seq < 1100", "large-zone-band");
+    both(col, row, "SELECT id, seq FROM big WHERE seq >= 2050 AND seq <= 2060", "large-zone-proj");
+    both(col, row, "SELECT seq, COUNT(*) FROM big WHERE seq > 1500 GROUP BY seq", "large-zone-groupby");
+    both(col, row, "SELECT COUNT(*) FROM big WHERE seq > 99999", "large-zone-allskip");
+    both(col, row, "SELECT grp, COUNT(*), SUM(val) FROM big WHERE val > 250 GROUP BY grp", "large-zone-noskip");
     // DELETE a big swathe, re-flush -> the table shrinks below 2 chunks; stale chunks retired.
     for (std::size_t i = 1000; i < N; ++i) {
         both(col, row, "DELETE FROM big WHERE id = " + std::to_string(i), "large-delete");

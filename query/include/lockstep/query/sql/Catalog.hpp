@@ -436,6 +436,15 @@ inline const std::string& row_del_marker() {
     k.push_back(';');  // ':' + 1 — exclusive upper bound of this column's blocks
     return k;
 }
+// ZONE-MAP key (Phase 4 data skipping; namespace 'Z', disjoint from t/i/d/B/c). One KV per
+// columnar table holds every chunk's per-INT-column [min,max] so a WHERE col CMP literal can
+// SKIP chunks that can't match WITHOUT decoding their column blocks. Maintained on flush.
+[[nodiscard]] inline Key zone_key(std::uint32_t table_id) {
+    Key k = "Z";
+    put_be32(k, table_id);
+    return k;
+}
+
 [[nodiscard]] inline Key block_key(std::uint32_t table_id, std::uint32_t col_id,
                                    std::uint64_t block_no) {
     Key k = block_col_prefix(table_id, col_id);
