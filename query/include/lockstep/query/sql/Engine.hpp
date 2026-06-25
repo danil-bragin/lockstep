@@ -1952,6 +1952,8 @@ private:
         std::map<std::vector<std::string>,
                  std::pair<std::vector<std::uint32_t>, std::vector<Datum>>>
             groups;
+        std::vector<std::string> key;  // REUSED across rows (clear keeps capacity) — avoids a
+        key.reserve(gcols.size());     // per-row vector heap allocation (200k-1M of them).
         for (std::uint32_t r = 0; r < count; ++r) {
             if (has_filter) {
                 bool ok = true;
@@ -1965,8 +1967,7 @@ private:
                     continue;
                 }
             }
-            std::vector<std::string> key;
-            key.reserve(gcols.size());
+            key.clear();
             for (const std::size_t g : gcols) {
                 key.push_back(group_key_field(cols[g].at(r)));
             }
