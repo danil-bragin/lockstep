@@ -675,23 +675,22 @@ public:
             merged.insert(it, std::pair<Key, Best>{k, Best{s, std::move(v), tomb, vl, true}});
         };
 
-        auto in_range = [&](const Key& k) {
-            if (k < range.lo) {
-                return false;
+        // SEEK to range.lo by binary search instead of walking the WHOLE memtable: keys()
+        // is sorted, so a scan whose range is a small slice (a columnar column family, a
+        // PK sub-range, an index lookup) touches O(slice) keys, not O(memtable). A full-
+        // table scan still starts at begin (lower_bound of the table prefix) and runs to
+        // the namespace end — same work as before. Stop at the first key >= range.hi.
+        const std::vector<Memtable::KeyVersions>& mk = mem_.keys();
+        auto it = std::lower_bound(
+            mk.begin(), mk.end(), range.lo,
+            [](const Memtable::KeyVersions& kv, const Key& k) { return kv.key < k; });
+        for (; it != mk.end(); ++it) {
+            if (!range.hi_unbounded && !(it->key < range.hi)) {
+                break;  // past the range upper bound (keys ascending)
             }
-            if (!range.hi_unbounded && !(k < range.hi)) {
-                return false;
-            }
-            return true;
-        };
-
-        for (const Memtable::KeyVersions& kv : mem_.keys()) {
-            if (!in_range(kv.key)) {
-                continue;
-            }
-            Memtable::Hit h = mem_.lookup_hit(kv.key, at);
+            Memtable::Hit h = mem_.lookup_hit(it->key, at);
             if (h.covered) {
-                offer(kv.key, h.seq, std::move(h.value), h.tombstone, h.vlog);
+                offer(it->key, h.seq, std::move(h.value), h.tombstone, h.vlog);
             }
         }
         for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
