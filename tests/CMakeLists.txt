@@ -949,6 +949,24 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_conformance_test COMMAND lockstep_sql_conformance_test)
 
+  # sql_columnar_codec_test: the COLUMNAR key-schema codec gate (pure functions, no
+  # engine/storage). Proves col_key grouping/order + per-column value round-trip +
+  # PK recovery + namespace disjointness BEFORE the columnar write/read path is wired,
+  # so a layout bug can't reach the durable core. Step 1 of the columnar rollout.
+  add_executable(lockstep_sql_columnar_codec_test sql_columnar_codec_test.cpp)
+  target_include_directories(lockstep_sql_columnar_codec_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_columnar_codec_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_columnar_codec_test COMMAND lockstep_sql_columnar_codec_test)
+
   # sql_aggregates_test (SQL v2): the EXTENDED SELECT surface — WHERE on ANY column
   # (a general boolean predicate tree), aggregates (COUNT(*)/COUNT(col)/SUM/MIN/MAX/
   # AVG) + GROUP BY + HAVING, ORDER BY [ASC|DESC] + LIMIT/OFFSET, DISTINCT. Each is

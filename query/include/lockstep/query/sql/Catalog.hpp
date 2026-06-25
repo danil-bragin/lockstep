@@ -275,6 +275,108 @@ inline void put_pk_int(std::string& out, std::int64_t v) {
 }
 
 // ----------------------------------------------------------------------------
+// COLUMNAR KEY-SCHEMA (column-family layout) — opt-in per table.
+//
+// A columnar table stores each (row, column) pair as its OWN key-value entry, in a
+// namespace DISJOINT from row-mode tables ('c' vs 't') and indexes ('i'):
+//   col_key = "c" ++ be32(table_id) ++ ":" ++ be32(col_id) ++ ":" ++ encode_pk(pk)
+// col_id is a PREFIX (before the pk), so every value of ONE column is a CONTIGUOUS
+// byte range — a projection scans ONLY the needed columns' families (the pushdown
+// win). pk is the SUFFIX, so within a column the values stay pk-ascending (row
+// assembly merges the per-column streams by pk; a pk range stays a sub-range).
+// Per-column VALUE = one datum: a single kNullTag (0xFE) for SQL NULL, else a 0x00
+// present tag + payload (INT 8-byte be64 / TEXT raw bytes); type comes from schema.
+// The durable KV core (WalEngine/WAL/MVCC/recovery) is UNCHANGED: a columnar row's N
+// entries commit in ONE write batch (the existing atomic unit), so row atomicity +
+// acked==durable hold by the SAME mechanism row-mode already uses.
+// ----------------------------------------------------------------------------
+
+// Whole columnar-table namespace [lo, hi): "c" ++ be32(table_id) ++ ":" .. ";".
+[[nodiscard]] inline Key col_table_prefix(std::uint32_t table_id) {
+    Key k = "c";
+    put_be32(k, table_id);
+    k.push_back(':');
+    return k;
+}
+[[nodiscard]] inline Key col_table_prefix_end(std::uint32_t table_id) {
+    Key k = "c";
+    put_be32(k, table_id);
+    k.push_back(';');  // ':' + 1 — exclusive upper bound of the table namespace
+    return k;
+}
+// One column family's range [lo, hi): every value of column `col_id` is contiguous.
+[[nodiscard]] inline Key col_prefix(std::uint32_t table_id, std::uint32_t col_id) {
+    Key k = "c";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, col_id);
+    k.push_back(':');
+    return k;
+}
+[[nodiscard]] inline Key col_prefix_end(std::uint32_t table_id, std::uint32_t col_id) {
+    Key k = "c";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, col_id);
+    k.push_back(';');  // ':' + 1 — exclusive upper bound of this column family
+    return k;
+}
+// The full columnar key for (col_id, pk).
+[[nodiscard]] inline Key col_key(std::uint32_t table_id, std::uint32_t col_id, const Datum& pk) {
+    return col_prefix(table_id, col_id) + encode_pk(pk);
+}
+
+// One column's datum -> storage value. NULL == a single kNullTag byte; else a 0x00
+// present tag (distinct from kNullTag) + payload. The value's own size delimits it
+// (one datum per KV — no length prefix needed); the type is recovered from schema.
+[[nodiscard]] inline Value encode_col_value(const Datum& d) {
+    Value v;
+    if (d.is_null) {
+        v.push_back(static_cast<char>(kNullTag));
+        return v;
+    }
+    v.push_back(static_cast<char>(0x00));  // present tag (!= kNullTag)
+    if (d.type == Type::Int) {
+        const std::uint64_t bits = static_cast<std::uint64_t>(d.i);
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            v.push_back(static_cast<char>((bits >> shift) & 0xFF));
+        }
+    } else {
+        v += d.s;  // raw TEXT bytes
+    }
+    return v;
+}
+[[nodiscard]] inline Datum decode_col_value(Type ty, const Value& v) {
+    if (!v.empty() && static_cast<unsigned char>(v[0]) == kNullTag) {
+        return Datum::make_null(ty);
+    }
+    // v[0] is the present tag (0x00); the payload begins at offset 1.
+    if (ty == Type::Int) {
+        std::uint64_t bits = 0;
+        for (std::size_t b = 1; b <= 8; ++b) {
+            bits = (bits << 8) | static_cast<unsigned char>(v[b]);
+        }
+        return Datum::make_int(static_cast<std::int64_t>(bits));
+    }
+    return Datum::make_text(v.substr(1));
+}
+
+// Decode the PK datum from a COLUMNAR key (strip the fixed 11-byte col prefix, decode
+// the suffix per the PK type — the same suffix transform decode_pk uses for row keys).
+[[nodiscard]] inline Datum decode_pk_from_col_key(const Table& t, const Key& key) {
+    constexpr std::size_t kColPrefixLen = 11;  // "c" + be32 + ":" + be32 + ":"
+    const std::string suffix = key.substr(kColPrefixLen);
+    if (t.pk().type == Type::Int) {
+        std::uint64_t bits = 0;
+        for (std::size_t b = 1; b <= 8; ++b) {
+            bits = (bits << 8) | static_cast<unsigned char>(suffix[b]);
+        }
+        return Datum::make_int(static_cast<std::int64_t>(bits ^ 0x8000000000000000ULL));
+    }
+    return Datum::make_text(suffix);
+}
+
+// ----------------------------------------------------------------------------
 // SECONDARY-INDEX KEY ENCODING (order-preserving + self-delimiting).
 //
 // An index lives in a DISJOINT key namespace from the table rows: the row namespace
