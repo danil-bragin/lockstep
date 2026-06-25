@@ -45,6 +45,7 @@
 
 #include <lockstep/query/Database.hpp>
 #include <lockstep/query/Query.hpp>
+#include <lockstep/query/sql/Engine.hpp>  // SQL-over-wire: run a SQL string server-side
 #include <lockstep/query/wire/Protocol.hpp>
 
 #include <lockstep/txn/Transaction.hpp>
@@ -237,6 +238,8 @@ public:
                 return handle_submit(req);
             case MsgKind::Query:
                 return handle_query(req);
+            case MsgKind::SqlExec:
+                return handle_sql(req);
             default: {
                 Response r;
                 r.kind = MsgKind::Error;
@@ -378,6 +381,23 @@ private:
         return r;
     }
 
+    // SQL-over-the-wire: run the statement string through the server's PERSISTENT SqlEngine
+    // (state accumulates across requests — CREATE TABLE / INSERT / SELECT all see prior
+    // statements). The Engine lowers onto its own verified query::Database (the SQL-optimize
+    // incremental write path, NOT the batch re-run), so writes are O(1). Result carries
+    // {ok, error, affected, row-count} — rows themselves are not shipped (throughput surface).
+    Response handle_sql(const Request& req) {
+        const sql::ExecResult er = sql_eng_.exec(req.sql);
+        Response r;
+        r.kind = MsgKind::SqlResult;
+        r.req_id = req.req_id;
+        r.sql_ok = er.ok;
+        r.sql_error = er.error;
+        r.sql_affected = er.affected;
+        r.sql_rows = static_cast<std::uint64_t>(er.rows.size());
+        return r;
+    }
+
     template <typename L>
     static void add_steps(Query<L>& q, const std::vector<Step>& steps) {
         for (const Step& s : steps) {
@@ -393,6 +413,7 @@ private:
 
     INetwork* net_;
     Database db_;
+    sql::SqlEngine sql_eng_;                    // SQL-over-wire: persistent across requests
     std::vector<TxnFn> batch_;                 // ordered committed txns (seqLog)
     std::map<std::uint64_t, Response> dedup_;  // submit_key -> memoized response
     Seq tip_ = 0;

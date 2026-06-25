@@ -78,10 +78,12 @@ enum class MsgKind : std::uint8_t {
     SubmitOk = 4,  // server -> client: commit info
     QueryOk = 5,   // server -> client: query result
     Error = 6,     // server -> client: a decode/dispatch failure
+    SqlExec = 7,   // client -> server: a SQL statement string (CREATE/INSERT/SELECT/...)
+    SqlResult = 8, // server -> client: SQL exec result (ok, affected, row count)
 };
 
 [[nodiscard]] inline bool valid_msg_kind(std::uint8_t k) noexcept {
-    return k <= static_cast<std::uint8_t>(MsgKind::Error);
+    return k <= static_cast<std::uint8_t>(MsgKind::SqlResult);
 }
 
 // The named, deterministic ops a Submit can carry. The wire NEVER ships a
@@ -184,6 +186,9 @@ struct Request {
     Seq max_lag = 0;                     // Bounded level param
     SessionId session = 0;               // RYW level param
     std::vector<Step> steps;             // composed point/range read steps
+
+    // --- SqlExec ---
+    std::string sql;  // a SQL statement string (server runs it through sql::Engine)
 };
 
 // ----------------------------------------------------------------------------
@@ -221,6 +226,12 @@ struct Response {
 
     // --- Error ---
     std::string error;
+
+    // --- SqlResult ---
+    bool sql_ok = false;             // statement executed without error
+    std::string sql_error;           // error text iff !sql_ok
+    std::uint64_t sql_affected = 0;  // rows inserted/updated/deleted/returned
+    std::uint64_t sql_rows = 0;      // SELECT result row count (rows not shipped — bench)
 };
 
 // ===========================================================================
@@ -407,6 +418,9 @@ inline void seal_crc(std::vector<std::byte>& out) {
             }
             break;
         }
+        case MsgKind::SqlExec:
+            put_str(out, r.sql);
+            break;
         default:
             // A response kind never goes out as a request; still seal so a stray
             // never decodes (kind-validity is rechecked on decode anyway).
@@ -479,6 +493,12 @@ inline void seal_crc(std::vector<std::byte>& out) {
             }
             return rd.consumed() == body.size();
         }
+        case MsgKind::SqlExec: {
+            if (!rd.str(r.sql)) {
+                return false;
+            }
+            return rd.consumed() == body.size();
+        }
         default:
             return false;  // a response kind is not a valid request
     }
@@ -530,6 +550,12 @@ inline void seal_crc(std::vector<std::byte>& out) {
         }
         case MsgKind::Error:
             put_str(out, r.error);
+            break;
+        case MsgKind::SqlResult:
+            put_u8(out, r.sql_ok ? 1u : 0u);
+            put_str(out, r.sql_error);
+            put_u64(out, r.sql_affected);
+            put_u64(out, r.sql_rows);
             break;
         default:
             break;
@@ -622,6 +648,15 @@ inline void seal_crc(std::vector<std::byte>& out) {
                 return false;
             }
             return rd.consumed() == body.size();
+        case MsgKind::SqlResult: {
+            std::uint8_t ok = 0;
+            if (!rd.u8(ok) || !rd.str(r.sql_error) || !rd.u64(r.sql_affected) ||
+                !rd.u64(r.sql_rows)) {
+                return false;
+            }
+            r.sql_ok = ok != 0;
+            return rd.consumed() == body.size();
+        }
         default:
             return false;
     }

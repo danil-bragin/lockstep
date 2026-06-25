@@ -154,6 +154,17 @@ public:
         co_return;
     }
 
+    // Run a SQL statement string server-side. Returns the SqlResult (ok/affected/row-count)
+    // in out.response. Idempotent re-send on a deadline is safe for read-only statements;
+    // for writes the server's exactly-once semantics apply at the statement level.
+    core::Task sql(std::string statement, CallResult& out) {
+        Request req;
+        req.kind = MsgKind::SqlExec;
+        req.sql = std::move(statement);
+        co_await round_trip(req, out);
+        co_return;
+    }
+
 private:
     // Encode-send-poll-retry. Assigns the req_id, registers a cell, re-sends the
     // SAME bytes on each deadline (idempotent: same req_id + submit_key), and waits

@@ -112,6 +112,19 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_runtime
         lockstep_providers_sim
         lockstep_providers_prod)
+
+    # --- lockstep_sqlbench — SQL-over-wire load driver (ClientStub.sql) [LINUX ONLY] -
+    add_executable(lockstep_sqlbench lockstep_sqlbench.cpp)
+    target_link_libraries(lockstep_sqlbench
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_query
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim
+        lockstep_providers_prod)
   endif()
 
 else()
