@@ -70,37 +70,80 @@ for q in scan_agg groupby_cat groupby_region filtered_agg zone_skip; do
 done
 docker rm -f pg_analytics >/dev/null 2>&1 || true
 
-# ---- DuckDB: the real columnar competitor, pinned cpu 0, single thread --------------------
-echo "-- running duckdb (pinned cpu $PIN, threads=1) --"
+# ---- Embedded competitors: DuckDB + SQLite, pinned cpu 0, 1 thread -------------------------
+echo "-- running embedded competitors (duckdb + sqlite, pinned cpu $PIN) --"
 docker run --rm --cpuset-cpus="$PIN" -v "$ROOT":/work -w /work python:3.12-slim \
-  bash -c "pip install -q duckdb 2>/dev/null && taskset -c $PIN python3 bench/compare/sql_analytics/duck_bench.py $N $ITERS" \
-  2>/dev/null | grep -o '{"sys":"duckdb".*}' | tee "$OUT/duckdb.jsonl"
+  bash -c "pip install -q duckdb 2>/dev/null; taskset -c $PIN python3 bench/compare/sql_analytics/embedded_engines.py $N $ITERS" \
+  2>/dev/null | grep -oE '\{"sys":"[a-z]+","q":"[a-z_]+","ms_each":[0-9.]+\}' | tee "$OUT/embedded.jsonl"
 
-# ---- compare --------------------------------------------------------------------------------
+# ---- ClickHouse: columnar OLAP leader, server image, pinned cpu 0 --------------------------
+echo "-- running clickhouse (pinned cpu $PIN) --"
+docker rm -f ch_analytics >/dev/null 2>&1 || true
+docker run -d --name ch_analytics --cpuset-cpus="$PIN" -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+  clickhouse/clickhouse-server:24.8 >/dev/null 2>&1
+for i in $(seq 1 60); do
+  if docker exec ch_analytics clickhouse-client --query "SELECT 1" >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+docker exec ch_analytics clickhouse-client --query "
+  CREATE TABLE events ENGINE=MergeTree ORDER BY id AS
+  SELECT toInt32(number) id, toInt32(number%10000) uid, toInt32(number%8) cat,
+         toInt32((number*2654435761)%1000) amount,
+         (['north','south','east','west','central'])[(number%5)+1] region, toInt32(number) ts
+  FROM numbers($N)" 2>/dev/null
+chq() {
+  case "$1" in
+    scan_agg)       echo "SELECT COUNT(*),SUM(amount),MIN(amount),MAX(amount) FROM events";;
+    groupby_cat)    echo "SELECT cat,COUNT(*),SUM(amount) FROM events GROUP BY cat";;
+    groupby_region) echo "SELECT region,COUNT(*),SUM(amount) FROM events GROUP BY region";;
+    filtered_agg)   echo "SELECT COUNT(*),SUM(amount) FROM events WHERE amount>800";;
+    zone_skip)      echo "SELECT COUNT(*),SUM(amount) FROM events WHERE ts>$TSHI";;
+  esac
+}
+for q in scan_agg groupby_cat groupby_region filtered_agg zone_skip; do
+  SQLQ="$(chq "$q")"
+  # 5 reps in ONE client session (connection overhead amortized); --time prints per-query
+  # Elapsed (server-side execution). FORMAT Null avoids result transfer. Take the min.
+  SCRIPT=""; for r in 1 2 3 4 5; do SCRIPT="$SCRIPT$SQLQ FORMAT Null;"; done
+  best=$(printf '%s' "$SCRIPT" | docker exec -i ch_analytics clickhouse-client --max_threads 1 \
+           --time --multiquery 2>&1 | grep -oE '^[0-9.]+$' \
+           | awk 'NR==1||$1<m{m=$1} END{print m*1000}')
+  [ -z "$best" ] && best="0"
+  echo "{\"sys\":\"clickhouse\",\"q\":\"$q\",\"ms_each\":$best}" | tee -a "$OUT/embedded.jsonl"
+done
+docker rm -f ch_analytics >/dev/null 2>&1 || true
+
+# ---- compare (N-way) ------------------------------------------------------------------------
 echo ""
-echo "== COMPARISON (ms per query, lower = faster) =="
-python3 - "$OUT/lockstep.jsonl" "$OUT/postgres.jsonl" "$OUT/duckdb.jsonl" <<'PY'
+echo "== COMPARISON (ms per query; >1x = Lockstep faster than that competitor) =="
+python3 - "$OUT/lockstep.jsonl" "$OUT/postgres.jsonl" "$OUT/embedded.jsonl" <<'PY'
 import json, sys
-def load(p):
+def load(*paths):
     d={}
-    try: f=open(p)
-    except: return d
-    for line in f:
-        line=line.strip()
-        if not line: continue
-        try: o=json.loads(line)
+    for p in paths:
+        try: f=open(p)
         except: continue
-        d[o["q"]]=float(o["ms_each"])
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            try: o=json.loads(line)
+            except: continue
+            d.setdefault(o["sys"], {})[o["q"]]=float(o["ms_each"])
     return d
-ls=load(sys.argv[1]); pg=load(sys.argv[2]); dk=load(sys.argv[3])
-print(f"{'query':<18}{'lockstep':>10}{'postgres':>10}{'duckdb':>10}{'vs_pg':>8}{'vs_duck':>9}")
+data=load(*sys.argv[1:])
+ls=data.get("lockstep",{})
+comps=["postgres","duckdb","clickhouse","sqlite"]
+hdr=f"{'query':<16}{'lockstep':>9}"+"".join(f"{c:>11}" for c in comps)
+print(hdr); print("-"*len(hdr))
 for q in ["scan_agg","groupby_cat","groupby_region","filtered_agg","zone_skip"]:
-    l=ls.get(q); p=pg.get(q); d=dk.get(q)
-    ls_s = f"{l:.3f}" if l is not None else "?"
-    pg_s = f"{p:.3f}" if p is not None else "?"
-    dk_s = f"{d:.3f}" if d is not None else "?"
-    vpg = f"{p/l:.2f}x" if (l and p) else ""
-    vdk = f"{d/l:.2f}x" if (l and d) else ""
-    print(f"{q:<18}{ls_s:>10}{pg_s:>10}{dk_s:>10}{vpg:>8}{vdk:>9}")
+    l=ls.get(q)
+    row=f"{q:<16}{(f'{l:.3f}' if l is not None else '?'):>9}"
+    for c in comps:
+        v=data.get(c,{}).get(q)
+        if v is None: row+=f"{'-':>11}"
+        elif l: row+=f"{v:.2f}/{v/l:.1f}x".rjust(11)
+        else: row+=f"{v:.3f}".rjust(11)
+    print(row)
+print("\n(cell = competitor_ms / speedup; speedup>1 = Lockstep faster. N-way, 1 CPU, in-memory.)")
 PY
 rm -rf "$OUT"
