@@ -1894,6 +1894,9 @@ private:
         // SELECT SUM/COUNT/MIN/MAX FROM t. Placed BEFORE the column decode so the concat is
         // never built for this path.
         if (gcols.empty() && !has_filter && !has_having) {
+            // NB: ONE compute_agg_chunked PER aggregate — each is a TIGHT per-column fold the
+            // compiler auto-vectorizes. A FUSED single pass (sum+min+max per element) measured
+            // SLOWER (branchy loop defeats SIMD — same finding as the running-accumulator).
             ResultRow out;
             for (const SelectItem& item : sel.items) {
                 out.cells.emplace_back(item.label, compute_agg_chunked(item.agg, t));
