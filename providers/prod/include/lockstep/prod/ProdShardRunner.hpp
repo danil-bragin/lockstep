@@ -326,6 +326,19 @@ struct ReplShardRunConfig {
     std::uint64_t election_max_ms = 300;
     std::uint64_t heartbeat_ms = 30;
 
+    // CROSS-MACHINE: dial host per process id (1-based: proc_hosts[q-1] is process q's IP).
+    // Empty / short / blank entry => 127.0.0.1 (single-host cluster — the historical default,
+    // every existing replicated-shard run leaves this empty and dials loopback exactly as
+    // before). A multi-host run sets each process's IP so cross-process AppendEntries reaches
+    // the right machine. Pair with LOCKSTEP_BIND_ADDR=0.0.0.0 so the listen sockets accept.
+    std::vector<std::string> proc_hosts{};
+    [[nodiscard]] std::string host_for(std::uint64_t proc) const {
+        if (proc >= 1 && proc <= proc_hosts.size() && !proc_hosts[proc - 1].empty()) {
+            return proc_hosts[proc - 1];
+        }
+        return "127.0.0.1";
+    }
+
 #if defined(__linux__) && defined(LOCKSTEP_TLS)
     // TLS TRANSPORT (opt-in): each replica's reactor owns its own TLS contexts (single-
     // thread-per-shard; no cross-thread SSL sharing). Empty/disabled -> plaintext.
@@ -416,7 +429,8 @@ inline void run_one_repl_shard(const ReplShardRunConfig& cfg, std::uint64_t shar
         for (std::uint64_t q = 1; q <= cfg.cluster_size; ++q) {
             cluster.push_back(q);
             if (q != cfg.proc_id) {
-                bus->add_peer(q, repl_consensus_port(cfg.base_port, cfg.shards, q, shard));
+                bus->add_peer(q, cfg.host_for(q),
+                              repl_consensus_port(cfg.base_port, cfg.shards, q, shard));
             }
         }
         ProdConsensusNode::Timing timing;

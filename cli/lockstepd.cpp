@@ -152,6 +152,9 @@ struct Args {
     // process agrees a priori). cluster_size<=1 keeps the S9.1 single-node shard path.
     std::uint64_t proc_id = 1;
     std::uint64_t cluster_size = 1;
+    // CROSS-MACHINE replicated shards: dial host per process id (proc_hosts[q-1] = proc q's
+    // IP). Empty => 127.0.0.1 (single-host, the default). Set via --proc-host ID:HOST.
+    std::vector<std::string> proc_hosts;
 
     // --- Phase 10 OBSERVABILITY -----------------------------------------------
     // Structured lifecycle logs are emitted by default (a bounded, small set of events).
@@ -264,6 +267,18 @@ Args parse_args(int argc, char** argv) {
             a.proc_id = parse_u64(v, a.proc_id);
         } else if (std::strcmp(k, "--cluster-size") == 0) {
             a.cluster_size = parse_u64(v, a.cluster_size);
+        } else if (std::strcmp(k, "--proc-host") == 0) {
+            // --proc-host ID:HOST — record process ID's dial IP for cross-machine repl shards.
+            const char* colon = (v != nullptr) ? std::strchr(v, ':') : nullptr;
+            if (colon != nullptr && colon != v && colon[1] != '\0') {
+                const std::uint64_t id = parse_u64(std::string(v, colon).c_str(), 0);
+                if (id >= 1) {
+                    if (a.proc_hosts.size() < id) {
+                        a.proc_hosts.resize(id);
+                    }
+                    a.proc_hosts[id - 1] = std::string(colon + 1);
+                }
+            }
         } else if (std::strcmp(k, "--verbose") == 0) {
             // OBSERVABILITY: --verbose 1 enables debug-level lifecycle events (the
             // pair-based parser takes a value so a bare flag never desyncs the pairing).
@@ -361,6 +376,7 @@ int run_repl_multishard(const Args& args) {
     cfg.shards = args.shards;
     cfg.proc_id = args.proc_id;
     cfg.cluster_size = args.cluster_size;
+    cfg.proc_hosts = args.proc_hosts;  // cross-machine dial IPs (empty => loopback)
     cfg.base_port = args.shard_base_port;
     cfg.data_dir = args.data_dir;
     cfg.seed = args.seed;
