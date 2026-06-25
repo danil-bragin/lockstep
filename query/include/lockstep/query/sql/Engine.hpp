@@ -864,6 +864,13 @@ private:
         std::vector<bool> need = needed_columns(*t, sel);
         std::vector<std::vector<Datum>> rows;
         const bool used_index = ap.kind == AccessPath::Kind::Index;
+        // Phase 3: pre-extract a vectorizable conjunctive filter ONCE. On a seq scan it FUSES
+        // into the decode (decode-into-scratch + push only survivors → no per-row alloc for a
+        // filtered-out row, the measured bottleneck). On the index path it applies post-fetch.
+        std::vector<VecTerm> vterms;
+        const bool vectorizable = sel.filter.present() && !pk_fast && vectorize_ &&
+                                  try_extract_conjuncts(sel.filter, sel.filter.root, *t, vterms);
+        bool filter_applied = false;
         if (used_index) {
             // Index scan: range-scan the index for the PKs, point-get each row; the full
             // predicate still runs as the residual filter in (2).
@@ -884,35 +891,57 @@ private:
             // projection or a filtered scan this cuts the dominant per-row decode cost.
             // Byte-identical to a full decode on the needed columns => result unchanged.
             rows.reserve(kvs.size());
-            for (const storage::KeyValue& kv : kvs) {
-                if (is_tombstone(kv.second)) {
-                    continue;
+            if (vectorizable) {
+                // FUSED: decode into a REUSED scratch buffer, apply the conjuncts, push only
+                // survivors. A filtered-out row never allocates a persistent vector<Datum>.
+                std::vector<Datum> scratch;
+                std::size_t scanned_n = 0;
+                for (const storage::KeyValue& kv : kvs) {
+                    if (is_tombstone(kv.second)) {
+                        continue;
+                    }
+                    ++scanned_n;
+                    decode_row_projected_into(*t, kv.first, kv.second, need, scratch);
+                    bool ok = true;
+                    for (const VecTerm& vt : vterms) {
+                        if (!apply_cmp(vt.op, cmp_datum(scratch[vt.col], vt.lit))) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        rows.push_back(scratch);  // survivor — the only persistent alloc
+                    }
                 }
-                rows.push_back(decode_row_projected(*t, kv.first, kv.second, need));
+                filter_applied = true;
+                if (plan_stats_ != nullptr) {
+                    plan_stats_->scanned = scanned_n;
+                    plan_stats_->after_filter = rows.size();
+                }
+            } else {
+                for (const storage::KeyValue& kv : kvs) {
+                    if (is_tombstone(kv.second)) {
+                        continue;
+                    }
+                    rows.push_back(decode_row_projected(*t, kv.first, kv.second, need));
+                }
             }
         }
 
-        if (plan_stats_ != nullptr) {
+        if (!filter_applied && plan_stats_ != nullptr) {
             plan_stats_->scanned = rows.size();
         }
 
-        // (2) WHERE — apply the general predicate as a row filter UNLESS the PK fast
-        // path already enforced the entire WHERE (a pure-PK predicate). When the fast
-        // path was NOT taken (full scan), the predicate must run here.
-        if (sel.filter.present() && !pk_fast) {
-            // VECTORIZED FILTER FAST PATH (PERF_PLAN Phase 3). When the WHERE is a pure
-            // conjunction of `not_null_col <op> literal` terms, pre-extract the flat term
-            // list once and apply it in a tight loop — no recursive eval_pred tree-walk, no
-            // node-pool indirection, no 3-valued-logic branching per row. Reuses the SAME
-            // apply_cmp + cmp_datum the interpreter uses, so it is BYTE-IDENTICAL; anything
-            // it cannot represent (OR/NOT/IS NULL/IN/EXISTS/subquery/nullable col/agg) falls
-            // back to the row-at-a-time interpreter below.
-            std::vector<VecTerm> terms;
+        // (2) WHERE residual filter — UNLESS the seq scan already FUSED it (filter_applied),
+        // or the PK fast path enforced the whole WHERE. Runs for the index path + any
+        // non-vectorizable predicate. Vectorizable conjuncts reuse the pre-extracted vterms
+        // (byte-identical to the interpreter, which handles everything else).
+        if (sel.filter.present() && !pk_fast && !filter_applied) {
             std::vector<std::vector<Datum>> kept;
-            if (vectorize_ && try_extract_conjuncts(sel.filter, sel.filter.root, *t, terms)) {
+            if (vectorizable) {
                 for (auto& row : rows) {
                     bool ok = true;
-                    for (const VecTerm& vt : terms) {
+                    for (const VecTerm& vt : vterms) {
                         if (!apply_cmp(vt.op, cmp_datum(row[vt.col], vt.lit))) {
                             ok = false;
                             break;

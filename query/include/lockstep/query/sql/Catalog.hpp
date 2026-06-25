@@ -448,6 +448,48 @@ inline void put_index_col(std::string& out, const Datum& d) {
 // for (the v2 pipeline computes `need` from projection + WHERE + GROUP BY + aggregates).
 // PURE inverse over the needed subset; byte-identical to decode_row for those columns,
 // so the conformance gate (== full-decode reference) still proves equality.
+// Decode a projected row INTO a caller-provided buffer (reused across rows). Lets a scan
+// decode-then-discard a filtered-out row WITHOUT a per-row vector allocation (the buffer's
+// capacity is reused) — only surviving rows are copied into the result. Same bytes as the
+// returning variant. (PERF_PLAN Phase 3: the per-row vector<Datum> alloc was the measured
+// scan bottleneck, not the predicate eval.)
+inline void decode_row_projected_into(const Table& t, const Key& key, const Value& value,
+                                      const std::vector<bool>& need, std::vector<Datum>& row) {
+    row.assign(t.columns.size(), Datum{});  // reuses capacity (no realloc after the first row)
+    if (need[t.pk_index]) {
+        row[t.pk_index] = decode_pk(t, key);
+    }
+    std::size_t off = 0;
+    for (std::size_t c = 0; c < t.columns.size(); ++c) {
+        if (c == t.pk_index) {
+            continue;
+        }
+        if (static_cast<unsigned char>(value[off]) == kNullTag) {
+            off += 1;
+            if (need[c]) {
+                row[c] = Datum::make_null(t.columns[c].type);
+            }
+            continue;
+        }
+        const Type ty = static_cast<Type>(static_cast<unsigned char>(value[off]));
+        off += 1;
+        const std::uint32_t len = get_be32(value, off);
+        off += 4;
+        if (need[c]) {
+            if (ty == Type::Int) {
+                std::uint64_t bits = 0;
+                for (std::uint32_t b = 0; b < len; ++b) {
+                    bits = (bits << 8) | static_cast<unsigned char>(value[off + b]);
+                }
+                row[c] = Datum::make_int(static_cast<std::int64_t>(bits));
+            } else {
+                row[c] = Datum::make_text(value.substr(off, len));
+            }
+        }
+        off += len;
+    }
+}
+
 [[nodiscard]] inline std::vector<Datum> decode_row_projected(
     const Table& t, const Key& key, const Value& value,
     const std::vector<bool>& need) {

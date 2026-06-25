@@ -95,3 +95,24 @@ struct-of-arrays buffers (a few allocations per batch, not one vector per row), 
 (already-extracted) conjuncts as raw column passes (SIMD-friendly) over those arrays. The flat
 conjunct extractor is kept as the reusable substrate for that columnar filter. NEXT: columnar
 decode + columnar materialization (the actual speedup), measured the same way.
+
+### Phase 3 — SECOND MEASURED FINDING: the bottleneck is STORAGE, not the SQL layer
+A decode-into-reused-scratch FUSION (decode+filter in one pass, only survivors get a persistent
+alloc — attacking the "50k vector<Datum> per query" decode-alloc hypothesis) was landed AND
+A/B-measured (set_vectorize toggle, N=8000, 200 iters/query). Result on EVERY shape (selective 1%,
+selective 10%, 50%, full): speedup 0.98–1.01× — a WASH. CHK-OK byte-identical throughout. So the
+decode allocation is ALSO not the bottleneck. The decisive probe: `SELECT id FROM emp` (minimal
+SQL — project ONE narrow col, NO filter, NO decode of sal/bio) clocked 56.5 ms/query — IDENTICAL
+to the filtered/decoded `SELECT id,sal WHERE sal>500` at 56.7 ms/query. **The entire SQL layer
+(decode + predicate + projection) is < 2 % of per-query cost; ~100 % is in `db_.run(q)` +
+`collect` — the STORAGE range scan + the full key+value byte copy (incl. the 64-byte unreferenced
+`bio`).** 56 ms / 8000 rows ≈ 7 µs/row for a pure scan, and it GROWS with table size — this is the
+standing FLAG: `storage::WalEngine` memtable does a LINEAR key scan per get + the range
+materializer copies every kv. So Phases 3–5 (SQL-operator vectorization) were optimizing a layer
+that is already free at this scale. THE REAL LEVER, in order: (1) **storage read path** — binary-
+search the sorted memtable (O(N log N) not O(N^1.9)); (2) **projection/late materialization pushed
+INTO the scan** — never copy bytes for columns the SELECT doesn't reference (the wide-TEXT skip the
+SQL layer cannot do because it only sees kvs AFTER the copy). The fused decode path stays (correct,
+fewer allocs, the substrate that pays off ONCE storage stops dominating) but is not the win NOW.
+NEXT: instrument + attack the storage range scan. The profile-first methodology refuted two SQL-
+layer hypotheses before spending real effort there — exactly its purpose.
