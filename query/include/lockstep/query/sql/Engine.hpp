@@ -291,6 +291,7 @@ public:
             writes.emplace_back(kv.first, tombstone_marker());
         }
         commit_writes(writes);  // ATOMIC: blocks + delta clear in one durable batch
+        t->delta_dirty = false;  // delta is now empty (compacted into blocks)
         return std::nullopt;
     }
 
@@ -648,6 +649,12 @@ private:
         if (auto e = block_base_rows(t, sel, need, pk_between, base)) {
             return e;
         }
+        // FAST PATH: a clean delta (no writes since the last flush) — the blocks ARE the
+        // answer, already pk-ascending. Skip the delta scan + merge entirely.
+        if (!t.delta_dirty) {
+            rows_out = std::move(base);
+            return std::nullopt;
+        }
         // Overlay: the row 'd' delta. A live value overwrites/inserts; a del-marker drops.
         Key lo = row_delta_prefix(t.id);
         Key hi = row_delta_prefix_end(t.id);
@@ -738,6 +745,159 @@ private:
         return std::nullopt;
     }
 
+    // A4: fold an ungrouped SUM/COUNT/MIN/MAX/AVG over the SoA column blocks directly — no
+    // AoS row materialisation. nullopt => not applicable (caller falls back to the generic
+    // AoS path, which the conformance gate cross-checks this against). Replicates
+    // compute_agg's ungrouped semantics EXACTLY (NULL handling, empty-group=0, AVG trunc).
+    [[nodiscard]] std::optional<ExecResult> columnar_vectorized_scalar_agg(
+        const Table& t, const SelectStmt& sel) {
+        if (t.delta_dirty || !has_blocks(t)) {
+            return std::nullopt;  // delta non-empty (generic merge) or pre-flush (no blocks)
+        }
+        std::vector<VecTerm> vterms;
+        const bool has_filter = sel.filter.present();
+        if (has_filter &&
+            (!vectorize_ || !try_extract_conjuncts(sel.filter, sel.filter.root, t, vterms))) {
+            return std::nullopt;  // non-vectorizable predicate — generic path
+        }
+        if (auto e = validate_aggs(sel, t)) {
+            return ExecResult::failure(*e);  // identical error to the generic path
+        }
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Column) {
+                return std::nullopt;  // plain col w/ aggregate — let the generic path error
+            }
+        }
+        // Decode the needed column blocks: filter columns + aggregate target columns.
+        std::vector<bool> need(t.columns.size(), false);
+        for (const VecTerm& vt : vterms) {
+            need[vt.col] = true;
+        }
+        for (const SelectItem& item : sel.items) {
+            if (item.agg.kind != AggKind::CountStar) {
+                if (const auto idx = t.column_index(item.agg.column)) {
+                    need[*idx] = true;
+                }
+            }
+        }
+        std::vector<ColumnChunk> cols(t.columns.size());
+        std::uint32_t count = 0;
+        bool count_set = false;
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            if (!need[c]) {
+                continue;
+            }
+            const ReadResult cb =
+                read_committed(block_key(t.id, static_cast<std::uint32_t>(c), 0));
+            if (!cb.has_value()) {
+                return std::nullopt;
+            }
+            cols[c] = decode_column_block(*cb);
+            count = cols[c].count;
+            count_set = true;
+        }
+        if (!count_set) {  // COUNT(*) with no filter/target — read the pk block for the count
+            const ReadResult pkb =
+                read_committed(block_key(t.id, static_cast<std::uint32_t>(t.pk_index), 0));
+            if (!pkb.has_value()) {
+                return std::nullopt;
+            }
+            count = decode_column_block(*pkb).count;
+        }
+        // Selection vector (filter). Without a filter, all rows are selected (idx == row).
+        std::vector<std::uint32_t> sidx;
+        if (has_filter) {
+            sidx.reserve(count);
+            for (std::uint32_t r = 0; r < count; ++r) {
+                bool ok = true;
+                for (const VecTerm& vt : vterms) {
+                    if (!apply_cmp(vt.op, cmp_datum(cols[vt.col].at(r), vt.lit))) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    sidx.push_back(r);
+                }
+            }
+        }
+        const std::size_t nsel = has_filter ? sidx.size() : count;
+        auto at = [&](std::size_t i) -> std::uint32_t {
+            return has_filter ? sidx[i] : static_cast<std::uint32_t>(i);
+        };
+        ResultRow out;
+        for (const SelectItem& item : sel.items) {
+            const AggExpr& a = item.agg;
+            Datum d;
+            if (a.kind == AggKind::CountStar) {
+                d = Datum::make_int(static_cast<std::int64_t>(nsel));
+            } else {
+                const std::size_t ci = *t.column_index(a.column);
+                const ColumnChunk& cc = cols[ci];
+                const Type ty = t.columns[ci].type;
+                if (a.kind == AggKind::Count) {
+                    std::int64_t cnt = 0;
+                    for (std::size_t i = 0; i < nsel; ++i) {
+                        if (!cc.nulls[at(i)]) {
+                            ++cnt;
+                        }
+                    }
+                    d = Datum::make_int(cnt);
+                } else if (nsel == 0) {
+                    d = Datum::make_int(0);  // synthetic empty group (compute_agg parity)
+                } else if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
+                    Datum best;
+                    bool any = false;
+                    for (std::size_t i = 0; i < nsel; ++i) {
+                        const std::uint32_t r = at(i);
+                        if (cc.nulls[r]) {
+                            continue;
+                        }
+                        const Datum v = cc.at(r);
+                        if (!any) {
+                            best = v;
+                            any = true;
+                        } else {
+                            const int c = cmp_datum(v, best);
+                            if ((a.kind == AggKind::Min && c < 0) ||
+                                (a.kind == AggKind::Max && c > 0)) {
+                                best = v;
+                            }
+                        }
+                    }
+                    d = any ? best : Datum::make_null(ty);
+                } else {  // SUM / AVG over INT (validated INT)
+                    std::int64_t sum = 0;
+                    std::int64_t n = 0;
+                    for (std::size_t i = 0; i < nsel; ++i) {
+                        const std::uint32_t r = at(i);
+                        if (cc.nulls[r]) {
+                            continue;
+                        }
+                        sum += cc.ints[r];
+                        ++n;
+                    }
+                    if (n == 0) {
+                        d = a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
+                    } else if (a.kind == AggKind::Sum) {
+                        d = Datum::make_int(sum);
+                    } else {
+                        d = Datum::make_int(sum / n);  // AVG: trunc toward zero
+                    }
+                }
+            }
+            out.cells.emplace_back(item.label, d);
+        }
+        ExecResult r;
+        r.rows.push_back(std::move(out));
+        if (auto e = apply_order_by_labels(sel, r.rows)) {
+            return ExecResult::failure(*e);
+        }
+        apply_limit(sel, r.rows);
+        r.affected = r.rows.size();
+        return r;
+    }
+
     ExecResult exec_insert(const InsertStmt& ins) {
         const Table* t = catalog_.find(ins.table);
         if (t == nullptr) {
@@ -803,6 +963,9 @@ private:
         index_writes_for_row(*t, row, /*tombstone=*/false, writes);
         commit_writes(writes);
         if (Table* mt = catalog_.find_mut(ins.table)) {
+            if (mt->columnar) {
+                mt->delta_dirty = true;  // the delta now has a live entry (until next flush)
+            }
             ++mt->row_count;  // a committed INSERT adds exactly one new row (dup PK is rejected)
             // Grow per-column INT min/max (skip NULLs). Stats may lag a DELETE of an extreme —
             // acceptable for a cost estimate (a slightly-wide range under-estimates selectivity).
@@ -893,6 +1056,11 @@ private:
         index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
         index_writes_for_row(*t, row, /*tombstone=*/false, writes);
         commit_writes(writes);
+        if (t->columnar) {
+            if (Table* mt = catalog_.find_mut(up.table)) {
+                mt->delta_dirty = true;
+            }
+        }
         ExecResult r;
         r.affected = 1;
         return r;
@@ -941,6 +1109,9 @@ private:
         index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
         commit_writes(writes);
         if (Table* mt = catalog_.find_mut(del.table)) {
+            if (mt->columnar) {
+                mt->delta_dirty = true;  // a del-marker now lives in the delta
+            }
             if (mt->row_count > 0) {
                 --mt->row_count;  // a committed DELETE removes exactly one present row
             }
@@ -1206,6 +1377,18 @@ private:
         const Table* t = catalog_.find(sel.table);
         if (t == nullptr) {
             return ExecResult::failure("unknown table '" + sel.table + "'");
+        }
+
+        // A4 VECTORIZED SCALAR AGGREGATE: a columnar+flushed table, an ungrouped aggregate
+        // (no GROUP BY / HAVING / DISTINCT), and a vectorizable (or absent) WHERE — fold
+        // SUM/COUNT/MIN/MAX/AVG DIRECTLY over the SoA column blocks (no AoS row
+        // materialisation, the measured win). nullopt => not applicable, fall through to
+        // the generic AoS path (which the conformance gate cross-checks this against).
+        if (t->columnar && sel.has_aggregates && sel.group_by.empty() &&
+            !sel.having.present() && !sel.distinct) {
+            if (auto fast = columnar_vectorized_scalar_agg(*t, sel)) {
+                return std::move(*fast);
+            }
         }
 
         // (1) READ — pick the storage read (PK fast path vs full scan), run at the

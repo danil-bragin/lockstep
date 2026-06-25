@@ -156,6 +156,14 @@ void run_seed(std::uint64_t seed) {
     check(!col.flush_columnar("emp").has_value(), "flush #2 ok");
     both(col, row, "SELECT id, sal FROM emp WHERE sal > 500", "filter-postflush2");
     both(col, row, "SELECT id, dept FROM emp WHERE id BETWEEN 10 AND 40", "pk-between-postflush2");
+    // A4 vectorized scalar aggregates over SoA blocks (delta empty post-flush) — must
+    // equal row-mode (generic AoS aggregate). Covers COUNT(*)/COUNT(col w/ NULLs)/SUM/MIN/
+    // MAX/AVG, INT + TEXT, with and without a vectorized filter, and an empty selection.
+    both(col, row, "SELECT COUNT(*), SUM(sal), MIN(sal), MAX(sal), AVG(sal) FROM emp", "agg-all");
+    both(col, row, "SELECT COUNT(*), SUM(sal) FROM emp WHERE sal > 500", "agg-filtered");
+    both(col, row, "SELECT COUNT(dept), MIN(dept), MAX(dept) FROM emp", "agg-text-nullable");
+    both(col, row, "SELECT COUNT(*), SUM(sal) FROM emp WHERE sal > 999999", "agg-empty-sel");
+    both(col, row, "SELECT AVG(age), MIN(age), MAX(age) FROM emp WHERE age > 30", "agg-age");
 
     both(col, row, "CREATE INDEX idx_sal ON emp (sal)", "create-index");
     both(col, row, "SELECT id, sal FROM emp WHERE sal = 250", "indexed-eq");
