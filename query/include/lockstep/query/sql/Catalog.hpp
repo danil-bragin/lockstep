@@ -367,6 +367,82 @@ inline void put_pk_int(std::string& out, std::int64_t v) {
     return Datum::make_text(v.substr(1));
 }
 
+// COLUMNAR DELTA storage (LSM write buffer; namespace 'd', disjoint from row 't' / index
+// 'i' / block 'B'). A columnar table's INSERT/UPDATE/DELETE writes a ROW-mode KV here
+//   row_delta_key = "d" ++ be32(table_id) ++ ":" ++ encode_pk(pk)
+// value = encode_value(row) for a live row, or the single-byte kRowDelMarker for a
+// DELETE (a LIVE sentinel — a scan returns it, so a delta delete SHADOWS a flushed block
+// row; a plain tombstone would be hidden by the scan and the block row would wrongly
+// survive). The read path merges blocks (base) with the delta overlay (delta wins per
+// pk; a marker drops the pk); FLUSH packs the merged rows into column blocks + clears the
+// delta. Delta values reuse the ROW codec (encode_value/decode_row), so a pre-flush
+// columnar table reads exactly like a row-mode table (delta IS the whole table).
+inline const std::string& row_del_marker() {
+    static const std::string m(1, '\x01');  // 1 byte; no encode_value output is 1 byte
+    return m;                                // (a non-pk column needs >=1 tag byte +data)
+}
+[[nodiscard]] inline bool is_row_del_marker(const Value& v) { return v == row_del_marker(); }
+
+[[nodiscard]] inline Key row_delta_prefix(std::uint32_t table_id) {
+    Key k = "d";
+    put_be32(k, table_id);
+    k.push_back(':');
+    return k;
+}
+[[nodiscard]] inline Key row_delta_prefix_end(std::uint32_t table_id) {
+    Key k = "d";
+    put_be32(k, table_id);
+    k.push_back(';');  // ':' + 1 — exclusive upper bound of the delta namespace
+    return k;
+}
+[[nodiscard]] inline Key row_delta_key(const Table& t, const Datum& pk) {
+    return row_delta_prefix(t.id) + encode_pk(pk);
+}
+// Decode the PK from a delta key (strip "d" + be32 + ":" = 6 bytes, like decode_pk).
+[[nodiscard]] inline Datum decode_pk_from_delta_key(const Table& t, const Key& key) {
+    constexpr std::size_t kPrefixLen = 6;  // "d" + be32 + ":"
+    const std::string suffix = key.substr(kPrefixLen);
+    if (t.pk().type == Type::Int) {
+        std::uint64_t bits = 0;
+        for (std::size_t b = 1; b <= 8; ++b) {
+            bits = (bits << 8) | static_cast<unsigned char>(suffix[b]);
+        }
+        return Datum::make_int(static_cast<std::int64_t>(bits ^ 0x8000000000000000ULL));
+    }
+    return Datum::make_text(suffix);
+}
+
+// COLUMNAR BLOCK storage keys (LSM-flushed SoA chunks; namespace 'B', disjoint from row
+// 't' / index 'i' / columnar-delta 'd'). A flushed column chunk lives at
+//   block_key = "B" ++ be32(table_id) ++ ":" ++ be32(col_id) ++ ":" ++ be64(block_no)
+// block_no orders chunks within a column (recency / pk-range). The value is an
+// encode_column_block SoA chunk. Written through the verified commit path (durable core
+// unchanged). [lo,hi) over col_id enumerates one column's blocks key-ascending.
+[[nodiscard]] inline Key block_col_prefix(std::uint32_t table_id, std::uint32_t col_id) {
+    Key k = "B";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, col_id);
+    k.push_back(':');
+    return k;
+}
+[[nodiscard]] inline Key block_col_prefix_end(std::uint32_t table_id, std::uint32_t col_id) {
+    Key k = "B";
+    put_be32(k, table_id);
+    k.push_back(':');
+    put_be32(k, col_id);
+    k.push_back(';');  // ':' + 1 — exclusive upper bound of this column's blocks
+    return k;
+}
+[[nodiscard]] inline Key block_key(std::uint32_t table_id, std::uint32_t col_id,
+                                   std::uint64_t block_no) {
+    Key k = block_col_prefix(table_id, col_id);
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        k.push_back(static_cast<char>((block_no >> shift) & 0xFF));  // be64, order-preserving
+    }
+    return k;
+}
+
 // Decode the PK datum from a COLUMNAR key (strip the fixed 11-byte col prefix, decode
 // the suffix per the PK type — the same suffix transform decode_pk uses for row keys).
 [[nodiscard]] inline Datum decode_pk_from_col_key(const Table& t, const Key& key) {

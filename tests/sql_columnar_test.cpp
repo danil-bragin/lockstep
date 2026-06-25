@@ -117,6 +117,12 @@ void run_seed(std::uint64_t seed) {
         both(col, row, sql, "insert");
     }
 
+    // FLUSH the columnar table: live rows move INSERTed-so-far into column blocks; the
+    // row engine is unaffected. Subsequent reads must merge blocks + (new) delta and stay
+    // byte-identical to row-mode. (A flush mid-workload exercises block+delta merge,
+    // post-flush UPDATE/DELETE shadowing a block row, and re-INSERT of a flushed pk.)
+    check(!col.flush_columnar("emp").has_value(), "flush #1 ok");
+
     // UPDATEs + DELETEs (PK-targeted, incl. absent rows => affected=0).
     for (std::size_t k = 0; k < 20; ++k) {
         const std::int64_t id = static_cast<std::int64_t>(rng.below(60));
@@ -145,6 +151,12 @@ void run_seed(std::uint64_t seed) {
 
     // Secondary index — create on both, then an indexed WHERE (columnar assembles the
     // matched rows from their families) must equal the row-mode (full-scan) answer.
+    // Second flush AFTER updates/deletes: blocks now rebuilt from the merged set (the
+    // delta — incl. post-flush deletes that shadowed block rows — is compacted away).
+    check(!col.flush_columnar("emp").has_value(), "flush #2 ok");
+    both(col, row, "SELECT id, sal FROM emp WHERE sal > 500", "filter-postflush2");
+    both(col, row, "SELECT id, dept FROM emp WHERE id BETWEEN 10 AND 40", "pk-between-postflush2");
+
     both(col, row, "CREATE INDEX idx_sal ON emp (sal)", "create-index");
     both(col, row, "SELECT id, sal FROM emp WHERE sal = 250", "indexed-eq");
     both(col, row, "SELECT id, sal, dept FROM emp WHERE sal BETWEEN 100 AND 300", "indexed-range");

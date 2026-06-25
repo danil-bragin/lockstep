@@ -151,6 +151,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -159,6 +160,7 @@
 #include <lockstep/query/Query.hpp>
 #include <lockstep/query/sql/Ast.hpp>
 #include <lockstep/query/sql/Catalog.hpp>
+#include <lockstep/query/sql/ColumnBlock.hpp>
 #include <lockstep/query/sql/Parser.hpp>
 #include <lockstep/txn/Transaction.hpp>
 
@@ -247,6 +249,51 @@ public:
     // columnar conformance gate run the SAME workload with this on vs off.
     void set_columnar_default(bool v) { columnar_default_ = v; }
 
+    // FLUSH a columnar table's row 'd' delta into column blocks (LSM compaction): read the
+    // merged live rows, pack each column into a block (block_no 0, overwrite), and clear
+    // the delta — ALL in ONE atomic commit (the durable batch), so a crash leaves either
+    // the pre-flush or the post-flush state, never a torn mix. After flush, reads take the
+    // SoA block path (projection pushdown); writes repopulate the delta. No-op for a
+    // row-mode table. Public so the bench/tests + a future auto-flush trigger can call it.
+    std::optional<std::string> flush_columnar(const std::string& table) {
+        Table* t = catalog_.find_mut(table);
+        if (t == nullptr) {
+            return std::string("unknown table '" + table + "'");
+        }
+        if (!t->columnar) {
+            return std::nullopt;  // nothing to flush
+        }
+        SelectStmt full;
+        full.table = table;
+        full.level = Level::StrictSerializable;
+        const std::vector<bool> all(t->columns.size(), true);
+        std::vector<std::vector<Datum>> rows;  // merged live rows, pk-ascending
+        if (auto e = columnar_build_rows(*t, full, all, rows)) {
+            return e;
+        }
+        std::vector<std::pair<Key, Value>> writes;
+        for (std::size_t c = 0; c < t->columns.size(); ++c) {
+            std::vector<Datum> cells;
+            cells.reserve(rows.size());
+            for (const std::vector<Datum>& row : rows) {
+                cells.push_back(row[c]);
+            }
+            writes.emplace_back(block_key(t->id, static_cast<std::uint32_t>(c), 0),
+                                encode_column_block(t->columns[c].type, cells));
+        }
+        std::vector<storage::KeyValue> delta;  // clear the delta: tombstone every 'd' key
+        {
+            Query<Strict> q;
+            q.scan(row_delta_prefix(t->id), row_delta_prefix_end(t->id));
+            collect(db_.run(q), delta);
+        }
+        for (const storage::KeyValue& kv : delta) {
+            writes.emplace_back(kv.first, tombstone_marker());
+        }
+        commit_writes(writes);  // ATOMIC: blocks + delta clear in one durable batch
+        return std::nullopt;
+    }
+
 private:
     // --- CREATE TABLE ---------------------------------------------------------
     ExecResult exec_create(const CreateStmt& c) {
@@ -318,26 +365,19 @@ private:
         // verified scan path (a full table scan), then commit one index-entry write per
         // row through the verified executor (one txn per row — atomic, ordered).
         if (t->columnar) {
-            // Columnar: enumerate live PKs from the pk-column family, assemble each row
-            // from its column families (point-gets), then write its index entry.
-            std::vector<storage::KeyValue> anchor;
-            {
-                Query<Strict> q;
-                q.scan(col_prefix(table_id, static_cast<std::uint32_t>(pk_index)),
-                       col_prefix_end(table_id, static_cast<std::uint32_t>(pk_index)));
-                collect(db_.run(q), anchor);
+            // Columnar: enumerate every live row (block+delta merge, all columns) and
+            // write its index entry.
+            SelectStmt full;  // a bare full-table SELECT for the merged enumeration
+            full.table = t->name;
+            full.level = Level::StrictSerializable;
+            std::vector<bool> all(t->columns.size(), true);
+            std::vector<std::vector<Datum>> rows;
+            if (auto e = columnar_build_rows(*t, full, all, rows)) {
+                return ExecResult::failure(*e);
             }
-            for (const storage::KeyValue& kv : anchor) {
-                if (is_tombstone(kv.second)) {
-                    continue;
-                }
-                const Datum pk = decode_pk_from_col_key(*t, kv.first);
-                const auto row = read_columnar_row(*t, pk);
-                if (!row) {
-                    continue;
-                }
+            for (const std::vector<Datum>& row : rows) {
                 const Key ikey =
-                    encode_index_entry(table_id, ix, (*row)[ix.column], (*row)[pk_index]);
+                    encode_index_entry(table_id, ix, row[ix.column], row[pk_index]);
                 commit_writes({{ikey, std::string{}}});
             }
             return ExecResult{};
@@ -455,57 +495,47 @@ private:
                           : encode_key(t, pk);
     }
 
-    // Emit the storage write(s) that MATERIALISE a row. Row mode: one {row_key, value}.
-    // Columnar: one {col_key, col_value} per column (incl. the PK column, whose family
-    // doubles as the existence anchor). The caller commits them in ONE batch, so the
-    // row is atomic regardless of layout (the durable core's write batch is the unit).
+    // Emit the storage write that MATERIALISES a row. Row mode: {row_key, value} under
+    // 't'. Columnar: {row_delta_key, value} under the 'd' delta overlay (same ROW codec);
+    // FLUSH later compacts the delta into column blocks. One KV either way (atomic).
     void emit_row_writes(const Table& t, const std::vector<Datum>& row,
                          std::vector<std::pair<Key, Value>>& writes) const {
         const Datum& pk = row[t.pk_index];
         if (t.columnar) {
-            for (std::size_t c = 0; c < t.columns.size(); ++c) {
-                writes.emplace_back(col_key(t.id, static_cast<std::uint32_t>(c), pk),
-                                    encode_col_value(row[c]));
-            }
+            writes.emplace_back(row_delta_key(t, pk), encode_value(t, row));
         } else {
             writes.emplace_back(encode_key(t, pk), encode_value(t, row));
         }
     }
 
-    // Emit the tombstone write(s) that RETIRE a row (one per column family in columnar).
+    // Emit the write that RETIRES a row. Row mode: a tombstone (scan-hidden). Columnar: a
+    // LIVE del-marker in the delta so it SHADOWS any flushed block row (a plain tombstone
+    // would be hidden by the scan and the block row would wrongly survive); FLUSH GCs it.
     void emit_row_tombstones(const Table& t, const Datum& pk,
                              std::vector<std::pair<Key, Value>>& writes) const {
         if (t.columnar) {
-            for (std::size_t c = 0; c < t.columns.size(); ++c) {
-                writes.emplace_back(col_key(t.id, static_cast<std::uint32_t>(c), pk),
-                                    tombstone_marker());
-            }
+            writes.emplace_back(row_delta_key(t, pk), row_del_marker());
         } else {
             writes.emplace_back(encode_key(t, pk), tombstone_marker());
         }
     }
 
-    // Read a columnar row by PK (one point-get per column family). nullopt if no live
-    // family entry exists (row absent/deleted). PK is taken from the arg (authoritative).
-    // Used by UPDATE/DELETE (need the full old row for index upkeep) + the index fetch.
+    // Read a columnar row by PK, MERGING the delta overlay over the flushed blocks. The
+    // delta wins: a live delta value is the row; a del-marker means deleted (nullopt);
+    // absent from the delta falls through to the blocks. nullopt if neither has a live
+    // row. Used by UPDATE/DELETE (need the old row for index upkeep) + the index fetch +
+    // the dup-PK probe.
     [[nodiscard]] std::optional<std::vector<Datum>> read_columnar_row(const Table& t,
                                                                       const Datum& pk) {
-        std::vector<Datum> row(t.columns.size());
-        bool any = false;
-        for (std::size_t c = 0; c < t.columns.size(); ++c) {
-            const ReadResult v =
-                read_committed(col_key(t.id, static_cast<std::uint32_t>(c), pk));
-            if (!v.has_value() || is_tombstone(*v)) {
-                continue;
+        const ReadResult dv = read_committed(row_delta_key(t, pk));
+        if (dv.has_value() && !is_tombstone(*dv)) {
+            if (is_row_del_marker(*dv)) {
+                return std::nullopt;  // delta delete shadows any block row
             }
-            row[c] = decode_col_value(t.columns[c].type, *v);
-            any = true;
+            return decode_row(t, encode_key(t, pk), *dv);  // live delta row (row codec)
         }
-        if (!any) {
-            return std::nullopt;
-        }
-        row[t.pk_index] = pk;  // authoritative PK from the key
-        return row;
+        // Not in the delta — look in the flushed blocks (A3.2). No blocks yet => absent.
+        return read_block_row(t, pk);
     }
 
     // Range-scan ONE key range [lo,hi) at the statement's D5 level (the column-family
@@ -548,72 +578,150 @@ private:
     // so the i-th live entry of every family is the same row). Only NEEDED columns are
     // scanned: the projection-pushdown win (a wide unreferenced column's family is never
     // read). Needed columns are decoded into rows_out; unneeded stay Datum{}.
-    // `pk_between` (with sel.lo_value/hi_value) restricts every family scan to the PK
-    // sub-range [lo, hi] — the columnar PK-fast BETWEEN path (the pk suffix is order-
-    // preserving, so a family's [col_prefix++pk_lo, col_prefix++pk_hi++) covers it).
+    // Does the table have flushed blocks? Probe the pk-column's block (block_no 0).
+    [[nodiscard]] bool has_blocks(const Table& t) {
+        return read_committed(block_key(t.id, static_cast<std::uint32_t>(t.pk_index), 0))
+            .has_value();
+    }
+
+    // Locate a pk within a (pk-ascending) pk-column chunk by binary search.
+    [[nodiscard]] static std::optional<std::uint32_t> chunk_find_pk(const ColumnChunk& pkc,
+                                                                    const Datum& pk) {
+        if (pkc.type == Type::Int) {
+            auto it = std::lower_bound(pkc.ints.begin(), pkc.ints.end(), pk.i);
+            if (it != pkc.ints.end() && *it == pk.i) {
+                return static_cast<std::uint32_t>(it - pkc.ints.begin());
+            }
+        } else {
+            auto it = std::lower_bound(pkc.texts.begin(), pkc.texts.end(), pk.s);
+            if (it != pkc.texts.end() && *it == pk.s) {
+                return static_cast<std::uint32_t>(it - pkc.texts.begin());
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Assemble a single row from the flushed column blocks (nullopt if no blocks, or the
+    // pk is not present). Decodes the pk block to locate the row index, then reads every
+    // column's block at that index (used by the single-pk merge: dup probe / UPDATE /
+    // DELETE / index fetch, where the full row is needed).
+    [[nodiscard]] std::optional<std::vector<Datum>> read_block_row(const Table& t,
+                                                                   const Datum& pk) {
+        const ReadResult pkb =
+            read_committed(block_key(t.id, static_cast<std::uint32_t>(t.pk_index), 0));
+        if (!pkb.has_value() || is_tombstone(*pkb)) {
+            return std::nullopt;  // no blocks
+        }
+        const ColumnChunk pkc = decode_column_block(*pkb);
+        const auto idx = chunk_find_pk(pkc, pk);
+        if (!idx) {
+            return std::nullopt;  // pk not in the blocks
+        }
+        std::vector<Datum> row(t.columns.size());
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            if (c == t.pk_index) {
+                row[c] = pk;
+                continue;
+            }
+            const ReadResult cb =
+                read_committed(block_key(t.id, static_cast<std::uint32_t>(c), 0));
+            if (!cb.has_value()) {
+                return std::nullopt;  // corrupt/missing column block (defensive)
+            }
+            row[c] = decode_column_block(*cb).at(*idx);
+        }
+        return row;
+    }
+
+    // Build the post-scan `rows` for a COLUMNAR table by MERGING the flushed column blocks
+    // (base, A3.2) with the row 'd' delta overlay (the delta wins per pk; a del-marker
+    // drops the pk). `pk_between` restricts the scan to the PK range [lo,hi] (the columnar
+    // PK-fast BETWEEN path; encode_pk is order-preserving). Only NEEDED columns are
+    // materialised. Output is pk-ascending (an ordered map keyed by the order-preserving
+    // pk encoding) so it matches the row-mode full-scan order the conformance gate checks.
     [[nodiscard]] std::optional<std::string> columnar_build_rows(
         const Table& t, const SelectStmt& sel, const std::vector<bool>& need,
         std::vector<std::vector<Datum>>& rows_out, bool pk_between = false) {
-        auto fam_lo = [&](std::uint32_t c) {
-            Key k = col_prefix(t.id, c);
-            if (pk_between) {
-                k += encode_pk(sel.lo_value);
-            }
-            return k;
-        };
-        auto fam_hi = [&](std::uint32_t c) {
-            if (pk_between) {
-                Key k = col_prefix(t.id, c) + encode_pk(sel.hi_value);
-                k.push_back('\0');  // inclusive upper bound -> half-open
-                return k;
-            }
-            return col_prefix_end(t.id, c);
-        };
-        const std::uint32_t pkc = static_cast<std::uint32_t>(t.pk_index);
-        std::vector<storage::KeyValue> anchor;  // pk-column family enumerates live rows
-        if (auto e = scan_range_at_level(sel, fam_lo(pkc), fam_hi(pkc), anchor)) {
+        std::map<Key, std::vector<Datum>> merged;  // key = encode_pk(pk) (pk-ascending)
+        // Base: flushed blocks (A3.2 fills block_base_rows; empty pre-flush).
+        if (auto e = block_base_rows(t, sel, need, pk_between, merged)) {
             return e;
         }
-        std::vector<Datum> pks;
-        pks.reserve(anchor.size());
-        for (const storage::KeyValue& kv : anchor) {
+        // Overlay: the row 'd' delta. A live value overwrites/inserts; a del-marker drops.
+        Key lo = row_delta_prefix(t.id);
+        Key hi = row_delta_prefix_end(t.id);
+        if (pk_between) {
+            lo = row_delta_prefix(t.id) + encode_pk(sel.lo_value);
+            hi = row_delta_prefix(t.id) + encode_pk(sel.hi_value);
+            hi.push_back('\0');  // inclusive upper bound -> half-open
+        }
+        std::vector<storage::KeyValue> delta;
+        if (auto e = scan_range_at_level(sel, lo, hi, delta)) {
+            return e;
+        }
+        for (const storage::KeyValue& kv : delta) {
             if (is_tombstone(kv.second)) {
+                continue;  // (scan already drops these; defensive)
+            }
+            const Datum pk = decode_pk_from_delta_key(t, kv.first);
+            const Key mk = encode_pk(pk);
+            if (is_row_del_marker(kv.second)) {
+                merged.erase(mk);  // delta delete shadows the block row
                 continue;
             }
-            pks.push_back(decode_pk_from_col_key(t, kv.first));
+            std::vector<Datum> row = decode_row_projected(t, encode_key(t, pk), kv.second, need);
+            merged[mk] = std::move(row);
         }
-        std::vector<std::vector<Datum>> rows(pks.size(),
-                                             std::vector<Datum>(t.columns.size()));
-        if (need[t.pk_index]) {
-            for (std::size_t i = 0; i < pks.size(); ++i) {
-                rows[i][t.pk_index] = pks[i];
-            }
+        rows_out.reserve(merged.size());
+        for (auto& [k, row] : merged) {
+            (void)k;
+            rows_out.push_back(std::move(row));
         }
+        return std::nullopt;
+    }
+
+    // Populate `merged` (keyed by encode_pk, pk-ascending) from the flushed column blocks
+    // for the NEEDED columns over the pk range — the projection-pushdown read: decode the
+    // pk block + only the needed column blocks (SoA), zip by position. Empty if no blocks.
+    [[nodiscard]] std::optional<std::string> block_base_rows(
+        const Table& t, const SelectStmt& sel, const std::vector<bool>& need,
+        bool pk_between, std::map<Key, std::vector<Datum>>& merged) {
+        const std::uint32_t pkc_id = static_cast<std::uint32_t>(t.pk_index);
+        const ReadResult pkb = read_committed(block_key(t.id, pkc_id, 0));
+        if (!pkb.has_value() || is_tombstone(*pkb)) {
+            return std::nullopt;  // no blocks (pre-flush)
+        }
+        const ColumnChunk pkc = decode_column_block(*pkb);
+        std::vector<ColumnChunk> cols(t.columns.size());  // decoded needed col blocks
         for (std::size_t c = 0; c < t.columns.size(); ++c) {
             if (c == t.pk_index || !need[c]) {
                 continue;
             }
-            std::vector<storage::KeyValue> fam;
-            if (auto e = scan_range_at_level(sel, fam_lo(static_cast<std::uint32_t>(c)),
-                                             fam_hi(static_cast<std::uint32_t>(c)), fam)) {
-                return e;
+            const ReadResult cb =
+                read_committed(block_key(t.id, static_cast<std::uint32_t>(c), 0));
+            if (!cb.has_value()) {
+                return std::string("columnar block missing column");
             }
-            std::size_t i = 0;
-            for (const storage::KeyValue& kv : fam) {
-                if (is_tombstone(kv.second)) {
+            cols[c] = decode_column_block(*cb);
+        }
+        for (std::uint32_t i = 0; i < pkc.count; ++i) {
+            const Datum pk = pkc.type == Type::Int ? Datum::make_int(pkc.ints[i])
+                                                   : Datum::make_text(pkc.texts[i]);
+            if (pk_between && (pk.less_than(sel.lo_value) || sel.hi_value.less_than(pk))) {
+                continue;
+            }
+            std::vector<Datum> row(t.columns.size());
+            if (need[t.pk_index]) {
+                row[t.pk_index] = pk;
+            }
+            for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                if (c == t.pk_index || !need[c]) {
                     continue;
                 }
-                if (i >= rows.size()) {
-                    return std::string("columnar family misaligned (extra column entry)");
-                }
-                rows[i][c] = decode_col_value(t.columns[c].type, kv.second);
-                ++i;
+                row[c] = cols[c].at(i);
             }
-            if (i != rows.size()) {
-                return std::string("columnar family misaligned (missing column entry)");
-            }
+            merged[encode_pk(pk)] = std::move(row);
         }
-        rows_out = std::move(rows);
         return std::nullopt;
     }
 
@@ -660,12 +768,17 @@ private:
 
         // INCREMENTAL write path (see commit_write): the read-modify-write DECISION
         // (dup-PK detect) runs in the Engine over the VERIFIED read path (the live
-        // committed store), so we never re-submit the whole prior write-log. The
-        // committed state is probed via the existence key (the row key, or — in columnar
-        // mode — the pk-column family anchor); the resulting writes commit through the
-        // verified executor + apply incrementally.
-        const ReadResult existing = read_committed(existence_key(*t, pk));
-        if (existing.has_value() && !is_tombstone(*existing)) {
+        // committed store), so we never re-submit the whole prior write-log. Columnar
+        // probes the merged block+delta view (read_columnar_row handles the del-marker);
+        // row mode probes the row key.
+        bool exists;
+        if (t->columnar) {
+            exists = read_columnar_row(*t, pk).has_value();
+        } else {
+            const ReadResult existing = read_committed(encode_key(*t, pk));
+            exists = existing.has_value() && !is_tombstone(*existing);
+        }
+        if (exists) {
             return ExecResult::failure("duplicate primary key in table '" + ins.table +
                                        "' (row already exists)");
         }
