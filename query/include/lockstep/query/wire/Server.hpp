@@ -264,14 +264,32 @@ private:
             return cached;
         }
 
-        batch_.push_back(materialize(req));
-        const SubmitResult rr = db_.submit(batch_);
+        // WRITE-ONLY FAST PATH (kills the O(n^2)). A Put writes its key UNCONDITIONALLY
+        // (declares no reads), so its committed write-set is INDEPENDENT of prior state —
+        // running it as a SINGLETON yields the identical effect as re-running it at the
+        // tail of the whole batch. So submit just this txn (O(1)) instead of re-submitting
+        // the GROWING batch_ (which re-executes ALL prior committed txns from an empty
+        // engine every call ⇒ O(n) per submit ⇒ O(n^2) over a run). Read-modify-write ops
+        // (Transfer/Increment) DO read prior state, so they keep the batch re-run (which
+        // replays the seqLog so they observe every prior commit). Write-only txns are still
+        // RECORDED in batch_ afterward, so a later read-modify-write's re-run sees them.
+        const bool write_only = (req.op == SubmitOp::Put);
+        TxnFn fn = materialize(req);
+        SubmitResult rr;
+        if (write_only) {
+            std::vector<TxnFn> one;
+            one.push_back(fn);
+            rr = db_.submit(one);
+        } else {
+            batch_.push_back(fn);
+            rr = db_.submit(batch_);
+        }
 
         Response r;
         r.kind = MsgKind::SubmitOk;
         r.req_id = req.req_id;
         if (!rr.commits.empty()) {
-            // The just-submitted txn is the LAST in the ordered batch.
+            // The just-submitted txn is the LAST in the ordered batch (or the only one).
             const txn::CommitInfo& ci = rr.commits.back();
             r.status = static_cast<std::uint8_t>(ci.status);
             r.commit_version = ci.commit_version;
@@ -280,14 +298,19 @@ private:
             if (ci.status == txn::Status::Committed) {
                 // Apply this txn's committed write-set to the DURABLE query store
                 // EXACTLY ONCE (WAL'd + synced over the injected IDisk), advancing
-                // the query-visible tip by one. This replaces the old "re-prime the
-                // WHOLE history each submit" model with an incremental durable apply,
-                // so the committed query state survives + recovers on a restart.
+                // the query-visible tip by one. Incremental durable apply (survives +
+                // recovers on a restart). For the write-only path, the query-visible
+                // commit version is the monotonic tip (the singleton executor's local
+                // version is per-call, not a global sequence).
                 tip_ = db_.apply_committed(ci.writes_committed);
                 ++applied_;
-            } else {
-                // Aborted txns leave no effect: drop it from the live batch so a
-                // re-run does not keep re-attempting (deterministic, idempotent).
+                if (write_only) {
+                    r.commit_version = tip_;
+                    batch_.push_back(std::move(fn));  // record for later read-txn re-runs
+                }
+            } else if (!write_only) {
+                // Aborted read-modify-write txn leaves no effect: drop it from the live
+                // batch so a re-run does not keep re-attempting (deterministic, idempotent).
                 batch_.pop_back();
             }
         }
