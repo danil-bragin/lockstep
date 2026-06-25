@@ -296,6 +296,14 @@ struct SelectStmt {
     Seq snapshot_version = kNoSeq;  // AT SNAPSHOT <version>
     Seq max_lag = 0;                // AT BOUNDED <max_lag>
     SessionId session = 0;          // AT RYW <session>
+
+    // EXPLAIN [ANALYZE] <select> — when set, exec_select returns the chosen PLAN (access
+    // path + pipeline stages) as text rows instead of the query result. ANALYZE also RUNS
+    // the query and reports DETERMINISTIC per-stage counters (rows / comparisons / decodes
+    // — a pure function of the seed, never wall-clock). The transparency surface for finding
+    // bottlenecks (PERF_PLAN.md Phase 0).
+    bool explain = false;
+    bool explain_analyze = false;
 };
 
 // The tagged statement union (a small value; no heap-owned polymorphism).

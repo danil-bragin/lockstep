@@ -564,7 +564,134 @@ private:
     }
 
     // --- SELECT (the v2 pipeline) --------------------------------------------
+    // DETERMINISTIC plan counters (EXPLAIN ANALYZE). Pure functions of the seed — rows /
+    // groups at each pipeline boundary, never wall-clock. A null plan_stats_ means a normal
+    // run (zero overhead beyond the null check).
+    struct PlanStats {
+        std::size_t scanned = 0;       // rows read from storage (post-access-path)
+        std::size_t after_filter = 0;  // rows surviving the WHERE residual
+        std::size_t groups = 0;        // GROUP BY group count (0 if no grouping)
+        std::size_t output = 0;        // final rows returned
+    };
+
+    // EXPLAIN [ANALYZE] <select>: return the chosen PLAN (access path + pipeline stages) as
+    // text rows. ANALYZE additionally RUNS the query and appends DETERMINISTIC actual counts
+    // (rows scanned/filtered, groups, output) — the transparency surface for finding
+    // bottlenecks (a "Seq Scan: scanned 1,000,000 -> 12" line screams "add an index").
+    ExecResult explain_select(const SelectStmt& sel) {
+        ExecResult out;
+        auto line = [&](const std::string& s) {
+            ResultRow r;
+            r.cells.emplace_back("QUERY PLAN", Datum::make_text(s));
+            out.rows.push_back(std::move(r));
+        };
+        const Table* t = catalog_.find(sel.table);
+        if (t == nullptr && !sel.is_join()) {
+            return ExecResult::failure("unknown table '" + sel.table + "'");
+        }
+
+        // Run first (ANALYZE) so actual counts are available to annotate each node.
+        PlanStats st;
+        ExecResult run_res;
+        if (sel.explain_analyze) {
+            SelectStmt run = sel;
+            run.explain = false;
+            run.explain_analyze = false;
+            plan_stats_ = &st;
+            run_res = exec_select(run);
+            plan_stats_ = nullptr;
+            if (!run_res.ok) {
+                return run_res;  // surface the execution error
+            }
+            st.output = run_res.rows.size();
+        }
+        auto act = [&](const std::string& field, std::size_t n) -> std::string {
+            return sel.explain_analyze ? "  (actual " + field + "=" + std::to_string(n) + ")"
+                                       : std::string{};
+        };
+
+        // Innermost: the access path. Re-derive the planner's choice (PK point/range, index
+        // range, or full scan) for description — same predicates exec_select uses.
+        if (sel.is_join()) {
+            line("Join (" + std::to_string(sel.from.size()) + " tables, left-deep)" +
+                 act("rows", st.output));
+            line("  -> per-table Seq Scan + hash/nested-loop join (see PERF_PLAN Phase 1)");
+        } else {
+            const bool pk_fast = sel.where != SelectWhereKind::None &&
+                                 sel.where_column == t->pk().name &&
+                                 predicate_is_pure_pk(sel, *t);
+            std::string scan;
+            if (pk_fast && sel.where == SelectWhereKind::Eq) {
+                scan = "PK Point Get on " + sel.table + " (" + t->pk().name + " = const)";
+            } else if (pk_fast && sel.where == SelectWhereKind::Between) {
+                scan = "PK Range Scan on " + sel.table + " (" + t->pk().name + " BETWEEN)";
+            } else if (!pk_fast && sel.filter.present()) {
+                if (auto plan = choose_index_access(sel, *t)) {
+                    scan = "Index Scan using " + plan->index->name +
+                           (plan->is_eq ? " (= const)" : " (range)") + " on " + sel.table +
+                           " + point-get rows";
+                } else {
+                    scan = "Seq Scan on " + sel.table;
+                }
+            } else {
+                scan = "Seq Scan on " + sel.table;
+            }
+            line(scan + act("scanned_rows", st.scanned));
+        }
+
+        // The stages above the scan, innermost-first in execution order.
+        if (sel.filter.present() &&
+            !(sel.where != SelectWhereKind::None && !sel.is_join() && t != nullptr &&
+              sel.where_column == t->pk().name && predicate_is_pure_pk(sel, *t))) {
+            line("  Filter: WHERE residual predicate" + act("rows", st.after_filter));
+        }
+        if (sel.has_aggregates || !sel.group_by.empty()) {
+            line("  HashAggregate: " +
+                 (sel.group_by.empty() ? std::string("scalar aggregate")
+                                       : "GROUP BY " + std::to_string(sel.group_by.size()) +
+                                             " col(s)") +
+                 act("groups", st.groups));
+            if (sel.having.present()) {
+                line("  Having: filter groups");
+            }
+        }
+        if (sel.distinct) {
+            line("  Distinct");
+        }
+        if (!sel.order_by.empty()) {
+            line("  Sort: ORDER BY " + std::to_string(sel.order_by.size()) +
+                 " key(s) (stable, PK tie-break)");
+        }
+        if (sel.has_limit) {
+            line("  Limit: " + std::to_string(sel.limit) +
+                 (sel.offset > 0 ? " offset " + std::to_string(sel.offset) : ""));
+        }
+        line("Level: " + level_name(sel.level) +
+             (sel.explain_analyze
+                  ? std::string("  | EXPLAIN ANALYZE (deterministic counters, not wall-clock)")
+                  : std::string{}));
+        out.affected = out.rows.size();
+        return out;
+    }
+
+    static std::string level_name(Level l) {
+        switch (l) {
+            case Level::StrictSerializable:
+                return "StrictSerializable";
+            case Level::Snapshot:
+                return "Snapshot";
+            case Level::BoundedStaleness:
+                return "BoundedStaleness";
+            case Level::ReadYourWrites:
+                return "ReadYourWrites";
+        }
+        return "?";
+    }
+
     ExecResult exec_select(const SelectStmt& sel) {
+        if (sel.explain) {
+            return explain_select(sel);
+        }
         // v3: a genuine JOIN (>1 FROM entry) OR an aliased single table takes the
         // joined pipeline (qualified-column resolution over a multi-table schema).
         const bool joined =
@@ -630,6 +757,10 @@ private:
             }
         }
 
+        if (plan_stats_ != nullptr) {
+            plan_stats_->scanned = rows.size();
+        }
+
         // (2) WHERE — apply the general predicate as a row filter UNLESS the PK fast
         // path already enforced the entire WHERE (a pure-PK predicate). When the fast
         // path was NOT taken (full scan), the predicate must run here.
@@ -647,10 +778,18 @@ private:
             }
             rows = std::move(kept);
         }
+        if (plan_stats_ != nullptr) {
+            plan_stats_->after_filter = rows.size();
+        }
 
         // (3)/(4) GROUP + AGGREGATE + HAVING when the query has aggregates / GROUP BY.
         if (sel.has_aggregates || !sel.group_by.empty()) {
-            return exec_aggregate(sel, *t, rows);
+            ExecResult ar = exec_aggregate(sel, *t, rows);
+            if (plan_stats_ != nullptr) {
+                plan_stats_->groups = ar.rows.size();
+                plan_stats_->output = ar.rows.size();
+            }
+            return ar;
         }
 
         // No aggregates: resolve the plain projection (validate columns exist).
@@ -2763,6 +2902,7 @@ private:
     Database db_;
     Seq tip_ = 0;
     std::uint64_t next_txn_id_ = 1;
+    PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run
 };
 
 }  // namespace lockstep::query::sql

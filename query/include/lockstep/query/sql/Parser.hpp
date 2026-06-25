@@ -338,6 +338,27 @@ public:
             r = parse_delete();
         } else if (kw == "select") {
             r = parse_select();
+        } else if (kw == "explain") {
+            // EXPLAIN [ANALYZE] <select> — transparency. Consume the prefix, parse the inner
+            // SELECT, and tag it so the engine returns the plan (+ ANALYZE counters) instead
+            // of rows. Only SELECT is explainable in this phase.
+            advance();  // consume EXPLAIN
+            bool analyze = false;
+            if (cur_.kind == Tok::Ident && lower(cur_.text) == "analyze") {
+                analyze = true;
+                advance();
+            }
+            if (cur_.kind != Tok::Ident || lower(cur_.text) != "select") {
+                return err("EXPLAIN must be followed by a SELECT statement");
+            }
+            Statement st;
+            st.kind = StmtKind::Select;
+            if (auto e = parse_select_stmt(st.select)) {
+                return ParseResult{*e};
+            }
+            st.select.explain = true;
+            st.select.explain_analyze = analyze;
+            r = ParseResult{std::move(st)};
         } else if (kw == "drop") {
             r = parse_drop_index();
         } else {
