@@ -239,6 +239,10 @@ public:
 
     [[nodiscard]] const Catalog& catalog() const { return catalog_; }
 
+    // TEST/BENCH-ONLY: toggle the vectorized filter fast path (for A/B measurement). A pure
+    // config flag (deterministic per setting); the default is on.
+    void set_vectorize(bool v) { vectorize_ = v; }
+
 private:
     // --- CREATE TABLE ---------------------------------------------------------
     ExecResult exec_create(const CreateStmt& c) {
@@ -896,15 +900,38 @@ private:
         // path already enforced the entire WHERE (a pure-PK predicate). When the fast
         // path was NOT taken (full scan), the predicate must run here.
         if (sel.filter.present() && !pk_fast) {
+            // VECTORIZED FILTER FAST PATH (PERF_PLAN Phase 3). When the WHERE is a pure
+            // conjunction of `not_null_col <op> literal` terms, pre-extract the flat term
+            // list once and apply it in a tight loop — no recursive eval_pred tree-walk, no
+            // node-pool indirection, no 3-valued-logic branching per row. Reuses the SAME
+            // apply_cmp + cmp_datum the interpreter uses, so it is BYTE-IDENTICAL; anything
+            // it cannot represent (OR/NOT/IS NULL/IN/EXISTS/subquery/nullable col/agg) falls
+            // back to the row-at-a-time interpreter below.
+            std::vector<VecTerm> terms;
             std::vector<std::vector<Datum>> kept;
-            for (auto& row : rows) {
-                bool truth = false;
-                if (auto e = eval_pred(sel.filter, sel.filter.root, *t, row,
-                                       /*group=*/nullptr, truth)) {
-                    return ExecResult::failure(*e);
+            if (vectorize_ && try_extract_conjuncts(sel.filter, sel.filter.root, *t, terms)) {
+                for (auto& row : rows) {
+                    bool ok = true;
+                    for (const VecTerm& vt : terms) {
+                        if (!apply_cmp(vt.op, cmp_datum(row[vt.col], vt.lit))) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        kept.push_back(std::move(row));
+                    }
                 }
-                if (truth) {
-                    kept.push_back(std::move(row));
+            } else {
+                for (auto& row : rows) {
+                    bool truth = false;
+                    if (auto e = eval_pred(sel.filter, sel.filter.root, *t, row,
+                                           /*group=*/nullptr, truth)) {
+                        return ExecResult::failure(*e);
+                    }
+                    if (truth) {
+                        kept.push_back(std::move(row));
+                    }
                 }
             }
             rows = std::move(kept);
@@ -2508,6 +2535,41 @@ private:
         return false;
     }
 
+    // VECTORIZED FILTER (Phase 3) — a single comparison term `col <op> literal`.
+    struct VecTerm {
+        std::size_t col = 0;
+        CmpOp op = CmpOp::Eq;
+        Datum lit;
+    };
+
+    // Try to flatten the WHERE predicate into a pure conjunction of `not_null_col <op>
+    // literal` terms. Returns false (→ interpreter fallback) for ANYTHING else: OR / NOT /
+    // IS NULL / IN / EXISTS / a scalar-subquery RHS / a column-vs-column RHS / a qualified
+    // column / a nullable column (3VL) / a type-mismatched or NULL literal. The conservative
+    // conditions guarantee the flat apply is BYTE-IDENTICAL to eval_pred.
+    bool try_extract_conjuncts(const Predicate& f, std::int32_t idx, const Table& t,
+                               std::vector<VecTerm>& out) const {
+        if (idx < 0 || static_cast<std::size_t>(idx) >= f.nodes.size()) {
+            return false;
+        }
+        const PredNode& n = f.nodes[static_cast<std::size_t>(idx)];
+        if (n.kind == PredNodeKind::And) {
+            return try_extract_conjuncts(f, n.left, t, out) &&
+                   try_extract_conjuncts(f, n.right, t, out);
+        }
+        if (n.kind != PredNodeKind::Cmp || n.operand != OperandKind::Column ||
+            n.rhs_is_column || n.rhs_is_subquery || !n.qualifier.empty() ||
+            n.literal.is_null) {
+            return false;
+        }
+        const auto ci = t.column_index(n.column);
+        if (!ci || t.columns[*ci].nullable || n.literal.type != t.columns[*ci].type) {
+            return false;
+        }
+        out.push_back(VecTerm{*ci, n.op, n.literal});
+        return true;
+    }
+
     // ========================================================================
     // v4: SUBQUERY EVALUATION. A subquery is LOWERED by running its inner SELECT through
     // the SAME exec_select pipeline (no new query surface) and applying the predicate to
@@ -3133,6 +3195,7 @@ private:
     Seq tip_ = 0;
     std::uint64_t next_txn_id_ = 1;
     PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run
+    bool vectorize_ = true;            // vectorized filter fast path (test-toggleable)
 };
 
 }  // namespace lockstep::query::sql

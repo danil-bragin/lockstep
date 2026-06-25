@@ -82,3 +82,16 @@ more join types). Closes the feature-breadth gap (the biggest "can it even run r
 - Perf receipt per phase: the deterministic EXPLAIN-ANALYZE counters (load-independent) + the prod
   wall-clock bench (lockstepd --wire-server + lockstep_sqlbench) vs Postgres/Cockroach on the same
   workload + resource pin.
+
+### Phase 3 — MEASURED FINDING (profile-first, the methodology paying off)
+A first vectorized increment — a flat-conjunct filter (`not_null_col <op> literal` AND-chain,
+reusing apply_cmp/cmp_datum, byte-identical, interpreter fallback for OR/NULL/subquery) — was
+landed AND A/B-measured (set_vectorize toggle): VECTORIZED 2156 ms vs interpreter 2116 ms over a
+50k-row scan — IDENTICAL. So the predicate EVAL is NOT the bottleneck; the per-row DECODE is (each
+scanned row mints a fresh `std::vector<Datum>` — 50k allocations per query). EXPLAIN ANALYZE shows
+row COUNTS, not where the CPU goes — the real hot spot is decode/alloc, not filter. So Phase 3's
+true lever is COLUMNAR BATCH DECODE: decode a batch of rows' needed columns into reused
+struct-of-arrays buffers (a few allocations per batch, not one vector per row), then run the
+(already-extracted) conjuncts as raw column passes (SIMD-friendly) over those arrays. The flat
+conjunct extractor is kept as the reusable substrate for that columnar filter. NEXT: columnar
+decode + columnar materialization (the actual speedup), measured the same way.
