@@ -1769,13 +1769,13 @@ private:
     // skipping, empty-group=0, all-NULL group => SUM 0 / MIN/MAX/AVG typed NULL, AVG int
     // truncation toward zero.
     [[nodiscard]] Datum compute_agg_soa(const AggExpr& a, const Table& t,
-                                        const std::vector<ColumnChunk>& cols,
+                                        const std::vector<const ColumnChunk*>& cols,
                                         const std::vector<std::uint32_t>& idxs) {
         if (a.kind == AggKind::CountStar) {
             return Datum::make_int(static_cast<std::int64_t>(idxs.size()));
         }
         const std::size_t ci = *t.column_index(a.column);
-        const ColumnChunk& cc = cols[ci];
+        const ColumnChunk& cc = *cols[ci];
         const Type ty = t.columns[ci].type;
         if (a.kind == AggKind::Count) {
             std::int64_t cnt = 0;
@@ -1869,7 +1869,7 @@ private:
     // compute_agg_soa over the group's member indices; a column operand reads the group key.
     [[nodiscard]] std::optional<std::string> having_eval_soa(
         const Predicate& p, std::int32_t node, const Table& t,
-        const std::vector<ColumnChunk>& cols, const std::vector<std::uint32_t>& idxs,
+        const std::vector<const ColumnChunk*>& cols, const std::vector<std::uint32_t>& idxs,
         const std::vector<std::size_t>& gcols, const std::vector<Datum>& keyd, bool& truth) {
         if (node < 0) {
             truth = true;
@@ -2047,28 +2047,35 @@ private:
                 use_survivors = true;
             }
         }
-        auto decode_col = [&](std::uint32_t c) {
-            return use_survivors ? read_col_concat_chunks(t, c, survivors)
-                                 : read_col_concat(t, c);
-        };
-        std::vector<ColumnChunk> cols(t.columns.size());
+        // Bind each needed column. The non-survivor (full-column) case points DIRECTLY at the
+        // cached flat concat — zero copy. The survivor (zone-skipped) case is query-specific, so
+        // it is built into `owned` and pointed at. `cols[c]` is a pointer either way.
+        std::vector<ColumnChunk> owned(t.columns.size());  // backs survivor / non-cached columns
+        std::vector<const ColumnChunk*> cols(t.columns.size(), nullptr);
         std::uint32_t count = 0;
         bool count_set = false;
         for (std::size_t c = 0; c < t.columns.size(); ++c) {
             if (!need[c]) {
                 continue;
             }
-            cols[c] = decode_col(static_cast<std::uint32_t>(c));
-            count = cols[c].count;
+            if (use_survivors) {
+                owned[c] = read_col_concat_chunks(t, static_cast<std::uint32_t>(c), survivors);
+                cols[c] = &owned[c];
+            } else {
+                cols[c] = &read_col_concat(t, static_cast<std::uint32_t>(c));
+            }
+            count = cols[c]->count;
             count_set = true;
         }
         if (!count_set) {  // COUNT(*) only, no filter/group — the pk column gives the count
-            count = decode_col(static_cast<std::uint32_t>(t.pk_index)).count;
+            const std::uint32_t pkc = static_cast<std::uint32_t>(t.pk_index);
+            count = use_survivors ? read_col_concat_chunks(t, pkc, survivors).count
+                                  : read_col_concat(t, pkc).count;
         }
         // A row filter shared by both group paths.
         auto passes = [&](std::uint32_t rr) {
             for (const VecTerm& vt : vterms) {
-                if (!apply_cmp(vt.op, cmp_datum(cols[vt.col].at(rr), vt.lit))) {
+                if (!apply_cmp(vt.op, cmp_datum(cols[vt.col]->at(rr), vt.lit))) {
                     return false;
                 }
             }
@@ -2174,18 +2181,18 @@ private:
             if (par_group) {
                 build_groups_parallel(
                     ig, count, has_filter, passes,
-                    [&](std::uint32_t rr) { return cols[gc].ints[rr]; },
+                    [&](std::uint32_t rr) { return cols[gc]->ints[rr]; },
                     [&](std::uint32_t rr) {
-                        return std::vector<Datum>{Datum::make_int(cols[gc].ints[rr])};
+                        return std::vector<Datum>{Datum::make_int(cols[gc]->ints[rr])};
                     });
             } else {
                 for (std::uint32_t rr = 0; rr < count; ++rr) {
                     if (has_filter && !passes(rr)) {
                         continue;
                     }
-                    auto& slot = ig[cols[gc].ints[rr]];
+                    auto& slot = ig[cols[gc]->ints[rr]];
                     if (slot.second.empty()) {
-                        slot.second.push_back(Datum::make_int(cols[gc].ints[rr]));
+                        slot.second.push_back(Datum::make_int(cols[gc]->ints[rr]));
                     }
                     slot.first.push_back(rr);
                 }
@@ -2210,18 +2217,18 @@ private:
             if (par_group) {
                 build_groups_parallel(
                     tg, count, has_filter, passes,
-                    [&](std::uint32_t rr) { return cols[gc].texts[rr]; },
+                    [&](std::uint32_t rr) { return cols[gc]->texts[rr]; },
                     [&](std::uint32_t rr) {
-                        return std::vector<Datum>{Datum::make_text(cols[gc].texts[rr])};
+                        return std::vector<Datum>{Datum::make_text(cols[gc]->texts[rr])};
                     });
             } else {
                 for (std::uint32_t rr = 0; rr < count; ++rr) {
                     if (has_filter && !passes(rr)) {
                         continue;
                     }
-                    auto& slot = tg[cols[gc].texts[rr]];
+                    auto& slot = tg[cols[gc]->texts[rr]];
                     if (slot.second.empty()) {
-                        slot.second.push_back(Datum::make_text(cols[gc].texts[rr]));
+                        slot.second.push_back(Datum::make_text(cols[gc]->texts[rr]));
                     }
                     slot.first.push_back(rr);
                 }
@@ -2243,14 +2250,14 @@ private:
             auto key_of = [&](std::uint32_t rr) {
                 std::vector<std::string> key;
                 key.reserve(gcols.size());
-                for (const std::size_t g : gcols) key.push_back(group_key_field(cols[g].at(rr)));
+                for (const std::size_t g : gcols) key.push_back(group_key_field(cols[g]->at(rr)));
                 return key;
             };
             auto key_datum_of = [&](std::uint32_t rr) {
                 std::vector<Datum> kd;
                 if (!gcols.empty()) {
                     kd.reserve(gcols.size());
-                    for (const std::size_t g : gcols) kd.push_back(cols[g].at(rr));
+                    for (const std::size_t g : gcols) kd.push_back(cols[g]->at(rr));
                 }
                 return kd;
             };
