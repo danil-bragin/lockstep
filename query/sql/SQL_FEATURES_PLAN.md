@@ -80,7 +80,7 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [ ] E2 CROSS
 - [ ] D3 FROM-subquery · D4 CTE · E3 N-way · E4 non-equi · A4 CAST
 - [x] E4 non-equi join — ALREADY PRESENT (theta via nested_loop; verified)
-- [ ] F1 composite PK/index (HIGHEST risk — last)
+- [ ] F1 composite PK / multi-col INDEX (HIGHEST risk — DEFERRED to a dedicated session): composite PK touches the byte-deterministic core key codec (~99 sites every conformance/cross-check/columnar gate depends on) + needs order-preserving length-delimited encoding for variable-length TEXT (raw concat breaks key ordering). Not safe to rush in compacted context. Multi-col secondary INDEX = lower-risk half, lands first.
 - [x] E2 CROSS JOIN — ALREADY PRESENT (catalog miss; verified)
 - [x] E3 N-way join (3+) — ALREADY PRESENT (catalog miss; verified 3-table)
 - [x] D5 INSERT ... SELECT (rows from a query, atomic; arity+dup teeth; both modes) — sql_insert_select_test
