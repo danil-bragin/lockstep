@@ -69,7 +69,7 @@ HIGHEST RISK LAST → F1 (composite key encoding).
 ## Status (ALL taken — implementing in dependency/risk order)
 Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] D6 multi-row INSERT (atomic; row+columnar == N single inserts; teeth=dup-in-batch) — sql_multirow_insert_test
-- [ ] F8 DROP TABLE
+- [x] F8 DROP TABLE (catalog forget + durable schema tombstone; re-create empty; teeth=unknown) — sql_drop_table_test
 - [ ] C1 COUNT/SUM/AVG(DISTINCT)
 - [ ] B1 LIKE / NOT LIKE
 - [ ] G3 NULLS FIRST/LAST

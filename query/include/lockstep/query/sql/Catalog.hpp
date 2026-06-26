@@ -825,6 +825,14 @@ public:
         return it == tables_.end() ? nullptr : &it->second;
     }
 
+    // DROP TABLE (F8): forget the table so a later reference is "unknown table" and a re-CREATE
+    // of the same name starts empty. The on-disk data under the old (monotonic) table id is left
+    // orphaned-but-invisible — matches the no-GC model (DROP INDEX likewise leaves tombstones).
+    // Returns false if the table did not exist.
+    bool remove(const std::string& name) {
+        return tables_.erase(name) != 0;
+    }
+
     [[nodiscard]] bool has(const std::string& name) const {
         return tables_.count(name) != 0;
     }

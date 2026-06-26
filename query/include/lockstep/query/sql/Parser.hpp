@@ -631,9 +631,18 @@ private:
         return ParseResult{std::move(st)};
     }
 
-    // DROP INDEX <name> ON <table>
+    // DROP INDEX <name> ON <table>  |  DROP TABLE <table>  (F8)
     ParseResult parse_drop_index() {
         advance();  // DROP
+        if (is_kw("table")) {
+            advance();  // TABLE
+            Statement st;
+            st.kind = StmtKind::DropTable;
+            if (auto e = expect_ident("a table name after DROP TABLE", st.drop_table.table)) {
+                return ParseResult{*e};
+            }
+            return ParseResult{std::move(st)};
+        }
         if (auto e = expect_kw("index")) {
             return ParseResult{*e};
         }

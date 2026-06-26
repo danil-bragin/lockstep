@@ -388,6 +388,8 @@ public:
                 return exec_create_index(st.create_index);
             case StmtKind::DropIndex:
                 return exec_drop_index(st.drop_index);
+            case StmtKind::DropTable:
+                return exec_drop_table(st.drop_table);
         }
         return ExecResult::failure("unknown statement kind");
     }
@@ -876,6 +878,26 @@ private:
             }
         }
         persist_schema(di.table);  // C7: drop reflected in the durable schema
+        return ExecResult{};
+    }
+
+    // DROP TABLE <t> (F8): forget the table (catalog) + durably TOMBSTONE its schema record (so a
+    // restart does not resurrect it). The row/columnar/index/zone DATA under the table's monotonic
+    // id is left orphaned-but-invisible (no query can name a dropped table; a re-CREATE gets a NEW
+    // id) — the same no-space-reclaim model DROP INDEX uses. Unknown table => error.
+    ExecResult exec_drop_table(const DropTableStmt& dt) {
+        if (catalog_.find(dt.table) == nullptr) {
+            return ExecResult::failure("unknown table '" + dt.table + "'");
+        }
+        // Durably retire the schema record in the SEPARATE catalog store (its own Seq line).
+        (void)commit_batch(catalog_db_, {{catalog_key(dt.table), tombstone_marker()}},
+                           /*nosync=*/false);
+        catalog_.remove(dt.table);
+        // Invalidate any decoded-block / zone caches that keyed on this table's flush_gen.
+        chunk_cache_.clear();
+        concat_cache_.clear();
+        text_dict_cache_.clear();
+        zone_cache_.clear();
         return ExecResult{};
     }
 

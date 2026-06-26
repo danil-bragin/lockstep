@@ -310,6 +310,11 @@ struct SelectStmt {
 };
 
 // The tagged statement union (a small value; no heap-owned polymorphism).
+// DROP TABLE <t>  (F8)
+struct DropTableStmt {
+    std::string table;
+};
+
 enum class StmtKind : std::uint8_t {
     Create = 0,
     Insert = 1,
@@ -318,6 +323,7 @@ enum class StmtKind : std::uint8_t {
     Select = 4,
     CreateIndex = 5,
     DropIndex = 6,
+    DropTable = 7,
 };
 
 struct Statement {
@@ -329,6 +335,7 @@ struct Statement {
     SelectStmt select;
     CreateIndexStmt create_index;
     DropIndexStmt drop_index;
+    DropTableStmt drop_table;
 };
 
 }  // namespace lockstep::query::sql
