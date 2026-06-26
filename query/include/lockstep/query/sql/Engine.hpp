@@ -210,32 +210,53 @@ class SqlEngine {
 public:
     SqlEngine() = default;
 
-    // DURABLE backing (crash/recovery testing + a real durable server): the committed
+    // DURABLE DATA backing (crash/recovery testing + a real durable server): the committed
     // query state is a WalEngine over the injected IDisk (a SimDisk for a deterministic
-    // crash test, a ProdDisk for real on-disk recovery). The CATALOG (schemas) is NOT
-    // durable here — the caller re-establishes DDL (a separately-durable/replayed concern,
-    // FLAGGED); this seam proves the DATA path (rows, columnar blocks + delta) survives.
+    // crash test, a ProdDisk for real on-disk recovery). The CATALOG (schemas) is held in a
+    // SEPARATE in-memory store here (its own Seq line — so DDL never shifts data versions);
+    // the catalog is NOT durable in this 2-arg form — the caller re-establishes DDL. Use the
+    // 4-arg ctor below for a durably-recoverable catalog (C7).
     SqlEngine(core::Scheduler& sched, core::IDisk& disk) : db_(sched, disk) {}
 
-    // Recover the committed query state from the durable disk image (after a crash). The
-    // in-memory catalog is unchanged (the caller keeps/replays the schema); reads then see
-    // the recovered rows / columnar blocks + delta.
-    void recover(std::size_t durable_len) {
-        db_.recover(durable_len);
+    // DURABLE DATA + DURABLE CATALOG (C7): the data store (db_) and the catalog store
+    // (catalog_db_) each get their OWN scheduler + IDisk, hence their OWN WAL and OWN Seq
+    // line. Keeping the catalog out of db_'s Seq line is what preserves the data-MVCC version
+    // numbering (`AT SNAPSHOT N` counts DATA writes only), while still surviving a restart
+    // (recover() replays both). Two WalEngines cannot share one WAL — exactly the keyed-vs-SQL
+    // split, applied again to data-vs-catalog.
+    SqlEngine(core::Scheduler& sched, core::IDisk& disk, core::Scheduler& cat_sched,
+              core::IDisk& cat_disk)
+        : db_(sched, disk), catalog_db_(cat_sched, cat_disk), catalog_durable_(true) {}
+
+    // Recover the committed DATA query state from the durable disk image (after a crash). The
+    // catalog is recovered separately (recover(data_len, catalog_len)); this 1-arg form recovers
+    // data only and rebuilds the catalog from whatever catalog_db_ holds (durable when the 4-arg
+    // ctor was used, else empty — the caller replays DDL).
+    void recover(std::size_t durable_len) { recover(durable_len, 0); }
+
+    // Recover DATA (db_, data_len bytes) AND CATALOG (catalog_db_, catalog_len bytes) from their
+    // OWN durable images, then rebuild the in-memory Catalog from the catalog store's schema
+    // records. Two stores ⇒ two byte lengths. catalog_len is ignored when the catalog is not
+    // disk-backed (the 2-arg ctor); the scan then sees the in-memory catalog_db_.
+    void recover(std::size_t data_len, std::size_t catalog_len) {
+        db_.recover(data_len);
         tip_ = db_.tip();
         chunk_cache_.clear();  // recovered blocks may differ from any cached decode
         concat_cache_.clear();
         text_dict_cache_.clear();
         zone_cache_.clear();
-        // C7: rebuild the CATALOG from its durable schema records (reserved 0x01 namespace).
-        // Without this the recovered ROW/BLOCK data is uninterpretable after a restart (the
-        // schema lived only in memory). Each record is a serialized Table re-registered with its
-        // PERSISTED id (the data keys are namespaced by it).
+        if (catalog_durable_) {
+            catalog_db_.recover(catalog_len);
+        }
+        // C7: rebuild the CATALOG from its durable schema records (reserved 0x01 namespace) in the
+        // SEPARATE catalog store. Without this the recovered ROW/BLOCK data is uninterpretable after
+        // a restart (the schema lived only in memory). Each record is a serialized Table re-registered
+        // with its PERSISTED id (the data keys are namespaced by it).
         std::vector<storage::KeyValue> kvs;
         {
             Query<Strict> q;
             q.scan(std::string(1, '\x01'), std::string(1, '\x02'));
-            collect(db_.run(q), kvs);
+            collect(catalog_db_.run(q), kvs);
         }
         for (const storage::KeyValue& kv : kvs) {
             if (is_tombstone(kv.second)) {
@@ -246,6 +267,10 @@ public:
             (void)catalog_.insert_recovered(std::move(t));
         }
     }
+
+    // True iff the catalog store is disk-backed (4-arg ctor) — the caller then persists the
+    // catalog disk's length alongside the data disk's and passes both to recover().
+    [[nodiscard]] bool catalog_durable() const noexcept { return catalog_durable_; }
 
     // ---- Catalog persistence (C7) — schema records under the reserved 0x01 key namespace ----
     static void cat_put_u32(std::string& o, std::uint32_t v) {
@@ -323,10 +348,16 @@ public:
         return t;
     }
     // Durably (re)write the table's schema record. Called after CREATE / CREATE INDEX / DROP INDEX.
+    // The schema record goes to the SEPARATE catalog store (catalog_db_), NOT the data store, so
+    // DDL never consumes a data MVCC Seq — `AT SNAPSHOT N` keeps counting DATA writes only (the
+    // pre-C7 invariant the conformance gate encodes; C7 had funneled the catalog through db_ and
+    // shifted every data version by the DDL count). Catalog reads are tip-only (recover scans the
+    // strict tip), so it needs no group commit; write it durably (immediate sync) — DDL is rare.
     void persist_schema(const std::string& name) {
         const Table* t = catalog_.find(name);
         if (t != nullptr) {
-            commit_writes({{catalog_key(name), serialize_schema(*t)}});
+            (void)commit_batch(catalog_db_, {{catalog_key(name), serialize_schema(*t)}},
+                               /*nosync=*/false);
         }
     }
 
@@ -5918,7 +5949,11 @@ private:
     // atomicity is the existing verified txn path). The body is a PURE writer (no read)
     // — V-DET-USER holds — so a single-txn batch over the empty executor store is
     // correct (the read-modify-write decision was already made over the live store).
-    void commit_writes(const std::vector<std::pair<Key, Value>>& kvs) {
+    // Submit one write batch as a single txn to `target` and apply its committed writes.
+    // Returns the target's new tip Seq. `nosync` defers the fsync (group commit). Used for
+    // BOTH the data store (db_) and the separate catalog store (catalog_db_) — see commit_writes
+    // / persist_schema. Factoring this out is what lets the catalog live in its OWN Seq line.
+    Seq commit_batch(Database& target, const std::vector<std::pair<Key, Value>>& kvs, bool nosync) {
         TxnFn fn;
         fn.id = next_txn_id_++;
         std::vector<txn::Read> decl;
@@ -5936,17 +5971,22 @@ private:
         };
 
         txn::ExecConfig cfg;  // defaults: max_retry=2, replica_lag=0
-        const SubmitResult sr = db_.submit(fn, cfg);
+        const SubmitResult sr = target.submit(fn, cfg);
+        Seq t = target.tip();
         for (const txn::CommitInfo& c : sr.commits) {
             if (c.status == txn::Status::Committed && !c.writes_committed.empty()) {
-                // GROUP COMMIT: defer the fsync when the caller (wire::Server, net-backed) will
-                // sync() once for the whole burst — the SQL-write analogue of the keyed path,
-                // amortizing the per-statement durability barrier. acked==durable holds because
-                // the caller withholds the SqlResult ack until its sync.
-                tip_ = group_commit_ ? db_.apply_committed_nosync(c.writes_committed)
-                                     : db_.apply_committed(c.writes_committed);
+                t = nosync ? target.apply_committed_nosync(c.writes_committed)
+                           : target.apply_committed(c.writes_committed);
             }
         }
+        return t;
+    }
+
+    void commit_writes(const std::vector<std::pair<Key, Value>>& kvs) {
+        // GROUP COMMIT: defer the fsync when the caller (wire::Server, net-backed) will sync()
+        // once for the whole burst — the SQL-write analogue of the keyed path. acked==durable
+        // holds because the caller withholds the SqlResult ack until its sync.
+        tip_ = commit_batch(db_, kvs, /*nosync=*/group_commit_);
     }
 
     // Convenience: a single-key write (back-compat for the index-only DDL paths).
@@ -5956,6 +5996,9 @@ private:
 
     Catalog catalog_;
     Database db_;
+    Database catalog_db_;       // SEPARATE store for schema records (own Seq line / WAL) — keeps
+                                // DDL out of the data MVCC version line (see persist_schema).
+    bool catalog_durable_ = false;  // true ⇒ catalog_db_ is disk-backed + recovered on restart.
     Seq tip_ = 0;
     std::uint64_t next_txn_id_ = 1;
     PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run

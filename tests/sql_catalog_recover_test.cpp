@@ -49,6 +49,12 @@ struct Backing {
     lockstep::core::SimClock clock{sched};
     lockstep::sim::SeededRandom rng{0xC7C7'1234ULL};
     lockstep::sim::SimDisk disk{sched, clock, rng};
+    // The catalog now lives in its OWN durable store (separate WAL/Seq line — keeps DDL out
+    // of the data MVCC version line). Recovering the SCHEMA needs this disk recovered too.
+    lockstep::core::Scheduler cat_sched;
+    lockstep::core::SimClock cat_clock{cat_sched};
+    lockstep::sim::SeededRandom cat_rng{0xCA7A'5678ULL};
+    lockstep::sim::SimDisk cat_disk{cat_sched, cat_clock, cat_rng};
 };
 
 // The DDL + data workload (identical for the recovered run and the oracle).
@@ -87,18 +93,20 @@ int main() {
     // ---- CRASH + RECOVER: load, drop the engine (keep the disk), reopen + recover ----
     Backing b;
     std::size_t durable_len = 0;
+    std::size_t cat_len = 0;
     {
-        SqlEngine e(b.sched, b.disk);
+        SqlEngine e(b.sched, b.disk, b.cat_sched, b.cat_disk);
         load(e);
-        durable_len = b.disk.durable_len();  // the durable byte image after the workload
+        durable_len = b.disk.durable_len();      // durable DATA image after the workload
+        cat_len = b.cat_disk.durable_len();      // durable CATALOG image (separate WAL)
         // Sanity: BEFORE recovery a fresh engine over the same disk does NOT know the table.
     }
-    SqlEngine recovered(b.sched, b.disk);
+    SqlEngine recovered(b.sched, b.disk, b.cat_sched, b.cat_disk);
     // Without recover() the catalog is empty => "unknown table".
     const ExecResult pre = recovered.exec("SELECT COUNT(*) FROM t");
     check(!pre.ok, "pre-recover: table unknown (catalog empty) — got [" + render(pre) + "]");
 
-    recovered.recover(durable_len);
+    recovered.recover(durable_len, cat_len);
 
     // After recover: schema + data are back; every query equals the oracle byte-for-byte.
     for (std::size_t i = 0; i < queries().size(); ++i) {
