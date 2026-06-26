@@ -3533,7 +3533,224 @@ private:
         std::vector<std::vector<Datum>> rows;  // each row in the table's schema order
     };
 
+    // A3 — fused streaming JOIN + aggregate for the star-schema shape. Returns nullopt (fall back
+    // to the AoS join) unless: exactly 2 tables, inner equi-join (fact.key = dim.key), an aggregate
+    // / GROUP BY query, NO WHERE / HAVING, and the FACT (from[0]) is a clean flushed COLUMNAR table
+    // (its columns readable as SoA). Folds EXACTLY as exec_aggregate_joined (same group_key_field
+    // ordered map, same compute_agg_joined per-aggregate semantics) — proven byte-identical by the
+    // columnar==row-mode JOIN conformance gate (row-mode falls to the AoS path).
+    [[nodiscard]] std::optional<ExecResult> try_fused_join_aggregate(const SelectStmt& sel) {
+        if (sel.from.size() != 2 || sel.from[1].kind != JoinKind::Inner) return std::nullopt;
+        if (sel.filter.present() || sel.having.present()) return std::nullopt;
+        if (!sel.has_aggregates && sel.group_by.empty()) return std::nullopt;
+        const Table* fact = catalog_.find(sel.from[0].table);
+        const Table* dim = catalog_.find(sel.from[1].table);
+        if (fact == nullptr || dim == nullptr) return std::nullopt;
+        if (!fact->columnar || fact->delta_dirty || !has_blocks(*fact) || has_overlays(*fact)) {
+            return std::nullopt;  // need fact columns as a complete SoA (clean flushed single run)
+        }
+        // Build the joined schema (fact cols then dim cols) — same layout as exec_select_joined.
+        JoinSchema schema;
+        const std::size_t fnc = fact->columns.size();
+        for (const Column& c : fact->columns)
+            schema.cols.push_back(JoinColumn{sel.from[0].alias, c.name, c.type});
+        schema.alias_span.emplace(sel.from[0].alias, std::make_pair(std::size_t{0}, fnc));
+        for (const Column& c : dim->columns)
+            schema.cols.push_back(JoinColumn{sel.from[1].alias, c.name, c.type});
+        schema.alias_span.emplace(sel.from[1].alias,
+                                  std::make_pair(fnc, fnc + dim->columns.size()));
+        if (sel.from[0].alias == sel.from[1].alias) return std::nullopt;  // self-join: AoS path
+
+        std::optional<std::pair<std::size_t, std::size_t>> equi;
+        if (!sel.from[1].on.present() || detect_equi_key(sel.from[1].on, schema, sel.from[1].alias,
+                                                         equi) ||
+            !equi) {
+            return std::nullopt;  // not a clean equi-join
+        }
+        // equi = (left_idx, right_idx) flat. fact key = left_idx (< fnc); dim key = right_idx - fnc.
+        if (equi->first >= fnc || equi->second < fnc) return std::nullopt;
+        const std::size_t fact_key_col = equi->first;
+        const std::size_t dim_key_col = equi->second - fnc;
+
+        // Resolve every GROUP BY + SELECT/agg column to a flat index, then to (is_fact, local col).
+        struct Src { bool is_fact = true; std::size_t col = 0; Type type = Type::Int; };
+        auto resolve_src = [&](const std::string& qual, const std::string& col,
+                               Src& out) -> std::optional<std::string> {
+            std::size_t idx = 0;
+            if (auto e = schema.resolve(qual, col, idx)) return e;
+            out.is_fact = idx < fnc;
+            out.col = out.is_fact ? idx : (idx - fnc);
+            out.type = schema.cols[idx].type;
+            return std::nullopt;
+        };
+        std::vector<Src> gsrc;
+        for (const std::string& gc : sel.group_by) {
+            std::string q;
+            std::string c;
+            split_qualified(gc, q, c);
+            Src s;
+            if (resolve_src(q, c, s)) return std::nullopt;
+            gsrc.push_back(s);
+        }
+        // Per SELECT item: a group-key index (>=0) OR an aggregate (kind + optional value Src).
+        struct ItemPlan {
+            bool is_col = false;
+            std::size_t gkey = 0;        // for a column: which group key
+            AggKind kind = AggKind::CountStar;
+            bool has_val = false;
+            Src val;
+        };
+        std::vector<ItemPlan> plans;
+        for (const SelectItem& item : sel.items) {
+            ItemPlan p;
+            if (item.kind == SelectItemKind::Column) {
+                Src s;
+                if (resolve_src(item.qualifier, item.column, s)) return std::nullopt;
+                std::size_t gk = sel.group_by.size();
+                for (std::size_t k = 0; k < gsrc.size(); ++k) {
+                    if (gsrc[k].is_fact == s.is_fact && gsrc[k].col == s.col) { gk = k; break; }
+                }
+                if (gk == sel.group_by.size()) return std::nullopt;  // ungrouped column
+                p.is_col = true;
+                p.gkey = gk;
+            } else {
+                p.kind = item.agg.kind;
+                if (item.agg.kind != AggKind::CountStar) {
+                    Src s;
+                    if (resolve_src(item.agg.qualifier, item.agg.column, s)) return std::nullopt;
+                    if ((item.agg.kind == AggKind::Sum || item.agg.kind == AggKind::Avg) &&
+                        s.type != Type::Int) {
+                        return std::nullopt;  // SUM/AVG needs INT (the AoS path errors; let it)
+                    }
+                    p.has_val = true;
+                    p.val = s;
+                }
+            }
+            plans.push_back(p);
+        }
+
+        // SCAN dim -> AoS rows (small) + a hash group_key_field(dim.key) -> matching dim rows.
+        std::vector<std::vector<Datum>> dim_rows;
+        if (auto e = scan_table(*dim, sel, dim_rows)) return std::nullopt;
+        std::map<std::string, std::vector<std::uint32_t>> dim_hash;
+        for (std::uint32_t di = 0; di < dim_rows.size(); ++di) {
+            dim_hash[group_key_field(dim_rows[di][dim_key_col])].push_back(di);
+        }
+
+        // FACT columns as SoA (key + every referenced fact column), via the cached concat.
+        auto fact_col = [&](std::size_t c) -> const ColumnChunk& {
+            return read_col_concat(*fact, static_cast<std::uint32_t>(c));
+        };
+        const ColumnChunk& fkey = fact_col(fact_key_col);
+        const std::uint32_t fcount = fkey.count;
+
+        struct FAcc {
+            std::int64_t total = 0;  // CountStar
+            std::int64_t npres = 0;  // Count / SUM / AVG divisor
+            std::int64_t sum = 0;    // SUM / AVG
+            bool any = false;
+            Datum best;  // MIN / MAX
+        };
+        struct FGroup {
+            std::vector<Datum> keyd;
+            std::vector<FAcc> accs;
+        };
+        std::map<std::vector<std::string>, FGroup> groups;
+        const std::size_t nagg = plans.size();
+        std::vector<std::string> keybuf;
+        for (std::uint32_t rr = 0; rr < fcount; ++rr) {
+            const auto it = dim_hash.find(group_key_field(fkey.at(rr)));
+            if (it == dim_hash.end()) continue;  // inner join: no match => row drops
+            for (const std::uint32_t di : it->second) {
+                // group key (group_key_field of each group col, resolved fact/dim)
+                keybuf.clear();
+                keybuf.reserve(gsrc.size());
+                for (const Src& s : gsrc) {
+                    const Datum d = s.is_fact ? fact_col(s.col).at(rr) : dim_rows[di][s.col];
+                    keybuf.push_back(group_key_field(d));
+                }
+                FGroup& g = groups[keybuf];
+                if (g.accs.empty()) {
+                    g.accs.resize(nagg);
+                    g.keyd.reserve(gsrc.size());
+                    for (const Src& s : gsrc) {
+                        g.keyd.push_back(s.is_fact ? fact_col(s.col).at(rr) : dim_rows[di][s.col]);
+                    }
+                }
+                for (std::size_t a = 0; a < nagg; ++a) {
+                    const ItemPlan& p = plans[a];
+                    if (p.is_col) continue;
+                    FAcc& acc = g.accs[a];
+                    ++acc.total;
+                    if (p.kind == AggKind::CountStar) continue;
+                    const Datum v = p.val.is_fact ? fact_col(p.val.col).at(rr) : dim_rows[di][p.val.col];
+                    if (v.is_null) continue;
+                    ++acc.npres;
+                    if (p.kind == AggKind::Sum || p.kind == AggKind::Avg) {
+                        acc.sum += v.i;
+                    } else if (p.kind == AggKind::Min || p.kind == AggKind::Max) {
+                        if (!acc.any) { acc.best = v; acc.any = true; }
+                        else {
+                            const int c = cmp_datum(v, acc.best);
+                            if ((p.kind == AggKind::Min && c < 0) ||
+                                (p.kind == AggKind::Max && c > 0)) acc.best = v;
+                        }
+                    }
+                }
+            }
+        }
+        // Empty grouped result is valid (zero rows). An ungrouped query over zero matches still
+        // emits ONE row — but the AoS path handles that; bail so semantics never diverge.
+        if (groups.empty() && sel.group_by.empty()) return std::nullopt;
+
+        ExecResult r;
+        for (auto& [k, g] : groups) {
+            (void)k;
+            ResultRow out;
+            for (std::size_t a = 0; a < nagg; ++a) {
+                const ItemPlan& p = plans[a];
+                if (p.is_col) {
+                    out.cells.emplace_back(sel.items[a].label, g.keyd[p.gkey]);
+                    continue;
+                }
+                const FAcc& acc = g.accs[a];
+                Datum d;
+                if (p.kind == AggKind::CountStar) {
+                    d = Datum::make_int(acc.total);
+                } else if (p.kind == AggKind::Count) {
+                    d = Datum::make_int(acc.npres);
+                } else if (acc.npres == 0) {
+                    d = (p.kind == AggKind::Sum) ? Datum::make_int(0)
+                                                 : Datum::make_null(p.val.type);
+                } else if (p.kind == AggKind::Min || p.kind == AggKind::Max) {
+                    d = acc.best;
+                } else if (p.kind == AggKind::Sum) {
+                    d = Datum::make_int(acc.sum);
+                } else {  // AVG
+                    d = Datum::make_int(acc.sum / acc.npres);
+                }
+                out.cells.emplace_back(sel.items[a].label, d);
+            }
+            r.rows.push_back(std::move(out));
+        }
+        apply_distinct(sel, r.rows);
+        if (auto e = apply_order_by_labels_joined(sel, r.rows)) {
+            return ExecResult::failure(*e);
+        }
+        apply_limit(sel, r.rows);
+        r.affected = r.rows.size();
+        return r;
+    }
+
     ExecResult exec_select_joined(const SelectStmt& sel) {
+        // A3 — FUSED vectorized JOIN+GROUP BY fast path (star schema): stream the columnar fact
+        // table's SoA columns, probe the small dim hash, and fold aggregates DIRECTLY — never
+        // materializing the joined AoS row set (the ~100ms cost for a 500k-row join). Returns
+        // nullopt to fall back to the general AoS join below; the columnar==row-mode JOIN
+        // conformance gate cross-checks it byte-identical (row-mode takes the AoS path).
+        if (auto fused = try_fused_join_aggregate(sel)) {
+            return std::move(*fused);
+        }
         // (0) Validate aliases unique + tables exist; build the joined schema.
         JoinSchema schema;
         std::vector<ScannedTable> scans;

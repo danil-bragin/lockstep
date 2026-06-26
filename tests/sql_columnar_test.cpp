@@ -101,6 +101,18 @@ void run_join() {
          "SELECT cust.name, COUNT(*), SUM(ord.amt) FROM ord JOIN cust ON ord.cust = cust.cid "
          "GROUP BY cust.name",
          "join-groupby");
+    // A3 fused path coverage: MIN/MAX/AVG over the fact, a fact group col, ungrouped agg, ORDER BY.
+    both(col, row,
+         "SELECT cust.name, COUNT(*), SUM(ord.amt), MIN(ord.amt), MAX(ord.amt), AVG(ord.amt) "
+         "FROM ord JOIN cust ON ord.cust = cust.cid GROUP BY cust.name ORDER BY cust.name",
+         "join-minmaxavg");
+    both(col, row,
+         "SELECT ord.cust, COUNT(*), SUM(ord.amt) FROM ord JOIN cust ON ord.cust = cust.cid "
+         "GROUP BY ord.cust",
+         "join-fact-groupcol");
+    both(col, row,
+         "SELECT COUNT(*), SUM(ord.amt), MIN(ord.amt) FROM ord JOIN cust ON ord.cust = cust.cid",
+         "join-ungrouped-agg");
     col.flush_columnar("cust");  // both flushed
     both(col, row,
          "SELECT cust.name, SUM(ord.amt) FROM ord JOIN cust ON ord.cust = cust.cid "
