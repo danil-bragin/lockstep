@@ -61,8 +61,11 @@ int main() {
     constexpr std::size_t kShards = 4;
     constexpr std::size_t kRows = 2000;
 
+    // Oracle is ROW-MODE (the reference layout — columnar == row-mode == reference for the agg
+    // queries; row-mode also gives a correct JOIN oracle, whereas a flushed-vs-unflushed columnar
+    // JOIN is a separate columnar quirk out of scope here). Shards stay COLUMNAR (the distributed
+    // path is exercised over the columnar layout).
     SqlEngine solo;
-    solo.set_columnar_default(true);
 
     std::vector<SqlEngine> shards(kShards);
     std::vector<EngineSqlShard> wraps;
@@ -89,8 +92,7 @@ int main() {
         check(solo.exec(sql).ok, "solo insert");
         check(dist.exec(sql).ok, "dist insert (routed)");  // routed to one shard by PK hash
     }
-    for (SqlEngine& s : shards) s.flush_columnar("t");
-    solo.flush_columnar("t");
+    for (SqlEngine& s : shards) s.flush_columnar("t");  // shards columnar; solo is row-mode
 
     // Rows really spread across shards (routing is non-trivial — not all on one shard).
     std::size_t nonempty = 0, spread_total = 0;
@@ -118,6 +120,32 @@ int main() {
         const std::string s = render(solo.exec(q));
         const std::string d = render(dist.exec(q));
         check(s == d, "distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" + d + "]");
+    }
+
+    // ---- B4: a second sharded table + a JOIN + a GLOBAL-ORDER scan (gather + local execute) ----
+    const char* dimDDL =
+        "CREATE TABLE dim (cat INT, label TEXT NOT NULL, PRIMARY KEY (cat))";
+    check(solo.exec(dimDDL).ok, "solo create dim");
+    check(dist.exec(dimDDL).ok, "dist create dim");
+    const char* labels[] = {"a", "b", "c", "d", "e", "f", "g", "h"};
+    for (int cat = 0; cat < 8; ++cat) {
+        const std::string ins = "INSERT INTO dim (cat, label) VALUES (" + std::to_string(cat) +
+                                ", '" + labels[cat] + "')";
+        check(solo.exec(ins).ok, "solo dim insert");
+        check(dist.exec(ins).ok, "dist dim insert (routed)");
+    }
+    const std::vector<std::string> b4_queries = {
+        // distributed JOIN (gather both tables, run locally)
+        "SELECT t.region, dim.label, COUNT(*) FROM t JOIN dim ON t.cat = dim.cat "
+        "GROUP BY t.region, dim.label",
+        // distributed GLOBAL-ORDER scan (gather the table, ORDER BY locally)
+        "SELECT id, amount FROM t ORDER BY amount, id LIMIT 12",
+    };
+    for (const std::string& q : b4_queries) {
+        const std::string s = render(solo.exec(q));
+        const std::string d = render(dist.exec(q));
+        check(s == d, "B4 distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" + d +
+                          "]");
     }
 
     // Distributed AVG is explicitly rejected (can't merge an averaged value across shards).
