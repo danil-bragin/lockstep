@@ -117,6 +117,44 @@ int main() {
                       "'999999999999999999999999999999999999999999')").ok,
               "literal beyond int128 rejected");
     }
+    // follow-ons closed: bare big literal (unquoted), JOINED SUM, columnar SUM.
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE w (id INT, bal INT128 NOT NULL, PRIMARY KEY (id))");
+        // a bare integer literal past int64 is now accepted UNQUOTED (carried as a numeric string).
+        check(e.exec("INSERT INTO w (id, bal) VALUES (1, 1000000000000000000000000000000)").ok,
+              "bare big literal (unquoted) accepted");
+        check(cell0(e.exec("SELECT bal FROM w WHERE id = 1")) == "1000000000000000000000000000000",
+              "bare big literal stored exactly");
+        // an int64 column rejects an over-range bare literal (clean error, not saturation).
+        e.exec("CREATE TABLE i (id INT, n BIGINT NOT NULL, PRIMARY KEY (id))");
+        check(!e.exec("INSERT INTO i (id, n) VALUES (1, 99999999999999999999)").ok,
+              "bare literal past int64 rejected for BIGINT (no silent saturate)");
+    }
+    // JOINED SUM over INT128 (sum of a fact column across a join).
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE acct (id INT, name TEXT NOT NULL, PRIMARY KEY (id))");
+        e.exec("CREATE TABLE txn (tid INT, acct_id INT NOT NULL, amt INT128 NOT NULL, PRIMARY KEY (tid))");
+        e.exec("INSERT INTO acct (id, name) VALUES (1, 'alice')");
+        e.exec("INSERT INTO txn (tid, acct_id, amt) VALUES "
+               "(1, 1, '10000000000000000000000'), (2, 1, '20000000000000000000000')");
+        const ExecResult r = e.exec(
+            "SELECT SUM(t.amt) FROM acct a JOIN txn t ON a.id = t.acct_id");
+        check(r.ok && !r.rows.empty() &&
+                  r.rows[0].cells[0].second.render() == "30000000000000000000000",
+              "JOINED SUM(INT128) = 3e22");
+    }
+    // COLUMNAR SUM over INT128 (bails to the row AoS path, must still be correct).
+    {
+        SqlEngine e;
+        e.set_columnar_default(true);
+        e.exec("CREATE TABLE c (id INT, amt INT128 NOT NULL, PRIMARY KEY (id))");
+        e.exec("INSERT INTO c (id, amt) VALUES (1, '11111111111111111111'), "
+               "(2, '22222222222222222222'), (3, '33333333333333333333')");
+        check(cell0(e.exec("SELECT SUM(amt) FROM c")) == "66666666666666666666",
+              "columnar INT128 SUM correct (via AoS bail)");
+    }
     // durable: INT128 value + 16-byte payload survive a restart.
     {
         lockstep::core::Scheduler s, cs;

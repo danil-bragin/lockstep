@@ -113,8 +113,9 @@ enum class Tok : std::uint8_t {
 
 struct Token {
     Tok kind = Tok::End;
-    std::string text;       // Ident: the raw identifier; StrLit: the decoded string
-    std::int64_t int_val = 0;  // IntLit: the parsed value
+    std::string text;       // Ident: the raw identifier; StrLit: the decoded string; IntLit: raw digits
+    std::int64_t int_val = 0;  // IntLit: the parsed value (saturated at int64 if int_overflow)
+    bool int_overflow = false;  // F11: the IntLit's true value exceeds int64 (carry it as a string)
     std::size_t pos = 0;    // byte offset of the token start
     std::string bad_msg;    // Bad: why
 };
@@ -275,15 +276,18 @@ private:
             t.bad_msg = "malformed numeric literal";
             return t;
         }
-        const std::string digits = src_.substr(start, i_ - start);
+        std::string digits = src_.substr(start, i_ - start);
         t.kind = Tok::IntLit;
-        t.int_val = parse_i64(digits);
+        t.int_val = parse_i64(digits, t.int_overflow);  // F11: flag values past int64
+        t.text = std::move(digits);                     // raw digits (used when int_overflow)
         return t;
     }
 
     // Deterministic signed-decimal parse (no strtol/locale). Saturates on overflow
-    // (a bounded subset; values are small) so the parse is total.
-    static std::int64_t parse_i64(const std::string& digits) {
+    // (a bounded subset; values are small) so the parse is total; `overflow` is set when the
+    // true value exceeds int64 (the caller then carries the raw digits as a numeric string).
+    static std::int64_t parse_i64(const std::string& digits, bool& overflow) {
+        overflow = false;
         bool neg = false;
         std::size_t p = 0;
         if (p < digits.size() && digits[p] == '-') {
@@ -295,6 +299,7 @@ private:
             const int d = digits[p] - '0';
             if (v > (9223372036854775807LL - d) / 10) {
                 v = 9223372036854775807LL;  // saturate
+                overflow = true;
                 break;
             }
             v = v * 10 + d;
@@ -517,6 +522,24 @@ private:
             advance();
             return std::nullopt;
         }
+        // F11: BIT(n) — an n-bit UNSIGNED bitmask over INT (range 0..2^n-1). Default n=1. Stored in
+        // signed int64, so n is capped at 63. A value is an ordinary integer literal.
+        if (is_kw("bit")) {
+            out = Type::Int;
+            col.is_unsigned = true;
+            col.int_bits = 1;
+            advance();
+            if (cur_.kind == Tok::LParen) {
+                advance();
+                Datum n;
+                if (auto e = expect_literal(n)) return e;
+                if (n.type != Type::Int || n.i < 1 || n.i > 63)
+                    return make_err("BIT(n) width must be 1..63");
+                col.int_bits = static_cast<std::uint8_t>(n.i);
+                if (auto e = expect(Tok::RParen, "')' after BIT width")) return e;
+            }
+            return std::nullopt;
+        }
         // F10: narrow integer aliases — INT-backed, with a RANGE check (int_bits) at coerce.
         if (is_kw("tinyint") || is_kw("smallint") || is_kw("int32") || is_kw("int4") ||
             is_kw("mediumint")) {
@@ -625,7 +648,10 @@ private:
             return std::nullopt;
         }
         if (cur_.kind == Tok::IntLit) {
-            out = Datum::make_int(cur_.int_val);
+            // F11: a bare integer literal that exceeds int64 is carried as a NUMERIC STRING (so an
+            // INT128/DECIMAL128 column parses it losslessly, and an INT64 column gets a clean type
+            // error instead of a silent saturation).
+            out = cur_.int_overflow ? Datum::make_text(cur_.text) : Datum::make_int(cur_.int_val);
             advance();
             return std::nullopt;
         }

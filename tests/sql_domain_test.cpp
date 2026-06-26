@@ -73,6 +73,25 @@ int main() {
         check(!e.exec("INSERT INTO m (id, a) VALUES (2, 256)").ok, "TINYINT UNSIGNED 256 rejected");
         check(!e.exec("INSERT INTO m (id, a) VALUES (3, -1)").ok, "TINYINT UNSIGNED -1 rejected");
     }
+    // F11: BIT(n) — n-bit unsigned bitmask (range 0..2^n-1).
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE b (id INT, flags BIT(4) NOT NULL, one BIT NOT NULL, PRIMARY KEY (id))");
+        check(e.exec("INSERT INTO b (id, flags, one) VALUES (1, 15, 1)").ok, "BIT(4)=15, BIT=1 ok");
+        check(!e.exec("INSERT INTO b (id, flags, one) VALUES (2, 16, 0)").ok, "BIT(4)=16 out of range");
+        check(!e.exec("INSERT INTO b (id, flags, one) VALUES (3, 0, 2)").ok, "BIT(1)=2 out of range");
+        check(!e.exec("INSERT INTO b (id, flags, one) VALUES (4, -1, 0)").ok, "BIT negative rejected");
+        check(!e.exec("CREATE TABLE x (id INT, f BIT(64), PRIMARY KEY (id))").ok, "BIT(64) rejected (>63)");
+    }
+    // F10 fix: a WHERE literal longer than VARCHAR(n) is NO MATCH, not a query error.
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE t (id INT, v VARCHAR(3) NOT NULL, PRIMARY KEY (id))");
+        e.exec("INSERT INTO t (id, v) VALUES (1, 'abc')");
+        const ExecResult r = e.exec("SELECT id FROM t WHERE v = 'toolong'");
+        check(r.ok && r.rows.empty(), "WHERE with over-length literal: ok + 0 rows (not an error)");
+        check(e.exec("SELECT id FROM t WHERE v = 'abc'").rows.size() == 1, "normal match still works");
+    }
     // durable: constraints survive a restart (recovered from the schema).
     {
         lockstep::core::Scheduler s, cs;

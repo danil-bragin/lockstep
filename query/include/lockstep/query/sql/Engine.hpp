@@ -1028,9 +1028,13 @@ private:
 
     // Coerce a parsed literal Datum to a column's declared type (type checking).
     // INT<->TEXT mismatch is an error (no implicit conversion in v1).
+    // `for_write` true == an INSERT/UPDATE value (enforce the length cap); false == a comparison
+    // literal (F10: a too-long literal must mean NO MATCH, not an error — so the length cap is
+    // skipped; CHAR padding still applies so it compares equal to the padded stored value).
     [[nodiscard]] static std::optional<std::string> coerce(const Column& col,
                                                            const Datum& in,
-                                                           Datum& out) {
+                                                           Datum& out,
+                                                           bool for_write = true) {
         // v4: a NULL literal carries a placeholder type — re-type it to the column's
         // declared type and accept it iff the column is NULLABLE (fail-closed otherwise).
         if (in.is_null) {
@@ -1075,7 +1079,7 @@ private:
             out = Datum::make_int(v);
             out.logical = col.logical;
             out.scale = col.scale;
-            return check_domain(col, out);
+            return check_domain(col, out, for_write);
         }
         // F9c: a UUID column (physical TEXT). Validate + canonicalise (lowercase, dashed) the literal.
         if (col.type == Type::Text && col.logical == 4) {
@@ -1114,7 +1118,7 @@ private:
             out = Datum::make_text(Datum::encode_i128(v));
             out.logical = col.logical;
             out.scale = col.scale;
-            return check_domain(col, out);
+            return check_domain(col, out, for_write);
         }
         if (col.type != in.type) {
             return std::string("type mismatch for column '") + col.name +
@@ -1122,13 +1126,14 @@ private:
                    type_name(in.type);
         }
         out = in;
-        return check_domain(col, out);
+        return check_domain(col, out, for_write);
     }
 
     // F10: enforce a column's DOMAIN constraints on a coerced value (deterministic). Validates the
     // UNSIGNED sign, the integer-width range (TINYINT/SMALLINT/INT32), the DECIMAL precision, and the
     // VARCHAR/CHAR/BLOB length; CHAR right-pads to its length. `d` may be mutated (the CHAR pad).
-    static std::optional<std::string> check_domain(const Column& col, Datum& d) {
+    static std::optional<std::string> check_domain(const Column& col, Datum& d,
+                                                    bool enforce_len = true) {
         if (d.is_null) return std::nullopt;
         // Numeric INT-backed (not DATE/TIMESTAMP — sign/width are meaningless there).
         if (d.type == Type::Int && col.logical != 2 && col.logical != 3) {
@@ -1167,7 +1172,7 @@ private:
         }
         // Plain TEXT / VARCHAR(n) / CHAR(n) / BLOB(n).
         if (d.type == Type::Text && col.logical < 5) {
-            if (col.max_len != 0 && d.s.size() > col.max_len)
+            if (enforce_len && col.max_len != 0 && d.s.size() > col.max_len)
                 return "value too long for column '" + col.name + "' (max " + std::to_string(col.max_len) + ")";
             if (col.fixed_char && col.max_len != 0 && d.s.size() < col.max_len)
                 d.s.append(col.max_len - d.s.size(), ' ');  // CHAR right-pad
@@ -4703,6 +4708,8 @@ private:
         std::string alias;
         std::string column;
         Type type = Type::Int;
+        std::uint8_t logical = 0;  // F9b+: carries DECIMAL/DATE/TS/UUID/INT128 tag through a join
+        std::uint8_t scale = 0;
     };
     struct JoinSchema {
         std::vector<JoinColumn> cols;  // flat, in FROM order (table0 cols, table1 ...)
@@ -4778,10 +4785,10 @@ private:
         JoinSchema schema;
         const std::size_t fnc = fact->columns.size();
         for (const Column& c : fact->columns)
-            schema.cols.push_back(JoinColumn{sel.from[0].alias, c.name, c.type});
+            schema.cols.push_back(JoinColumn{sel.from[0].alias, c.name, c.type, c.logical, c.scale});
         schema.alias_span.emplace(sel.from[0].alias, std::make_pair(std::size_t{0}, fnc));
         for (const Column& c : dim->columns)
-            schema.cols.push_back(JoinColumn{sel.from[1].alias, c.name, c.type});
+            schema.cols.push_back(JoinColumn{sel.from[1].alias, c.name, c.type, c.logical, c.scale});
         schema.alias_span.emplace(sel.from[1].alias,
                                   std::make_pair(fnc, fnc + dim->columns.size()));
         if (sel.from[0].alias == sel.from[1].alias) return std::nullopt;  // self-join: AoS path
@@ -5045,7 +5052,7 @@ private:
             }
             const std::size_t lo = schema.cols.size();
             for (const Column& c : t->columns) {
-                schema.cols.push_back(JoinColumn{je.alias, c.name, c.type});
+                schema.cols.push_back(JoinColumn{je.alias, c.name, c.type, c.logical, c.scale});
             }
             schema.alias_span.emplace(je.alias,
                                       std::make_pair(lo, schema.cols.size()));
@@ -5667,8 +5674,8 @@ private:
             return e;
         }
         if ((a.kind == AggKind::Sum || a.kind == AggKind::Avg) &&
-            schema.cols[idx].type != Type::Int) {
-            return std::string("SUM/AVG requires an INT column (got TEXT column '" +
+            schema.cols[idx].type != Type::Int && schema.cols[idx].logical < 5) {  // F9f: allow 128-bit
+            return std::string("SUM/AVG requires a numeric column (got TEXT column '" +
                                a.column + "')");
         }
         return std::nullopt;
@@ -5720,6 +5727,19 @@ private:
                 }
             }
             out = best;
+            return std::nullopt;
+        }
+        // F9f: SUM/AVG over a 128-bit column (the present Datums carry the INT128/DECIMAL128 tag).
+        if (present.front()->logical >= 5) {
+            __int128 acc = 0;
+            for (const Datum* d : present) {
+                if (__builtin_add_overflow(acc, Datum::decode_i128(d->s), &acc))
+                    return "integer overflow in SUM";
+            }
+            if (a.kind == AggKind::Avg) acc /= static_cast<__int128>(present.size());
+            out = Datum::make_text(Datum::encode_i128(acc));
+            out.logical = present.front()->logical;
+            out.scale = present.front()->scale;
             return std::nullopt;
         }
         std::int64_t sum = 0;
@@ -6528,7 +6548,7 @@ private:
         Datum lit = n.literal;
         if (t.columns[*ci].logical != 0) {
             Datum cv;
-            if (coerce(t.columns[*ci], lit, cv)) return false;
+            if (coerce(t.columns[*ci], lit, cv, /*for_write=*/false)) return false;
             lit = cv;
         }
         if (lit.type != t.columns[*ci].type) {
@@ -6833,7 +6853,7 @@ private:
             const auto cidx = t.column_index(n.column);
             if (cidx && t.columns[*cidx].logical != 0) {
                 Datum cv;
-                if (auto e = coerce(t.columns[*cidx], rhs, cv)) return e;
+                if (auto e = coerce(t.columns[*cidx], rhs, cv, /*for_write=*/false)) return e;
                 rhs = cv;
             }
         }

@@ -53,15 +53,18 @@ int main() {
         const ExecResult s = e2.exec("SELECT SUM(a), SUM(b) FROM u");
         check(s.ok && s.rows[0].cells[0].second.i == 1000000, "normal SUM ok");
     }
-    // a literal beyond int64 SATURATES at parse (no error, capped to INT64_MAX).
+    // F11: a bare literal beyond int64 into a BIGINT column is REJECTED (clean type error — no
+    // silent saturation). A value that fits is still accepted unchanged. (For values past int64 use
+    // an INT128 column; see sql_int128_test.)
     {
         SqlEngine e3;
         e3.exec("CREATE TABLE s (id INT, v BIGINT NOT NULL, PRIMARY KEY (id))");
-        check(e3.exec("INSERT INTO s (id, v) VALUES (1, 99999999999999999999)").ok,
-              "huge literal accepted (saturates)");
-        const ExecResult r = e3.exec("SELECT v FROM s WHERE id = 1");
-        check(r.ok && r.rows[0].cells[0].second.i == 9223372036854775807LL,
-              "huge literal saturated to INT64_MAX");
+        check(!e3.exec("INSERT INTO s (id, v) VALUES (1, 99999999999999999999)").ok,
+              "huge bare literal rejected for BIGINT (no silent saturate)");
+        check(e3.exec("INSERT INTO s (id, v) VALUES (2, 9223372036854775807)").ok, "INT64_MAX fits");
+        const ExecResult r = e3.exec("SELECT v FROM s WHERE id = 2");
+        check(r.ok && !r.rows.empty() && r.rows[0].cells[0].second.i == 9223372036854775807LL,
+              "INT64_MAX stored exactly");
     }
     // DECIMAL value out of range is rejected (no UB in the scale multiply).
     {
@@ -72,7 +75,7 @@ int main() {
         check(!r.ok && r.error.find("range") != std::string::npos, "DECIMAL out-of-range rejected");
     }
     if (g_fail) { std::printf("sql_overflow_test: FAILED\n"); return 1; }
-    std::printf("sql_overflow_test: OK (checked int64: expr/SUM overflow -> error; literal saturates; "
-                "normal arithmetic unaffected)\n");
+    std::printf("sql_overflow_test: OK (checked int64: expr/SUM overflow -> error; bare literal past "
+                "int64 rejected; normal arithmetic unaffected)\n");
     return 0;
 }
