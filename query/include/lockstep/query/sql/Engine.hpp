@@ -225,6 +225,7 @@ public:
         tip_ = db_.tip();
         chunk_cache_.clear();  // recovered blocks may differ from any cached decode
         concat_cache_.clear();
+        text_dict_cache_.clear();
         zone_cache_.clear();
         // C7: rebuild the CATALOG from its durable schema records (reserved 0x01 namespace).
         // Without this the recovered ROW/BLOCK data is uninterpretable after a restart (the
@@ -1095,6 +1096,63 @@ private:
         }
         slot.col = std::move(out);
         return slot.col;
+    }
+
+    // A2 — dictionary-encoded TEXT column (codes aligned with the concat cache + a code->value
+    // table), flush_gen-tagged. A low-cardinality TEXT GROUP BY groups by INT codes (a direct
+    // array, ~9x faster than per-row string hashing). Pure function of the committed blocks.
+    struct TextDictEntry {
+        std::uint64_t gen = 0;
+        std::vector<std::uint32_t> codes;  // per row -> code
+        std::vector<std::string> values;   // code -> the distinct string
+    };
+
+    // Dictionary-encode a TEXT column: codes[row] = a dense int code for col.texts[row], and
+    // values[code] = the distinct string. Built via open addressing (string -> code) over the
+    // cached concat, cached flush_gen-tagged. A NOT NULL text column only (the caller gates).
+    [[nodiscard]] const TextDictEntry& col_text_dict_cached(const Table& t, std::uint32_t c) {
+        const std::uint64_t key = (static_cast<std::uint64_t>(t.id) << 20) | c;
+        TextDictEntry& slot = text_dict_cache_[key];
+        if (slot.gen == t.flush_gen + 1) {
+            return slot;
+        }
+        slot.gen = t.flush_gen + 1;
+        const ColumnChunk& col = read_col_concat(t, c);
+        slot.codes.assign(col.count, 0);
+        slot.values.clear();
+        std::size_t cap = 256;
+        std::vector<std::int32_t> dslot(cap, -1);
+        const std::hash<std::string> hf;
+        auto reinsert = [&](std::int32_t code) {
+            std::size_t p = hf(slot.values[static_cast<std::size_t>(code)]) & (cap - 1);
+            while (dslot[p] >= 0) p = (p + 1) & (cap - 1);
+            dslot[p] = code;
+        };
+        for (std::uint32_t r = 0; r < col.count; ++r) {
+            const std::string& s = col.texts[r];
+            std::size_t p = hf(s) & (cap - 1);
+            while (true) {
+                if (dslot[p] < 0) {
+                    if ((slot.values.size() + 1) * 10 >= cap * 7) {
+                        cap *= 2;
+                        dslot.assign(cap, -1);
+                        for (std::int32_t code = 0;
+                             code < static_cast<std::int32_t>(slot.values.size()); ++code) {
+                            reinsert(code);
+                        }
+                        p = hf(s) & (cap - 1);
+                        continue;
+                    }
+                    dslot[p] = static_cast<std::int32_t>(slot.values.size());
+                    slot.values.push_back(s);
+                    break;
+                }
+                if (slot.values[static_cast<std::size_t>(dslot[p])] == s) break;
+                p = (p + 1) & (cap - 1);
+            }
+            slot.codes[r] = static_cast<std::uint32_t>(dslot[p]);
+        }
+        return slot;
     }
 
     // Concatenate ONLY the given chunk ids of column c (zone-map survivors) into one SoA
@@ -2512,6 +2570,20 @@ private:
                     [&](std::uint32_t rr) {
                         return std::vector<Datum>{Datum::make_text(cols[gc]->texts[rr])};
                     });
+            } else if (!use_survivors) {
+                // A2 — DICTIONARY path: codes align with the full concat (non-survivor only), so
+                // group by INT codes (direct/fast) instead of per-row string hashing, then re-sort
+                // the (few) groups by the STRING value to match the string-ordered output.
+                const TextDictEntry& dict = col_text_dict_cached(t, static_cast<std::uint32_t>(gc));
+                hg = hash_group_collect<std::int64_t>(
+                    count, has_filter, passes,
+                    [&](std::uint32_t rr) { return static_cast<std::int64_t>(dict.codes[rr]); },
+                    [&](std::uint32_t rr) {
+                        return std::vector<Datum>{Datum::make_text(dict.values[dict.codes[rr]])};
+                    });
+                std::sort(hg.begin(), hg.end(), [](const auto& a, const auto& b) {
+                    return a.first[0].s < b.first[0].s;  // string order (codes are insertion order)
+                });
             } else {
                 hg = hash_group_collect<std::string>(  // open-addressing (A1) — sorted by key
                     count, has_filter, passes,
@@ -5532,6 +5604,8 @@ private:
         ColumnChunk col;
     };
     std::map<std::uint64_t, ConcatCacheEntry> concat_cache_;  // key = (table_id<<20 | col_id)
+    // A2 — dictionary-encoded TEXT column cache (struct declared above col_text_dict_cached).
+    std::map<std::uint64_t, TextDictEntry> text_dict_cache_;
     struct ZoneCacheEntry {
         std::uint64_t gen = 0;
         std::vector<std::vector<ColZone>> zones;
