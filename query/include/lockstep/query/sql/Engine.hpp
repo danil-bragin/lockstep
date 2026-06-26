@@ -3845,16 +3845,30 @@ private:
                 }
             }
         }
+        // C3: precompute each WINDOW function's value per row (over the post-WHERE row set, in scan
+        // order) — window functions see the whole partition, so they cannot be evaluated row-locally.
+        std::vector<std::vector<Datum>> win_vals(sel.items.size());
+        for (std::size_t a = 0; a < sel.items.size(); ++a) {
+            if (sel.items[a].kind == SelectItemKind::Window) {
+                if (auto e = compute_window(*sel.items[a].win, *t, rows, win_vals[a])) {
+                    return ExecResult::failure(*e);
+                }
+            }
+        }
         ExecResult r;
-        for (const auto& row : rows) {
+        for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+            const auto& row = rows[ri];
             ResultRow out;
             if (sel.star) {
                 for (std::size_t i = 0; i < t->columns.size(); ++i) {
                     out.cells.emplace_back(t->columns[i].name, row[i]);
                 }
             } else {
-                for (const SelectItem& item : sel.items) {
-                    if (item.kind == SelectItemKind::Expr) {
+                for (std::size_t a = 0; a < sel.items.size(); ++a) {
+                    const SelectItem& item = sel.items[a];
+                    if (item.kind == SelectItemKind::Window) {
+                        out.cells.emplace_back(item.label, win_vals[a][ri]);
+                    } else if (item.kind == SelectItemKind::Expr) {
                         Datum d;
                         if (auto e = eval_expr(*item.expr, *t, row, d)) {
                             return ExecResult::failure(*e);
@@ -4029,6 +4043,96 @@ private:
             }
             if (!truth) {
                 return "CHECK constraint violated: " + chk;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // C3: compute a window function's value for EVERY row (returned in `rows` order). Rows are
+    // partitioned by PARTITION BY; each partition is ordered by the window's ORDER BY; then
+    // ROW_NUMBER/RANK number the ordered rows and SUM/COUNT/MIN/MAX aggregate over the whole
+    // partition (same value for every partition row). Deterministic (ordered map + stable sort).
+    [[nodiscard]] std::optional<std::string> compute_window(const WindowFunc& w, const Table& t,
+                                                            const std::vector<std::vector<Datum>>& rows,
+                                                            std::vector<Datum>& out) {
+        out.assign(rows.size(), Datum::make_null(Type::Int));
+        std::vector<std::size_t> pcols;
+        for (const std::string& p : w.partition_by) {
+            const auto i = t.column_index(p);
+            if (!i) return "unknown PARTITION BY column '" + p + "'";
+            pcols.push_back(*i);
+        }
+        std::vector<std::size_t> ocols;
+        for (const OrderKey& k : w.order_by) {
+            const auto i = t.column_index(k.column);
+            if (!i) return "unknown window ORDER BY column '" + k.column + "'";
+            ocols.push_back(*i);
+        }
+        std::size_t argc = 0;
+        if (w.kind == WinKind::Sum || w.kind == WinKind::Min || w.kind == WinKind::Max ||
+            w.kind == WinKind::Count) {
+            const auto i = t.column_index(w.arg_column);
+            if (!i) return "unknown column '" + w.arg_column + "' in window function";
+            argc = *i;
+        }
+        // Partition the row indices (ordered map => deterministic partition order).
+        std::map<std::vector<std::string>, std::vector<std::size_t>> parts;
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            std::vector<std::string> key;
+            key.reserve(pcols.size());
+            for (const std::size_t pc : pcols) key.push_back(group_key_field(rows[r][pc]));
+            parts[key].push_back(r);
+        }
+        for (auto& [k, idxs] : parts) {
+            (void)k;
+            if (!ocols.empty()) {
+                std::stable_sort(idxs.begin(), idxs.end(), [&](std::size_t a, std::size_t b) {
+                    for (std::size_t j = 0; j < ocols.size(); ++j) {
+                        const int c = cmp_datum(rows[a][ocols[j]], rows[b][ocols[j]]);
+                        if (c != 0) return w.order_by[j].descending ? (c > 0) : (c < 0);
+                    }
+                    return false;
+                });
+            }
+            if (w.kind == WinKind::RowNumber) {
+                for (std::size_t k2 = 0; k2 < idxs.size(); ++k2)
+                    out[idxs[k2]] = Datum::make_int(static_cast<std::int64_t>(k2 + 1));
+            } else if (w.kind == WinKind::Rank) {
+                std::int64_t rank = 0;
+                for (std::size_t k2 = 0; k2 < idxs.size(); ++k2) {
+                    bool tie = false;
+                    if (k2 > 0 && !ocols.empty()) {
+                        tie = true;
+                        for (const std::size_t oc : ocols)
+                            if (cmp_datum(rows[idxs[k2]][oc], rows[idxs[k2 - 1]][oc]) != 0) { tie = false; break; }
+                    }
+                    if (!tie) rank = static_cast<std::int64_t>(k2 + 1);  // gaps on ties
+                    out[idxs[k2]] = Datum::make_int(rank);
+                }
+            } else {
+                // Whole-partition aggregate (same value for every row in the partition).
+                std::int64_t total = static_cast<std::int64_t>(idxs.size());
+                std::int64_t npres = 0, sum = 0;
+                Datum best;
+                bool any = false;
+                for (const std::size_t r : idxs) {
+                    const Datum& d = rows[r][argc];
+                    if (w.kind == WinKind::CountStar) continue;
+                    if (d.is_null) continue;
+                    ++npres;
+                    sum += d.type == Type::Int ? d.i : 0;
+                    if (!any) { best = d; any = true; }
+                    else {
+                        const int c = cmp_datum(d, best);
+                        if ((w.kind == WinKind::Min && c < 0) || (w.kind == WinKind::Max && c > 0)) best = d;
+                    }
+                }
+                Datum v;
+                if (w.kind == WinKind::CountStar) v = Datum::make_int(total);
+                else if (w.kind == WinKind::Count) v = Datum::make_int(npres);
+                else if (w.kind == WinKind::Sum) v = Datum::make_int(sum);
+                else v = any ? best : Datum::make_null(t.columns[argc].type);  // Min/Max
+                for (const std::size_t r : idxs) out[r] = v;
             }
         }
         return std::nullopt;
@@ -5393,8 +5497,9 @@ private:
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Column) {
                 mark(item.column);
-            } else if (item.kind == SelectItemKind::Expr) {
-                // A1: an expression may touch any column — decode them all (conservative + correct).
+            } else if (item.kind == SelectItemKind::Expr ||
+                       item.kind == SelectItemKind::Window) {
+                // A1/C3: an expression or window function may touch any column — decode them all.
                 return std::vector<bool>(t.columns.size(), true);
             } else if (item.agg.kind != AggKind::CountStar) {
                 mark(item.agg.column);  // COUNT(*) needs no column

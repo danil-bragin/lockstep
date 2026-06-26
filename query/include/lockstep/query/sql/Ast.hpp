@@ -269,13 +269,23 @@ struct OrderKey {
 
 // One SELECT-list item: either a plain column or an aggregate expression. A v1
 // `SELECT id, name` is all-Column items; a v2 `SELECT k, COUNT(*)` mixes them.
-enum class SelectItemKind : std::uint8_t { Column = 0, Aggregate = 1, Expr = 2 };
+// C3: a window function — ROW_NUMBER()/RANK(), or an aggregate OVER a partition.
+enum class WinKind : std::uint8_t { RowNumber = 0, Rank = 1, Sum = 2, Count = 3, Min = 4, Max = 5, CountStar = 6 };
+struct WindowFunc {
+    WinKind kind = WinKind::RowNumber;
+    std::string arg_column;                 // Sum/Min/Max/Count(col): the aggregated column
+    std::vector<std::string> partition_by;  // OVER (PARTITION BY ...)
+    std::vector<OrderKey> order_by;         // OVER (... ORDER BY ...)
+};
+
+enum class SelectItemKind : std::uint8_t { Column = 0, Aggregate = 1, Expr = 2, Window = 3 };
 struct SelectItem {
     SelectItemKind kind = SelectItemKind::Column;
     std::string qualifier;  // v3: optional table/alias qualifier ("" == unqualified)
     std::string column;     // Column: the column name; the OUTPUT label
     AggExpr agg;            // Aggregate: the aggregate
     std::shared_ptr<Expr> expr;  // A1: a scalar expression (computed column)
+    std::shared_ptr<WindowFunc> win;  // C3: a window function
     std::string label;      // the rendered output column label (col name or "COUNT(*)")
 };
 

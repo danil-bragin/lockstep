@@ -1129,6 +1129,86 @@ private:
         return out;
     }
 
+    // C3: parse an OVER ( [PARTITION BY ...] [ORDER BY ...] ) clause into a WindowFunc.
+    [[nodiscard]] std::optional<ParseError> parse_over(WindowFunc& w) {
+        if (auto e = expect_kw("over")) return e;
+        if (auto e = expect(Tok::LParen, "'(' after OVER")) return e;
+        if (is_kw("partition")) {
+            advance();
+            if (auto e = expect_kw("by")) return e;
+            for (;;) {
+                std::string q, c;
+                if (auto e = expect_qualified_column("a PARTITION BY column", q, c)) return e;
+                w.partition_by.push_back(q.empty() ? c : q + "." + c);
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
+        }
+        if (is_kw("order")) {
+            advance();
+            if (auto e = expect_kw("by")) return e;
+            for (;;) {
+                OrderKey k;
+                if (auto e = expect_qualified_column("an ORDER BY column", k.qualifier, k.column))
+                    return e;
+                if (is_kw("asc")) advance();
+                else if (is_kw("desc")) { k.descending = true; advance(); }
+                w.order_by.push_back(std::move(k));
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
+        }
+        return expect(Tok::RParen, "')' to close OVER");
+    }
+
+    // C3: try to parse a WINDOW function at the cursor — ROW_NUMBER()/RANK() OVER (...) or an
+    // aggregate with a trailing OVER. Sets matched + fills `item` (kind Window). For an aggregate
+    // call WITHOUT a trailing OVER, leaves matched=false AND fills `agg`/`agg_label` so the caller
+    // can emit a plain aggregate item (single-token lookahead means we must commit to parsing the
+    // call here). `consumed_agg` says the call was an aggregate already parsed into agg/agg_label.
+    [[nodiscard]] std::optional<ParseError> parse_window_or_agg(SelectItem& item, bool& is_window,
+                                                               AggExpr& agg, bool& is_agg,
+                                                               std::string& agg_label) {
+        is_window = false;
+        is_agg = false;
+        // ROW_NUMBER() / RANK() — window-only.
+        if (is_kw("row_number") || is_kw("rank")) {
+            const bool is_rank = is_kw("rank");
+            advance();
+            if (auto e = expect(Tok::LParen, "'(' after the window function")) return e;
+            if (auto e = expect(Tok::RParen, "')' (ROW_NUMBER/RANK take no arguments)")) return e;
+            auto w = std::make_shared<WindowFunc>();
+            w->kind = is_rank ? WinKind::Rank : WinKind::RowNumber;
+            if (auto e = parse_over(*w)) return e;
+            item.kind = SelectItemKind::Window;
+            item.win = std::move(w);
+            item.label = is_rank ? "RANK()" : "ROW_NUMBER()";
+            is_window = true;
+            return std::nullopt;
+        }
+        // An aggregate call — may be windowed (trailing OVER) or a plain aggregate.
+        if (auto e = parse_agg(agg, is_agg, agg_label)) return e;
+        if (is_agg && is_kw("over")) {
+            auto w = std::make_shared<WindowFunc>();
+            switch (agg.kind) {
+                case AggKind::CountStar: w->kind = WinKind::CountStar; break;
+                case AggKind::Count: w->kind = WinKind::Count; break;
+                case AggKind::Sum: w->kind = WinKind::Sum; break;
+                case AggKind::Min: w->kind = WinKind::Min; break;
+                case AggKind::Max: w->kind = WinKind::Max; break;
+                default: return make_err("AVG OVER is not supported (use SUM/COUNT)");
+            }
+            w->arg_column = agg.column;
+            if (auto e = parse_over(*w)) return e;
+            item.kind = SelectItemKind::Window;
+            item.win = std::move(w);
+            item.label = agg_label + " OVER";
+            is_window = true;
+            is_agg = false;  // it became a window, not a plain aggregate
+        }
+        return std::nullopt;
+    }
+
     // A readable, deterministic output label for an UNALIASED projected expression.
     static std::string expr_label(const Expr& e) {
         switch (e.kind) {
@@ -1409,14 +1489,24 @@ private:
             advance();
         } else {
             for (;;) {
-                // An aggregate item? (NAME '(' ...)
+                // A WINDOW function (ROW_NUMBER/RANK/agg OVER) or a plain AGGREGATE? (NAME '(' ...)
                 AggExpr agg;
                 bool is_agg = false;
+                bool is_window = false;
                 std::string label;
-                if (auto e = parse_agg(agg, is_agg, label)) {
+                SelectItem witem;
+                if (auto e = parse_window_or_agg(witem, is_window, agg, is_agg, label)) {
                     return e;
                 }
-                if (is_agg) {
+                if (is_window) {
+                    if (is_kw("as")) {  // optional AS <alias>
+                        advance();
+                        std::string alias;
+                        if (auto e = expect_ident("an alias after AS", alias)) return e;
+                        witem.label = alias;
+                    }
+                    sel.items.push_back(std::move(witem));
+                } else if (is_agg) {
                     SelectItem item;
                     item.kind = SelectItemKind::Aggregate;
                     item.agg = agg;

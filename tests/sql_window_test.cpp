@@ -1,0 +1,64 @@
+// sql_window_test.cpp — C3 window functions. ROW_NUMBER()/RANK() and SUM/COUNT OVER a partition,
+// with PARTITION BY + ORDER BY. Exact per-row values; row + columnar.
+#include <cstdio>
+#include <string>
+
+#include <lockstep/query/sql/Engine.hpp>
+
+using namespace lockstep::query::sql;
+
+namespace {
+int g_fail = 0;
+void check(bool ok, const std::string& what) {
+    if (!ok) { std::printf("FAIL: %s\n", what.c_str()); g_fail = 1; }
+}
+
+void run_mode(bool columnar, const char* tag) {
+    SqlEngine e;
+    if (columnar) e.set_columnar_default(true);
+    e.exec("CREATE TABLE t (id INT, dept TEXT NOT NULL, sal INT NOT NULL, PRIMARY KEY (id))");
+    e.exec("INSERT INTO t (id,dept,sal) VALUES (1,'A',100),(2,'A',200),(3,'B',150),(4,'A',200)");
+    if (columnar) e.flush_columnar("t");
+    const std::string T = tag;
+
+    // id, ROW_NUMBER within dept by sal desc, SUM(sal) over dept, COUNT(*) over dept.
+    const ExecResult r = e.exec(
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY sal DESC) AS rn, "
+        "SUM(sal) OVER (PARTITION BY dept) AS tot, COUNT(*) OVER (PARTITION BY dept) AS cnt "
+        "FROM t ORDER BY id");
+    check(r.ok && r.rows.size() == 4, T + " 4 rows");
+    if (r.rows.size() == 4) {
+        // expected by id: id1 rn3 tot500 cnt3 ; id2 rn1 tot500 cnt3 ; id3 rn1 tot150 cnt1 ; id4 rn2 tot500 cnt3
+        auto row = [&](int i, std::int64_t rn, std::int64_t tot, std::int64_t cnt) {
+            const auto& c = r.rows[i].cells;
+            check(c[1].second.i == rn, T + " id" + std::to_string(i + 1) + " rn=" + std::to_string(rn));
+            check(c[2].second.i == tot, T + " id" + std::to_string(i + 1) + " tot=" + std::to_string(tot));
+            check(c[3].second.i == cnt, T + " id" + std::to_string(i + 1) + " cnt=" + std::to_string(cnt));
+        };
+        row(0, 3, 500, 3);
+        row(1, 1, 500, 3);
+        row(2, 1, 150, 1);
+        row(3, 2, 500, 3);
+    }
+
+    // RANK() with a tie (sal 200 appears twice in dept A): ranks 1,1,3 (gap).
+    const ExecResult rk = e.exec(
+        "SELECT id, RANK() OVER (PARTITION BY dept ORDER BY sal DESC) AS rk FROM t WHERE dept = 'A' ORDER BY id");
+    // dept A by sal desc: id2(200),id4(200),id1(100) -> ranks 1,1,3. By id: id1->3, id2->1, id4->1.
+    if (rk.ok && rk.rows.size() == 3) {
+        check(rk.rows[0].cells[1].second.i == 3, T + " RANK id1 = 3");
+        check(rk.rows[1].cells[1].second.i == 1, T + " RANK id2 = 1");
+        check(rk.rows[2].cells[1].second.i == 1, T + " RANK id4 = 1 (tie)");
+    } else {
+        check(false, T + " RANK query");
+    }
+}
+}  // namespace
+
+int main() {
+    run_mode(false, "row");
+    run_mode(true, "columnar");
+    if (g_fail) { std::printf("sql_window_test: FAILED\n"); return 1; }
+    std::printf("sql_window_test: OK (ROW_NUMBER/RANK + SUM/COUNT OVER partition)\n");
+    return 0;
+}
