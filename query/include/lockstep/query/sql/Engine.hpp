@@ -308,6 +308,7 @@ public:
         o.push_back(t.columnar ? 1 : 0);
         cat_put_u32(o, t.next_index_id);
         cat_put_s(o, std::to_string(t.next_auto_id));  // F6: persist the AUTO_INCREMENT counter
+        cat_put_s(o, std::to_string(t.next_uuid));     // F9c: persist the gen_uuid() counter
         cat_put_u32(o, static_cast<std::uint32_t>(t.columns.size()));
         for (const Column& c : t.columns) {
             cat_put_s(o, c.name);
@@ -323,8 +324,9 @@ public:
             o.push_back(c.unique ? 1 : 0);           // F2
             cat_put_s(o, c.fk_table);                // F3
             cat_put_s(o, c.fk_column);
-            o.push_back(static_cast<char>(c.logical));  // F9b: DECIMAL/DATE/TIMESTAMP logical tag
+            o.push_back(static_cast<char>(c.logical));  // F9b: DECIMAL/DATE/TIMESTAMP/UUID logical tag
             o.push_back(static_cast<char>(c.scale));
+            o.push_back(c.uuid_default ? 1 : 0);        // F9c
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -351,6 +353,7 @@ public:
         t.columnar = s[p++] != 0;
         t.next_index_id = cat_get_u32(s, p);
         t.next_auto_id = std::strtoll(cat_get_s(s, p).c_str(), nullptr, 10);  // F6
+        t.next_uuid = std::strtoull(cat_get_s(s, p).c_str(), nullptr, 10);    // F9c
         const std::uint32_t nc = cat_get_u32(s, p);
         for (std::uint32_t i = 0; i < nc; ++i) {
             Column c;
@@ -372,6 +375,7 @@ public:
             c.fk_column = cat_get_s(s, p);
             c.logical = static_cast<std::uint8_t>(s[p++]);  // F9b
             c.scale = static_cast<std::uint8_t>(s[p++]);
+            c.uuid_default = s[p++] != 0;  // F9c
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -1059,6 +1063,20 @@ private:
             out = Datum::make_int(v);
             out.logical = col.logical;
             out.scale = col.scale;
+            return std::nullopt;
+        }
+        // F9c: a UUID column (physical TEXT). Validate + canonicalise (lowercase, dashed) the literal.
+        if (col.type == Type::Text && col.logical == 4) {
+            if (in.type != Type::Text) {
+                return std::string("type mismatch for column '") + col.name +
+                       "': expected UUID, got " + type_name(in.type);
+            }
+            std::string canon;
+            if (!parse_uuid(in.s, canon)) {
+                return std::string("invalid UUID literal '") + in.s + "' for column '" + col.name + "'";
+            }
+            out = Datum::make_text(canon);
+            out.logical = 4;
             return std::nullopt;
         }
         if (col.type != in.type) {
@@ -2991,6 +3009,7 @@ private:
         // F6: a working copy of the AUTO_INCREMENT counter, advanced as rows are built and written
         // back to the catalog (+ persisted) after a successful commit.
         std::int64_t auto_next = t->next_auto_id;
+        std::uint64_t uuid_next = t->next_uuid;  // F9c: working copy of the gen_uuid() counter
 
         // F2: UNIQUE constraint enforcement. Pre-scan the table once to collect the existing non-NULL
         // values of every UNIQUE column; staging then rejects a row that repeats one (existing OR
@@ -3049,6 +3068,13 @@ private:
                 // F6: an omitted AUTO_INCREMENT column gets the next monotonic id.
                 if (t->columns[c].auto_increment) {
                     row[c] = Datum::make_int(auto_next++);
+                    continue;
+                }
+                // F9c: an omitted DEFAULT gen_uuid() column gets a deterministic v4-shaped id.
+                if (t->columns[c].uuid_default) {
+                    Datum d = Datum::make_text(format_uuid(t->id, uuid_next++));
+                    d.logical = 4;
+                    row[c] = d;
                     continue;
                 }
                 // F4: an omitted column with a DEFAULT takes the default value.
@@ -3184,8 +3210,9 @@ private:
         if (Table* mt = catalog_.find_mut(ins.table)) {
             // F6: advance + durably persist the AUTO_INCREMENT counter so a restart never re-issues
             // an id (persist only when it actually moved — keeps the catalog write off the no-auto path).
-            if (auto_next != mt->next_auto_id) {
+            if (auto_next != mt->next_auto_id || uuid_next != mt->next_uuid) {
                 mt->next_auto_id = auto_next;
+                mt->next_uuid = uuid_next;  // F9c
                 persist_schema(ins.table);
             }
             // G2: a columnar ON CONFLICT DO UPDATE wrote new delta rows — mark the delta dirty.
@@ -6286,10 +6313,23 @@ private:
             return false;
         }
         const auto ci = t.column_index(n.column);
-        if (!ci || t.columns[*ci].nullable || n.literal.type != t.columns[*ci].type) {
+        if (!ci || t.columns[*ci].nullable) {
             return false;
         }
-        out.push_back(VecTerm{*ci, n.op, n.literal});
+        // F9b/F9c: a literal compared against a DECIMAL/DATE/TIMESTAMP/UUID column must be coerced to
+        // the column's stored representation (scaled int / days / secs / canonical string) BEFORE the
+        // zone/mask compares against raw stored values. A coercion failure falls back to eval_pred
+        // (which reports the error).
+        Datum lit = n.literal;
+        if (t.columns[*ci].logical != 0) {
+            Datum cv;
+            if (coerce(t.columns[*ci], lit, cv)) return false;
+            lit = cv;
+        }
+        if (lit.type != t.columns[*ci].type) {
+            return false;
+        }
+        out.push_back(VecTerm{*ci, n.op, lit});
         return true;
     }
 

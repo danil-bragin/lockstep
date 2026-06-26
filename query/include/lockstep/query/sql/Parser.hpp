@@ -551,6 +551,12 @@ private:
             }
             return std::nullopt;
         }
+        if (is_kw("uuid")) {  // F9c: UUID over TEXT (validated, canonicalised string)
+            out = Type::Text;
+            col.logical = 4;
+            advance();
+            return std::nullopt;
+        }
         if (is_kw("text")) {
             out = Type::Text;
             advance();
@@ -778,19 +784,30 @@ private:
             // must match the column type (checked at INSERT/coerce time).
             if (is_kw("default")) {
                 advance();
-                Datum dv;
-                if (auto e = expect_literal(dv)) {
-                    return ParseResult{*e};
-                }
-                col.has_default = true;
-                if (dv.type == Type::Int) {
-                    col.default_i = dv.i;
+                // F9c: DEFAULT gen_uuid() / uuid() — a deterministic generated default (UUID column).
+                if (is_kw("gen_uuid") || is_kw("gen_random_uuid")) {
+                    if (col.logical != 4) {
+                        return err("gen_uuid() DEFAULT requires a UUID column ('" + col.name + "')");
+                    }
+                    advance();
+                    if (auto e = expect(Tok::LParen, "'(' after gen_uuid")) return ParseResult{*e};
+                    if (auto e = expect(Tok::RParen, "')' after gen_uuid(")) return ParseResult{*e};
+                    col.uuid_default = true;
                 } else {
-                    col.default_s = dv.s;
-                }
-                // Remember the literal's type so coerce can validate it against the column.
-                if (dv.type != col.type) {
-                    return err("DEFAULT literal type does not match column '" + col.name + "'");
+                    Datum dv;
+                    if (auto e = expect_literal(dv)) {
+                        return ParseResult{*e};
+                    }
+                    col.has_default = true;
+                    if (dv.type == Type::Int) {
+                        col.default_i = dv.i;
+                    } else {
+                        col.default_s = dv.s;
+                    }
+                    // Remember the literal's type so coerce can validate it against the column.
+                    if (dv.type != col.type) {
+                        return err("DEFAULT literal type does not match column '" + col.name + "'");
+                    }
                 }
             }
             // F5: a COLUMN-level CHECK (e.g. `age INT CHECK (age >= 0)`) — same store as table-level.

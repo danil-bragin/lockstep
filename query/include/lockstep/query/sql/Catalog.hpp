@@ -97,9 +97,14 @@ struct Column {
     // F3 FOREIGN KEY: when fk_table is non-empty, a non-NULL value must exist as the PK of fk_table.
     std::string fk_table;
     std::string fk_column;  // the referenced column (the parent's PK)
-    // F9b: a LOGICAL type over INT storage — 0=plain, 1=DECIMAL(scale), 2=DATE, 3=TIMESTAMP.
+    // F9b: a LOGICAL type over physical storage — 0=plain, 1=DECIMAL(scale), 2=DATE, 3=TIMESTAMP
+    // (these over INT), 4=UUID (over TEXT: a validated, canonicalised 36-char string).
     std::uint8_t logical = 0;
     std::uint8_t scale = 0;
+    // F9c: DEFAULT gen_uuid() — an omitted UUID column gets a DETERMINISTIC v4-shaped id derived from
+    // the table's next_uuid counter (NOT random — random would diverge across the two Raft impls and
+    // break the cross-check). Independent of has_default (which holds literal defaults).
+    bool uuid_default = false;
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -129,6 +134,7 @@ struct Table {
     std::vector<Index> indexes;       // secondary indexes (in CREATE order)
     std::uint32_t next_index_id = 1;  // dense index-id assignment (0 reserved)
     std::int64_t next_auto_id = 1;    // F6: next AUTO_INCREMENT value (monotonic; persisted)
+    std::uint64_t next_uuid = 0;      // F9c: next DEFAULT gen_uuid() counter (monotonic; persisted)
     std::vector<std::string> checks;  // F5: CHECK predicate source texts (re-parsed + eval'd on write)
 
     // COLUMNAR layout (PERF_PLAN columnar rollout): when true, the table is an LSM of a
@@ -350,6 +356,57 @@ inline std::int64_t days_from_civil(std::int64_t y, std::int64_t m, std::int64_t
     }
     secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
     return true;
+}
+
+// F9c: validate a UUID string (8-4-4-4-12 hex, optionally braced/uppercased) and write its
+// CANONICAL form (lowercase, dashed) to `out`. Returns false on a malformed value. Pure.
+[[nodiscard]] inline bool parse_uuid(const std::string& in, std::string& out) {
+    std::string h;
+    h.reserve(32);
+    for (char ch : in) {
+        if (ch == '-' || ch == '{' || ch == '}' || ch == ' ') continue;
+        char lo = ch;
+        if (lo >= 'A' && lo <= 'F') lo = static_cast<char>(lo - 'A' + 'a');
+        const bool hex = (lo >= '0' && lo <= '9') || (lo >= 'a' && lo <= 'f');
+        if (!hex) return false;
+        h.push_back(lo);
+    }
+    if (h.size() != 32) return false;
+    out.clear();
+    out.reserve(36);
+    for (std::size_t i = 0; i < 32; ++i) {
+        if (i == 8 || i == 12 || i == 16 || i == 20) out.push_back('-');
+        out.push_back(h[i]);
+    }
+    return true;
+}
+// F9c: a DETERMINISTIC v4-shaped UUID from (table_id, counter) — splitmix64 mixed into 128 bits
+// with the version (4) and variant (10xx) nibbles set. Same inputs → same id on every replica, so
+// the cross-check stays sound. NOT a random UUID (random is forbidden — it would diverge).
+inline std::string format_uuid(std::uint32_t table_id, std::uint64_t counter) {
+    auto mix = [](std::uint64_t x) {
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        return x ^ (x >> 31);
+    };
+    const std::uint64_t seed = (static_cast<std::uint64_t>(table_id) << 40) ^ (counter + 1);
+    std::uint64_t hi = mix(seed);
+    std::uint64_t lo = mix(seed ^ 0xD1B54A32D192ED03ULL);
+    std::uint8_t b[16];
+    for (int i = 0; i < 8; ++i) b[i] = static_cast<std::uint8_t>(hi >> (56 - 8 * i));
+    for (int i = 0; i < 8; ++i) b[8 + i] = static_cast<std::uint8_t>(lo >> (56 - 8 * i));
+    b[6] = static_cast<std::uint8_t>((b[6] & 0x0F) | 0x40);  // version 4
+    b[8] = static_cast<std::uint8_t>((b[8] & 0x3F) | 0x80);  // variant 10xx
+    static const char* hexd = "0123456789abcdef";
+    std::string s;
+    s.reserve(36);
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) s.push_back('-');
+        s.push_back(hexd[b[i] >> 4]);
+        s.push_back(hexd[b[i] & 0x0F]);
+    }
+    return s;
 }
 
 // ----------------------------------------------------------------------------
