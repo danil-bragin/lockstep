@@ -240,7 +240,8 @@ void test_join() {
     expect_err("SELECT * FROM a LEFT JOIN b", "LEFT JOIN missing ON");
     expect_err("SELECT * FROM a JOIN b ON", "ON missing predicate");
     expect_err("SELECT * FROM a CROSS JOIN b ON a.k = b.k", "CROSS takes no ON");
-    expect_err("SELECT * FROM a RIGHT JOIN b ON a.k = b.k", "RIGHT JOIN is OUT");
+    (void)ok_parse("SELECT * FROM a RIGHT JOIN b ON a.k = b.k");  // E1: RIGHT JOIN now supported
+    (void)ok_parse("SELECT * FROM a FULL OUTER JOIN b ON a.k = b.k");  // E1: FULL JOIN now supported
     expect_err("SELECT * FROM a AS", "AS without an alias");
     expect_err("SELECT a. FROM a", "dangling '.' (no column after qualifier)");
     expect_err("SELECT * FROM a JOIN ON a.k = b.k", "JOIN without a table");
