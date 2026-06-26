@@ -48,10 +48,48 @@ scan/zone. The gap is GROUP BY + filtered (their vectorized hash-aggregate + SIM
 - **The differentiator the competitors don't have:** every number sits on a formally-verified,
   jepsen-durable, dual-cross-checked core. Speed was never traded for correctness.
 
+## Live re-bench + the three "honest-asterisk" closures (this session)
+
+All measured live on the 14-core host. The earlier framing carried three caveats; here is where each landed.
+
+**⭐1 — apples-to-apples KEYED op (not the lighter opaque-append).** `lockstep_kvbench` keyed Put/Get
+vs `lockstepd --wire-server 1`, real prod epoll transport:
+- keyed **READ**: **242,786 /s** (p99 413 µs) — **~9.7× etcd (~25k)**. Decisive win on a fair op.
+- keyed **WRITE (durable)**: **3,320 /s** (p50 19 ms) — **LOSES to etcd**. Honest: the wire keyed-write
+  path fsyncs one Put at a time (no group commit yet); the ~107k figure was the consensus admin path's
+  opaque value-append (group-committed, lighter op). Fix = add group commit to the wire write path
+  (drain N ready Puts → apply → ONE fsync → ack N); bounded, durability-preserving, a focused follow-up.
+
+**⭐2 — node-level HORIZONTAL ceiling (multi-shard × multi-client), removing the single-client cap.**
+`bench/compare/multi_shard_ceiling.sh` (M shards, K=2 clients/shard, sum durable commit_tput):
+| shards | aggregate commit/s |
+|---:|---:|
+| 1 | 148,232 |
+| 2 | 187,264 |
+| 4 | 386,828 |
+| **6** | **635,140** |
+Near-linear in shards → **635k/s single node** (3.1× the single-shard ~206k ceiling, ~25–63× the
+competitors). The earlier "flat sharded curve" was purely the single-client driver artifact, now gone.
+
+**⭐3 — SQL OVER THE WIRE (not in-process only).** The `MsgKind::SqlExec` path was made EXACTLY-ONCE
+(submit_key dedup; a retried statement no longer re-applies — caught + fixed by the new
+`tests/sql_wire_test.cpp` gate, which asserts wire == in-process oracle byte-for-byte under
+dup/drop/reorder). Live over the real transport: `lockstep_sqlbench` runs SQL statements at
+**104,977 /s** (p99 474 µs) against `lockstepd --wire-server 1`. (Durability of the SQL write path vs
+the keyed durable path is a fair open flag — the SQL number is much higher than the 3.3k durable keyed
+write, so confirm its fsync semantics before quoting as durable.)
+
+## Bottom line (updated)
+- **vs row stores (Postgres/etcd/TiKV/Cockroach/SQLite):** decisive on KV reads + SQL analytics; KV
+  durable writes need wire group-commit to win (honest gap, scoped).
+- **Horizontal:** real — 635k/s on one node across 6 shards; the architecture scales, now shown live.
+- **SQL is no longer in-process-only:** runs over the wire (verified exactly-once) at ~105k/s.
+
 ## Open levers (documented, fresh-session)
+wire write-path GROUP COMMIT (turn the 3.3k durable keyed write into a win — the ⭐1 follow-up) ·
+distributed SQL across shards (scatter-gather; single-node SQL-over-wire is the foundation) ·
+vectorized hash-aggregate / dictionary-RLE / vectorized JOIN (close the residual DuckDB analytics gap).
 
-morsel parallelism (multi-core SQL — multiplies all SQL wins by cores; cross-layer, threads live in
-providers/prod) · vectorized hash-aggregate (close the DuckDB GROUP BY gap) · dictionary/RLE (needs a
-global dict) · vectorized JOIN · multi-machine analytics over the shards.
-
-Reproduce: `bench/compare/run.sh` (KV) · `bench/compare/sql_analytics/run_analytics.sh 1000000 20` (SQL).
+Reproduce: `bench/compare/run.sh` (KV) · `bench/compare/multi_shard_ceiling.sh` (horizontal) ·
+`bench/compare/sql_analytics/run_analytics.sh 1000000 20` (SQL analytics) · `lockstep_sqlbench` /
+`lockstep_kvbench` vs `lockstepd --wire-server 1` (keyed + SQL over the wire).
