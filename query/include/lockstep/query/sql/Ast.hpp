@@ -73,6 +73,8 @@ struct DropIndexStmt {
     std::string table;
 };
 
+struct SelectStmt;  // fwd (defined below) — InsertStmt::select_source for INSERT ... SELECT (D5)
+
 // INSERT INTO <t> (<cols>) VALUES (<vals>)
 struct InsertStmt {
     std::string table;
@@ -81,6 +83,9 @@ struct InsertStmt {
     // D6 multi-row: VALUES (..),(..),... — rows 1..N-1 (row 0 stays in `values` for back-compat).
     // Empty for a single-row INSERT. Each inner vector has columns.size() values (parser-checked).
     std::vector<std::vector<Datum>> more_rows;
+    // D5 INSERT ... SELECT: when set, the rows come from this query instead of VALUES. The SELECT's
+    // output arity must match `columns`; each output row becomes one inserted row (atomic, like D6).
+    std::shared_ptr<SelectStmt> select_source;
 };
 
 // UPDATE <t> SET <col> = <v> WHERE <pk> = <v>

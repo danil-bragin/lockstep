@@ -690,6 +690,15 @@ private:
         if (auto e = expect(Tok::RParen, "')' to close the column list")) {
             return ParseResult{*e};
         }
+        // D5: INSERT INTO t (cols) SELECT ... — the rows come from a query instead of VALUES.
+        if (is_kw("select")) {
+            auto sub = std::make_shared<SelectStmt>();
+            if (auto e = parse_select_stmt(*sub)) {
+                return ParseResult{*e};
+            }
+            st.insert.select_source = std::move(sub);
+            return ParseResult{std::move(st)};
+        }
         if (auto e = expect_kw("values")) {
             return ParseResult{*e};
         }

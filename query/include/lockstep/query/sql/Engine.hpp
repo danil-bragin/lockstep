@@ -2902,12 +2902,39 @@ private:
             rows.push_back(std::move(row));
             return std::nullopt;
         };
-        if (auto e = stage(ins.values)) {
-            return ExecResult::failure(*e);
-        }
-        for (const std::vector<Datum>& extra : ins.more_rows) {
-            if (auto e = stage(extra)) {
+        // D5: INSERT ... SELECT — materialise the source query's rows as value tuples (the SELECT
+        // output arity must match the named columns), then stage them through the SAME atomic path
+        // as VALUES. The SELECT reads a CONSISTENT snapshot before any write (no self-feedback).
+        if (ins.select_source) {
+            const ExecResult src = exec_select(*ins.select_source);
+            if (!src.ok) {
+                return src;  // surface the SELECT's parse/exec error verbatim
+            }
+            for (const ResultRow& srow : src.rows) {
+                if (srow.cells.size() != ins.columns.size()) {
+                    return ExecResult::failure(
+                        "INSERT ... SELECT: the query produces " +
+                        std::to_string(srow.cells.size()) + " columns but " +
+                        std::to_string(ins.columns.size()) + " were named");
+                }
+                std::vector<Datum> vals;
+                vals.reserve(srow.cells.size());
+                for (const auto& [label, d] : srow.cells) {
+                    (void)label;
+                    vals.push_back(d);
+                }
+                if (auto e = stage(vals)) {
+                    return ExecResult::failure(*e);
+                }
+            }
+        } else {
+            if (auto e = stage(ins.values)) {
                 return ExecResult::failure(*e);
+            }
+            for (const std::vector<Datum>& extra : ins.more_rows) {
+                if (auto e = stage(extra)) {
+                    return ExecResult::failure(*e);
+                }
             }
         }
         // ATOMIC: every row's materialisation + secondary-index entries in ONE txn (index/columns
