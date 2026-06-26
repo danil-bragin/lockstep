@@ -1828,6 +1828,73 @@ private:
         return Datum::make_int(sum / n);  // AVG: trunc toward zero
     }
 
+    // VECTORIZED FILTER: build a 0/1 row mask for an all-INT-NOT-NULL conjunctive predicate with
+    // BRANCHLESS comparisons (each `a OP lit` yields 0/1; the per-term AND auto-vectorizes), then
+    // count the matches. Replaces the per-row branchy `passes()` + index gather for the common
+    // filtered scalar aggregate. mask[r]==1 iff row r satisfies EVERY term.
+    [[nodiscard]] std::int64_t build_filter_mask(const std::vector<const ColumnChunk*>& cols,
+                                                 std::uint32_t count,
+                                                 const std::vector<VecTerm>& vterms,
+                                                 std::vector<std::uint8_t>& mask) {
+        mask.assign(count, 1);
+        for (const VecTerm& vt : vterms) {
+            const std::int64_t* a = cols[vt.col]->ints.data();
+            const std::int64_t b = vt.lit.i;
+            switch (vt.op) {
+                case CmpOp::Eq:
+                    for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] == b);
+                    break;
+                case CmpOp::Ne:
+                    for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] != b);
+                    break;
+                case CmpOp::Lt:
+                    for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] < b);
+                    break;
+                case CmpOp::Le:
+                    for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] <= b);
+                    break;
+                case CmpOp::Gt:
+                    for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] > b);
+                    break;
+                case CmpOp::Ge:
+                    for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] >= b);
+                    break;
+            }
+        }
+        std::int64_t n = 0;
+        for (std::uint32_t r = 0; r < count; ++r) n += mask[r];
+        return n;
+    }
+
+    // Fold ONE aggregate over the masked rows (mask[r]==1 => row counts). Byte-identical to
+    // compute_agg_soa over the set of matching indices, INCLUDING compute_agg_soa's empty-set rule
+    // (zero matches => int 0 for every kind). Caller guarantees the agg column is INT NOT NULL.
+    [[nodiscard]] Datum compute_masked_agg(const AggExpr& a, const Table& t,
+                                           const std::vector<const ColumnChunk*>& cols,
+                                           std::uint32_t count,
+                                           const std::vector<std::uint8_t>& mask,
+                                           std::int64_t nmatch) {
+        if (a.kind == AggKind::CountStar || a.kind == AggKind::Count) {
+            return Datum::make_int(nmatch);  // INT NOT NULL => Count == match count
+        }
+        if (nmatch == 0) {
+            return Datum::make_int(0);  // compute_agg_soa empty-index parity (int 0 for all kinds)
+        }
+        const ColumnChunk& cc = *cols[*t.column_index(a.column)];
+        const std::int64_t* v = cc.ints.data();
+        if (a.kind == AggKind::Sum || a.kind == AggKind::Avg) {
+            std::int64_t s = 0;
+            for (std::uint32_t r = 0; r < count; ++r) s += v[r] * mask[r];  // branchless masked sum
+            return a.kind == AggKind::Sum ? Datum::make_int(s) : Datum::make_int(s / nmatch);
+        }
+        std::int64_t best = (a.kind == AggKind::Min) ? INT64_MAX : INT64_MIN;
+        for (std::uint32_t r = 0; r < count; ++r) {
+            const std::int64_t cand = mask[r] ? v[r] : best;  // masked-out rows keep `best`
+            best = (a.kind == AggKind::Min) ? std::min(best, cand) : std::max(best, cand);
+        }
+        return Datum::make_int(best);
+    }
+
     // Is the HAVING predicate SoA-evaluable (only And/Or/Not + Cmp with an Agg or grouped-
     // column LHS and a literal RHS)? If so, collect its referenced columns into `need` so
     // their blocks are decoded. Returns false => the caller bails to the generic AoS path
@@ -2081,6 +2148,55 @@ private:
             }
             return true;
         };
+        // VECTORIZED FILTERED SCALAR AGGREGATE fast path: ungrouped + a fully INT-NOT-NULL
+        // conjunctive filter + no HAVING + every aggregate foldable on an INT NOT NULL column.
+        // Build a branchless 0/1 row mask (SIMD compares) and fold each aggregate over it — no
+        // per-row branch, no index gather (the generic path collects matching indices then folds
+        // by gather). Byte-identical to the generic path; the columnar conformance gate proves it.
+        if (gcols.empty() && has_filter && !has_having && !vterms.empty()) {
+            bool vec_ok = true;
+            for (const VecTerm& vt : vterms) {
+                if (t.columns[vt.col].type != Type::Int || t.columns[vt.col].nullable ||
+                    vt.lit.type != Type::Int || vt.lit.is_null) {
+                    vec_ok = false;
+                    break;
+                }
+            }
+            if (vec_ok) {
+                for (const SelectItem& item : sel.items) {
+                    if (item.kind != SelectItemKind::Aggregate) {
+                        vec_ok = false;
+                        break;
+                    }
+                    if (item.agg.kind == AggKind::CountStar) {
+                        continue;
+                    }
+                    const auto ci = t.column_index(item.agg.column);
+                    if (!ci || t.columns[*ci].type != Type::Int || t.columns[*ci].nullable) {
+                        vec_ok = false;
+                        break;
+                    }
+                }
+            }
+            if (vec_ok) {
+                std::vector<std::uint8_t> mask;
+                const std::int64_t nmatch = build_filter_mask(cols, count, vterms, mask);
+                ResultRow out;
+                for (const SelectItem& item : sel.items) {
+                    out.cells.emplace_back(
+                        item.label, compute_masked_agg(item.agg, t, cols, count, mask, nmatch));
+                }
+                ExecResult rr;
+                rr.rows.push_back(std::move(out));
+                apply_distinct(sel, rr.rows);
+                if (auto e = apply_order_by_labels(sel, rr.rows)) {
+                    return ExecResult::failure(*e);
+                }
+                apply_limit(sel, rr.rows);
+                rr.affected = rr.rows.size();
+                return rr;
+            }
+        }
         ExecResult r;
         // Emit ONE group's result row (HAVING-filtered): aggregates fold via compute_agg_soa
         // (TIGHT per-column second pass; a 1-pass branchy running-accumulator measured SLOWER).
