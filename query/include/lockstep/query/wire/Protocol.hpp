@@ -231,7 +231,10 @@ struct Response {
     bool sql_ok = false;             // statement executed without error
     std::string sql_error;           // error text iff !sql_ok
     std::uint64_t sql_affected = 0;  // rows inserted/updated/deleted/returned
-    std::uint64_t sql_rows = 0;      // SELECT result row count (rows not shipped — bench)
+    std::uint64_t sql_rows = 0;      // SELECT result row count
+    std::string sql_rows_blob;       // SELECT result ROWS, serialized (wire::SqlRows). Empty for a
+                                     // write/DDL or when row shipping is off. Opaque here (the
+                                     // Protocol stays SQL-type-free); decoded by a SQL-aware peer.
 };
 
 // ===========================================================================
@@ -557,6 +560,7 @@ inline void seal_crc(std::vector<std::byte>& out) {
             put_str(out, r.sql_error);
             put_u64(out, r.sql_affected);
             put_u64(out, r.sql_rows);
+            put_str(out, r.sql_rows_blob);
             break;
         default:
             break;
@@ -652,7 +656,7 @@ inline void seal_crc(std::vector<std::byte>& out) {
         case MsgKind::SqlResult: {
             std::uint8_t ok = 0;
             if (!rd.u8(ok) || !rd.str(r.sql_error) || !rd.u64(r.sql_affected) ||
-                !rd.u64(r.sql_rows)) {
+                !rd.u64(r.sql_rows) || !rd.str(r.sql_rows_blob)) {
                 return false;
             }
             r.sql_ok = ok != 0;

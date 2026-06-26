@@ -47,6 +47,7 @@
 #include <lockstep/query/Query.hpp>
 #include <lockstep/query/sql/Engine.hpp>  // SQL-over-wire: run a SQL string server-side
 #include <lockstep/query/wire/Protocol.hpp>
+#include <lockstep/query/wire/SqlRows.hpp>  // serialize SELECT rows into the SqlResult blob
 
 #include <lockstep/txn/Transaction.hpp>
 
@@ -467,6 +468,7 @@ private:
         r.sql_error = er.error;
         r.sql_affected = er.affected;
         r.sql_rows = static_cast<std::uint64_t>(er.rows.size());
+        r.sql_rows_blob = serialize_rows(er.rows);  // ship the SELECT rows (decoded by a SQL peer)
         dedup_.emplace(req.submit_key, r);  // memoize (exactly-once on retry/dup)
         return r;
     }

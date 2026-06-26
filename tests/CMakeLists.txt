@@ -1040,6 +1040,24 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_distributed_test COMMAND lockstep_sql_distributed_test)
 
+  # sql_distributed_wire_test: DISTRIBUTED SQL OVER THE WIRE (B5). The same DistributedSql coordinator
+  # but each shard is a REMOTE SqlEngine reached over wire::Server <-> ClientStub on SimNetwork, with
+  # SELECT rows shipped back in the SqlResult blob and merged. Asserts byte-identical to one in-process
+  # engine — SQL is no longer in-process-only; the coordinator is transport-agnostic.
+  add_executable(lockstep_sql_distributed_wire_test sql_distributed_wire_test.cpp)
+  target_include_directories(lockstep_sql_distributed_wire_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_distributed_wire_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_distributed_wire_test COMMAND lockstep_sql_distributed_wire_test)
+
   # sql_catalog_recover_test: the DURABLE SQL CATALOG + recover gate (C7). Build a table (+ index +
   # rows) through a durable SqlEngine, drop it (a crash) keeping the disk, reopen + recover() — the
   # schema AND data must be back (queries that would error "unknown table" now equal the no-crash

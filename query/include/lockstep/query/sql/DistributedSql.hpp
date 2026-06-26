@@ -27,9 +27,28 @@
 
 namespace lockstep::query::sql {
 
+// A shard the coordinator can run a statement on — IN-PROCESS (a local SqlEngine) or OVER THE WIRE
+// (a wire connection to a remote SqlEngine). The coordinator is transport-agnostic: it routes +
+// scatters + merges over this interface, so the SAME scatter-gather logic serves a single-process
+// test and a real multi-node cluster (the wire SqlResult now ships the SELECT rows).
+struct ISqlShard {
+    virtual ~ISqlShard() = default;
+    virtual ExecResult exec(const std::string& sql) = 0;
+};
+
+// In-process shard: a local SqlEngine.
+class EngineSqlShard final : public ISqlShard {
+public:
+    explicit EngineSqlShard(SqlEngine* e) : eng_(e) {}
+    ExecResult exec(const std::string& sql) override { return eng_->exec(sql); }
+
+private:
+    SqlEngine* eng_;
+};
+
 class DistributedSql {
 public:
-    explicit DistributedSql(std::vector<SqlEngine*> shards) : shards_(std::move(shards)) {}
+    explicit DistributedSql(std::vector<ISqlShard*> shards) : shards_(std::move(shards)) {}
 
     ExecResult exec(const std::string& sql) {
         ParseResult pr = parse_sql(sql);
@@ -82,7 +101,7 @@ private:
 
     ExecResult broadcast(const std::string& sql) {
         ExecResult last;
-        for (SqlEngine* s : shards_) last = s->exec(sql);
+        for (ISqlShard* s : shards_) last = s->exec(sql);
         return last;  // identical across shards (same DDL) — return any
     }
 
@@ -96,7 +115,7 @@ private:
         }
         std::vector<ExecResult> parts;
         parts.reserve(shards_.size());
-        for (SqlEngine* s : shards_) {
+        for (ISqlShard* s : shards_) {
             parts.push_back(s->exec(sql));
             if (!parts.back().ok) return parts.back();  // propagate the first shard error
         }
@@ -205,7 +224,7 @@ private:
         return r;
     }
 
-    std::vector<SqlEngine*> shards_;
+    std::vector<ISqlShard*> shards_;
     std::map<std::string, std::string> pk_;  // table -> PK column (for INSERT routing)
 };
 

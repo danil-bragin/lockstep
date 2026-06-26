@@ -65,11 +65,14 @@ int main() {
     solo.set_columnar_default(true);
 
     std::vector<SqlEngine> shards(kShards);
-    std::vector<SqlEngine*> shard_ptrs;
+    std::vector<EngineSqlShard> wraps;
+    wraps.reserve(kShards);
     for (SqlEngine& s : shards) {
         s.set_columnar_default(true);
-        shard_ptrs.push_back(&s);
+        wraps.emplace_back(&s);
     }
+    std::vector<ISqlShard*> shard_ptrs;
+    for (EngineSqlShard& w : wraps) shard_ptrs.push_back(&w);
     DistributedSql dist(shard_ptrs);
 
     check(solo.exec(kDDL).ok, "solo create");

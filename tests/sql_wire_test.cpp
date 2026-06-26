@@ -25,6 +25,7 @@
 #include <lockstep/query/wire/ClientStub.hpp>
 #include <lockstep/query/wire/Protocol.hpp>
 #include <lockstep/query/wire/Server.hpp>
+#include <lockstep/query/wire/SqlRows.hpp>
 
 namespace {
 
@@ -48,15 +49,27 @@ constexpr std::uint64_t kServerEp = 1;
 constexpr std::uint64_t kClientEp = 2;
 
 // One statement's wire outcome, rendered for byte-comparison vs the in-process oracle.
+std::string render_rows(const std::vector<lockstep::query::sql::ResultRow>& rows) {
+    std::string o;
+    for (const auto& row : rows) {
+        o += "{";
+        for (const auto& [label, d] : row.cells) o += label + "=" + d.render() + ",";
+        o += "}";
+    }
+    return o;
+}
+
 struct SqlOutcome {
     bool replied = false;
     bool ok = false;
     std::string error;
     std::uint64_t affected = 0;
     std::uint64_t rows = 0;
+    std::string row_values;  // the actual SELECT cell values (over the wire: from the blob)
     std::string render() const {
         return std::string(replied ? "R" : "-") + (ok ? "ok" : "ERR") + "|err=" + error +
-               "|aff=" + std::to_string(affected) + "|rows=" + std::to_string(rows);
+               "|aff=" + std::to_string(affected) + "|rows=" + std::to_string(rows) +
+               "|vals=" + row_values;
     }
 };
 
@@ -90,6 +103,7 @@ Task sql_driver(wire::ClientStub& cli, std::vector<SqlOutcome>* out) {
             o.error = cr.response.sql_error;
             o.affected = cr.response.sql_affected;
             o.rows = cr.response.sql_rows;
+            o.row_values = render_rows(wire::deserialize_rows(cr.response.sql_rows_blob));
         }
         out->push_back(o);
     }
@@ -132,6 +146,7 @@ std::vector<SqlOutcome> run_oracle() {
         o.error = er.error;
         o.affected = er.affected;
         o.rows = static_cast<std::uint64_t>(er.rows.size());
+        o.row_values = render_rows(er.rows);
         out.push_back(o);
     }
     return out;
