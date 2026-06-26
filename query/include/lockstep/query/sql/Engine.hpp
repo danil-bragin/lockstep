@@ -1512,6 +1512,7 @@ private:
                     case CmpOp::Le: if (cz.lo > x) return true; break;
                     case CmpOp::Eq: if (x < cz.lo || x > cz.hi) return true; break;
                     case CmpOp::Ne: break;
+                    case CmpOp::Like: break;  // LIKE is TEXT — never an INT zone term
                 }
             } else if (vt.lit.type == Type::Text && cz.is_text) {
                 if (!cz.has) {
@@ -1525,6 +1526,7 @@ private:
                     case CmpOp::Le: if (cz.tlo > x) return true; break;
                     case CmpOp::Eq: if (x < cz.tlo || x > cz.thi) return true; break;
                     case CmpOp::Ne: break;
+                    case CmpOp::Like: break;  // LIKE handled in the general path, not zone-skipped
                 }
             }
         }
@@ -2217,6 +2219,8 @@ private:
                 case CmpOp::Ge:
                     for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] >= b);
                     break;
+                case CmpOp::Like:
+                    break;  // LIKE is never an INT-vectorizable term (extractor rejects it)
             }
         }
         std::int64_t n = 0;
@@ -2348,7 +2352,7 @@ private:
         if (lhs.type != rhs.type) {
             return std::string("type mismatch in HAVING");
         }
-        truth = apply_cmp(n.op, cmp_datum(lhs, rhs));
+        truth = leaf_truth(n.op, lhs, rhs);
         return std::nullopt;
     }
 
@@ -4362,7 +4366,7 @@ private:
             return std::string("type mismatch in predicate: comparing ") +
                    type_name(lhs.type) + " to " + type_name(rhs.type);
         }
-        truth = apply_cmp(n.op, cmp_datum(lhs, rhs));
+        truth = leaf_truth(n.op, lhs, rhs);
         return std::nullopt;
     }
 
@@ -4733,7 +4737,7 @@ private:
             return std::string("type mismatch in HAVING: comparing ") +
                    type_name(lhs.type) + " to " + type_name(rhs.type);
         }
-        truth = apply_cmp(n.op, cmp_datum(lhs, rhs));
+        truth = leaf_truth(n.op, lhs, rhs);
         return std::nullopt;
     }
 
@@ -5384,8 +5388,43 @@ private:
             case CmpOp::Le: return c <= 0;
             case CmpOp::Gt: return c > 0;
             case CmpOp::Ge: return c >= 0;
+            case CmpOp::Like: return false;  // never reached: leaf_truth handles Like before apply_cmp
         }
         return false;
+    }
+
+    // B1: SQL LIKE pattern match. `%` matches any run of chars (including empty), `_` matches exactly
+    // one char; every other char is literal (no ESCAPE clause — out of scope). Iterative greedy
+    // backtracking, O(|s|*|pat|) worst case. Pure function of the two strings.
+    static bool like_match(const std::string& s, const std::string& pat) {
+        std::size_t si = 0, pi = 0, star = std::string::npos, ss = 0;
+        while (si < s.size()) {
+            if (pi < pat.size() && (pat[pi] == '_' || pat[pi] == s[si])) {
+                ++si;
+                ++pi;
+            } else if (pi < pat.size() && pat[pi] == '%') {
+                star = pi++;
+                ss = si;
+            } else if (star != std::string::npos) {
+                pi = star + 1;
+                si = ++ss;
+            } else {
+                return false;
+            }
+        }
+        while (pi < pat.size() && pat[pi] == '%') {
+            ++pi;
+        }
+        return pi == pat.size();
+    }
+
+    // Evaluate ONE comparison leaf (lhs OP rhs) to a bool — the single place LIKE diverges from the
+    // 3-way ordered comparators. Both operands are already NULL-checked + type-equal by the caller.
+    static bool leaf_truth(CmpOp op, const Datum& lhs, const Datum& rhs) {
+        if (op == CmpOp::Like) {
+            return lhs.type == Type::Text && rhs.type == Type::Text && like_match(lhs.s, rhs.s);
+        }
+        return apply_cmp(op, cmp_datum(lhs, rhs));
     }
 
     // Try to flatten the WHERE predicate into a pure conjunction of `not_null_col <op>
@@ -5405,7 +5444,7 @@ private:
         }
         if (n.kind != PredNodeKind::Cmp || n.operand != OperandKind::Column ||
             n.rhs_is_column || n.rhs_is_subquery || !n.qualifier.empty() ||
-            n.literal.is_null) {
+            n.literal.is_null || n.op == CmpOp::Like) {  // B1: LIKE is not zone/mask-vectorizable
             return false;
         }
         const auto ci = t.column_index(n.column);
@@ -5654,7 +5693,7 @@ private:
             return std::string("type mismatch in predicate: comparing ") +
                    type_name(lhs.type) + " to " + type_name(rhs.type);
         }
-        truth = apply_cmp(n.op, cmp_datum(lhs, rhs));
+        truth = leaf_truth(n.op, lhs, rhs);
         return std::nullopt;
     }
 

@@ -118,6 +118,7 @@ enum class CmpOp : std::uint8_t {
     Le = 3,  // <=
     Gt = 4,  // >
     Ge = 5,  // >=
+    Like = 6,  // B1: SQL LIKE pattern match (% any run, _ one char); TEXT only
 };
 
 // What the left-hand side of a comparison REFERENCES.

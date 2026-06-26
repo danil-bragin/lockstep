@@ -1301,18 +1301,15 @@ private:
         // semantics (a NULL in the subquery makes NOT IN UNKNOWN) are enforced by the
         // Engine. (A literal IN-list `IN (1,2,3)` is OUT — only the subquery form here.)
         {
-            bool in_not = false;
-            const Token save = cur_;
+            bool neg = false;
             if (is_kw("not")) {
-                // Could be `NOT IN` — peek the next keyword. Only consume NOT if IN
-                // follows; otherwise this NOT belongs to a higher rule (shouldn't happen
-                // mid-primary, but stay safe and surface a clean error).
+                // `NOT IN` / `NOT LIKE` — consume NOT only if IN or LIKE follows; otherwise this
+                // NOT belongs to a higher rule (shouldn't happen mid-primary; surface a clean error).
                 advance();
-                if (!is_kw("in")) {
-                    return make_err("expected IN after NOT in a predicate (only "
-                                    "<col> NOT IN (SELECT ...) is supported here)");
+                if (!is_kw("in") && !is_kw("like")) {
+                    return make_err("expected IN or LIKE after NOT in a predicate");
                 }
-                in_not = true;
+                neg = true;
             }
             if (is_kw("in")) {
                 if (is_agg) {
@@ -1329,13 +1326,43 @@ private:
                 n.operand = OperandKind::Column;
                 n.qualifier = leaf.qualifier;
                 n.column = leaf.column;
-                n.is_not = in_not;
+                n.is_not = neg;
                 n.subquery = std::move(sub);
                 p.nodes.push_back(std::move(n));
                 out = static_cast<std::int32_t>(p.nodes.size() - 1);
                 return std::nullopt;
             }
-            (void)save;  // (NOT-without-IN already errored above)
+            // B1: <column> [NOT] LIKE '<pattern>' — `%` matches any run (incl. empty), `_` one char.
+            // The pattern must be a (string) literal. NOT LIKE wraps the LIKE leaf in a Not node so it
+            // reuses the existing negation eval.
+            if (is_kw("like")) {
+                if (is_agg) {
+                    return make_err("LIKE is not supported for an aggregate operand");
+                }
+                advance();
+                Datum pat;
+                if (auto e = expect_literal(pat)) {
+                    return e;
+                }
+                PredNode n = leaf;  // the column operand
+                n.kind = PredNodeKind::Cmp;
+                n.op = CmpOp::Like;
+                n.literal = pat;
+                p.nodes.push_back(std::move(n));
+                std::int32_t li = static_cast<std::int32_t>(p.nodes.size() - 1);
+                if (neg) {
+                    PredNode notn;
+                    notn.kind = PredNodeKind::Not;
+                    notn.left = li;
+                    p.nodes.push_back(std::move(notn));
+                    li = static_cast<std::int32_t>(p.nodes.size() - 1);
+                }
+                out = li;
+                return std::nullopt;
+            }
+            if (neg) {
+                return make_err("expected IN or LIKE after NOT");  // (unreachable: errored above)
+            }
         }
 
         // BETWEEN sugar (only for a column operand): col BETWEEN a AND b.
