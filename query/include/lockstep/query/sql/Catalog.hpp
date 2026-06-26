@@ -255,7 +255,49 @@ struct Datum {
             if (logical == 2) return render_date(i);
             if (logical == 3) return render_timestamp(i);
         }
+        if (type == Type::Text && logical >= 5) {  // F9e: INT128 / DECIMAL128 (16-byte payload in s)
+            if (logical == 5) return render_i128(decode_i128(s));
+            if (logical == 6) return render_decimal128(decode_i128(s), scale);
+        }
         return type == Type::Int ? std::to_string(i) : s;
+    }
+
+    // --- F9e: 128-bit integer / fixed-point (logical=5/6) over physical TEXT. The value is a 16-byte
+    // ORDER-PRESERVING big-endian encoding (top sign bit flipped) held in `s`, so a plain TEXT byte
+    // compare == numeric order and the TEXT key/value codecs need no change. Deterministic. ---
+    static std::string encode_i128(__int128 v) {
+        unsigned __int128 u = static_cast<unsigned __int128>(v) ^ (static_cast<unsigned __int128>(1) << 127);
+        std::string s(16, '\0');
+        for (int k = 0; k < 16; ++k) s[15 - k] = static_cast<char>(static_cast<unsigned char>(u >> (8 * k)));
+        return s;
+    }
+    static __int128 decode_i128(const std::string& s) {
+        unsigned __int128 u = 0;
+        for (int k = 0; k < 16; ++k) u = (u << 8) | static_cast<unsigned char>(s[static_cast<std::size_t>(k)]);
+        u ^= (static_cast<unsigned __int128>(1) << 127);
+        return static_cast<__int128>(u);
+    }
+    static std::string render_u128(unsigned __int128 u) {
+        if (u == 0) return "0";
+        char buf[40];
+        int i = 40;
+        while (u != 0) { buf[--i] = static_cast<char>('0' + static_cast<int>(u % 10)); u /= 10; }
+        return std::string(buf + i, static_cast<std::size_t>(40 - i));
+    }
+    static unsigned __int128 abs_u128(__int128 v) {
+        return v < 0 ? static_cast<unsigned __int128>(-(v + 1)) + 1 : static_cast<unsigned __int128>(v);
+    }
+    static std::string render_i128(__int128 v) {
+        return (v < 0 ? "-" : "") + render_u128(abs_u128(v));
+    }
+    static std::string render_decimal128(__int128 v, std::uint8_t scale) {
+        if (scale == 0) return render_i128(v);
+        unsigned __int128 mag = abs_u128(v);
+        unsigned __int128 pow = 1;
+        for (std::uint8_t k = 0; k < scale; ++k) pow *= 10;
+        std::string frac = render_u128(mag % pow);
+        while (frac.size() < scale) frac.insert(frac.begin(), '0');
+        return (v < 0 ? "-" : "") + render_u128(mag / pow) + "." + frac;
     }
 
     // --- F9b logical-type formatting (pure, deterministic; no locale, no wall-clock) ---
@@ -407,6 +449,74 @@ inline std::string format_uuid(std::uint32_t table_id, std::uint64_t counter) {
         s.push_back(hexd[b[i] & 0x0F]);
     }
     return s;
+}
+
+// F9e: parse a decimal STRING (optional sign) into a signed 128-bit integer. Returns false on a
+// malformed digit or on overflow past the int128 range (NOT saturating — a clean error). Pure.
+[[nodiscard]] inline bool parse_i128(const std::string& in, __int128& out) {
+    std::size_t p = 0;
+    bool neg = false;
+    if (p < in.size() && (in[p] == '+' || in[p] == '-')) { neg = in[p] == '-'; ++p; }
+    if (p >= in.size()) return false;
+    unsigned __int128 v = 0;
+    const unsigned __int128 lim = static_cast<unsigned __int128>(1) << 127;  // |INT128_MIN|
+    const unsigned __int128 maxmag = neg ? lim : lim - 1;
+    for (; p < in.size(); ++p) {
+        if (in[p] < '0' || in[p] > '9') return false;
+        const unsigned d = static_cast<unsigned>(in[p] - '0');
+        if (v > (maxmag - d) / 10) return false;  // would overflow
+        v = v * 10 + d;
+    }
+    out = neg ? -static_cast<__int128>(v) : static_cast<__int128>(v);
+    return true;
+}
+// F9e: parse 'int[.frac]' (optional sign) into a scaled 128-bit fixed-point value (× 10^scale).
+// Digits past `scale` are truncated. Returns false on malformed input or overflow. Pure.
+[[nodiscard]] inline bool parse_decimal128(const std::string& in, std::uint8_t scale, __int128& out) {
+    std::size_t p = 0;
+    bool neg = false;
+    if (p < in.size() && (in[p] == '+' || in[p] == '-')) { neg = in[p] == '-'; ++p; }
+    unsigned __int128 v = 0;
+    bool any = false;
+    const unsigned __int128 lim = static_cast<unsigned __int128>(1) << 127;
+    const unsigned __int128 maxmag = neg ? lim : lim - 1;
+    auto push = [&](unsigned d) -> bool {
+        if (v > (maxmag - d) / 10) return false;
+        v = v * 10 + d;
+        return true;
+    };
+    for (; p < in.size() && in[p] >= '0' && in[p] <= '9'; ++p) {
+        if (!push(static_cast<unsigned>(in[p] - '0'))) return false;
+        any = true;
+    }
+    std::uint8_t fdig = 0;
+    if (p < in.size() && in[p] == '.') {
+        ++p;
+        for (; p < in.size() && in[p] >= '0' && in[p] <= '9'; ++p) {
+            if (fdig < scale) { if (!push(static_cast<unsigned>(in[p] - '0'))) return false; ++fdig; }
+            any = true;
+        }
+    }
+    if (!any || p != in.size()) return false;
+    for (std::uint8_t k = fdig; k < scale; ++k) { if (!push(0)) return false; }  // pad to scale
+    out = neg ? -static_cast<__int128>(v) : static_cast<__int128>(v);
+    return true;
+}
+
+// F9e: parse a numeric string into a 128-bit value, INFERRING the scale from its fractional digits
+// ('9000000000' -> (9e9, scale 0); '0.0000000001' -> (1, scale 10)). Used when a bare string literal
+// is an operand in INT128/DECIMAL128 arithmetic (no column to fix the scale). Pure.
+[[nodiscard]] inline bool parse_decimal128_infer(const std::string& in, __int128& val,
+                                                 std::uint8_t& scale) {
+    const std::size_t dot = in.find('.');
+    std::uint8_t sc = 0;
+    if (dot != std::string::npos) {
+        const std::size_t fd = in.size() - dot - 1;
+        sc = static_cast<std::uint8_t>(fd > 38 ? 38 : fd);
+    }
+    if (!parse_decimal128(in, sc, val)) return false;
+    scale = sc;
+    return true;
 }
 
 // ----------------------------------------------------------------------------

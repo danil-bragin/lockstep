@@ -530,24 +530,40 @@ private:
             advance();
             return std::nullopt;
         }
-        if (is_kw("decimal") || is_kw("numeric")) {
+        // F9e: HUGEINT / INT128 — a 128-bit integer over TEXT (16-byte order-preserving payload).
+        if (is_kw("int128") || is_kw("hugeint")) {
+            out = Type::Text;
+            col.logical = 5;
+            advance();
+            return std::nullopt;
+        }
+        if (is_kw("decimal") || is_kw("numeric") || is_kw("decimal128") || is_kw("numeric128")) {
+            // DECIMAL128 is always 128-bit; DECIMAL/NUMERIC promotes to 128-bit when precision > 18.
+            const bool force128 = is_kw("decimal128") || is_kw("numeric128");
             out = Type::Int;
             col.logical = 1;
             col.scale = 0;
             advance();
-            if (cur_.kind == Tok::LParen) {  // DECIMAL(precision[, scale]) — precision ignored
+            std::int64_t precision = 0;
+            if (cur_.kind == Tok::LParen) {  // DECIMAL(precision[, scale])
                 advance();
                 Datum prec;
                 if (auto e = expect_literal(prec)) return e;
+                if (prec.type == Type::Int) precision = prec.i;
                 if (cur_.kind == Tok::Comma) {
                     advance();
                     Datum sc;
                     if (auto e = expect_literal(sc)) return e;
-                    if (sc.type != Type::Int || sc.i < 0 || sc.i > 18)
-                        return make_err("DECIMAL scale must be 0..18");
+                    const bool wide = force128 || precision > 18;
+                    if (sc.type != Type::Int || sc.i < 0 || sc.i > (wide ? 38 : 18))
+                        return make_err(wide ? "DECIMAL128 scale must be 0..38" : "DECIMAL scale must be 0..18");
                     col.scale = static_cast<std::uint8_t>(sc.i);
                 }
                 if (auto e = expect(Tok::RParen, "')' after DECIMAL precision/scale")) return e;
+            }
+            if (force128 || precision > 18) {  // promote to 128-bit fixed-point over TEXT
+                out = Type::Text;
+                col.logical = 6;
             }
             return std::nullopt;
         }

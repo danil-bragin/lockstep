@@ -1081,6 +1081,31 @@ private:
             out.logical = 4;
             return std::nullopt;
         }
+        // F9e: an INT128 (logical 5) / DECIMAL128 (logical 6) column (physical TEXT, 16-byte payload).
+        // Accept a decimal string ('123...' / '12.34'), or a bare INT widened to 128-bit.
+        if (col.type == Type::Text && col.logical >= 5) {
+            __int128 v = 0;
+            if (in.type == Type::Text) {
+                const bool ok = col.logical == 5 ? parse_i128(in.s, v)
+                                                 : parse_decimal128(in.s, col.scale, v);
+                if (!ok) {
+                    return std::string("invalid ") + logical_name(col.logical) + " literal '" +
+                           in.s + "' for column '" + col.name + "'";
+                }
+            } else if (in.type == Type::Int) {
+                v = static_cast<__int128>(in.i);
+                if (col.logical == 6) {  // whole-number literal scaled to fixed-point
+                    for (std::uint8_t k = 0; k < col.scale; ++k) v *= 10;
+                }
+            } else {
+                return std::string("type mismatch for column '") + col.name + "': expected " +
+                       logical_name(col.logical) + ", got " + type_name(in.type);
+            }
+            out = Datum::make_text(Datum::encode_i128(v));
+            out.logical = col.logical;
+            out.scale = col.scale;
+            return std::nullopt;
+        }
         if (col.type != in.type) {
             return std::string("type mismatch for column '") + col.name +
                    "': expected " + type_name(col.type) + ", got " +
@@ -1095,6 +1120,9 @@ private:
             case 1: return "DECIMAL";
             case 2: return "DATE";
             case 3: return "TIMESTAMP";
+            case 4: return "UUID";
+            case 5: return "INT128";
+            case 6: return "DECIMAL128";
             default: return "INT";
         }
     }
@@ -4044,6 +4072,69 @@ private:
                                          static_cast<std::uint64_t>(b));
     }
 
+    // F9e: 128-bit checked arithmetic over INT128/DECIMAL128 (operands carry their payload in `s`; a
+    // narrow INT/DECIMAL64 operand widens in). Mirrors the int64 DECIMAL rules (Add/Sub align scales,
+    // Mul adds, Div keeps the left scale) but on __int128, with __builtin overflow checks. The result
+    // is INT128 (logical 5) when both operands are scale-0, else DECIMAL128 (logical 6).
+    [[nodiscard]] std::optional<std::string> eval_bin_i128(BinOp op, const Datum& l, const Datum& r,
+                                                           Datum& out) {
+        auto decode = [](const Datum& d, __int128& val, std::uint8_t& sc) -> bool {
+            if (d.logical >= 5) {
+                if (d.type != Type::Text || d.s.size() != 16) return false;
+                val = Datum::decode_i128(d.s);
+                sc = d.logical == 6 ? d.scale : 0;
+            } else if (d.type == Type::Int) {
+                val = static_cast<__int128>(d.i);
+                sc = d.logical == 1 ? d.scale : 0;  // DECIMAL64 keeps its scale
+            } else {  // F9e: a bare numeric string literal — infer its scale from the fraction
+                return parse_decimal128_infer(d.s, val, sc);
+            }
+            return true;
+        };
+        __int128 lv = 0, rv = 0;
+        std::uint8_t ls = 0, rs = 0;
+        if (!decode(l, lv, ls) || !decode(r, rv, rs)) return "arithmetic requires numeric operands";
+        auto p10 = [](std::uint8_t k) { __int128 p = 1; while (k--) p *= 10; return p; };
+        __int128 v = 0;
+        std::uint8_t out_sc = 0;
+        switch (op) {
+            case BinOp::Add:
+            case BinOp::Sub: {
+                const std::uint8_t cs = ls > rs ? ls : rs;
+                __int128 li = 0, ri = 0;
+                if (__builtin_mul_overflow(lv, p10(cs - ls), &li) ||
+                    __builtin_mul_overflow(rv, p10(cs - rs), &ri))
+                    return "integer overflow";
+                if (op == BinOp::Add ? __builtin_add_overflow(li, ri, &v)
+                                     : __builtin_sub_overflow(li, ri, &v))
+                    return "integer overflow";
+                out_sc = cs;
+                break;
+            }
+            case BinOp::Mul:
+                if (__builtin_mul_overflow(lv, rv, &v)) return "integer overflow";
+                out_sc = static_cast<std::uint8_t>(ls + rs);
+                break;
+            case BinOp::Div: {
+                if (rv == 0) return "division by zero";
+                __int128 num = 0;
+                if (__builtin_mul_overflow(lv, p10(rs), &num)) return "integer overflow";
+                v = num / rv;  // result scale = ls
+                out_sc = ls;
+                break;
+            }
+            case BinOp::Mod:
+                if (rv == 0) return "modulo by zero";
+                v = lv % rv;
+                out_sc = ls;
+                break;
+        }
+        out = Datum::make_text(Datum::encode_i128(v));
+        out.logical = out_sc > 0 ? 6 : 5;
+        out.scale = out_sc;
+        return std::nullopt;
+    }
+
     // A1-A4: evaluate a scalar expression over a single-table `row` to a Datum. Arithmetic is INT
     // (NULL-propagating; division/mod by zero is an error); string/scalar functions + CAST + CASE.
     [[nodiscard]] std::optional<std::string> eval_expr(const Expr& e, const Table& t,
@@ -4062,6 +4153,10 @@ private:
                 Datum c;
                 if (auto er = eval_expr(*e.left, t, row, c)) return er;
                 if (c.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+                if (c.logical >= 5) {  // F9e: negate a 128-bit operand (0 - c)
+                    Datum zero = Datum::make_int(0);
+                    return eval_bin_i128(BinOp::Sub, zero, c, out);
+                }
                 if (c.type != Type::Int) return "unary '-' requires an INT operand";
                 std::int64_t neg = 0;
                 if (sub_ovf(0, c.i, neg)) return "integer overflow";  // -INT64_MIN overflows
@@ -4075,6 +4170,11 @@ private:
                 if (auto er = eval_expr(*e.left, t, row, l)) return er;
                 if (auto er = eval_expr(*e.right, t, row, r)) return er;
                 if (l.is_null || r.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+                // F9e: if either operand is 128-bit (INT128/DECIMAL128), compute in __int128. A plain
+                // INT / DECIMAL64 operand widens in (so 128-bit mixes with the narrow types).
+                if (l.logical >= 5 || r.logical >= 5) {
+                    return eval_bin_i128(e.op, l, r, out);
+                }
                 if (l.type != Type::Int || r.type != Type::Int)
                     return "arithmetic requires INT operands";
                 // F9b: DECIMAL fixed-point arithmetic — all on int64 (deterministic). The
