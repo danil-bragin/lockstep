@@ -117,12 +117,16 @@ public:
           disk_(disk_sched_, cfg.data_dir.empty()
                                  ? std::string("/dev/null")
                                  : (cfg.data_dir + "/lockstepd.wal")),
-          // The committed QUERY STATE is backed by the durable ProdDisk over the data
-          // dir (S5a closure), driven on disk_sched_ (the disk's own scheduler, pumped
-          // INLINE by the query layer — not by the reactor). A restart recovers it via
-          // recover(). When no data dir is given the disk is /dev/null (no durability).
-          server_(net_ != nullptr ? wire::Server(*net_, disk_sched_, disk_)
-                                   : wire::Server(disk_sched_, disk_)),
+          // The keyed committed state (db_) and the SQL-over-wire state (sql_eng_) each get
+          // their OWN durable ProdDisk (separate WAL files) — two WalEngines cannot share one
+          // WAL. Without sql_disk_ the SqlEngine would default to an in-memory disk, making
+          // acked SQL writes NON-durable. Both driven INLINE on their own disk scheduler.
+          sql_disk_(sql_disk_sched_, cfg.data_dir.empty()
+                                         ? std::string("/dev/null")
+                                         : (cfg.data_dir + "/lockstepd-sql.wal")),
+          server_(net_ != nullptr
+                      ? wire::Server(*net_, disk_sched_, disk_, sql_disk_sched_, sql_disk_)
+                      : wire::Server(disk_sched_, disk_)),
           cfg_(cfg) {}
 
     ProdServerNode(const ProdServerNode&) = delete;
@@ -222,6 +226,8 @@ private:
     ProdRandom rng_;             // election jitter / backoff entropy (seeded)
     core::Scheduler disk_sched_; // mints ProdDisk's inline-ready Futures (harness only)
     ProdDisk disk_;              // durability anchor over the data dir (RAII-closed)
+    core::Scheduler sql_disk_sched_; // SQL state's OWN disk scheduler (distinct WAL)
+    ProdDisk sql_disk_;          // SQL-over-wire durability anchor (separate WAL file)
     wire::Server server_;        // the UNCHANGED client-facing protocol server
     ProdServerConfig cfg_;
     std::unique_ptr<AuthPolicy> auth_{};  // RBAC policy (stable box; hooks capture its ptr)

@@ -127,6 +127,14 @@ public:
     Server(INetwork& net, core::Scheduler& dsched, core::IDisk& disk)
         : net_(&net), db_(dsched, disk) {}
 
+    // As above, but ALSO backs the SQL-over-wire engine with a SEPARATE durable IDisk
+    // (`sql_dsched`/`sql_disk`) — distinct from db_'s, since two WalEngines cannot share one
+    // WAL. Without this the SqlEngine defaults to an in-memory disk, so acked SQL writes are
+    // NOT durable (they vanish on restart). Pass a distinct data file for the SQL state.
+    Server(INetwork& net, core::Scheduler& dsched, core::IDisk& disk, core::Scheduler& sql_dsched,
+           core::IDisk& sql_disk)
+        : net_(&net), db_(dsched, disk), sql_eng_(sql_dsched, sql_disk) {}
+
     // Dispatch-only server (no transport): for the round-trip oracle, which calls
     // dispatch() directly with no serve()/recv(). net_ stays null and is NEVER
     // dereferenced on this path.
@@ -164,8 +172,30 @@ public:
     // A torn / corrupt frame is REJECTED at decode and DROPPED (no reply, no
     // effect) — the client retries. Bounded by `max_msgs` (V: no unbounded loop).
     Task serve(int max_msgs) {
+        // GROUP-COMMIT batch of write acks withheld until ONE shared fsync. A keyed Put applies
+        // to the memtable WITHOUT its own fsync (handle_submit, net-backed) and its ack is parked
+        // here; when no more frames are immediately readable (or the budget ends) we fsync ONCE
+        // and release every parked ack — so acked==durable holds while the barrier is amortized
+        // over the whole drained burst (the per-Put fsync was the ~3.3k write cap).
+        std::vector<std::pair<Endpoint, std::vector<std::byte>>> parked;
+        auto flush = [&]() -> Task {
+            if (parked.empty()) co_return;
+            db_.sync();  // single durability barrier for every buffered write in the burst
+            for (auto& [to, bytes] : parked) {
+                (void)co_await net_->send(
+                    to, std::span<const std::byte>(bytes.data(), bytes.size()));
+            }
+            parked.clear();
+            co_return;
+        };
         for (int i = 0; i < max_msgs; ++i) {
-            Message m = co_await net_->recv();
+            core::Future<Message> f = net_->recv();
+            // Nothing queued to receive right now => the burst is drained: commit it (fsync once,
+            // release the parked acks) before parking for the next frame.
+            if (!f.ready()) {
+                co_await flush();
+            }
+            Message m = co_await f;
             // Copy the bytes out before any further await (V-RKV1: the Message
             // payload view is non-owning and valid only until the next recv).
             std::vector<std::byte> frame(m.payload.begin(), m.payload.end());
@@ -204,9 +234,20 @@ public:
 
             const Response resp = dispatch(req);
             std::vector<std::byte> out = encode_response(resp);
-            (void)co_await net_->send(from,
-                                      std::span<const std::byte>(out.data(), out.size()));
+            // A keyed Put was applied WITHOUT its fsync (group commit): PARK its ack until the
+            // shared barrier (incl. a dedup'd duplicate — its write may still be un-synced, so it
+            // must wait too, else a dup ack could outrun durability). Everything else (reads,
+            // RMW which synced inline, SQL, ping, errors) is durable/durability-free already and
+            // is sent immediately.
+            const bool defer = (req.kind == MsgKind::Submit && req.op == SubmitOp::Put);
+            if (defer) {
+                parked.emplace_back(from, std::move(out));
+            } else {
+                (void)co_await net_->send(
+                    from, std::span<const std::byte>(out.data(), out.size()));
+            }
         }
+        co_await flush();  // release any acks still parked at the bounded-budget exit
         co_return;
     }
 
@@ -299,13 +340,18 @@ private:
             r.result = ci.result;
             r.writes = ci.writes_committed;
             if (ci.status == txn::Status::Committed) {
-                // Apply this txn's committed write-set to the DURABLE query store
-                // EXACTLY ONCE (WAL'd + synced over the injected IDisk), advancing
-                // the query-visible tip by one. Incremental durable apply (survives +
-                // recovers on a restart). For the write-only path, the query-visible
-                // commit version is the monotonic tip (the singleton executor's local
-                // version is per-call, not a global sequence).
-                tip_ = db_.apply_committed(ci.writes_committed);
+                // Apply this txn's committed write-set to the DURABLE query store EXACTLY ONCE,
+                // advancing the query-visible tip. GROUP COMMIT: over a real transport
+                // (net_ != null) a write-only Put applies WITHOUT its own fsync and signals the
+                // serve loop (last_deferred_) to fsync ONCE for the whole drained batch and only
+                // THEN ack — so acked==durable holds while amortizing the barrier over many Puts
+                // (the per-Put fsync was the ~3.3k cap). RMW / the dispatch-only oracle keep the
+                // inline synced apply (deterministic, unchanged results).
+                if (write_only && net_ != nullptr) {
+                    tip_ = db_.apply_committed_nosync(ci.writes_committed);
+                } else {
+                    tip_ = db_.apply_committed(ci.writes_committed);
+                }
                 ++applied_;
                 if (write_only) {
                     r.commit_version = tip_;

@@ -244,6 +244,24 @@ public:
         sched_->run();
     }
 
+    // GROUP-COMMIT seam: apply a committed write-set to the memtable + advance the prefix
+    // boundary but DEFER the fsync (no durability barrier here). The caller MUST call
+    // sync_durable() before acking any of the batched writes — until then the writes are buffered,
+    // NOT durable. Lets the wire server amortize ONE fsync over many writes (drain N ready frames
+    // -> apply each nosync -> sync_durable() once -> ack all N). acked==durable is preserved
+    // because the ack is withheld until the shared sync completes.
+    void apply_committed_nosync(const txn::WriteSet& ws) {
+        sched_->spawn(apply_task_nosync(ws));
+        sched_->run();
+    }
+
+    // Durability barrier for all writes applied via apply_committed_nosync() since the last
+    // sync: fsync the WAL once. After this returns, every buffered write is durable.
+    void sync_durable() {
+        sched_->spawn(sync_task());
+        sched_->run();
+    }
+
     // The live committed tip (number of committed write-sets applied).
     [[nodiscard]] Seq tip() const noexcept { return static_cast<Seq>(snap_.size()) - 1; }
 
@@ -311,6 +329,28 @@ private:
         (void)co_await engine_->sync();
         const storage::Snapshot tip = co_await engine_->snapshot();
         snap_.push_back(tip.at);
+        co_return;
+    }
+
+    // As apply_task but WITHOUT the fsync — the WAL bytes are appended (buffered) and the prefix
+    // boundary advances, but durability waits for a later sync_task(). The buffered writes are not
+    // acked until then, so a crash before sync loses only un-acked writes (acked==durable holds).
+    core::Task apply_task_nosync(const txn::WriteSet& ws) {
+        for (const auto& [k, v] : ws) {
+            if (v == delete_sentinel()) {
+                (void)co_await engine_->del(k);
+            } else {
+                (void)co_await engine_->put(k, v);
+            }
+        }
+        const storage::Snapshot tip = co_await engine_->snapshot();
+        snap_.push_back(tip.at);
+        co_return;
+    }
+
+    // The deferred durability barrier: fsync the WAL once for all nosync-applied writes.
+    core::Task sync_task() {
+        (void)co_await engine_->sync();
         co_return;
     }
 
@@ -427,6 +467,16 @@ public:
         store_->apply_committed(ws);
         return store_->tip();
     }
+
+    // GROUP-COMMIT: apply a committed write-set but DEFER the fsync (see PersistentStore). The
+    // caller must sync() before acking. Returns the new (durably-pending) tip.
+    Seq apply_committed_nosync(const txn::WriteSet& ws) {
+        store_->apply_committed_nosync(ws);
+        return store_->tip();
+    }
+
+    // Flush the deferred fsync once — after this, all nosync-applied writes are durable.
+    void sync() { store_->sync_durable(); }
 
     // Prime the standalone read-path with a committed write-set HISTORY IN ORDER:
     // `history[p-1]` is the write-set committed by the p-th commit. Rebuilds the
