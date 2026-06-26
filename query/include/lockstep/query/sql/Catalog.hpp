@@ -116,6 +116,9 @@ struct Column {
     Type elem_type = Type::Int;
     std::uint8_t elem_logical = 0;
     std::uint8_t elem_scale = 0;
+    // F13: ENUM (logical == 9). The ordered label set; the stored value is the 0-based ordinal (so
+    // comparison follows DECLARATION order, like Postgres/MySQL). Render shows the label.
+    std::vector<std::string> enum_labels;
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -261,10 +264,13 @@ struct Datum {
         if (is_null) {
             return "NULL";
         }
-        if (type == Type::Int && logical != 0) {  // F9b: DECIMAL / DATE / TIMESTAMP
+        if (type == Type::Int && logical != 0) {  // F9b: DECIMAL / DATE / TIMESTAMP; F13: TIME/ENUM/INTERVAL
             if (logical == 1) return render_decimal(i, scale);
             if (logical == 2) return render_date(i);
             if (logical == 3) return render_timestamp(i);
+            if (logical == 8) return render_time(i);
+            if (logical == 9) return s;  // ENUM: label populated at decode (ordinal kept in i)
+            if (logical == 10) return render_interval(i);
         }
         if (type == Type::Text && logical == 7) return render_array(s);  // F12: ARRAY
         if (type == Type::Text && logical >= 5) {  // F9e: INT128 / DECIMAL128 (16-byte payload in s)
@@ -351,6 +357,25 @@ struct Datum {
         }
         out.push_back('}');
         return out;
+    }
+    // F13: TIME (logical=8) — seconds since midnight (0..86399) -> "HH:MM:SS".
+    static std::string render_time(std::int64_t secs) {
+        char buf[12];
+        std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld", static_cast<long long>(secs / 3600),
+                      static_cast<long long>((secs % 3600) / 60), static_cast<long long>(secs % 60));
+        return std::string(buf);
+    }
+    // F13: INTERVAL (logical=10) — a signed second count -> "[-]Dd HH:MM:SS" (days + clock part).
+    static std::string render_interval(std::int64_t secs) {
+        const bool neg = secs < 0;
+        std::int64_t a = neg ? -secs : secs;
+        const std::int64_t days = a / 86400;
+        a %= 86400;
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "%s%lldd %02lld:%02lld:%02lld", neg ? "-" : "",
+                      static_cast<long long>(days), static_cast<long long>(a / 3600),
+                      static_cast<long long>((a % 3600) / 60), static_cast<long long>(a % 60));
+        return std::string(buf);
     }
 
     // --- F9e: 128-bit integer / fixed-point (logical=5/6) over physical TEXT. The value is a 16-byte
@@ -488,6 +513,69 @@ inline std::int64_t days_from_civil(std::int64_t y, std::int64_t m, std::int64_t
         return false;
     }
     secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+    return true;
+}
+
+// F13: TIME 'HH:MM[:SS]' -> seconds since midnight (0..86399). Pure.
+[[nodiscard]] inline bool parse_time(const std::string& in, std::int64_t& secs) {
+    int h = 0, m = 0, s = 0, n = 0;
+    int got = std::sscanf(in.c_str(), "%d:%d:%d%n", &h, &m, &s, &n);
+    if (got == 2) { n = 0; got = std::sscanf(in.c_str(), "%d:%d%n", &h, &m, &n); s = 0; }
+    if (got < 2 || static_cast<std::size_t>(n) != in.size() || h < 0 || h > 23 || m < 0 || m > 59 ||
+        s < 0 || s > 59) {
+        return false;
+    }
+    secs = h * 3600 + m * 60 + s;
+    return true;
+}
+// F13: INTERVAL — a count + unit phrases ('1 day', '2 hours 30 minutes', '90 seconds'), and/or an
+// embedded clock 'HH:MM:SS'. Units: week/day/hour/minute/second (+ common abbrevs). Months/years are
+// NOT supported (calendar-variable). Sums to a signed SECOND count. Pure.
+[[nodiscard]] inline bool parse_interval(const std::string& in, std::int64_t& secs) {
+    std::int64_t total = 0;
+    bool any = false;
+    std::size_t p = 0;
+    bool neg = false;
+    auto skip_ws = [&]() { while (p < in.size() && (in[p] == ' ' || in[p] == '\t')) ++p; };
+    skip_ws();
+    if (p < in.size() && in[p] == '-') { neg = true; ++p; }
+    while (p < in.size()) {
+        skip_ws();
+        if (p >= in.size()) break;
+        // an embedded clock part HH:MM:SS (no unit word).
+        std::size_t q = p;
+        std::int64_t num = 0;
+        bool has_num = false;
+        while (q < in.size() && in[q] >= '0' && in[q] <= '9') { num = num * 10 + (in[q] - '0'); ++q; has_num = true; }
+        if (!has_num) return false;
+        if (q < in.size() && in[q] == ':') {  // a clock 'H:M[:S]' chunk
+            int h = 0, m = 0, s = 0, cn = 0;
+            int got = std::sscanf(in.c_str() + p, "%d:%d:%d%n", &h, &m, &s, &cn);
+            if (got == 2) { cn = 0; got = std::sscanf(in.c_str() + p, "%d:%d%n", &h, &m, &cn); s = 0; }
+            if (got < 2) return false;
+            total += h * 3600 + m * 60 + s;
+            p += static_cast<std::size_t>(cn);
+            any = true;
+            continue;
+        }
+        p = q;
+        skip_ws();
+        std::string unit;
+        while (p < in.size() && in[p] >= 'a' && in[p] <= 'z') unit.push_back(in[p++]);
+        while (p < in.size() && in[p] >= 'A' && in[p] <= 'Z') unit.push_back(static_cast<char>(in[p++] - 'A' + 'a'));
+        if (!unit.empty() && unit.back() == 's' && unit.size() > 1) unit.pop_back();  // plural -> singular
+        std::int64_t mult = 0;
+        if (unit == "second" || unit == "sec" || unit == "s") mult = 1;
+        else if (unit == "minute" || unit == "min") mult = 60;
+        else if (unit == "hour" || unit == "hr" || unit == "h") mult = 3600;
+        else if (unit == "day" || unit == "d") mult = 86400;
+        else if (unit == "week" || unit == "w") mult = 604800;
+        else return false;  // unknown / month / year
+        total += num * mult;
+        any = true;
+    }
+    if (!any) return false;
+    secs = neg ? -total : total;
     return true;
 }
 
@@ -1089,6 +1177,11 @@ inline void tag_logical_cols(const Table& t, std::vector<Datum>& row) {
         if (t.columns[c].logical != 0) {
             row[c].logical = t.columns[c].logical;
             row[c].scale = t.columns[c].scale;
+            // F13 ENUM: populate the label string from the stored ordinal so render shows the label.
+            if (t.columns[c].logical == 9 && !row[c].is_null && row[c].i >= 0 &&
+                row[c].i < static_cast<std::int64_t>(t.columns[c].enum_labels.size())) {
+                row[c].s = t.columns[c].enum_labels[static_cast<std::size_t>(row[c].i)];
+            }
         }
     }
 }

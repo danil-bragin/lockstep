@@ -335,6 +335,8 @@ public:
             o.push_back(static_cast<char>(c.elem_type == Type::Int ? 0 : 1));  // F12
             o.push_back(static_cast<char>(c.elem_logical));
             o.push_back(static_cast<char>(c.elem_scale));
+            cat_put_u32(o, static_cast<std::uint32_t>(c.enum_labels.size()));  // F13
+            for (const std::string& lbl : c.enum_labels) cat_put_s(o, lbl);
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -392,6 +394,8 @@ public:
             c.elem_type = (s[p++] == 0) ? Type::Int : Type::Text;  // F12
             c.elem_logical = static_cast<std::uint8_t>(s[p++]);
             c.elem_scale = static_cast<std::uint8_t>(s[p++]);
+            const std::uint32_t nlbl = cat_get_u32(s, p);  // F13 ENUM labels
+            for (std::uint32_t li = 0; li < nlbl; ++li) c.enum_labels.push_back(cat_get_s(s, p));
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -1063,7 +1067,13 @@ private:
                 bool ok = false;
                 if (col.logical == 1) ok = parse_decimal(in.s, col.scale, v);
                 else if (col.logical == 2) ok = parse_date(in.s, v);
-                else ok = parse_timestamp(in.s, v);
+                else if (col.logical == 3) ok = parse_timestamp(in.s, v);
+                else if (col.logical == 8) ok = parse_time(in.s, v);          // F13 TIME
+                else if (col.logical == 10) ok = parse_interval(in.s, v);     // F13 INTERVAL
+                else if (col.logical == 9) {                                  // F13 ENUM label -> ordinal
+                    for (std::size_t k = 0; k < col.enum_labels.size(); ++k)
+                        if (col.enum_labels[k] == in.s) { v = static_cast<std::int64_t>(k); ok = true; break; }
+                }
                 if (!ok) {
                     return std::string("invalid ") + logical_name(col.logical) +
                            " literal '" + in.s + "' for column '" + col.name + "'";
@@ -1082,9 +1092,14 @@ private:
                 return std::string("type mismatch for column '") + col.name + "': expected " +
                        logical_name(col.logical) + ", got " + type_name(in.type);
             }
+            if (col.logical == 9) {  // F13 ENUM: range-check the ordinal + tag its label for render
+                if (v < 0 || v >= static_cast<std::int64_t>(col.enum_labels.size()))
+                    return std::string("ENUM ordinal out of range for column '") + col.name + "'";
+            }
             out = Datum::make_int(v);
             out.logical = col.logical;
             out.scale = col.scale;
+            if (col.logical == 9) out.s = col.enum_labels[static_cast<std::size_t>(v)];
             return check_domain(col, out, for_write);
         }
         // F9c: a UUID column (physical TEXT). Validate + canonicalise (lowercase, dashed) the literal.
@@ -1266,6 +1281,9 @@ private:
             case 4: return "UUID";
             case 5: return "INT128";
             case 6: return "DECIMAL128";
+            case 8: return "TIME";
+            case 9: return "ENUM";
+            case 10: return "INTERVAL";
             default: return "INT";
         }
     }
@@ -4358,11 +4376,47 @@ private:
                 if (l.is_null || r.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
                 // F9e: if either operand is 128-bit (INT128/DECIMAL128), compute in __int128. A plain
                 // INT / DECIMAL64 operand widens in (so 128-bit mixes with the narrow types).
-                if (l.logical >= 5 || r.logical >= 5) {
+                if (l.logical == 5 || l.logical == 6 || r.logical == 5 || r.logical == 6) {
                     return eval_bin_i128(e.op, l, r, out);
                 }
                 if (l.type != Type::Int || r.type != Type::Int)
                     return "arithmetic requires INT operands";
+                // F13: temporal arithmetic (DATE/TIMESTAMP/TIME/INTERVAL — all INT-backed seconds,
+                // except DATE = days). DATE is normalised to seconds. Supported: temporal ± INTERVAL
+                // -> same temporal (TIME wraps into a day; DATE+interval promotes to TIMESTAMP);
+                // INTERVAL ± INTERVAL; TIMESTAMP/TIME/DATE difference -> INTERVAL; INTERVAL */ INT.
+                auto temporal = [](std::uint8_t lg) { return lg == 2 || lg == 3 || lg == 8 || lg == 10; };
+                if (temporal(l.logical) || temporal(r.logical)) {
+                    if (e.op == BinOp::Mul || e.op == BinOp::Div) {  // INTERVAL scaled by a number
+                        const bool li = l.logical == 10, ri = r.logical == 10;
+                        if (li ^ ri) {
+                            const std::int64_t iv = li ? l.i : r.i, k = li ? r.i : l.i;
+                            if (e.op == BinOp::Div && k == 0) return "division by zero";
+                            std::int64_t v = 0;
+                            if (e.op == BinOp::Mul ? mul_ovf(iv, k, v) : (v = iv / k, false))
+                                return "integer overflow";
+                            out = Datum::make_int(v); out.logical = 10; return std::nullopt;
+                        }
+                        return "unsupported temporal operation";
+                    }
+                    std::uint8_t llg = l.logical, rlg = r.logical;
+                    std::int64_t lv = l.i, rv = r.i;
+                    if (llg == 2) { lv = l.i * 86400; llg = 3; }  // DATE days -> seconds (TIMESTAMP)
+                    if (rlg == 2) { rv = r.i * 86400; rlg = 3; }
+                    std::int64_t v = 0;
+                    if (e.op == BinOp::Add ? add_ovf(lv, rv, v) : sub_ovf(lv, rv, v))
+                        return "integer overflow";
+                    std::uint8_t out_lg = 0;
+                    if ((llg == 3 && rlg == 10) || (llg == 10 && rlg == 3 && e.op == BinOp::Add)) out_lg = 3;
+                    else if (llg == 8 && rlg == 10) { out_lg = 8; v = ((v % 86400) + 86400) % 86400; }
+                    else if (llg == 10 && rlg == 10) out_lg = 10;
+                    else if (llg == 3 && rlg == 3 && e.op == BinOp::Sub) out_lg = 10;
+                    else if (llg == 8 && rlg == 8 && e.op == BinOp::Sub) out_lg = 10;
+                    else if (llg == 10 && rlg == 0) out_lg = 10;
+                    else if (llg == 0 && rlg == 10) out_lg = 10;
+                    else return "unsupported temporal operand combination";
+                    out = Datum::make_int(v); out.logical = out_lg; return std::nullopt;
+                }
                 // F9b: DECIMAL fixed-point arithmetic — all on int64 (deterministic). The
                 // effective scale of a non-DECIMAL operand is 0. Add/Sub align to the wider
                 // scale; Mul adds scales; Div keeps the left scale. The result is tagged

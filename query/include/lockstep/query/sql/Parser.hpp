@@ -583,6 +583,26 @@ private:
             advance();
             return std::nullopt;
         }
+        // F13: TIME (seconds since midnight) / INTERVAL (seconds) — INT-backed.
+        if (is_kw("time")) { out = Type::Int; col.logical = 8; advance(); return std::nullopt; }
+        if (is_kw("interval")) { out = Type::Int; col.logical = 10; advance(); return std::nullopt; }
+        // F13: ENUM('a','b',...) — INT-backed ordinal; the label set is stored on the column.
+        if (is_kw("enum")) {
+            out = Type::Int;
+            col.logical = 9;
+            advance();
+            if (auto e = expect(Tok::LParen, "'(' after ENUM")) return e;
+            for (;;) {
+                if (cur_.kind != Tok::StrLit) return make_err("ENUM labels must be 'string' literals");
+                col.enum_labels.push_back(cur_.text);
+                advance();
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
+            if (auto e = expect(Tok::RParen, "')' to close ENUM(...)")) return e;
+            if (col.enum_labels.empty()) return make_err("ENUM must have at least one label");
+            return std::nullopt;
+        }
         if (is_kw("timestamp") || is_kw("datetime")) {
             out = Type::Int;
             col.logical = 3;
@@ -685,6 +705,17 @@ private:
         }
         if (cur_.kind == Tok::StrLit) {
             out = Datum::make_text(cur_.text);
+            advance();
+            return std::nullopt;
+        }
+        // F13: INTERVAL '1 day 02:30:00' -> a logical-INTERVAL Datum (seconds).
+        if (is_kw("interval")) {
+            advance();
+            if (cur_.kind != Tok::StrLit) return make_err("INTERVAL requires a 'string' literal");
+            std::int64_t secs = 0;
+            if (!parse_interval(cur_.text, secs)) return make_err("invalid INTERVAL literal '" + cur_.text + "'");
+            out = Datum::make_int(secs);
+            out.logical = 10;
             advance();
             return std::nullopt;
         }
@@ -1544,6 +1575,19 @@ private:
             out = n;
             return std::nullopt;
         }
+        // F13: INTERVAL '...' literal in an expression (e.g. ts + INTERVAL '1 day').
+        if (is_kw("interval")) {
+            advance();
+            if (cur_.kind != Tok::StrLit) return make_err("INTERVAL requires a 'string' literal");
+            std::int64_t secs = 0;
+            if (!parse_interval(cur_.text, secs)) return make_err("invalid INTERVAL literal '" + cur_.text + "'");
+            auto n = mk_expr(ExprKind::Lit);
+            n->lit = Datum::make_int(secs);
+            n->lit.logical = 10;
+            advance();
+            out = n;
+            return std::nullopt;
+        }
         // F12: ARRAY[e0, e1, ...] literal.
         if (is_kw("array")) {
             advance();
@@ -2295,7 +2339,8 @@ private:
             leaf.rhs_is_subquery = true;
             leaf.subquery = std::move(sub);
         } else if (!is_agg && cur_.kind == Tok::Ident && !at_clause_boundary() &&
-                   !is_kw("true") && !is_kw("false") && !is_kw("array")) {  // F9/F12: literals, not columns
+                   !is_kw("true") && !is_kw("false") && !is_kw("array") &&
+                   !is_kw("interval")) {  // F9/F12/F13: literals, not columns
             std::string rq;
             std::string rc;
             if (auto e = expect_qualified_column("a column name on the right of the "
