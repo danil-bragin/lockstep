@@ -3573,7 +3573,12 @@ private:
         const std::size_t dim_key_col = equi->second - fnc;
 
         // Resolve every GROUP BY + SELECT/agg column to a flat index, then to (is_fact, local col).
-        struct Src { bool is_fact = true; std::size_t col = 0; Type type = Type::Int; };
+        struct Src {
+            bool is_fact = true;
+            std::size_t col = 0;
+            Type type = Type::Int;
+            const ColumnChunk* fp = nullptr;  // hoisted fact-col SoA pointer (is_fact only)
+        };
         auto resolve_src = [&](const std::string& qual, const std::string& col,
                                Src& out) -> std::optional<std::string> {
             std::size_t idx = 0;
@@ -3632,17 +3637,18 @@ private:
         // SCAN dim -> AoS rows (small) + a hash group_key_field(dim.key) -> matching dim rows.
         std::vector<std::vector<Datum>> dim_rows;
         if (auto e = scan_table(*dim, sel, dim_rows)) return std::nullopt;
-        std::map<std::string, std::vector<std::uint32_t>> dim_hash;
-        for (std::uint32_t di = 0; di < dim_rows.size(); ++di) {
-            dim_hash[group_key_field(dim_rows[di][dim_key_col])].push_back(di);
-        }
 
-        // FACT columns as SoA (key + every referenced fact column), via the cached concat.
-        auto fact_col = [&](std::size_t c) -> const ColumnChunk& {
-            return read_col_concat(*fact, static_cast<std::uint32_t>(c));
-        };
-        const ColumnChunk& fkey = fact_col(fact_key_col);
+        // HOIST: resolve every fact-column SoA pointer ONCE (cached concat; stable std::map ref) so
+        // the hot loop never re-does a per-row cache lookup.
+        const ColumnChunk* fkeyp = &read_col_concat(*fact, static_cast<std::uint32_t>(fact_key_col));
+        for (Src& s : gsrc)
+            if (s.is_fact) s.fp = &read_col_concat(*fact, static_cast<std::uint32_t>(s.col));
+        for (ItemPlan& p : plans)
+            if (!p.is_col && p.has_val && p.val.is_fact)
+                p.val.fp = &read_col_concat(*fact, static_cast<std::uint32_t>(p.val.col));
+        const ColumnChunk& fkey = *fkeyp;
         const std::uint32_t fcount = fkey.count;
+        const bool key_int = fkey.type == Type::Int;
 
         struct FAcc {
             std::int64_t total = 0;  // CountStar
@@ -3657,45 +3663,93 @@ private:
         };
         std::map<std::vector<std::string>, FGroup> groups;
         const std::size_t nagg = plans.size();
-        std::vector<std::string> keybuf;
-        for (std::uint32_t rr = 0; rr < fcount; ++rr) {
-            const auto it = dim_hash.find(group_key_field(fkey.at(rr)));
-            if (it == dim_hash.end()) continue;  // inner join: no match => row drops
-            for (const std::uint32_t di : it->second) {
-                // group key (group_key_field of each group col, resolved fact/dim)
-                keybuf.clear();
-                keybuf.reserve(gsrc.size());
-                for (const Src& s : gsrc) {
-                    const Datum d = s.is_fact ? fact_col(s.col).at(rr) : dim_rows[di][s.col];
-                    keybuf.push_back(group_key_field(d));
+
+        // DIM hash by the RAW key (int -> int map, no per-row string encode for the probe).
+        std::map<std::int64_t, std::vector<std::uint32_t>> dim_hash_i;
+        std::map<std::string, std::vector<std::uint32_t>> dim_hash_s;
+        for (std::uint32_t di = 0; di < dim_rows.size(); ++di) {
+            const Datum& dk = dim_rows[di][dim_key_col];
+            if (key_int) dim_hash_i[dk.is_null ? 0 : dk.i].push_back(di);
+            else dim_hash_s[group_key_field(dk)].push_back(di);
+        }
+
+        // Fold ONE joined pair (fact row rr x dim row di) into a group's accumulators.
+        auto fold_pair = [&](FGroup& g, std::uint32_t rr, std::uint32_t di) {
+            if (g.accs.empty()) {
+                g.accs.resize(nagg);
+                g.keyd.reserve(gsrc.size());
+                for (const Src& s : gsrc)
+                    g.keyd.push_back(s.is_fact ? s.fp->at(rr) : dim_rows[di][s.col]);
+            }
+            for (std::size_t a = 0; a < nagg; ++a) {
+                const ItemPlan& p = plans[a];
+                if (p.is_col) continue;
+                FAcc& acc = g.accs[a];
+                ++acc.total;
+                if (p.kind == AggKind::CountStar) continue;
+                const Datum v = p.val.is_fact ? p.val.fp->at(rr) : dim_rows[di][p.val.col];
+                if (v.is_null) continue;
+                ++acc.npres;
+                if (p.kind == AggKind::Sum || p.kind == AggKind::Avg) acc.sum += v.i;
+                else if (p.kind == AggKind::Min || p.kind == AggKind::Max) {
+                    if (!acc.any) { acc.best = v; acc.any = true; }
+                    else {
+                        const int c = cmp_datum(v, acc.best);
+                        if ((p.kind == AggKind::Min && c < 0) ||
+                            (p.kind == AggKind::Max && c > 0)) acc.best = v;
+                    }
                 }
-                FGroup& g = groups[keybuf];
-                if (g.accs.empty()) {
-                    g.accs.resize(nagg);
+            }
+        };
+        auto probe = [&](std::uint32_t rr) -> const std::vector<std::uint32_t>* {
+            if (key_int) {
+                const auto it = dim_hash_i.find(fkey.ints[rr]);
+                return it == dim_hash_i.end() ? nullptr : &it->second;
+            }
+            const auto it = dim_hash_s.find(group_key_field(fkey.at(rr)));
+            return it == dim_hash_s.end() ? nullptr : &it->second;
+        };
+
+        // FAST: when every GROUP BY column is a DIM column, the group is constant per dim row —
+        // precompute each dim row's group slot ONCE, so the per-fact-row work is just probe + fold
+        // (no per-row group_key_field, no per-row map insert). A FACT group column falls to the
+        // general per-pair path below.
+        const bool all_dim_groups = [&] {
+            for (const Src& s : gsrc) if (s.is_fact) return false;
+            return true;
+        }();
+        if (all_dim_groups) {
+            std::vector<FGroup*> dgrp(dim_rows.size(), nullptr);
+            std::vector<std::string> kb;
+            for (std::uint32_t di = 0; di < dim_rows.size(); ++di) {
+                kb.clear();
+                for (const Src& s : gsrc) kb.push_back(group_key_field(dim_rows[di][s.col]));
+                FGroup& g = groups[kb];
+                if (g.keyd.empty() && !gsrc.empty()) {
                     g.keyd.reserve(gsrc.size());
-                    for (const Src& s : gsrc) {
-                        g.keyd.push_back(s.is_fact ? fact_col(s.col).at(rr) : dim_rows[di][s.col]);
-                    }
+                    for (const Src& s : gsrc) g.keyd.push_back(dim_rows[di][s.col]);
                 }
-                for (std::size_t a = 0; a < nagg; ++a) {
-                    const ItemPlan& p = plans[a];
-                    if (p.is_col) continue;
-                    FAcc& acc = g.accs[a];
-                    ++acc.total;
-                    if (p.kind == AggKind::CountStar) continue;
-                    const Datum v = p.val.is_fact ? fact_col(p.val.col).at(rr) : dim_rows[di][p.val.col];
-                    if (v.is_null) continue;
-                    ++acc.npres;
-                    if (p.kind == AggKind::Sum || p.kind == AggKind::Avg) {
-                        acc.sum += v.i;
-                    } else if (p.kind == AggKind::Min || p.kind == AggKind::Max) {
-                        if (!acc.any) { acc.best = v; acc.any = true; }
-                        else {
-                            const int c = cmp_datum(v, acc.best);
-                            if ((p.kind == AggKind::Min && c < 0) ||
-                                (p.kind == AggKind::Max && c > 0)) acc.best = v;
-                        }
+                if (g.accs.empty()) g.accs.resize(nagg);
+                dgrp[di] = &g;
+            }
+            for (std::uint32_t rr = 0; rr < fcount; ++rr) {
+                const std::vector<std::uint32_t>* m = probe(rr);
+                if (m == nullptr) continue;
+                for (const std::uint32_t di : *m) fold_pair(*dgrp[di], rr, di);
+            }
+        } else {
+            for (std::uint32_t rr = 0; rr < fcount; ++rr) {
+                const std::vector<std::uint32_t>* m = probe(rr);
+                if (m == nullptr) continue;  // inner join: no match => row drops
+                std::vector<std::string> keybuf;
+                for (const std::uint32_t di : *m) {
+                    keybuf.clear();
+                    keybuf.reserve(gsrc.size());
+                    for (const Src& s : gsrc) {
+                        keybuf.push_back(
+                            group_key_field(s.is_fact ? s.fp->at(rr) : dim_rows[di][s.col]));
                     }
+                    fold_pair(groups[keybuf], rr, di);
                 }
             }
         }
