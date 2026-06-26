@@ -180,6 +180,11 @@ public:
     // on-disk WAL file length. After this, a Query returns every committed value
     // WITHOUT replaying the consensus log (S5a closure).
     void recover(std::size_t durable_len) { server_.recover(durable_len); }
+    // Recover the SQL-over-wire engine's separate durable WAL (catalog + data).
+    void recover_sql(std::size_t durable_len) { server_.recover_sql(durable_len); }
+    [[nodiscard]] std::uint64_t disk_sql_logical_len() const noexcept {
+        return sql_disk_.logical_len();
+    }
     [[nodiscard]] Seq tip() const noexcept { return server_.tip(); }
 
     // The reactor's shared clock (ONE identity) — handed to a client stub's IClock&.

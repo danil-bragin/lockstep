@@ -1040,6 +1040,24 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_distributed_test COMMAND lockstep_sql_distributed_test)
 
+  # sql_catalog_recover_test: the DURABLE SQL CATALOG + recover gate (C7). Build a table (+ index +
+  # rows) through a durable SqlEngine, drop it (a crash) keeping the disk, reopen + recover() — the
+  # schema AND data must be back (queries that would error "unknown table" now equal the no-crash
+  # oracle byte-for-byte). Proves the SQL catalog survives a restart, not just the row/block data.
+  add_executable(lockstep_sql_catalog_recover_test sql_catalog_recover_test.cpp)
+  target_include_directories(lockstep_sql_catalog_recover_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_catalog_recover_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_catalog_recover_test COMMAND lockstep_sql_catalog_recover_test)
+
   # sql_columnar_durability_test: the columnar crash/recovery gate (A5). Proves the
   # committed columnar state (blocks + delta) survives a crash + recovery byte-for-byte
   # over a deterministic SimDisk — projection/aggregate/GROUP BY identical post-recovery,

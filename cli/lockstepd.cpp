@@ -440,6 +440,9 @@ int run_wire_server(const Args& args) {
     if (const std::uint64_t wal_len = node.disk_logical_len(); wal_len > 0) {
         node.recover(static_cast<std::size_t>(wal_len));
     }
+    if (const std::uint64_t sql_len = node.disk_sql_logical_len(); sql_len > 0) {
+        node.recover_sql(static_cast<std::size_t>(sql_len));  // SQL catalog + data (C7)
+    }
     // A large recv budget so the bounded serve loop covers a full bench run without
     // re-spawn; the reactor deadline is the real bound.
     node.start(1'000'000'000);

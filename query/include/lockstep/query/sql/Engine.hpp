@@ -226,6 +226,107 @@ public:
         chunk_cache_.clear();  // recovered blocks may differ from any cached decode
         concat_cache_.clear();
         zone_cache_.clear();
+        // C7: rebuild the CATALOG from its durable schema records (reserved 0x01 namespace).
+        // Without this the recovered ROW/BLOCK data is uninterpretable after a restart (the
+        // schema lived only in memory). Each record is a serialized Table re-registered with its
+        // PERSISTED id (the data keys are namespaced by it).
+        std::vector<storage::KeyValue> kvs;
+        {
+            Query<Strict> q;
+            q.scan(std::string(1, '\x01'), std::string(1, '\x02'));
+            collect(db_.run(q), kvs);
+        }
+        for (const storage::KeyValue& kv : kvs) {
+            if (is_tombstone(kv.second)) {
+                continue;
+            }
+            Table t = deserialize_schema(kv.second);
+            t.delta_dirty = t.columnar;  // force a delta merge for columnar (safe); stats stay 0
+            (void)catalog_.insert_recovered(std::move(t));
+        }
+    }
+
+    // ---- Catalog persistence (C7) — schema records under the reserved 0x01 key namespace ----
+    static void cat_put_u32(std::string& o, std::uint32_t v) {
+        o.push_back(static_cast<char>(v >> 24));
+        o.push_back(static_cast<char>(v >> 16));
+        o.push_back(static_cast<char>(v >> 8));
+        o.push_back(static_cast<char>(v));
+    }
+    static std::uint32_t cat_get_u32(const std::string& s, std::size_t& p) {
+        const std::uint32_t v = (static_cast<std::uint32_t>(static_cast<unsigned char>(s[p])) << 24) |
+                                (static_cast<std::uint32_t>(static_cast<unsigned char>(s[p + 1])) << 16) |
+                                (static_cast<std::uint32_t>(static_cast<unsigned char>(s[p + 2])) << 8) |
+                                static_cast<std::uint32_t>(static_cast<unsigned char>(s[p + 3]));
+        p += 4;
+        return v;
+    }
+    static void cat_put_s(std::string& o, const std::string& v) {
+        cat_put_u32(o, static_cast<std::uint32_t>(v.size()));
+        o += v;
+    }
+    static std::string cat_get_s(const std::string& s, std::size_t& p) {
+        const std::uint32_t n = cat_get_u32(s, p);
+        std::string v = s.substr(p, n);
+        p += n;
+        return v;
+    }
+    static Key catalog_key(const std::string& name) { return std::string(1, '\x01') + name; }
+
+    static std::string serialize_schema(const Table& t) {
+        std::string o;
+        cat_put_s(o, t.name);
+        cat_put_u32(o, t.id);
+        cat_put_u32(o, static_cast<std::uint32_t>(t.pk_index));
+        o.push_back(t.columnar ? 1 : 0);
+        cat_put_u32(o, t.next_index_id);
+        cat_put_u32(o, static_cast<std::uint32_t>(t.columns.size()));
+        for (const Column& c : t.columns) {
+            cat_put_s(o, c.name);
+            o.push_back(static_cast<char>(c.type == Type::Int ? 0 : 1));
+            o.push_back(c.nullable ? 1 : 0);
+        }
+        cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
+        for (const Index& ix : t.indexes) {
+            cat_put_s(o, ix.name);
+            cat_put_u32(o, ix.id);
+            cat_put_u32(o, static_cast<std::uint32_t>(ix.column));
+        }
+        return o;
+    }
+    static Table deserialize_schema(const std::string& s) {
+        std::size_t p = 0;
+        Table t;
+        t.name = cat_get_s(s, p);
+        t.id = cat_get_u32(s, p);
+        t.pk_index = cat_get_u32(s, p);
+        t.columnar = s[p++] != 0;
+        t.next_index_id = cat_get_u32(s, p);
+        const std::uint32_t nc = cat_get_u32(s, p);
+        for (std::uint32_t i = 0; i < nc; ++i) {
+            Column c;
+            c.name = cat_get_s(s, p);
+            c.type = (s[p++] == 0) ? Type::Int : Type::Text;
+            c.nullable = s[p++] != 0;
+            t.columns.push_back(std::move(c));
+        }
+        const std::uint32_t ni = cat_get_u32(s, p);
+        for (std::uint32_t i = 0; i < ni; ++i) {
+            Index ix;
+            ix.name = cat_get_s(s, p);
+            ix.id = cat_get_u32(s, p);
+            ix.column = cat_get_u32(s, p);
+            t.indexes.push_back(std::move(ix));
+        }
+        t.col_stats.assign(t.columns.size(), Table::ColStat{});
+        return t;
+    }
+    // Durably (re)write the table's schema record. Called after CREATE / CREATE INDEX / DROP INDEX.
+    void persist_schema(const std::string& name) {
+        const Table* t = catalog_.find(name);
+        if (t != nullptr) {
+            commit_writes({{catalog_key(name), serialize_schema(*t)}});
+        }
     }
 
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
@@ -625,6 +726,7 @@ private:
         t.col_stats.assign(t.columns.size(), Table::ColStat{});  // per-column stats (Phase 2)
         t.columnar = columnar_default_;  // columnar layout opt-in (engine default at CREATE)
         (void)catalog_.create(std::move(t));
+        persist_schema(c.table);  // C7: durable schema record (survives a restart)
         return ExecResult{};
     }
 
@@ -661,6 +763,7 @@ private:
         ix.id = t->next_index_id++;
         ix.column = *col;
         t->indexes.push_back(ix);
+        persist_schema(ci.table);  // C7: the new index is part of the durable schema
         const std::uint32_t table_id = t->id;
         const std::size_t pk_index = t->pk_index;
 
@@ -739,6 +842,7 @@ private:
                 break;
             }
         }
+        persist_schema(di.table);  // C7: drop reflected in the durable schema
         return ExecResult{};
     }
 

@@ -276,6 +276,11 @@ public:
         tip_ = db_.tip();
     }
 
+    // Recover the SQL-over-wire engine's durable state (its OWN WAL — separate from db_). Rebuilds
+    // the SQL catalog + data so SQL statements work after a restart. `durable_len` is the SQL WAL's
+    // on-disk byte length.
+    void recover_sql(std::size_t durable_len) { sql_eng_.recover(durable_len); }
+
     // Direct (no-wire) dispatch — used by the round-trip oracle to compute the
     // SAME effect the wire path would, against the SAME server state. Pure fn.
     [[nodiscard]] Response dispatch(const Request& req) {

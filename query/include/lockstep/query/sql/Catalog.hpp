@@ -799,6 +799,20 @@ public:
         return true;
     }
 
+    // RECOVERY: re-register a table with its PERSISTED id (the data keys are namespaced by that
+    // id, so it must be preserved verbatim). Keeps the id allocator monotonic past every recovered
+    // id so a post-recovery CREATE never collides. Returns false on a duplicate name.
+    [[nodiscard]] bool insert_recovered(Table t) {
+        if (tables_.count(t.name) != 0) {
+            return false;
+        }
+        if (t.id >= next_id_) {
+            next_id_ = t.id + 1;
+        }
+        tables_.emplace(t.name, std::move(t));
+        return true;
+    }
+
     [[nodiscard]] const Table* find(const std::string& name) const {
         const auto it = tables_.find(name);
         return it == tables_.end() ? nullptr : &it->second;
