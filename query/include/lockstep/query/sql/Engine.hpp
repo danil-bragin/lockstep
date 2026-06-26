@@ -334,6 +334,10 @@ public:
         for (const std::string& chk : t.checks) {
             cat_put_s(o, chk);
         }
+        cat_put_u32(o, static_cast<std::uint32_t>(t.pk_columns.size()));  // F1 (0 => single-col)
+        for (const std::size_t c : t.pk_columns) {
+            cat_put_u32(o, static_cast<std::uint32_t>(c));
+        }
         return o;
     }
     static Table deserialize_schema(const std::string& s) {
@@ -377,6 +381,10 @@ public:
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
         for (std::uint32_t i = 0; i < ncheck; ++i) {
             t.checks.push_back(cat_get_s(s, p));
+        }
+        const std::uint32_t npk = cat_get_u32(s, p);  // F1
+        for (std::uint32_t i = 0; i < npk; ++i) {
+            t.pk_columns.push_back(cat_get_u32(s, p));
         }
         t.col_stats.assign(t.columns.size(), Table::ColStat{});
         return t;
@@ -808,12 +816,31 @@ private:
             return ExecResult::failure("PRIMARY KEY column '" + c.pk_column +
                                        "' is not a declared column");
         }
+        // F1: resolve the (possibly composite) PK column list. A composite PK is row-mode + all-INT
+        // (fixed-width components keep the key order-preserving + self-delimiting); reject otherwise.
+        const std::vector<std::string>& pkc =
+            c.pk_columns.empty() ? std::vector<std::string>{c.pk_column} : c.pk_columns;
+        t.columnar = columnar_default_;  // columnar layout opt-in (engine default at CREATE)
+        if (pkc.size() > 1) {
+            if (t.columnar) {
+                return ExecResult::failure("a composite PRIMARY KEY is row-mode only (columnar OUT)");
+            }
+            for (const std::string& name : pkc) {
+                const auto ci = t.column_index(name);
+                if (!ci) return ExecResult::failure("PRIMARY KEY column '" + name + "' is not declared");
+                if (t.columns[*ci].type != Type::Int) {
+                    return ExecResult::failure(
+                        "a composite PRIMARY KEY column must be INT ('" + name + "' is not)");
+                }
+                t.pk_columns.push_back(*ci);
+                t.columns[*ci].nullable = false;
+            }
+        }
         // v4: the PRIMARY KEY column is ALWAYS NOT NULL (a NULL PK is meaningless and
         // could never be addressed by the order-preserving key encoding). Force it
         // regardless of any NOT NULL spelling in the DDL.
         t.columns[t.pk_index].nullable = false;
         t.col_stats.assign(t.columns.size(), Table::ColStat{});  // per-column stats (Phase 2)
-        t.columnar = columnar_default_;  // columnar layout opt-in (engine default at CREATE)
         (void)catalog_.create(std::move(t));
         persist_schema(c.table);  // C7: durable schema record (survives a restart)
         return ExecResult{};
@@ -1046,7 +1073,7 @@ private:
         if (t.columnar) {
             writes.emplace_back(row_delta_key(t, pk), encode_value(t, row));
         } else {
-            writes.emplace_back(encode_key(t, pk), encode_value(t, row));
+            writes.emplace_back(encode_key_row(t, row), encode_value(t, row));  // F1: composite-aware
         }
     }
 
@@ -3007,7 +3034,7 @@ private:
                 return e;
             }
             const Datum& pk = row[t->pk_index];
-            const Key pk_key = encode_key(*t, pk);
+            const Key pk_key = t->composite_pk() ? encode_key_row(*t, row) : encode_key(*t, pk);  // F1
             if (!batch_pks.insert(pk_key).second) {
                 return "duplicate primary key within the INSERT batch (table '" + ins.table + "')";
             }
@@ -3155,6 +3182,9 @@ private:
         if (t == nullptr) {
             return ExecResult::failure("unknown table '" + up.table + "'");
         }
+        if (t->composite_pk()) {  // F1: composite-PK UPDATE addressing is a follow-on
+            return ExecResult::failure("UPDATE on a composite-PRIMARY-KEY table is not supported");
+        }
         if (up.where_column != t->pk().name) {
             return ExecResult::failure(
                 "UPDATE WHERE must filter on the primary key '" + t->pk().name +
@@ -3231,6 +3261,9 @@ private:
         const Table* t = catalog_.find(del.table);
         if (t == nullptr) {
             return ExecResult::failure("unknown table '" + del.table + "'");
+        }
+        if (t->composite_pk()) {  // F1: composite-PK DELETE addressing is a follow-on
+            return ExecResult::failure("DELETE on a composite-PRIMARY-KEY table is not supported");
         }
         if (del.where_column != t->pk().name) {
             return ExecResult::failure(
@@ -5672,7 +5705,9 @@ private:
 
     AccessPath choose_access_path(const SelectStmt& sel, const Table& t) {
         AccessPath ap;
-        const bool pk_fast = sel.where != SelectWhereKind::None &&
+        // F1: the single-column PK point/range fast path is invalid for a COMPOSITE PK (the key
+        // needs ALL pk columns) — fall through to a full scan + filter.
+        const bool pk_fast = !t.composite_pk() && sel.where != SelectWhereKind::None &&
                              sel.where_column == t.pk().name && predicate_is_pure_pk(sel, t);
         if (pk_fast && sel.where == SelectWhereKind::Eq) {
             ap.kind = AccessPath::Kind::PkPoint;

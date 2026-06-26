@@ -116,7 +116,12 @@ struct Table {
     std::string name;
     std::uint32_t id = 0;  // dense table id => the key-prefix namespace
     std::vector<Column> columns;
-    std::size_t pk_index = 0;  // which column is the (single) PRIMARY KEY
+    std::size_t pk_index = 0;  // the FIRST PK column (== pk_columns[0]; the single-col fast paths)
+    // F1: the PRIMARY KEY column list. Size 1 for a single-column PK (the common case, byte-identical
+    // to before); >1 for a COMPOSITE PK (all-INT, row-mode — the key is the columns' order-preserving
+    // encodings concatenated). Empty is treated as {pk_index} for back-compat with recovered records.
+    std::vector<std::size_t> pk_columns;
+    [[nodiscard]] bool composite_pk() const { return pk_columns.size() > 1; }
     std::vector<Index> indexes;       // secondary indexes (in CREATE order)
     std::uint32_t next_index_id = 1;  // dense index-id assignment (0 reserved)
     std::int64_t next_auto_id = 1;    // F6: next AUTO_INCREMENT value (monotonic; persisted)
@@ -294,6 +299,42 @@ inline void put_pk_int(std::string& out, std::int64_t v) {
 // The full storage key for a row identified by its PK datum.
 [[nodiscard]] inline Key encode_key(const Table& t, const Datum& pk) {
     return table_prefix(t.id) + encode_pk(pk);
+}
+
+// F1: the storage key for a ROW (single OR composite PK). For a single-column PK this is exactly
+// encode_key(t, row[pk_index]) (byte-identical). For a composite PK (all-INT) it is the prefix
+// followed by each PK column's fixed-width order-preserving INT encoding, concatenated — so the
+// composite key sorts by the PK tuple lexicographically and is self-delimiting (9 bytes/column).
+[[nodiscard]] inline Key encode_key_row(const Table& t, const std::vector<Datum>& row) {
+    if (!t.composite_pk()) {
+        return encode_key(t, row[t.pk_index]);
+    }
+    Key out = table_prefix(t.id);
+    for (const std::size_t c : t.pk_columns) {
+        out += encode_pk(row[c]);
+    }
+    return out;
+}
+
+// F1: is column `c` part of the PRIMARY KEY (single or composite)? PK columns live in the storage
+// KEY, not the value, so the (de)serializers skip them.
+[[nodiscard]] inline bool is_pk_col(const Table& t, std::size_t c) {
+    if (!t.composite_pk()) return c == t.pk_index;
+    return std::find(t.pk_columns.begin(), t.pk_columns.end(), c) != t.pk_columns.end();
+}
+
+// F1: reconstruct a composite PK's columns into `row` from the storage key (all-INT 9-byte chunks).
+inline void decode_composite_pk(const Table& t, const Key& key, std::vector<Datum>& row) {
+    constexpr std::size_t kPrefixLen = 6;  // "t" + be32 + ":"
+    std::size_t off = kPrefixLen;
+    for (const std::size_t c : t.pk_columns) {
+        std::uint64_t bits = 0;
+        for (std::size_t b = 1; b <= 8; ++b) {
+            bits = (bits << 8) | static_cast<unsigned char>(key[off + b]);
+        }
+        row[c] = Datum::make_int(static_cast<std::int64_t>(bits ^ 0x8000000000000000ULL));
+        off += 9;
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -643,8 +684,8 @@ inline void put_index_col(std::string& out, const Datum& d) {
                                         const std::vector<Datum>& row) {
     Value out;
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c == t.pk_index) {
-            continue;  // the PK lives in the key, not the value
+        if (is_pk_col(t, c)) {
+            continue;  // the PK column(s) live in the key, not the value
         }
         const Datum& d = row[c];
         // v4: a NULL field is a single tag byte (no length, no payload). Decode knows
@@ -673,11 +714,12 @@ inline void put_index_col(std::string& out, const Datum& d) {
 [[nodiscard]] inline std::vector<Datum> decode_row(const Table& t, const Key& key,
                                                    const Value& value) {
     std::vector<Datum> row(t.columns.size());
-    row[t.pk_index] = decode_pk(t, key);
+    if (t.composite_pk()) decode_composite_pk(t, key, row);  // F1
+    else row[t.pk_index] = decode_pk(t, key);
     std::size_t off = 0;
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c == t.pk_index) {
-            continue;
+        if (is_pk_col(t, c)) {
+            continue;  // PK column(s) come from the key, not the value
         }
         // F7: a column ADDed (ALTER TABLE) after this row was written has no bytes in the stored
         // value — pad it with its DEFAULT (or NULL). The encoder writes the PK from the key, so the
@@ -730,12 +772,11 @@ inline void put_index_col(std::string& out, const Datum& d) {
 inline void decode_row_projected_into(const Table& t, const Key& key, const Value& value,
                                       const std::vector<bool>& need, std::vector<Datum>& row) {
     row.assign(t.columns.size(), Datum{});  // reuses capacity (no realloc after the first row)
-    if (need[t.pk_index]) {
-        row[t.pk_index] = decode_pk(t, key);
-    }
+    if (t.composite_pk()) decode_composite_pk(t, key, row);  // F1 (all PK cols; cheap INT)
+    else if (need[t.pk_index]) row[t.pk_index] = decode_pk(t, key);
     std::size_t off = 0;
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c == t.pk_index) {
+        if (is_pk_col(t, c)) {
             continue;
         }
         if (off >= value.size()) {  // F7: ALTER-added suffix column — pad with DEFAULT/NULL
@@ -778,12 +819,11 @@ inline void decode_row_projected_into(const Table& t, const Key& key, const Valu
     const Table& t, const Key& key, const Value& value,
     const std::vector<bool>& need) {
     std::vector<Datum> row(t.columns.size());
-    if (need[t.pk_index]) {
-        row[t.pk_index] = decode_pk(t, key);
-    }
+    if (t.composite_pk()) decode_composite_pk(t, key, row);  // F1
+    else if (need[t.pk_index]) row[t.pk_index] = decode_pk(t, key);
     std::size_t off = 0;
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
-        if (c == t.pk_index) {
+        if (is_pk_col(t, c)) {
             continue;
         }
         if (off >= value.size()) {  // F7: ALTER-added suffix column — pad with DEFAULT/NULL

@@ -659,17 +659,22 @@ private:
                 if (auto e = expect(Tok::LParen, "'(' after PRIMARY KEY")) {
                     return ParseResult{*e};
                 }
-                if (auto e = expect_ident("the primary-key column name",
-                                          st.create.pk_column)) {
-                    return ParseResult{*e};
+                // F1: a single OR composite PK — one or more column names.
+                for (;;) {
+                    std::string pkc;
+                    if (auto e = expect_ident("a primary-key column name", pkc)) {
+                        return ParseResult{*e};
+                    }
+                    st.create.pk_columns.push_back(pkc);
+                    if (cur_.kind == Tok::Comma) {
+                        advance();
+                        continue;
+                    }
+                    break;
                 }
-                if (auto e = expect(Tok::RParen, "')' after PRIMARY KEY column")) {
+                st.create.pk_column = st.create.pk_columns.front();  // back-compat (first PK col)
+                if (auto e = expect(Tok::RParen, "')' after the PRIMARY KEY column(s)")) {
                     return ParseResult{*e};
-                }
-                // v1: single-column PK only — a comma here would mean a multi-col PK.
-                if (cur_.kind == Tok::Comma) {
-                    return err("multi-column PRIMARY KEY is OUT in v1 (single-column "
-                               "PK only)");
                 }
                 seen_pk_clause = true;
                 break;  // PRIMARY KEY is the last clause

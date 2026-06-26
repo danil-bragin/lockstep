@@ -56,7 +56,8 @@ namespace lockstep::query::sql {
 struct CreateStmt {
     std::string table;
     std::vector<Column> columns;
-    std::string pk_column;  // the single PK column name
+    std::string pk_column;  // the FIRST PK column name (== pk_columns[0])
+    std::vector<std::string> pk_columns;  // F1: the PK column list (1 = single, >1 = composite)
     std::vector<std::string> checks;  // F5: CHECK predicate source texts (column- or table-level)
 };
 

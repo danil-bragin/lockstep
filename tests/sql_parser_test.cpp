@@ -78,8 +78,7 @@ void test_create() {
     expect_err("CREATE TABLE t (id FLOAT, PRIMARY KEY (id))", "unsupported type FLOAT");
     expect_err("CREATE TABLE t (id INT, PRIMARY KEY (missing))",
                "PK names an undeclared column");
-    expect_err("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))",
-               "multi-column PK is OUT");
+    (void)ok_parse("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))");  // F1: composite PK now parses
 }
 
 void test_insert() {
