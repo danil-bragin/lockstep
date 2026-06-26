@@ -64,6 +64,7 @@ public:
             case StmtKind::CreateIndex:
             case StmtKind::DropIndex:
             case StmtKind::DropTable:
+            case StmtKind::Truncate:  // E2: a DDL/all-rows op -> every shard
             case StmtKind::Alter:
             case StmtKind::Begin:
             case StmtKind::Commit:

@@ -466,6 +466,8 @@ public:
                 return exec_drop_index(st.drop_index);
             case StmtKind::DropTable:
                 return exec_drop_table(st.drop_table);
+            case StmtKind::Truncate:
+                return exec_truncate(st.truncate);
             case StmtKind::Alter:
                 return exec_alter(st.alter);
             case StmtKind::Begin:
@@ -833,8 +835,11 @@ private:
     // --- CREATE TABLE ---------------------------------------------------------
     ExecResult exec_create(const CreateStmt& c) {
         if (catalog_.has(c.table)) {
+            if (c.if_not_exists) return ExecResult{};  // E2: no-op
             return ExecResult::failure("table '" + c.table + "' already exists");
         }
+        if (!c.like_table.empty()) return exec_create_like(c);  // E2
+        if (c.as_select) return exec_create_as_select(c);       // E3
         Table t;
         t.name = c.table;
         t.columns = c.columns;
@@ -878,6 +883,98 @@ private:
         t.col_stats.assign(t.columns.size(), Table::ColStat{});  // per-column stats (Phase 2)
         (void)catalog_.create(std::move(t));
         persist_schema(c.table);  // C7: durable schema record (survives a restart)
+        return ExecResult{};
+    }
+
+    // E2: CREATE TABLE t LIKE other — a fresh, EMPTY table with `other`'s columns + PK + checks.
+    ExecResult exec_create_like(const CreateStmt& c) {
+        const Table* src = catalog_.find(c.like_table);
+        if (src == nullptr) return ExecResult::failure("unknown source table '" + c.like_table + "'");
+        Table t;
+        t.name = c.table;
+        t.columns = src->columns;
+        t.pk_index = src->pk_index;
+        t.pk_columns = src->pk_columns;
+        t.checks = src->checks;
+        t.next_auto_id = 1;  // a copy of the SCHEMA only — counters reset, no data, no indexes
+        t.col_stats.assign(t.columns.size(), Table::ColStat{});
+        (void)catalog_.create(std::move(t));
+        persist_schema(c.table);
+        return ExecResult{};
+    }
+
+    // E3: CREATE TABLE t AS SELECT ... — run the query, infer the column types from the result, create
+    // the table (with a HIDDEN auto-increment PK so the model's PK requirement is met without polluting
+    // SELECT *), and INSERT every result row.
+    ExecResult exec_create_as_select(const CreateStmt& c) {
+        const ExecResult q = exec_select(*c.as_select);
+        if (!q.ok) return q;
+        // Determine the output column names + types. Names from the result labels; a type from the
+        // first non-NULL value in each column (default INT if a column is entirely NULL/empty).
+        std::size_t ncol = q.rows.empty() ? 0 : q.rows[0].cells.size();
+        if (ncol == 0) return ExecResult::failure("CREATE TABLE AS SELECT needs a non-empty result shape");
+        Table t;
+        t.name = c.table;
+        Column pk;  // a hidden synthetic identity
+        pk.name = "_ctid";
+        pk.type = Type::Int;
+        pk.auto_increment = true;
+        pk.nullable = false;
+        pk.dropped = true;  // hidden from SELECT * / name lookup; still the key identity
+        t.columns.push_back(pk);
+        t.pk_index = 0;
+        for (std::size_t k = 0; k < ncol; ++k) {
+            Column col;
+            col.name = q.rows.empty() ? ("c" + std::to_string(k)) : q.rows[0].cells[k].first;
+            col.nullable = true;
+            col.type = Type::Int;
+            for (const ResultRow& r : q.rows) {
+                if (!r.cells[k].second.is_null) {
+                    col.type = r.cells[k].second.type;
+                    col.logical = r.cells[k].second.logical;
+                    col.scale = r.cells[k].second.scale;
+                    break;
+                }
+            }
+            t.columns.push_back(std::move(col));
+        }
+        t.col_stats.assign(t.columns.size(), Table::ColStat{});
+        (void)catalog_.create(std::move(t));
+        persist_schema(c.table);
+        // Insert the rows over the verified write path.
+        Table* mt = catalog_.find_mut(c.table);
+        std::int64_t auto_id = 1;
+        std::vector<std::pair<Key, Value>> writes;
+        for (const ResultRow& r : q.rows) {
+            std::vector<Datum> row(mt->columns.size());
+            row[0] = Datum::make_int(auto_id++);
+            for (std::size_t k = 0; k < ncol; ++k) {
+                Datum d;
+                if (auto e = coerce(mt->columns[k + 1], r.cells[k].second, d))
+                    return ExecResult::failure(*e);
+                row[k + 1] = d;
+            }
+            emit_row_writes(*mt, row, writes);
+        }
+        commit_writes(writes);
+        mt->next_auto_id = auto_id;
+        persist_schema(c.table);
+        return ExecResult{};
+    }
+
+    // E2: TRUNCATE TABLE — delete every row (schema kept). Tombstones each row + its index entries.
+    ExecResult exec_truncate(const TruncateStmt& tr) {
+        Table* t = catalog_.find_mut(tr.table);
+        if (t == nullptr) return ExecResult::failure("unknown table '" + tr.table + "'");
+        std::vector<std::pair<Datum, std::vector<Datum>>> rows;
+        if (auto e = scan_all_rows(*t, rows)) return ExecResult::failure(*e);
+        std::vector<std::pair<Key, Value>> writes;
+        for (auto& [pk, r] : rows) {
+            const Key rk = t->composite_pk() ? encode_key_row(*t, r) : encode_key(*t, pk);
+            writes.emplace_back(rk, tombstone_marker());
+            index_writes_for_row(*t, r, /*tombstone=*/true, writes);
+        }
+        commit_writes(writes);
         return ExecResult{};
     }
 
@@ -962,10 +1059,12 @@ private:
     ExecResult exec_drop_index(const DropIndexStmt& di) {
         Table* t = catalog_.find_mut(di.table);
         if (t == nullptr) {
+            if (di.if_exists) return ExecResult{};  // E2: no-op
             return ExecResult::failure("unknown table '" + di.table + "'");
         }
         const Index* ixp = t->index_by_name(di.index);
         if (ixp == nullptr) {
+            if (di.if_exists) return ExecResult{};  // E2: no-op
             return ExecResult::failure("unknown index '" + di.index + "' on table '" +
                                        di.table + "'");
         }
@@ -1171,6 +1270,7 @@ private:
     // id) — the same no-space-reclaim model DROP INDEX uses. Unknown table => error.
     ExecResult exec_drop_table(const DropTableStmt& dt) {
         if (catalog_.find(dt.table) == nullptr) {
+            if (dt.if_exists) return ExecResult{};  // E2: no-op
             return ExecResult::failure("unknown table '" + dt.table + "'");
         }
         // Durably retire the schema record in the SEPARATE catalog store (its own Seq line).

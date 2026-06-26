@@ -423,6 +423,13 @@ public:
             r = parse_alter();
         } else if (kw == "drop") {
             r = parse_drop_index();
+        } else if (kw == "truncate") {
+            advance();
+            if (is_kw("table")) advance();  // optional TABLE
+            Statement st;
+            st.kind = StmtKind::Truncate;
+            if (auto e = expect_ident("a table name after TRUNCATE", st.truncate.table)) return ParseResult{*e};
+            r = ParseResult{std::move(st)};
         } else {
             return err("unknown / unsupported statement keyword '" + cur_.text +
                        "' (v1 supports CREATE/INSERT/UPDATE/DELETE/SELECT)");
@@ -925,8 +932,29 @@ private:
         }
         Statement st;
         st.kind = StmtKind::Create;
+        if (is_kw("if")) {  // E2: CREATE TABLE IF NOT EXISTS
+            advance();
+            if (auto e = expect_kw("not")) return ParseResult{*e};
+            if (auto e = expect_kw("exists")) return ParseResult{*e};
+            st.create.if_not_exists = true;
+        }
         if (auto e = expect_ident("a table name after CREATE TABLE", st.create.table)) {
             return ParseResult{*e};
+        }
+        // E2: CREATE TABLE t LIKE other — copy other's schema (no column list, no data).
+        if (is_kw("like")) {
+            advance();
+            if (auto e = expect_ident("a source table name after LIKE", st.create.like_table)) return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
+        // E3: CREATE TABLE t AS SELECT ... — populate from a query.
+        if (is_kw("as")) {
+            advance();
+            if (!is_kw("select")) return err("expected SELECT after CREATE TABLE ... AS");
+            auto sel = std::make_shared<SelectStmt>();  // parse_select_stmt consumes SELECT
+            if (auto e = parse_select_stmt(*sel)) return ParseResult{*e};
+            st.create.as_select = std::move(sel);
+            return ParseResult{std::move(st)};
         }
         if (auto e = expect(Tok::LParen, "'(' to open the column list")) {
             return ParseResult{*e};
@@ -1125,10 +1153,15 @@ private:
     // DROP INDEX <name> ON <table>  |  DROP TABLE <table>  (F8)
     ParseResult parse_drop_index() {
         advance();  // DROP
+        auto parse_if_exists = [&]() -> bool {
+            if (is_kw("if")) { advance(); (void)expect_kw("exists"); return true; }
+            return false;
+        };
         if (is_kw("table")) {
             advance();  // TABLE
             Statement st;
             st.kind = StmtKind::DropTable;
+            st.drop_table.if_exists = parse_if_exists();  // E2
             if (auto e = expect_ident("a table name after DROP TABLE", st.drop_table.table)) {
                 return ParseResult{*e};
             }
@@ -1139,6 +1172,7 @@ private:
         }
         Statement st;
         st.kind = StmtKind::DropIndex;
+        st.drop_index.if_exists = parse_if_exists();  // E2
         if (auto e = expect_ident("an index name after DROP INDEX",
                                   st.drop_index.index)) {
             return ParseResult{*e};
@@ -1910,6 +1944,12 @@ private:
                     item.kind = SelectItemKind::Aggregate;
                     item.agg = agg;
                     item.label = label;
+                    if (is_kw("as")) {  // E3: optional AS <alias> on an aggregate (e.g. SUM(v) AS total)
+                        advance();
+                        std::string alias;
+                        if (auto e = expect_ident("an alias after AS", alias)) return e;
+                        item.label = alias;
+                    }
                     sel.items.push_back(std::move(item));
                     sel.has_aggregates = true;
                 } else {

@@ -52,6 +52,8 @@
 
 namespace lockstep::query::sql {
 
+struct SelectStmt;  // defined below; CreateStmt holds a shared_ptr to it (E3 CTAS)
+
 // CREATE TABLE <name> (<col> <type>, ..., PRIMARY KEY (<col>))
 struct CreateStmt {
     std::string table;
@@ -59,6 +61,9 @@ struct CreateStmt {
     std::string pk_column;  // the FIRST PK column name (== pk_columns[0])
     std::vector<std::string> pk_columns;  // F1: the PK column list (1 = single, >1 = composite)
     std::vector<std::string> checks;  // F5: CHECK predicate source texts (column- or table-level)
+    bool if_not_exists = false;       // E2: CREATE TABLE IF NOT EXISTS — no-op if it already exists
+    std::string like_table;           // E2: CREATE TABLE t LIKE other — copy other's schema (no data)
+    std::shared_ptr<SelectStmt> as_select;  // E3: CREATE TABLE t AS SELECT ... (populate from a query)
 };
 
 // CREATE INDEX <name> ON <table> (<col>) — a single-column SECONDARY INDEX. The
@@ -72,6 +77,12 @@ struct CreateIndexStmt {
 // DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).
 struct DropIndexStmt {
     std::string index;
+    std::string table;
+    bool if_exists = false;  // E2
+};
+
+// E2: TRUNCATE TABLE <table> — delete every row (schema kept).
+struct TruncateStmt {
     std::string table;
 };
 
@@ -400,6 +411,7 @@ struct SelectStmt {
 // DROP TABLE <t>  (F8)
 struct DropTableStmt {
     std::string table;
+    bool if_exists = false;  // E2
 };
 
 // ALTER TABLE <t> ADD [COLUMN] <col> <type> [constraints]  (F7)
@@ -443,6 +455,7 @@ enum class StmtKind : std::uint8_t {
     Begin = 9,     // G1: BEGIN [TRANSACTION]
     Commit = 10,   // G1: COMMIT
     Rollback = 11, // G1: ROLLBACK
+    Truncate = 12, // E2: TRUNCATE TABLE
 };
 
 struct Statement {
@@ -455,6 +468,7 @@ struct Statement {
     CreateIndexStmt create_index;
     DropIndexStmt drop_index;
     DropTableStmt drop_table;
+    TruncateStmt truncate;  // E2
     AlterStmt alter;
 };
 
