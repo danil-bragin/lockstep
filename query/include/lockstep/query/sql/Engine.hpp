@@ -6095,6 +6095,60 @@ private:
     // SELECT reads the SAME committed store at the SAME D5 level the outer statement runs.
     // ========================================================================
 
+    // B2: flip a comparison operator (for swapping LHS/RHS during correlation rewriting).
+    static CmpOp flip_op(CmpOp op) {
+        switch (op) {
+            case CmpOp::Lt: return CmpOp::Gt;
+            case CmpOp::Le: return CmpOp::Ge;
+            case CmpOp::Gt: return CmpOp::Lt;
+            case CmpOp::Ge: return CmpOp::Le;
+            default: return op;  // Eq/Ne/Like are symmetric (Like rarely correlated)
+        }
+    }
+
+    // B2 CORRELATED subqueries: produce a copy of the inner SELECT with every reference to an OUTER
+    // column (one that is NOT a column of the inner table but IS a column of the outer table)
+    // substituted by the OUTER ROW's value as a literal. Called per outer row, so the inner query is
+    // re-evaluated against the current outer binding. Handles a correlation appearing on either side
+    // of a comparison (`inner.x = outer.y` or `outer.y = inner.x`).
+    [[nodiscard]] SelectStmt correlate_subquery(const SelectStmt& sub, const Table& outer_t,
+                                                const std::vector<Datum>& outer_row) {
+        SelectStmt s = sub;
+        const std::string inner_name =
+            !s.table.empty() ? s.table : (s.from.empty() ? std::string() : s.from[0].table);
+        const Table* inner = catalog_.find(inner_name);
+        if (inner == nullptr || !s.filter.present()) {
+            return s;
+        }
+        auto outer_val = [&](const std::string& col) -> std::optional<Datum> {
+            if (inner->column_index(col)) return std::nullopt;  // an inner column — not correlated
+            const auto oi = outer_t.column_index(col);
+            if (!oi) return std::nullopt;
+            return outer_row[*oi];
+        };
+        for (PredNode& n : s.filter.nodes) {
+            if (n.kind != PredNodeKind::Cmp) continue;
+            if (n.rhs_is_column) {
+                if (auto v = outer_val(n.rhs_column)) {  // RHS is an outer column
+                    n.literal = *v;
+                    n.rhs_is_column = false;
+                    continue;
+                }
+            }
+            if (n.operand == OperandKind::Column) {
+                if (auto v = outer_val(n.column)) {  // LHS is an outer column
+                    if (n.rhs_is_column) {           // ... and the inner column is on the RHS — swap
+                        n.column = n.rhs_column;
+                        n.rhs_is_column = false;
+                        n.literal = *v;
+                        n.op = flip_op(n.op);
+                    }
+                }
+            }
+        }
+        return s;
+    }
+
     // The collected values of an IN/scalar subquery's single output column + whether any
     // were NULL (load-bearing for NOT IN's three-valued logic).
     struct SubColumn {
@@ -6267,16 +6321,18 @@ private:
                                        t.name + "'");
                 }
                 SubColumn sub;
-                if (auto e = run_sub_column(*n.subquery, sub)) return e;
+                const SelectStmt cs = correlate_subquery(*n.subquery, t, row);  // B2
+                if (auto e = run_sub_column(cs, sub)) return e;
                 return apply_in(row[*idx], n.is_not, sub, truth);
             }
             case PredNodeKind::Exists: {
-                // v4: [NOT] EXISTS (SELECT ...) — uncorrelated existence test.
+                // v4/B2: [NOT] EXISTS (SELECT ...) — existence test (correlated per outer row).
                 if (group != nullptr) {
                     return std::string("EXISTS subqueries are not supported in HAVING");
                 }
                 bool ex = false;
-                if (auto e = run_exists_sub(*n.subquery, ex)) return e;
+                const SelectStmt cs = correlate_subquery(*n.subquery, t, row);  // B2
+                if (auto e = run_exists_sub(cs, ex)) return e;
                 truth = n.is_not ? !ex : ex;
                 return std::nullopt;
             }
@@ -6306,7 +6362,8 @@ private:
         Datum rhs;
         if (n.rhs_is_subquery) {
             bool snull = false;
-            if (auto e = run_scalar_sub(*n.subquery, snull, rhs)) return e;
+            const SelectStmt cs = correlate_subquery(*n.subquery, t, row);  // B2
+            if (auto e = run_scalar_sub(cs, snull, rhs)) return e;
             if (snull) {
                 truth = false;  // comparison with a NULL scalar is UNKNOWN
                 return std::nullopt;
