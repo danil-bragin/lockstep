@@ -221,6 +221,36 @@ struct Predicate {
     [[nodiscard]] bool present() const { return root >= 0; }
 };
 
+// A1/A2/A3/A4: a SCALAR EXPRESSION tree — arithmetic (+ - * / %), a column reference, a literal,
+// a scalar function (UPPER/LOWER/LENGTH/SUBSTR/CONCAT/COALESCE/ABS/CAST), or a CASE expression.
+// Evaluated to a Datum over a row. Held by shared_ptr so the tree stays copyable.
+enum class ExprKind : std::uint8_t { Col = 0, Lit = 1, Neg = 2, Bin = 3, Func = 4, Case = 5 };
+enum class BinOp : std::uint8_t { Add = 0, Sub = 1, Mul = 2, Div = 3, Mod = 4 };
+
+struct Expr {
+    ExprKind kind = ExprKind::Lit;
+    // Col
+    std::string qualifier;
+    std::string column;
+    // Lit
+    Datum lit;
+    // Bin / Neg
+    BinOp op = BinOp::Add;
+    std::shared_ptr<Expr> left;
+    std::shared_ptr<Expr> right;  // Bin: both operands; Neg: `left` only
+    // Func — A2 string/scalar functions + A4 CAST. `func` is the upper-cased name; CAST stores its
+    // target in cast_type.
+    std::string func;
+    Type cast_type = Type::Int;
+    std::vector<std::shared_ptr<Expr>> args;
+    // Case — A3: WHEN case_when[i] THEN case_then[i] ... [ELSE case_else]. First true WHEN wins;
+    // no match + no ELSE => NULL.
+    std::vector<Predicate> case_when;
+    std::vector<std::shared_ptr<Expr>> case_then;
+    std::shared_ptr<Expr> case_else;  // null => NULL default
+    std::string label;                // the rendered output label for a projected expression
+};
+
 // One ORDER BY key: a column name + a direction. (ORDER BY references projected /
 // table columns by name; tie-break by PK is appended by the planner for a total,
 // byte-deterministic order.)
@@ -237,12 +267,13 @@ struct OrderKey {
 
 // One SELECT-list item: either a plain column or an aggregate expression. A v1
 // `SELECT id, name` is all-Column items; a v2 `SELECT k, COUNT(*)` mixes them.
-enum class SelectItemKind : std::uint8_t { Column = 0, Aggregate = 1 };
+enum class SelectItemKind : std::uint8_t { Column = 0, Aggregate = 1, Expr = 2 };
 struct SelectItem {
     SelectItemKind kind = SelectItemKind::Column;
     std::string qualifier;  // v3: optional table/alias qualifier ("" == unqualified)
     std::string column;     // Column: the column name; the OUTPUT label
     AggExpr agg;            // Aggregate: the aggregate
+    std::shared_ptr<Expr> expr;  // A1: a scalar expression (computed column)
     std::string label;      // the rendered output column label (col name or "COUNT(*)")
 };
 

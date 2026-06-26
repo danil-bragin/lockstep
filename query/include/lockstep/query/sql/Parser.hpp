@@ -103,6 +103,10 @@ enum class Tok : std::uint8_t {
     Semi,     // ;
     Star,     // *
     Dot,      // .  (v3: qualified column table.col)
+    Plus,     // +  (A1 arithmetic)
+    Minus,    // -
+    Slash,    // /
+    Percent,  // %
     End,      // end of input
     Bad,      // a lexing error (unterminated string / stray byte)
 };
@@ -198,6 +202,22 @@ public:
             case '.':
                 ++i_;
                 t.kind = Tok::Dot;
+                return t;
+            case '+':
+                ++i_;
+                t.kind = Tok::Plus;
+                return t;
+            case '-':
+                ++i_;
+                t.kind = Tok::Minus;
+                return t;
+            case '/':
+                ++i_;
+                t.kind = Tok::Slash;
+                return t;
+            case '%':
+                ++i_;
+                t.kind = Tok::Percent;
                 return t;
             default:
                 break;
@@ -1002,6 +1022,224 @@ private:
         return out;
     }
 
+    // A readable, deterministic output label for an UNALIASED projected expression.
+    static std::string expr_label(const Expr& e) {
+        switch (e.kind) {
+            case ExprKind::Col:
+                return e.qualifier.empty() ? e.column : e.qualifier + "." + e.column;
+            case ExprKind::Lit:
+                return e.lit.is_null ? "NULL"
+                                     : (e.lit.type == Type::Int ? std::to_string(e.lit.i) : e.lit.s);
+            case ExprKind::Func:
+                return e.func == "CAST" ? "CAST" : e.func;
+            case ExprKind::Case:
+                return "CASE";
+            case ExprKind::Neg:
+                return "-expr";
+            case ExprKind::Bin:
+                return "expr";
+        }
+        return "expr";
+    }
+
+    // ---- A1-A4 scalar-expression grammar (precedence: add < mul < unary < primary) -----------
+    static std::shared_ptr<Expr> mk_expr(ExprKind k) {
+        auto e = std::make_shared<Expr>();
+        e->kind = k;
+        return e;
+    }
+    [[nodiscard]] std::optional<ParseError> parse_scalar_expr(std::shared_ptr<Expr>& out) {
+        return parse_expr_add(out);
+    }
+    [[nodiscard]] std::optional<ParseError> parse_expr_add(std::shared_ptr<Expr>& out) {
+        if (auto e = parse_expr_mul(out)) return e;
+        for (;;) {
+            BinOp op;
+            if (cur_.kind == Tok::Plus) {
+                op = BinOp::Add;
+                advance();
+            } else if (cur_.kind == Tok::Minus) {
+                op = BinOp::Sub;
+                advance();
+            } else if (cur_.kind == Tok::IntLit && cur_.int_val < 0) {
+                // A glued negative literal (`x-5` lexes x then IntLit(-5)) is a subtraction.
+                auto r = mk_expr(ExprKind::Lit);
+                r->lit = Datum::make_int(-cur_.int_val);
+                advance();
+                auto n = mk_expr(ExprKind::Bin);
+                n->op = BinOp::Sub;
+                n->left = out;
+                n->right = r;
+                out = n;
+                continue;
+            } else {
+                break;
+            }
+            std::shared_ptr<Expr> r;
+            if (auto e = parse_expr_mul(r)) return e;
+            auto n = mk_expr(ExprKind::Bin);
+            n->op = op;
+            n->left = out;
+            n->right = r;
+            out = n;
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<ParseError> parse_expr_mul(std::shared_ptr<Expr>& out) {
+        if (auto e = parse_expr_unary(out)) return e;
+        for (;;) {
+            BinOp op;
+            if (cur_.kind == Tok::Star) {
+                op = BinOp::Mul;
+            } else if (cur_.kind == Tok::Slash) {
+                op = BinOp::Div;
+            } else if (cur_.kind == Tok::Percent) {
+                op = BinOp::Mod;
+            } else {
+                break;
+            }
+            advance();
+            std::shared_ptr<Expr> r;
+            if (auto e = parse_expr_unary(r)) return e;
+            auto n = mk_expr(ExprKind::Bin);
+            n->op = op;
+            n->left = out;
+            n->right = r;
+            out = n;
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<ParseError> parse_expr_unary(std::shared_ptr<Expr>& out) {
+        if (cur_.kind == Tok::Minus) {
+            advance();
+            std::shared_ptr<Expr> c;
+            if (auto e = parse_expr_unary(c)) return e;
+            auto n = mk_expr(ExprKind::Neg);
+            n->left = c;
+            out = n;
+            return std::nullopt;
+        }
+        return parse_expr_primary(out);
+    }
+    [[nodiscard]] std::optional<ParseError> parse_expr_primary(std::shared_ptr<Expr>& out) {
+        if (cur_.kind == Tok::LParen) {
+            advance();
+            if (auto e = parse_scalar_expr(out)) return e;
+            return expect(Tok::RParen, "')' to close a parenthesized expression");
+        }
+        if (cur_.kind == Tok::IntLit) {
+            auto n = mk_expr(ExprKind::Lit);
+            n->lit = Datum::make_int(cur_.int_val);
+            advance();
+            out = n;
+            return std::nullopt;
+        }
+        if (cur_.kind == Tok::StrLit) {
+            auto n = mk_expr(ExprKind::Lit);
+            n->lit = Datum::make_text(cur_.text);
+            advance();
+            out = n;
+            return std::nullopt;
+        }
+        if (is_kw("null")) {
+            advance();
+            auto n = mk_expr(ExprKind::Lit);
+            n->lit = Datum::make_null(Type::Int);
+            out = n;
+            return std::nullopt;
+        }
+        if (is_kw("case")) {
+            return parse_case_expr(out);
+        }
+        if (is_kw("cast")) {
+            advance();
+            if (auto e = expect(Tok::LParen, "'(' after CAST")) return e;
+            auto n = mk_expr(ExprKind::Func);
+            n->func = "CAST";
+            std::shared_ptr<Expr> arg;
+            if (auto e = parse_scalar_expr(arg)) return e;
+            n->args.push_back(arg);
+            if (auto e = expect_kw("as")) return e;
+            if (is_kw("int")) {
+                n->cast_type = Type::Int;
+                advance();
+            } else if (is_kw("text")) {
+                n->cast_type = Type::Text;
+                advance();
+            } else {
+                return make_err("CAST target must be INT or TEXT");
+            }
+            if (auto e = expect(Tok::RParen, "')' to close CAST")) return e;
+            out = n;
+            return std::nullopt;
+        }
+        if (cur_.kind == Tok::Ident) {
+            const std::string name = cur_.text;
+            advance();
+            // A function call NAME '(' args ')'.
+            if (cur_.kind == Tok::LParen) {
+                advance();
+                auto n = mk_expr(ExprKind::Func);
+                n->func = upper(name);
+                if (cur_.kind != Tok::RParen) {
+                    for (;;) {
+                        std::shared_ptr<Expr> a;
+                        if (auto e = parse_scalar_expr(a)) return e;
+                        n->args.push_back(a);
+                        if (cur_.kind == Tok::Comma) {
+                            advance();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                if (auto e = expect(Tok::RParen, "')' to close a function call")) return e;
+                out = n;
+                return std::nullopt;
+            }
+            // A column reference (optionally qualified `table.col`).
+            auto n = mk_expr(ExprKind::Col);
+            n->column = name;
+            if (cur_.kind == Tok::Dot) {
+                advance();
+                if (cur_.kind != Tok::Ident) return make_err("expected a column name after '.'");
+                n->qualifier = name;
+                n->column = cur_.text;
+                advance();
+            }
+            out = n;
+            return std::nullopt;
+        }
+        return make_err("expected a scalar expression");
+    }
+    // CASE WHEN <pred> THEN <expr> [WHEN ...] [ELSE <expr>] END
+    [[nodiscard]] std::optional<ParseError> parse_case_expr(std::shared_ptr<Expr>& out) {
+        advance();  // CASE
+        auto n = mk_expr(ExprKind::Case);
+        if (!is_kw("when")) {
+            return make_err("expected WHEN after CASE");
+        }
+        while (is_kw("when")) {
+            advance();
+            Predicate cond;
+            if (auto e = parse_predicate(cond, /*allow_agg=*/false)) return e;
+            if (auto e = expect_kw("then")) return e;
+            std::shared_ptr<Expr> th;
+            if (auto e = parse_scalar_expr(th)) return e;
+            n->case_when.push_back(std::move(cond));
+            n->case_then.push_back(std::move(th));
+        }
+        if (is_kw("else")) {
+            advance();
+            std::shared_ptr<Expr> el;
+            if (auto e = parse_scalar_expr(el)) return e;
+            n->case_else = el;
+        }
+        if (auto e = expect_kw("end")) return e;
+        out = n;
+        return std::nullopt;
+    }
+
     // SELECT [DISTINCT] (* | item, ...) FROM t [WHERE p] [GROUP BY ..] [HAVING ..]
     //                                          [ORDER BY ..] [LIMIT n [OFFSET m]] [AT ..]
     ParseResult parse_select() {
@@ -1079,21 +1317,35 @@ private:
                     sel.items.push_back(std::move(item));
                     sel.has_aggregates = true;
                 } else {
-                    std::string qual;
-                    std::string c;
-                    if (auto e = expect_qualified_column(
-                            "a column name, aggregate, or '*'", qual, c)) {
-                        return e;
+                    // A1-A4: parse a scalar expression (covers a bare column, arithmetic, functions,
+                    // CASE, CAST). An optional `AS <alias>` names the output column.
+                    std::shared_ptr<Expr> ex;
+                    if (auto e = parse_scalar_expr(ex)) return e;
+                    std::string alias;
+                    bool has_alias = false;
+                    if (is_kw("as")) {
+                        advance();
+                        if (auto e = expect_ident("an alias after AS", alias)) return e;
+                        has_alias = true;
                     }
-                    SelectItem item;
-                    item.kind = SelectItemKind::Column;
-                    item.qualifier = qual;
-                    item.column = c;
-                    // The output label is the qualified spelling for a qualified ref so
-                    // self-joins distinguish a.x from b.x; bare for an unqualified one.
-                    item.label = qual.empty() ? c : qual + "." + c;
-                    sel.items.push_back(std::move(item));
-                    sel.columns.push_back(c);  // mirror for the v1 single-table path
+                    if (ex->kind == ExprKind::Col && !has_alias) {
+                        // A bare column stays a Column item (back-compat: GROUP BY validation, the v1
+                        // single-table fast path, qualified-label spelling).
+                        SelectItem item;
+                        item.kind = SelectItemKind::Column;
+                        item.qualifier = ex->qualifier;
+                        item.column = ex->column;
+                        item.label =
+                            ex->qualifier.empty() ? ex->column : ex->qualifier + "." + ex->column;
+                        sel.items.push_back(std::move(item));
+                        sel.columns.push_back(ex->column);
+                    } else {
+                        SelectItem item;
+                        item.kind = SelectItemKind::Expr;
+                        item.expr = ex;
+                        item.label = has_alias ? alias : expr_label(*ex);
+                        sel.items.push_back(std::move(item));
+                    }
                 }
                 if (cur_.kind == Tok::Comma) {
                     advance();

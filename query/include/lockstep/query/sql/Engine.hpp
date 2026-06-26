@@ -3728,33 +3728,45 @@ private:
             return ar;
         }
 
-        // No aggregates: resolve the plain projection (validate columns exist).
-        std::vector<std::size_t> proj;
-        std::vector<std::string> labels;
-        if (sel.star) {
-            for (std::size_t i = 0; i < t->columns.size(); ++i) {
-                proj.push_back(i);
-                labels.push_back(t->columns[i].name);
-            }
-        } else {
+        // No aggregates: project each item — a plain column (validated), or an A1-A4 scalar
+        // EXPRESSION evaluated per row (computed column). VALIDATE columns/expr-columns UP FRONT so
+        // an unknown reference errors even on an empty table (the row loop would otherwise skip it).
+        if (!sel.star) {
             for (const SelectItem& item : sel.items) {
-                // (an aggregate here is impossible — has_aggregates would be set)
-                const auto idx = t->column_index(item.column);
-                if (!idx) {
-                    return ExecResult::failure("unknown column '" + item.column +
-                                               "' in table '" + sel.table + "'");
+                if (item.kind == SelectItemKind::Expr) {
+                    if (auto e = validate_expr_columns(*item.expr, *t)) {
+                        return ExecResult::failure(*e);
+                    }
+                } else if (item.kind == SelectItemKind::Column && !t->column_index(item.column)) {
+                    return ExecResult::failure("unknown column '" + item.column + "' in table '" +
+                                               sel.table + "'");
                 }
-                proj.push_back(*idx);
-                labels.push_back(item.label);
             }
         }
-
-        // Build the projected output rows (still PK-ascending from the scan).
         ExecResult r;
         for (const auto& row : rows) {
             ResultRow out;
-            for (std::size_t k = 0; k < proj.size(); ++k) {
-                out.cells.emplace_back(labels[k], row[proj[k]]);
+            if (sel.star) {
+                for (std::size_t i = 0; i < t->columns.size(); ++i) {
+                    out.cells.emplace_back(t->columns[i].name, row[i]);
+                }
+            } else {
+                for (const SelectItem& item : sel.items) {
+                    if (item.kind == SelectItemKind::Expr) {
+                        Datum d;
+                        if (auto e = eval_expr(*item.expr, *t, row, d)) {
+                            return ExecResult::failure(*e);
+                        }
+                        out.cells.emplace_back(item.label, d);
+                    } else {
+                        const auto idx = t->column_index(item.column);
+                        if (!idx) {
+                            return ExecResult::failure("unknown column '" + item.column +
+                                                       "' in table '" + sel.table + "'");
+                        }
+                        out.cells.emplace_back(item.label, row[*idx]);
+                    }
+                }
             }
             r.rows.push_back(std::move(out));
         }
@@ -3782,6 +3794,176 @@ private:
             }
         }
         return false;
+    }
+
+    // A1-A4: evaluate a scalar expression over a single-table `row` to a Datum. Arithmetic is INT
+    // (NULL-propagating; division/mod by zero is an error); string/scalar functions + CAST + CASE.
+    [[nodiscard]] std::optional<std::string> eval_expr(const Expr& e, const Table& t,
+                                                       const std::vector<Datum>& row, Datum& out) {
+        switch (e.kind) {
+            case ExprKind::Lit:
+                out = e.lit;
+                return std::nullopt;
+            case ExprKind::Col: {
+                const auto idx = t.column_index(e.column);
+                if (!idx) return "unknown column '" + e.column + "' in expression";
+                out = row[*idx];
+                return std::nullopt;
+            }
+            case ExprKind::Neg: {
+                Datum c;
+                if (auto er = eval_expr(*e.left, t, row, c)) return er;
+                if (c.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+                if (c.type != Type::Int) return "unary '-' requires an INT operand";
+                out = Datum::make_int(-c.i);
+                return std::nullopt;
+            }
+            case ExprKind::Bin: {
+                Datum l, r;
+                if (auto er = eval_expr(*e.left, t, row, l)) return er;
+                if (auto er = eval_expr(*e.right, t, row, r)) return er;
+                if (l.is_null || r.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+                if (l.type != Type::Int || r.type != Type::Int)
+                    return "arithmetic requires INT operands";
+                std::int64_t v = 0;
+                switch (e.op) {
+                    case BinOp::Add: v = l.i + r.i; break;
+                    case BinOp::Sub: v = l.i - r.i; break;
+                    case BinOp::Mul: v = l.i * r.i; break;
+                    case BinOp::Div:
+                        if (r.i == 0) return "division by zero";
+                        v = l.i / r.i;
+                        break;
+                    case BinOp::Mod:
+                        if (r.i == 0) return "modulo by zero";
+                        v = l.i % r.i;
+                        break;
+                }
+                out = Datum::make_int(v);
+                return std::nullopt;
+            }
+            case ExprKind::Func:
+                return eval_func(e, t, row, out);
+            case ExprKind::Case: {
+                for (std::size_t i = 0; i < e.case_when.size(); ++i) {
+                    bool truth = false;
+                    if (auto er = eval_pred(e.case_when[i], e.case_when[i].root, t, row,
+                                            /*group=*/nullptr, truth))
+                        return er;
+                    if (truth) return eval_expr(*e.case_then[i], t, row, out);
+                }
+                if (e.case_else) return eval_expr(*e.case_else, t, row, out);
+                out = Datum::make_null(Type::Int);
+                return std::nullopt;
+            }
+        }
+        return "unhandled expression";
+    }
+
+    // A1: walk an expression and verify every column reference exists (so an unknown column errors
+    // up front — even on an empty table where the per-row eval would never run).
+    [[nodiscard]] std::optional<std::string> validate_expr_columns(const Expr& e, const Table& t) {
+        switch (e.kind) {
+            case ExprKind::Col:
+                if (!t.column_index(e.column))
+                    return "unknown column '" + e.column + "' in expression";
+                return std::nullopt;
+            case ExprKind::Lit:
+                return std::nullopt;
+            case ExprKind::Neg:
+                return validate_expr_columns(*e.left, t);
+            case ExprKind::Bin:
+                if (auto er = validate_expr_columns(*e.left, t)) return er;
+                return validate_expr_columns(*e.right, t);
+            case ExprKind::Func:
+                for (const auto& a : e.args)
+                    if (auto er = validate_expr_columns(*a, t)) return er;
+                return std::nullopt;
+            case ExprKind::Case:
+                for (const auto& th : e.case_then)
+                    if (auto er = validate_expr_columns(*th, t)) return er;
+                if (e.case_else)
+                    if (auto er = validate_expr_columns(*e.case_else, t)) return er;
+                return std::nullopt;
+        }
+        return std::nullopt;
+    }
+
+    // A2/A4: scalar function evaluation. NULL args generally propagate (COALESCE is the exception).
+    [[nodiscard]] std::optional<std::string> eval_func(const Expr& e, const Table& t,
+                                                       const std::vector<Datum>& row, Datum& out) {
+        std::vector<Datum> a(e.args.size());
+        for (std::size_t i = 0; i < e.args.size(); ++i) {
+            if (auto er = eval_expr(*e.args[i], t, row, a[i])) return er;
+        }
+        const std::string& f = e.func;
+        auto need = [&](std::size_t n) { return a.size() == n; };
+        if (f == "CAST") {
+            if (!need(1)) return "CAST takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(e.cast_type); return std::nullopt; }
+            if (e.cast_type == Type::Int) {
+                out = a[0].type == Type::Int ? a[0]
+                                             : Datum::make_int(std::strtoll(a[0].s.c_str(), nullptr, 10));
+            } else {
+                out = a[0].type == Type::Text ? a[0] : Datum::make_text(std::to_string(a[0].i));
+            }
+            return std::nullopt;
+        }
+        if (f == "COALESCE") {
+            for (const Datum& d : a) if (!d.is_null) { out = d; return std::nullopt; }
+            out = a.empty() ? Datum::make_null(Type::Int) : Datum::make_null(a.back().type);
+            return std::nullopt;
+        }
+        if (f == "ABS") {
+            if (!need(1)) return "ABS takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (a[0].type != Type::Int) return "ABS requires an INT argument";
+            out = Datum::make_int(a[0].i < 0 ? -a[0].i : a[0].i);
+            return std::nullopt;
+        }
+        // String functions below need their (single, where applicable) arg present.
+        if (f == "UPPER" || f == "LOWER" || f == "LENGTH") {
+            if (!need(1)) return f + " takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(f == "LENGTH" ? Type::Int : Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text) return f + " requires a TEXT argument";
+            if (f == "LENGTH") { out = Datum::make_int(static_cast<std::int64_t>(a[0].s.size())); return std::nullopt; }
+            std::string s = a[0].s;
+            for (char& c : s) {
+                if (f == "UPPER") c = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
+                else c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+            }
+            out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        if (f == "SUBSTR") {
+            if (a.size() != 2 && a.size() != 3) return "SUBSTR takes (text, start[, len])";
+            if (a[0].is_null || a[1].is_null || (a.size() == 3 && a[2].is_null)) {
+                out = Datum::make_null(Type::Text);
+                return std::nullopt;
+            }
+            if (a[0].type != Type::Text || a[1].type != Type::Int ||
+                (a.size() == 3 && a[2].type != Type::Int))
+                return "SUBSTR(text, INT[, INT])";
+            const std::string& s = a[0].s;
+            // 1-based start (SQL); clamp into range.
+            std::int64_t start = a[1].i < 1 ? 1 : a[1].i;
+            std::size_t b = static_cast<std::size_t>(start - 1);
+            if (b > s.size()) b = s.size();
+            std::size_t len = a.size() == 3 ? static_cast<std::size_t>(a[2].i < 0 ? 0 : a[2].i)
+                                            : s.size() - b;
+            out = Datum::make_text(s.substr(b, len));
+            return std::nullopt;
+        }
+        if (f == "CONCAT") {
+            std::string s;
+            for (const Datum& d : a) {
+                if (d.is_null) continue;  // SQL CONCAT skips NULLs
+                s += d.type == Type::Text ? d.s : std::to_string(d.i);
+            }
+            out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        return "unknown function '" + f + "'";
     }
 
     ExecResult exec_aggregate(const SelectStmt& sel, const Table& t,
@@ -5035,6 +5217,9 @@ private:
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Column) {
                 mark(item.column);
+            } else if (item.kind == SelectItemKind::Expr) {
+                // A1: an expression may touch any column — decode them all (conservative + correct).
+                return std::vector<bool>(t.columns.size(), true);
             } else if (item.agg.kind != AggKind::CountStar) {
                 mark(item.agg.column);  // COUNT(*) needs no column
             }
