@@ -72,7 +72,7 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] F8 DROP TABLE (catalog forget + durable schema tombstone; re-create empty; teeth=unknown) — sql_drop_table_test
 - [x] C1 COUNT/SUM/AVG(DISTINCT) (per-group dedup in compute_agg; fast paths gated; distributed rejects; teeth) — sql_distinct_agg_test
 - [x] B1 LIKE / NOT LIKE (% _; CmpOp::Like + matcher; vectorizer rejects; NOT LIKE wraps Not; teeth) — sql_like_test
-- [ ] G3 NULLS FIRST/LAST
+- [x] G3 NULLS FIRST/LAST (order_key_less honors per-key; default=NULL smallest unchanged; teeth) — sql_nulls_order_test
 - [ ] A1 scalar arithmetic (foundation)
 - [ ] A3 CASE WHEN · A2 string fns · F5 CHECK · G4 ORDER BY expr (ride on A1)
 - [ ] D1 UNION/ALL · D2 INTERSECT/EXCEPT · D5 INSERT…SELECT · E1 RIGHT/FULL · E2 CROSS · F4 DEFAULT · F6 AUTO_INCREMENT · G2 UPSERT

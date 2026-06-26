@@ -214,10 +214,15 @@ struct Predicate {
 // One ORDER BY key: a column name + a direction. (ORDER BY references projected /
 // table columns by name; tie-break by PK is appended by the planner for a total,
 // byte-deterministic order.)
+// G3: explicit NULL ordering for an ORDER BY key. Default = "NULL is the smallest value" (so NULLs
+// sort FIRST under ASC, LAST under DESC — the engine's pre-G3 behavior); First/Last override it.
+enum class NullsOrder : std::uint8_t { Default = 0, First = 1, Last = 2 };
+
 struct OrderKey {
     std::string qualifier;  // v3: optional table/alias qualifier ("" == unqualified)
     std::string column;
     bool descending = false;  // ASC default
+    NullsOrder nulls = NullsOrder::Default;  // G3: NULLS FIRST | LAST override
 };
 
 // One SELECT-list item: either a plain column or an aggregate expression. A v1

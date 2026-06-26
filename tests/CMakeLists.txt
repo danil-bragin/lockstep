@@ -1167,6 +1167,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_like_test COMMAND lockstep_sql_like_test)
 
+  # sql_nulls_order_test (G3): ORDER BY ... NULLS FIRST/LAST + default NULL placement.
+  add_executable(lockstep_sql_nulls_order_test sql_nulls_order_test.cpp)
+  target_include_directories(lockstep_sql_nulls_order_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_nulls_order_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_nulls_order_test COMMAND lockstep_sql_nulls_order_test)
+
   # sql_join_test (SQL v3): the EXTENDED FROM surface — INNER / LEFT [OUTER] / comma-
   # cross joins with ON predicates, qualified columns (table.col + AS alias), multi-
   # join (left-deep), self-join, 3-table join, and NULL-introducing LEFT joins. Each

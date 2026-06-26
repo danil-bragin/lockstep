@@ -1060,6 +1060,19 @@ private:
                     key.descending = true;
                     advance();
                 }
+                // G3: optional NULLS FIRST | NULLS LAST after the ASC/DESC direction.
+                if (is_kw("nulls")) {
+                    advance();
+                    if (is_kw("first")) {
+                        key.nulls = NullsOrder::First;
+                        advance();
+                    } else if (is_kw("last")) {
+                        key.nulls = NullsOrder::Last;
+                        advance();
+                    } else {
+                        return make_err("expected FIRST or LAST after NULLS in ORDER BY");
+                    }
+                }
                 sel.order_by.push_back(std::move(key));
                 if (cur_.kind == Tok::Comma) {
                     advance();

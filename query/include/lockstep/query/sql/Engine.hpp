@@ -5867,10 +5867,9 @@ private:
         std::stable_sort(rows.begin(), rows.end(),
                          [&](const ResultRow& x, const ResultRow& y) {
                              for (const OrderKey& k : sel.order_by) {
-                                 const int c = cmp_by_label(x, y, k.column);
-                                 if (c != 0) {
-                                     return k.descending ? (c > 0) : (c < 0);
-                                 }
+                                 int dir = 0;
+                                 if (order_key_less(x, y, k, dir)) return true;
+                                 if (dir != 0) return false;
                              }
                              // Tie-break by PK (ascending) for a TOTAL order.
                              const int c = cmp_by_label(x, y, pk_label);
@@ -5897,14 +5896,48 @@ private:
         std::stable_sort(rows.begin(), rows.end(),
                          [&](const ResultRow& x, const ResultRow& y) {
                              for (const OrderKey& k : sel.order_by) {
-                                 const int c = cmp_by_label(x, y, k.column);
-                                 if (c != 0) {
-                                     return k.descending ? (c > 0) : (c < 0);
-                                 }
+                                 int dir = 0;
+                                 if (order_key_less(x, y, k, dir)) return true;
+                                 if (dir != 0) return false;  // strictly greater on this key
                              }
                              return render_row(x) < render_row(y);  // total tie-break
                          });
         return std::nullopt;
+    }
+
+    // G3: compare two rows on ONE ORDER BY key, honoring NULLS FIRST/LAST. Returns true iff x<y on
+    // this key; sets `dir` to 0 only when the key is a TIE (continue to the next key). A NULL is
+    // placed FIRST/LAST per k.nulls; Default = NULL is the smallest value (FIRST under ASC, LAST
+    // under DESC) — byte-identical to the pre-G3 cmp_datum behavior.
+    static bool order_key_less(const ResultRow& x, const ResultRow& y, const OrderKey& k, int& dir) {
+        const Datum* dx = cell(x, k.column);
+        const Datum* dy = cell(y, k.column);
+        if (dx == nullptr || dy == nullptr) {
+            dir = 0;
+            return false;  // label missing on this row — treat as a tie (pre-G3 cmp_by_label==0)
+        }
+        const bool xn = dx->is_null, yn = dy->is_null;
+        if (xn || yn) {
+            if (xn && yn) {
+                dir = 0;
+                return false;
+            }
+            bool nulls_first;
+            if (k.nulls == NullsOrder::First) {
+                nulls_first = true;
+            } else if (k.nulls == NullsOrder::Last) {
+                nulls_first = false;
+            } else {
+                nulls_first = !k.descending;  // Default: matches cmp_datum (NULL smallest) + dir flip
+            }
+            const bool x_first = xn;  // the NULL side
+            dir = 1;                  // not a tie
+            return nulls_first ? x_first : !x_first;
+        }
+        const int c = cmp_datum(*dx, *dy);
+        dir = c;
+        if (c == 0) return false;
+        return k.descending ? (c > 0) : (c < 0);
     }
 
     // ORDER BY for the JOINED AGGREGATE path: an ORDER BY key may be spelled QUALIFIED
