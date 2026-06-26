@@ -260,6 +260,11 @@ struct JoinEntry {
     Predicate on;       // ON predicate (root -1 == none, i.e. a CROSS join)
 };
 
+// D1/D2: set operation linking two SELECTs. None for a plain query; UNION/INTERSECT/EXCEPT chain
+// the right-hand SELECT after this one. `all` keeps duplicates (UNION ALL); otherwise the combined
+// result is whole-row deduplicated.
+enum class SetOp : std::uint8_t { None = 0, Union = 1, Intersect = 2, Except = 3 };
+
 struct SelectStmt {
     std::string table;                 // v1/v2: the single base table (== from[0].table
                                        // when present); kept for the no-JOIN fast path.
@@ -319,6 +324,13 @@ struct SelectStmt {
     // bottlenecks (PERF_PLAN.md Phase 0).
     bool explain = false;
     bool explain_analyze = false;
+
+    // D1/D2: a trailing set operation. When set_op != None, set_op_rhs is the right-hand SELECT and
+    // the two results are combined (UNION/INTERSECT/EXCEPT); set_op_all keeps duplicates (… ALL).
+    // ORDER BY / LIMIT on the LAST arm apply to the whole combined result (SQL set-op semantics).
+    SetOp set_op = SetOp::None;
+    bool set_op_all = false;
+    std::shared_ptr<SelectStmt> set_op_rhs;
 };
 
 // The tagged statement union (a small value; no heap-owned polymorphism).

@@ -833,7 +833,8 @@ private:
                is_kw("right") || is_kw("outer") || is_kw("cross") || is_kw("on") ||
                is_kw("as") || is_kw("is") || is_kw("in") || is_kw("exists") ||
                is_kw("null") || is_kw("not") || is_kw("between") ||
-               is_kw("full") || is_kw("nulls") || is_kw("like") || is_kw("union");
+               is_kw("full") || is_kw("nulls") || is_kw("like") || is_kw("union") ||
+               is_kw("intersect") || is_kw("except");
     }
 
     // Try to parse an AGGREGATE call at the cursor: NAME '(' ('*' | col) ')'.
@@ -934,6 +935,39 @@ private:
         st.kind = StmtKind::Select;
         if (auto e = parse_select_stmt(st.select)) {
             return ParseResult{*e};
+        }
+        // D1/D2: trailing set operations — `... UNION [ALL] SELECT ...` (also INTERSECT/EXCEPT),
+        // right-linked through set_op_rhs. A trailing ORDER BY/LIMIT lands on the LAST arm and the
+        // executor applies it to the whole combined result.
+        SelectStmt* tail = &st.select;
+        for (;;) {
+            SetOp op = SetOp::None;
+            if (is_kw("union")) {
+                op = SetOp::Union;
+            } else if (is_kw("intersect")) {
+                op = SetOp::Intersect;
+            } else if (is_kw("except")) {
+                op = SetOp::Except;
+            } else {
+                break;
+            }
+            advance();
+            bool all = false;
+            if (is_kw("all")) {
+                all = true;
+                advance();
+            }
+            if (!is_kw("select")) {
+                return make_err("expected SELECT after a set operator (UNION/INTERSECT/EXCEPT)");
+            }
+            auto rhs = std::make_shared<SelectStmt>();
+            if (auto e = parse_select_stmt(*rhs)) {
+                return ParseResult{*e};
+            }
+            tail->set_op = op;
+            tail->set_op_all = all;
+            tail->set_op_rhs = rhs;
+            tail = rhs.get();
         }
         return ParseResult{std::move(st)};
     }

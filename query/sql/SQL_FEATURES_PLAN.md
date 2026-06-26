@@ -75,7 +75,8 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] G3 NULLS FIRST/LAST (order_key_less honors per-key; default=NULL smallest unchanged; teeth) — sql_nulls_order_test
 - [ ] A1 scalar arithmetic (foundation)
 - [ ] A3 CASE WHEN · A2 string fns · F5 CHECK · G4 ORDER BY expr (ride on A1)
-- [ ] D1 UNION/ALL · D2 INTERSECT/EXCEPT · E2 CROSS · F4 DEFAULT · F6 AUTO_INCREMENT · G2 UPSERT
+- [x] D1 UNION/ALL + D2 INTERSECT/EXCEPT (set-op chain; dedup; combined ORDER/LIMIT; arity teeth) — sql_setops_test
+- [ ] E2 CROSS · F4 DEFAULT · F6 AUTO_INCREMENT · G2 UPSERT
 - [ ] D3 FROM-subquery · D4 CTE · F9 types · B2 correlated · C3 window · F2 UNIQUE · F3 FK · F7 ALTER · E3 N-way · E4 non-equi · A4 CAST · C2 GROUPING SETS
 - [ ] F1 composite PK/index (HIGHEST risk — last)
 - [x] E2 CROSS JOIN — ALREADY PRESENT (catalog miss; verified)

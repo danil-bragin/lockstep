@@ -3345,7 +3345,102 @@ private:
         return "?";
     }
 
+    // D1/D2: UNION / INTERSECT / EXCEPT [ALL]. Flatten the right-linked chain into arms, run each
+    // arm's CORE (no per-arm ORDER BY / LIMIT / set_op), combine left-to-right by the op between
+    // consecutive arms, then apply the LAST arm's ORDER BY + LIMIT to the whole combined result
+    // (SQL set-op semantics). All arms must have the same output arity. UNION/INTERSECT/EXCEPT
+    // without ALL deduplicate whole rows (deterministic, by the canonical row rendering).
+    ExecResult exec_set_operation(const SelectStmt& sel) {
+        // Collect the arms + the op that joins each to the next.
+        std::vector<const SelectStmt*> arms;
+        std::vector<SetOp> ops;            // ops[i] joins arms[i] with arms[i+1]
+        std::vector<bool> alls;
+        for (const SelectStmt* s = &sel;;) {
+            arms.push_back(s);
+            if (s->set_op == SetOp::None || !s->set_op_rhs) break;
+            ops.push_back(s->set_op);
+            alls.push_back(s->set_op_all);
+            s = s->set_op_rhs.get();
+        }
+        // Run one arm's core (strip ORDER BY / LIMIT / set_op so they don't apply per-arm).
+        auto run_core = [&](const SelectStmt* a) -> ExecResult {
+            SelectStmt core = *a;
+            core.set_op = SetOp::None;
+            core.set_op_rhs.reset();
+            core.order_by.clear();
+            core.has_limit = false;
+            core.offset = 0;
+            return exec_select(core);
+        };
+        ExecResult acc = run_core(arms[0]);
+        if (!acc.ok) return acc;
+        for (std::size_t i = 1; i < arms.size(); ++i) {
+            const ExecResult rhs = run_core(arms[i]);
+            if (!rhs.ok) return rhs;
+            if (!acc.rows.empty() && !rhs.rows.empty() &&
+                acc.rows[0].cells.size() != rhs.rows[0].cells.size()) {
+                return ExecResult::failure(
+                    "set operation: each SELECT must have the same number of columns");
+            }
+            acc.rows = combine_rows(ops[i - 1], alls[i - 1], acc.rows, rhs.rows);
+        }
+        // The labels come from the FIRST arm (already in acc). Apply the LAST arm's ORDER BY/LIMIT.
+        const SelectStmt* last = arms.back();
+        if (auto e = apply_order_by_labels(*last, acc.rows)) {
+            return ExecResult::failure(*e);
+        }
+        apply_limit(*last, acc.rows);
+        acc.affected = acc.rows.size();
+        return acc;
+    }
+
+    // Combine two row sets per a set operator. `all` keeps multiplicity; otherwise the result is
+    // whole-row deduplicated (stable, first occurrence) by the canonical render_row key.
+    static std::vector<ResultRow> combine_rows(SetOp op, bool all,
+                                               const std::vector<ResultRow>& l,
+                                               const std::vector<ResultRow>& r) {
+        std::vector<ResultRow> out;
+        auto key = [](const ResultRow& row) { return render_row(row); };
+        if (op == SetOp::Union) {
+            out = l;
+            out.insert(out.end(), r.begin(), r.end());
+        } else if (op == SetOp::Intersect) {
+            std::multiset<std::string> rk;
+            for (const ResultRow& row : r) rk.insert(key(row));
+            for (const ResultRow& row : l) {
+                auto it = rk.find(key(row));
+                if (it != rk.end()) {
+                    out.push_back(row);
+                    if (all) rk.erase(it);  // ALL: pair up multiplicities
+                }
+            }
+        } else {  // Except: rows of l not matched in r
+            std::multiset<std::string> rk;
+            for (const ResultRow& row : r) rk.insert(key(row));
+            for (const ResultRow& row : l) {
+                auto it = rk.find(key(row));
+                if (it != rk.end()) {
+                    if (all) rk.erase(it);  // ALL: each right row cancels one left row
+                    continue;
+                }
+                out.push_back(row);
+            }
+        }
+        if (!all) {
+            std::vector<ResultRow> dedup;
+            std::set<std::string> seen;
+            for (ResultRow& row : out) {
+                if (seen.insert(key(row)).second) dedup.push_back(std::move(row));
+            }
+            out = std::move(dedup);
+        }
+        return out;
+    }
+
     ExecResult exec_select(const SelectStmt& sel) {
+        if (sel.set_op != SetOp::None) {
+            return exec_set_operation(sel);
+        }
         if (sel.explain) {
             return explain_select(sel);
         }
