@@ -1260,6 +1260,8 @@ private:
             kind = AggKind::Max;
         } else if (fn == "avg") {
             kind = AggKind::Avg;
+        } else if (fn == "array_agg") {
+            kind = AggKind::ArrayAgg;  // F12
         } else {
             return std::nullopt;  // not an aggregate name
         }
@@ -2270,7 +2272,22 @@ private:
         //   * ANOTHER column (col-vs-col theta, e.g. an equi-join key a.x = b.y).
         //   * a plain LITERAL (the v1/v2 case).
         // An aggregate operand (HAVING) only takes a literal RHS.
-        if (!is_agg && cur_.kind == Tok::LParen) {
+        if (!is_agg && (is_kw("any") || is_kw("all"))) {  // F12: lhs <op> ANY|ALL ( <array> )
+            leaf.any_quant = is_kw("any");
+            leaf.all_quant = is_kw("all");
+            advance();
+            if (auto e = expect(Tok::LParen, "'(' after ANY/ALL")) return e;
+            if (cur_.kind == Tok::Ident && !is_kw("array") && !at_clause_boundary()) {
+                std::string rq, rc;
+                if (auto e = expect_qualified_column("an array column inside ANY/ALL", rq, rc)) return e;
+                leaf.rhs_is_column = true;
+                leaf.rhs_qualifier = rq;
+                leaf.rhs_column = rc;
+            } else if (auto e = expect_value_or_null(leaf.literal)) {
+                return e;
+            }
+            if (auto e = expect(Tok::RParen, "')' to close ANY/ALL")) return e;
+        } else if (!is_agg && cur_.kind == Tok::LParen) {
             std::shared_ptr<SelectStmt> sub;
             if (auto e = parse_subquery(sub)) {
                 return e;

@@ -2763,6 +2763,7 @@ private:
         // bail to the row-mode AoS path (compute_agg), which decodes the 16-byte payloads.
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
+                if (item.agg.kind == AggKind::ArrayAgg) return std::nullopt;  // F12: row-AoS only
                 if (const auto idx = t.column_index(item.agg.column))
                     if (t.columns[*idx].logical >= 5) return std::nullopt;
             }
@@ -4143,36 +4144,70 @@ private:
                 }
             }
         }
+        // F12: UNNEST(arr) in the SELECT list expands each input row into ONE row per array element.
+        // Support a single UNNEST (not combined with window functions); other items repeat per element.
+        int unnest_idx = -1;
+        for (std::size_t a = 0; a < sel.items.size(); ++a) {
+            const SelectItem& item = sel.items[a];
+            if (item.kind == SelectItemKind::Expr && item.expr->kind == ExprKind::Func &&
+                item.expr->func == "UNNEST") {
+                if (unnest_idx >= 0) return ExecResult::failure("only one UNNEST per SELECT is supported");
+                if (item.expr->args.size() != 1) return ExecResult::failure("UNNEST takes one ARRAY argument");
+                unnest_idx = static_cast<int>(a);
+            }
+        }
+        if (unnest_idx >= 0)
+            for (const auto& it : sel.items)
+                if (it.kind == SelectItemKind::Window)
+                    return ExecResult::failure("UNNEST cannot be combined with window functions");
+
         ExecResult r;
         for (std::size_t ri = 0; ri < rows.size(); ++ri) {
             const auto& row = rows[ri];
-            ResultRow out;
+            // Evaluate one projected item to a Datum (column / expression / window).
+            auto eval_item = [&](std::size_t a, Datum& d) -> std::optional<std::string> {
+                const SelectItem& item = sel.items[a];
+                if (item.kind == SelectItemKind::Window) { d = win_vals[a][ri]; return std::nullopt; }
+                if (item.kind == SelectItemKind::Expr) return eval_expr(*item.expr, *t, row, d);
+                const auto idx = t->column_index(item.column);
+                if (!idx) return std::string("unknown column '" + item.column + "'");
+                d = row[*idx];
+                return std::nullopt;
+            };
             if (sel.star) {
-                for (std::size_t i = 0; i < t->columns.size(); ++i) {
+                ResultRow out;
+                for (std::size_t i = 0; i < t->columns.size(); ++i)
                     out.cells.emplace_back(t->columns[i].name, row[i]);
-                }
-            } else {
+                r.rows.push_back(std::move(out));
+            } else if (unnest_idx < 0) {
+                ResultRow out;
                 for (std::size_t a = 0; a < sel.items.size(); ++a) {
-                    const SelectItem& item = sel.items[a];
-                    if (item.kind == SelectItemKind::Window) {
-                        out.cells.emplace_back(item.label, win_vals[a][ri]);
-                    } else if (item.kind == SelectItemKind::Expr) {
-                        Datum d;
-                        if (auto e = eval_expr(*item.expr, *t, row, d)) {
-                            return ExecResult::failure(*e);
+                    Datum d;
+                    if (auto e = eval_item(a, d)) return ExecResult::failure(*e);
+                    out.cells.emplace_back(sel.items[a].label, d);
+                }
+                r.rows.push_back(std::move(out));
+            } else {
+                // Decode the UNNEST array for this row, then emit one output row per element.
+                Datum arr;
+                if (auto e = eval_expr(*sel.items[unnest_idx].expr->args[0], *t, row, arr))
+                    return ExecResult::failure(*e);
+                if (arr.is_null || arr.logical != 7) continue;  // NULL / non-array -> no rows
+                const std::vector<Datum> elems = Datum::decode_array(arr.s);
+                for (const Datum& el : elems) {
+                    ResultRow out;
+                    for (std::size_t a = 0; a < sel.items.size(); ++a) {
+                        if (static_cast<int>(a) == unnest_idx) {
+                            out.cells.emplace_back(sel.items[a].label, el);
+                        } else {
+                            Datum d;
+                            if (auto e = eval_item(a, d)) return ExecResult::failure(*e);
+                            out.cells.emplace_back(sel.items[a].label, d);
                         }
-                        out.cells.emplace_back(item.label, d);
-                    } else {
-                        const auto idx = t->column_index(item.column);
-                        if (!idx) {
-                            return ExecResult::failure("unknown column '" + item.column +
-                                                       "' in table '" + sel.table + "'");
-                        }
-                        out.cells.emplace_back(item.label, row[*idx]);
                     }
+                    r.rows.push_back(std::move(out));
                 }
             }
-            r.rows.push_back(std::move(out));
         }
 
         // (5) DISTINCT, (6) ORDER BY, (7) LIMIT/OFFSET.
@@ -4690,6 +4725,58 @@ private:
                 s += d.type == Type::Text ? d.s : std::to_string(d.i);
             }
             out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        // F12: array functions. An array argument is logical==7 (16-byte-ish self-describing payload).
+        auto is_array = [](const Datum& d) { return d.logical == 7 && d.type == Type::Text; };
+        if (f == "ARRAY_LENGTH" || f == "CARDINALITY") {
+            if (!need(1)) return f + " takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (!is_array(a[0])) return f + " requires an ARRAY argument";
+            out = Datum::make_int(static_cast<std::int64_t>(Datum::decode_array(a[0].s).size()));
+            return std::nullopt;
+        }
+        if (f == "ARRAY_CONTAINS") {  // array_contains(arr, x) -> 1/0 (== the `x = ANY(arr)` test)
+            if (!need(2)) return "ARRAY_CONTAINS takes (array, element)";
+            if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (!is_array(a[0])) return "ARRAY_CONTAINS requires an ARRAY first argument";
+            std::int64_t found = 0;
+            for (const Datum& el : Datum::decode_array(a[0].s))
+                if (!el.is_null && !a[1].is_null && cmp_datum(el, a[1]) == 0) { found = 1; break; }
+            out = Datum::make_int(found);
+            return std::nullopt;
+        }
+        if (f == "ARRAY_POSITION") {  // 1-based index of the first match, else NULL
+            if (!need(2)) return "ARRAY_POSITION takes (array, element)";
+            if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (!is_array(a[0])) return "ARRAY_POSITION requires an ARRAY first argument";
+            const std::vector<Datum> elems = Datum::decode_array(a[0].s);
+            out = Datum::make_null(Type::Int);
+            for (std::size_t k = 0; k < elems.size(); ++k)
+                if (!elems[k].is_null && !a[1].is_null && cmp_datum(elems[k], a[1]) == 0) {
+                    out = Datum::make_int(static_cast<std::int64_t>(k + 1));
+                    break;
+                }
+            return std::nullopt;
+        }
+        if (f == "ARRAY_APPEND") {  // array_append(arr, x) -> arr with x added
+            if (!need(2)) return "ARRAY_APPEND takes (array, element)";
+            if (!is_array(a[0])) return "ARRAY_APPEND requires an ARRAY first argument";
+            std::vector<Datum> elems = Datum::decode_array(a[0].s);
+            elems.push_back(a[1]);
+            out = Datum::make_text(Datum::encode_array(static_cast<std::uint8_t>(a[0].s[0]),
+                                                       static_cast<std::uint8_t>(a[0].s[1]), elems));
+            out.logical = 7;
+            return std::nullopt;
+        }
+        if (f == "ARRAY_CAT") {  // array_cat(a, b) -> concatenation
+            if (!need(2)) return "ARRAY_CAT takes (array, array)";
+            if (!is_array(a[0]) || !is_array(a[1])) return "ARRAY_CAT requires two ARRAY arguments";
+            std::vector<Datum> elems = Datum::decode_array(a[0].s);
+            for (Datum& el : Datum::decode_array(a[1].s)) elems.push_back(std::move(el));
+            out = Datum::make_text(Datum::encode_array(static_cast<std::uint8_t>(a[0].s[0]),
+                                                       static_cast<std::uint8_t>(a[0].s[1]), elems));
+            out.logical = 7;
             return std::nullopt;
         }
         return "unknown function '" + f + "'";
@@ -5791,6 +5878,7 @@ private:
             return std::string("SUM/AVG requires a numeric column (got TEXT column '" +
                                a.column + "')");
         }
+        if (a.kind == AggKind::ArrayAgg) return std::string("ARRAY_AGG is not supported in a join yet");
         return std::nullopt;
     }
 
@@ -6958,6 +7046,25 @@ private:
             }
             lhs = row[*idx];
         }
+        // F12: `lhs <op> ANY|ALL (<array>)` — test the op against every element.
+        if (n.any_quant || n.all_quant) {
+            Datum arr = n.literal;
+            if (n.rhs_is_column) {
+                const auto ai = t.column_index(n.rhs_column);
+                if (!ai) return "unknown column '" + n.rhs_column + "' in ANY/ALL";
+                arr = row[*ai];
+            }
+            if (lhs.is_null || arr.is_null || arr.logical != 7) { truth = false; return std::nullopt; }
+            const std::vector<Datum> elems = Datum::decode_array(arr.s);
+            bool any = false, all = true;
+            for (const Datum& el : elems) {
+                const bool m = !el.is_null && apply_cmp(n.op, cmp_datum(lhs, el));
+                any = any || m;
+                all = all && m;
+            }
+            truth = n.any_quant ? any : all;  // empty: ANY=false, ALL=true
+            return std::nullopt;
+        }
         // v4: the RHS may be a SCALAR SUBQUERY (col <op> (SELECT agg)). Resolve it to a
         // Datum (NULL if the subquery returned 0 rows; an error if it returned >1 row).
         Datum rhs;
@@ -7057,6 +7164,17 @@ private:
         }
         const std::size_t ci = *idx;
         const Type ty = t.columns[ci].type;
+        // F12: ARRAY_AGG — collect the group's values (in scan order, INCLUDING NULLs, Postgres
+        // semantics) into an array whose element type is the column's.
+        if (a.kind == AggKind::ArrayAgg) {
+            std::vector<Datum> elems;
+            elems.reserve(grp.rows.size());
+            for (const auto* rp : grp.rows) elems.push_back((*rp)[ci]);
+            out = Datum::make_text(
+                Datum::encode_array(t.columns[ci].logical, t.columns[ci].scale, elems));
+            out.logical = 7;
+            return std::nullopt;
+        }
         // Collect the PRESENT (non-NULL) values of the aggregated column.
         std::vector<const Datum*> present;
         for (const auto* rp : grp.rows) {

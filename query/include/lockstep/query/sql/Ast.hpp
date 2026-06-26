@@ -146,6 +146,7 @@ enum class AggKind : std::uint8_t {
     Min = 3,        // MIN(col)
     Max = 4,        // MAX(col)
     Avg = 5,        // AVG(col) — INT truncation toward zero (documented; see Engine)
+    ArrayAgg = 6,   // F12: ARRAY_AGG(col) — collect the group's values (in scan order) into an array
 };
 
 // One aggregate expression: a kind + (for non-CountStar) the target column name.
@@ -200,6 +201,12 @@ struct PredNode {
     // error, like real SQL; 0 rows => the scalar is NULL => the comparison is UNKNOWN).
     // Mutually exclusive with rhs_is_column / literal.
     bool rhs_is_subquery = false;
+
+    // F12: `lhs <op> ANY|ALL (<array>)` — the RHS array is `literal` (an array value) or the
+    // rhs_is_column reference. ANY == true if the op holds for SOME element; ALL == for EVERY
+    // element (an empty array is true for ALL, false for ANY).
+    bool any_quant = false;
+    bool all_quant = false;
 
     // v4: IsNull (`is_not` => IS NOT NULL); InList / Exists (`is_not` => NOT IN /
     // NOT EXISTS). For IsNull/InList the tested operand is (qualifier,column); for
