@@ -1691,17 +1691,21 @@ private:
         }
         if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
             if (ty == Type::Int && no_nulls) {
+                // BRANCHLESS reduction (the `if (x < best)` branch defeats vectorization — MIN/MAX
+                // measured ~3-4x SUM; a min/max reduction auto-vectorizes at -O2). Seed from the
+                // first element (or the carried partial) so there is no per-element `any` test.
                 for (std::size_t k = lo; k < hi; ++k) {
                     const ColumnChunk& ch = chunks[k];
+                    if (ch.count == 0) continue;
+                    const std::int64_t* x = ch.ints.data();
+                    std::int64_t b = p.any ? p.ibest : x[0];
                     if (a.kind == AggKind::Min) {
-                        for (std::uint32_t r = 0; r < ch.count; ++r) {
-                            if (!p.any || ch.ints[r] < p.ibest) { p.ibest = ch.ints[r]; p.any = true; }
-                        }
+                        for (std::uint32_t r = 0; r < ch.count; ++r) b = std::min(b, x[r]);
                     } else {
-                        for (std::uint32_t r = 0; r < ch.count; ++r) {
-                            if (!p.any || ch.ints[r] > p.ibest) { p.ibest = ch.ints[r]; p.any = true; }
-                        }
+                        for (std::uint32_t r = 0; r < ch.count; ++r) b = std::max(b, x[r]);
                     }
+                    p.ibest = b;
+                    p.any = true;
                 }
                 return p;
             }
