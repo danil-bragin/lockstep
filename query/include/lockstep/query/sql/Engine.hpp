@@ -1794,6 +1794,65 @@ private:
         }
     }
 
+    // OPEN-ADDRESSING hash GROUP BY collect (A1): build the groups for a single NOT NULL key via a
+    // flat linear-probe hash table (no std::map red-black tree — a tree's per-row key compares +
+    // pointer chasing are the text-key GROUP BY cost; profiled ~2.8x slower than open addressing).
+    // Collects each group's member row indices (row order) + the key datum, then returns the groups
+    // SORTED by key — byte-identical to the ordered-map output (same group order, same per-group
+    // index order). KeyT is std::int64_t or std::string (std::hash + operator< both defined).
+    template <class KeyT, class Passes, class KeyOf, class KeyDatumOf>
+    std::vector<std::pair<std::vector<Datum>, std::vector<std::uint32_t>>> hash_group_collect(
+        std::uint32_t count, bool has_filter, Passes passes, KeyOf key_of,
+        KeyDatumOf key_datum_of) {
+        std::size_t cap = 256;  // power of 2 (mask probing)
+        std::vector<std::int32_t> slots(cap, -1);
+        std::vector<KeyT> keys;
+        std::vector<std::vector<Datum>> kds;
+        std::vector<std::vector<std::uint32_t>> idxs;
+        const std::hash<KeyT> hashf;
+        auto reinsert = [&](std::int32_t gi) {
+            std::size_t p = hashf(keys[static_cast<std::size_t>(gi)]) & (cap - 1);
+            while (slots[p] >= 0) p = (p + 1) & (cap - 1);
+            slots[p] = gi;
+        };
+        for (std::uint32_t rr = 0; rr < count; ++rr) {
+            if (has_filter && !passes(rr)) continue;
+            KeyT k = key_of(rr);
+            std::size_t p = hashf(k) & (cap - 1);
+            while (true) {
+                if (slots[p] < 0) {
+                    if ((keys.size() + 1) * 10 >= cap * 7) {  // load factor 0.7 => grow + rehash
+                        cap *= 2;
+                        slots.assign(cap, -1);
+                        for (std::int32_t gi = 0; gi < static_cast<std::int32_t>(keys.size()); ++gi) {
+                            reinsert(gi);
+                        }
+                        p = hashf(k) & (cap - 1);
+                        continue;
+                    }
+                    slots[p] = static_cast<std::int32_t>(keys.size());
+                    keys.push_back(k);
+                    kds.push_back(key_datum_of(rr));
+                    idxs.emplace_back();
+                    break;
+                }
+                if (keys[static_cast<std::size_t>(slots[p])] == k) break;
+                p = (p + 1) & (cap - 1);
+            }
+            idxs[static_cast<std::size_t>(slots[p])].push_back(rr);
+        }
+        std::vector<std::size_t> order(keys.size());
+        for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](std::size_t a, std::size_t b) { return keys[a] < keys[b]; });
+        std::vector<std::pair<std::vector<Datum>, std::vector<std::uint32_t>>> out;
+        out.reserve(order.size());
+        for (const std::size_t oi : order) {
+            out.emplace_back(std::move(kds[oi]), std::move(idxs[oi]));
+        }
+        return out;
+    }
+
     // Fold ONE aggregate over the WHOLE column [0,count) — CONTIGUOUS (no index gather), so
     // the SUM/MIN/MAX loops auto-vectorize (SIMD) at -O2. For a NOT NULL column there is no
     // per-element null branch (the branch that otherwise defeats vectorization). Used by the
@@ -2407,6 +2466,7 @@ private:
             !t.columns[gcols[0]].nullable) {
             const std::size_t gc = gcols[0];
             std::map<std::int64_t, std::pair<std::vector<std::uint32_t>, std::vector<Datum>>> ig;
+            std::vector<std::pair<std::vector<Datum>, std::vector<std::uint32_t>>> hg;  // open-addr
             if (par_group) {
                 build_groups_parallel(
                     ig, count, has_filter, passes,
@@ -2415,22 +2475,23 @@ private:
                         return std::vector<Datum>{Datum::make_int(cols[gc]->ints[rr])};
                     });
             } else {
-                for (std::uint32_t rr = 0; rr < count; ++rr) {
-                    if (has_filter && !passes(rr)) {
-                        continue;
-                    }
-                    auto& slot = ig[cols[gc]->ints[rr]];
-                    if (slot.second.empty()) {
-                        slot.second.push_back(Datum::make_int(cols[gc]->ints[rr]));
-                    }
-                    slot.first.push_back(rr);
-                }
+                hg = hash_group_collect<std::int64_t>(  // open-addressing (A1) — sorted by key
+                    count, has_filter, passes,
+                    [&](std::uint32_t rr) { return cols[gc]->ints[rr]; },
+                    [&](std::uint32_t rr) {
+                        return std::vector<Datum>{Datum::make_int(cols[gc]->ints[rr])};
+                    });
             }
             std::vector<GroupRef> refs;
-            refs.reserve(ig.size());
-            for (const auto& [k, slot] : ig) {
-                (void)k;
-                refs.emplace_back(&slot.second, &slot.first);
+            if (par_group) {
+                refs.reserve(ig.size());
+                for (const auto& [k, slot] : ig) {
+                    (void)k;
+                    refs.emplace_back(&slot.second, &slot.first);
+                }
+            } else {
+                refs.reserve(hg.size());
+                for (const auto& g : hg) refs.emplace_back(&g.first, &g.second);
             }
             if (auto e = emit_all(refs)) {
                 return ExecResult::failure(*e);
@@ -2443,6 +2504,7 @@ private:
             // is constant), so output order is byte-identical.
             const std::size_t gc = gcols[0];
             std::map<std::string, std::pair<std::vector<std::uint32_t>, std::vector<Datum>>> tg;
+            std::vector<std::pair<std::vector<Datum>, std::vector<std::uint32_t>>> hg;  // open-addr
             if (par_group) {
                 build_groups_parallel(
                     tg, count, has_filter, passes,
@@ -2451,22 +2513,23 @@ private:
                         return std::vector<Datum>{Datum::make_text(cols[gc]->texts[rr])};
                     });
             } else {
-                for (std::uint32_t rr = 0; rr < count; ++rr) {
-                    if (has_filter && !passes(rr)) {
-                        continue;
-                    }
-                    auto& slot = tg[cols[gc]->texts[rr]];
-                    if (slot.second.empty()) {
-                        slot.second.push_back(Datum::make_text(cols[gc]->texts[rr]));
-                    }
-                    slot.first.push_back(rr);
-                }
+                hg = hash_group_collect<std::string>(  // open-addressing (A1) — sorted by key
+                    count, has_filter, passes,
+                    [&](std::uint32_t rr) { return cols[gc]->texts[rr]; },
+                    [&](std::uint32_t rr) {
+                        return std::vector<Datum>{Datum::make_text(cols[gc]->texts[rr])};
+                    });
             }
             std::vector<GroupRef> refs;
-            refs.reserve(tg.size());
-            for (const auto& [k, slot] : tg) {
-                (void)k;
-                refs.emplace_back(&slot.second, &slot.first);
+            if (par_group) {
+                refs.reserve(tg.size());
+                for (const auto& [k, slot] : tg) {
+                    (void)k;
+                    refs.emplace_back(&slot.second, &slot.first);
+                }
+            } else {
+                refs.reserve(hg.size());
+                for (const auto& g : hg) refs.emplace_back(&g.first, &g.second);
             }
             if (auto e = emit_all(refs)) {
                 return ExecResult::failure(*e);
