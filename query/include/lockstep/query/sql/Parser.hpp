@@ -380,6 +380,8 @@ public:
             st.select.explain = true;
             st.select.explain_analyze = analyze;
             r = ParseResult{std::move(st)};
+        } else if (kw == "alter") {
+            r = parse_alter();
         } else if (kw == "drop") {
             r = parse_drop_index();
         } else {
@@ -536,6 +538,47 @@ private:
         if (auto e = expect(Tok::RParen, "')' to close CHECK")) return e;
         cr.checks.push_back(std::move(text));
         return std::nullopt;
+    }
+
+    // F7: ALTER TABLE <t> ADD [COLUMN] <col> <type> [NOT NULL] [DEFAULT <lit>]
+    ParseResult parse_alter() {
+        advance();  // ALTER
+        if (auto e = expect_kw("table")) return ParseResult{*e};
+        Statement st;
+        st.kind = StmtKind::Alter;
+        if (auto e = expect_ident("a table name after ALTER TABLE", st.alter.table)) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect_kw("add")) return ParseResult{*e};
+        if (is_kw("column")) advance();  // optional COLUMN keyword
+        Column col;
+        if (auto e = expect_ident("a column name", col.name)) return ParseResult{*e};
+        if (is_kw("int")) {
+            col.type = Type::Int;
+            advance();
+        } else if (is_kw("text")) {
+            col.type = Type::Text;
+            advance();
+        } else {
+            return err("expected a column type (INT or TEXT) in ALTER TABLE ADD");
+        }
+        col.nullable = true;
+        if (is_kw("not")) {
+            advance();
+            if (auto e = expect_kw("null")) return ParseResult{*e};
+            col.nullable = false;
+        }
+        if (is_kw("default")) {
+            advance();
+            Datum dv;
+            if (auto e = expect_literal(dv)) return ParseResult{*e};
+            if (dv.type != col.type) return err("DEFAULT literal type does not match the column");
+            col.has_default = true;
+            if (dv.type == Type::Int) col.default_i = dv.i;
+            else col.default_s = dv.s;
+        }
+        st.alter.add_col = std::move(col);
+        return ParseResult{std::move(st)};
     }
 
     // CREATE TABLE t (...) | CREATE INDEX name ON t (col)

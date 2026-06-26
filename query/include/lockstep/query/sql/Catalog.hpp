@@ -679,6 +679,16 @@ inline void put_index_col(std::string& out, const Datum& d) {
         if (c == t.pk_index) {
             continue;
         }
+        // F7: a column ADDed (ALTER TABLE) after this row was written has no bytes in the stored
+        // value — pad it with its DEFAULT (or NULL). The encoder writes the PK from the key, so the
+        // PK is never in this suffix.
+        if (off >= value.size()) {
+            row[c] = t.columns[c].has_default
+                         ? (t.columns[c].type == Type::Int ? Datum::make_int(t.columns[c].default_i)
+                                                           : Datum::make_text(t.columns[c].default_s))
+                         : Datum::make_null(t.columns[c].type);
+            continue;
+        }
         // v4: a NULL field is a single kNullTag byte — reconstruct a typed NULL.
         if (static_cast<unsigned char>(value[off]) == kNullTag) {
             off += 1;
@@ -728,6 +738,16 @@ inline void decode_row_projected_into(const Table& t, const Key& key, const Valu
         if (c == t.pk_index) {
             continue;
         }
+        if (off >= value.size()) {  // F7: ALTER-added suffix column — pad with DEFAULT/NULL
+            if (need[c]) {
+                row[c] = t.columns[c].has_default
+                             ? (t.columns[c].type == Type::Int
+                                    ? Datum::make_int(t.columns[c].default_i)
+                                    : Datum::make_text(t.columns[c].default_s))
+                             : Datum::make_null(t.columns[c].type);
+            }
+            continue;
+        }
         if (static_cast<unsigned char>(value[off]) == kNullTag) {
             off += 1;
             if (need[c]) {
@@ -764,6 +784,16 @@ inline void decode_row_projected_into(const Table& t, const Key& key, const Valu
     std::size_t off = 0;
     for (std::size_t c = 0; c < t.columns.size(); ++c) {
         if (c == t.pk_index) {
+            continue;
+        }
+        if (off >= value.size()) {  // F7: ALTER-added suffix column — pad with DEFAULT/NULL
+            if (need[c]) {
+                row[c] = t.columns[c].has_default
+                             ? (t.columns[c].type == Type::Int
+                                    ? Datum::make_int(t.columns[c].default_i)
+                                    : Datum::make_text(t.columns[c].default_s))
+                             : Datum::make_null(t.columns[c].type);
+            }
             continue;
         }
         // v4: a NULL field is a single kNullTag byte (no length/payload).

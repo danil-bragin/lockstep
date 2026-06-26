@@ -64,6 +64,7 @@ public:
             case StmtKind::CreateIndex:
             case StmtKind::DropIndex:
             case StmtKind::DropTable:
+            case StmtKind::Alter:
                 return broadcast(sql);
             case StmtKind::Insert:
                 return route(sql, pk_value_of(st.insert));

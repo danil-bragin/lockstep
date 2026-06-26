@@ -377,6 +377,12 @@ struct DropTableStmt {
     std::string table;
 };
 
+// ALTER TABLE <t> ADD [COLUMN] <col> <type> [constraints]  (F7)
+struct AlterStmt {
+    std::string table;
+    Column add_col;
+};
+
 enum class StmtKind : std::uint8_t {
     Create = 0,
     Insert = 1,
@@ -386,6 +392,7 @@ enum class StmtKind : std::uint8_t {
     CreateIndex = 5,
     DropIndex = 6,
     DropTable = 7,
+    Alter = 8,
 };
 
 struct Statement {
@@ -398,6 +405,7 @@ struct Statement {
     CreateIndexStmt create_index;
     DropIndexStmt drop_index;
     DropTableStmt drop_table;
+    AlterStmt alter;
 };
 
 }  // namespace lockstep::query::sql

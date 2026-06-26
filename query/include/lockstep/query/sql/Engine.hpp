@@ -423,6 +423,8 @@ public:
                 return exec_drop_index(st.drop_index);
             case StmtKind::DropTable:
                 return exec_drop_table(st.drop_table);
+            case StmtKind::Alter:
+                return exec_alter(st.alter);
         }
         return ExecResult::failure("unknown statement kind");
     }
@@ -912,6 +914,32 @@ private:
             }
         }
         persist_schema(di.table);  // C7: drop reflected in the durable schema
+        return ExecResult{};
+    }
+
+    // ALTER TABLE <t> ADD COLUMN (F7): append a column to the schema. Existing rows were written
+    // with the OLD column count; the row decoder pads the new (suffix) columns with their DEFAULT or
+    // NULL on read (see decode_row), so no data rewrite is needed. Row-mode only (columnar block
+    // layout would need a per-column rewrite — OUT). A NOT NULL column without a DEFAULT is rejected
+    // on a non-empty table (existing rows would have no value).
+    ExecResult exec_alter(const AlterStmt& a) {
+        Table* t = catalog_.find_mut(a.table);
+        if (t == nullptr) {
+            return ExecResult::failure("unknown table '" + a.table + "'");
+        }
+        if (t->columnar) {
+            return ExecResult::failure("ALTER TABLE on a columnar table is not supported");
+        }
+        if (t->column_index(a.add_col.name)) {
+            return ExecResult::failure("column '" + a.add_col.name + "' already exists");
+        }
+        if (!a.add_col.nullable && !a.add_col.has_default && t->row_count > 0) {
+            return ExecResult::failure(
+                "ADD a NOT NULL column requires a DEFAULT on a non-empty table");
+        }
+        t->columns.push_back(a.add_col);
+        t->col_stats.assign(t->columns.size(), Table::ColStat{});  // keep stats sized to the schema
+        persist_schema(a.table);
         return ExecResult{};
     }
 
