@@ -89,6 +89,12 @@ int main(int argc, char** argv) {
                           std::to_string(ts_hi)},
     };
     for (const Q& q : qs) {
+        // WARM the lazy columnar decode (col_chunks built on first access) BEFORE timing — the
+        // analytics shape is load-once/query-many, and the competitors are measured warm (Postgres
+        // EXPLAIN ANALYZE min-of-5, DuckDB looped, ClickHouse 5 reps). Without this the one-time
+        // cold block decode (~90ms for 1M rows) lands in the average and the fast steady-state
+        // queries (scan_agg) read as ~3ms instead of their true ~0.2ms.
+        for (int w = 0; w < 3; ++w) (void)eng.exec(q.sql);
         auto t0 = std::chrono::steady_clock::now();
         std::uint64_t chk = 0;
         for (int k = 0; k < iters; ++k) {
