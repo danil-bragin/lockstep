@@ -188,6 +188,9 @@ public:
     [[nodiscard]] core::INetwork* network() noexcept { return net_; }
     [[nodiscard]] const ProdServerConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] bool disk_valid() const noexcept { return disk_.valid(); }
+    // The durable byte length of the keyed-state WAL (file size on reopen) — pass to recover()
+    // after a restart over the SAME data dir to replay the committed prefix. 0 == fresh/empty.
+    [[nodiscard]] std::uint64_t disk_logical_len() const noexcept { return disk_.logical_len(); }
 
     // The node's seeded entropy source (election jitter / backoff for S5b consensus).
     // Single-node S5a does not yet draw from it; exposed so the seed is observable and

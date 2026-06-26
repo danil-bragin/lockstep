@@ -433,6 +433,13 @@ int run_wire_server(const Args& args) {
         std::fprintf(stderr, "lockstepd --wire-server: failed to assemble server node\n");
         return 1;
     }
+    // RECOVER-ON-RESTART: if the keyed-state WAL on this data dir already holds committed bytes
+    // (a restart over the same dir), replay the durable committed prefix BEFORE serving — so an
+    // acked keyed write survives a process restart (acked==durable==recoverable). A fresh dir has
+    // logical_len 0 and skips recovery.
+    if (const std::uint64_t wal_len = node.disk_logical_len(); wal_len > 0) {
+        node.recover(static_cast<std::size_t>(wal_len));
+    }
     // A large recv budget so the bounded serve loop covers a full bench run without
     // re-spawn; the reactor deadline is the real bound.
     node.start(1'000'000'000);
