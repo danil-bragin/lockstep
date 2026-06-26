@@ -57,6 +57,7 @@ struct CreateStmt {
     std::string table;
     std::vector<Column> columns;
     std::string pk_column;  // the single PK column name
+    std::vector<std::string> checks;  // F5: CHECK predicate source texts (column- or table-level)
 };
 
 // CREATE INDEX <name> ON <table> (<col>) — a single-column SECONDARY INDEX. The

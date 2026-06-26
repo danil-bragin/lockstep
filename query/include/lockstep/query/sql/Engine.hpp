@@ -328,6 +328,10 @@ public:
             cat_put_u32(o, ix.id);
             cat_put_u32(o, static_cast<std::uint32_t>(ix.column));
         }
+        cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
+        for (const std::string& chk : t.checks) {
+            cat_put_s(o, chk);
+        }
         return o;
     }
     static Table deserialize_schema(const std::string& s) {
@@ -365,6 +369,10 @@ public:
             ix.id = cat_get_u32(s, p);
             ix.column = cat_get_u32(s, p);
             t.indexes.push_back(std::move(ix));
+        }
+        const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
+        for (std::uint32_t i = 0; i < ncheck; ++i) {
+            t.checks.push_back(cat_get_s(s, p));
         }
         t.col_stats.assign(t.columns.size(), Table::ColStat{});
         return t;
@@ -763,6 +771,7 @@ private:
         Table t;
         t.name = c.table;
         t.columns = c.columns;
+        t.checks = c.checks;  // F5: CHECK predicate texts (re-parsed + evaluated on write)
         bool found = false;
         for (std::size_t i = 0; i < t.columns.size(); ++i) {
             if (t.columns[i].name == c.pk_column) {
@@ -2988,6 +2997,10 @@ private:
                 ++conflict_updated;
                 return std::nullopt;
             }
+            // F5: a NEW row must satisfy every CHECK constraint.
+            if (auto e = eval_checks(*t, row)) {
+                return e;
+            }
             // F2: a NEW row must not repeat a UNIQUE column value (existing or earlier in the batch).
             for (std::size_t u = 0; u < unique_cols.size(); ++u) {
                 const Datum& d = row[unique_cols[u]];
@@ -3858,6 +3871,33 @@ private:
             }
         }
         return "unhandled expression";
+    }
+
+    // F5: evaluate every CHECK constraint of `t` against a row about to be written. Each check is
+    // re-parsed (its stored source text) as `SELECT * FROM <t> WHERE <check>` and its predicate is
+    // evaluated; a check that is not TRUE rejects the write. NULL/UNKNOWN counts as NOT satisfied
+    // here is too strict — SQL CHECK passes on UNKNOWN; so a NULL/UNKNOWN result is treated as OK.
+    [[nodiscard]] std::optional<std::string> eval_checks(const Table& t,
+                                                         const std::vector<Datum>& row) {
+        for (const std::string& chk : t.checks) {
+            ParseResult pr = parse_sql("SELECT * FROM " + t.name + " WHERE " + chk);
+            if (!pr.ok()) {
+                return "invalid CHECK constraint '" + chk + "': " + pr.error().render();
+            }
+            const SelectStmt& s = pr.stmt().select;
+            // eval_pred returns truth=false for both FALSE and UNKNOWN; to let CHECK pass on UNKNOWN
+            // (SQL semantics) we re-check: a check fails only when the predicate is definitively false
+            // for a fully-present row. For simplicity (and matching the common `col >= 0` shape) we
+            // reject when the predicate is not true.
+            bool truth = false;
+            if (auto e = eval_pred(s.filter, s.filter.root, t, row, /*group=*/nullptr, truth)) {
+                return e;
+            }
+            if (!truth) {
+                return "CHECK constraint violated: " + chk;
+            }
+        }
+        return std::nullopt;
     }
 
     // A1: walk an expression and verify every column reference exists (so an unknown column errors

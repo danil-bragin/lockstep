@@ -117,6 +117,7 @@ struct Table {
     std::vector<Index> indexes;       // secondary indexes (in CREATE order)
     std::uint32_t next_index_id = 1;  // dense index-id assignment (0 reserved)
     std::int64_t next_auto_id = 1;    // F6: next AUTO_INCREMENT value (monotonic; persisted)
+    std::vector<std::string> checks;  // F5: CHECK predicate source texts (re-parsed + eval'd on write)
 
     // COLUMNAR layout (PERF_PLAN columnar rollout): when true, the table is an LSM of a
     // row 'd' delta over flushed column blocks ('B'). Opt-in at CREATE; the durable KV

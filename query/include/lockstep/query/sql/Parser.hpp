@@ -122,6 +122,7 @@ struct Token {
 class Lexer {
 public:
     explicit Lexer(std::string src) : src_(std::move(src)) {}
+    [[nodiscard]] const std::string& src() const { return src_; }  // F5: raw text capture
 
     // Produce the next token. Pure progression over the byte string.
     [[nodiscard]] Token next() {
@@ -519,6 +520,24 @@ private:
 
     // --- grammar rules ---
 
+    // F5: CHECK ( <predicate> ) — capture the predicate's RAW SOURCE TEXT (so it persists in the
+    // catalog and is re-parsed + evaluated on every write). Validates the predicate parses here.
+    [[nodiscard]] std::optional<ParseError> parse_check(CreateStmt& cr) {
+        advance();  // CHECK
+        if (auto e = expect(Tok::LParen, "'(' after CHECK")) return e;
+        const std::size_t start = cur_.pos;
+        Predicate tmp;
+        if (auto e = parse_predicate(tmp, /*allow_agg=*/false)) return e;
+        const std::size_t end = cur_.pos;  // position of the closing ')'
+        std::string text = lex_.src().substr(start, end > start ? end - start : 0);
+        while (!text.empty() && (text.back() == ' ' || text.back() == '\t' || text.back() == '\n')) {
+            text.pop_back();
+        }
+        if (auto e = expect(Tok::RParen, "')' to close CHECK")) return e;
+        cr.checks.push_back(std::move(text));
+        return std::nullopt;
+    }
+
     // CREATE TABLE t (...) | CREATE INDEX name ON t (col)
     ParseResult parse_create() {
         advance();  // CREATE
@@ -561,6 +580,15 @@ private:
                 }
                 seen_pk_clause = true;
                 break;  // PRIMARY KEY is the last clause
+            }
+            // F5: a TABLE-level CHECK constraint (must precede the PRIMARY KEY clause, which breaks).
+            if (is_kw("check")) {
+                if (auto e = parse_check(st.create)) return ParseResult{*e};
+                if (cur_.kind == Tok::Comma) {
+                    advance();
+                    continue;
+                }
+                break;
             }
             // A column definition: <name> <TYPE>
             Column col;
@@ -623,6 +651,10 @@ private:
                 if (dv.type != col.type) {
                     return err("DEFAULT literal type does not match column '" + col.name + "'");
                 }
+            }
+            // F5: a COLUMN-level CHECK (e.g. `age INT CHECK (age >= 0)`) — same store as table-level.
+            if (is_kw("check")) {
+                if (auto e = parse_check(st.create)) return ParseResult{*e};
             }
             st.create.columns.push_back(std::move(col));
             if (cur_.kind == Tok::Comma) {
