@@ -86,6 +86,11 @@ struct Column {
     std::string name;
     Type type = Type::Int;
     bool nullable = false;  // v4: true => may store NULL (NOT NULL / PK => false)
+    // F4 DEFAULT: a column-level default used when an INSERT omits the column. Stored as primitives
+    // (Datum is defined below this struct): default_i for INT, default_s for TEXT, per `type`.
+    bool has_default = false;
+    std::int64_t default_i = 0;
+    std::string default_s;
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column

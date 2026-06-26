@@ -312,6 +312,12 @@ public:
             cat_put_s(o, c.name);
             o.push_back(static_cast<char>(c.type == Type::Int ? 0 : 1));
             o.push_back(c.nullable ? 1 : 0);
+            // F4: persist the DEFAULT (has-default byte, then the value rendered as a string —
+            // decimal for INT, raw for TEXT).
+            o.push_back(c.has_default ? 1 : 0);
+            if (c.has_default) {
+                cat_put_s(o, c.type == Type::Int ? std::to_string(c.default_i) : c.default_s);
+            }
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -335,6 +341,15 @@ public:
             c.name = cat_get_s(s, p);
             c.type = (s[p++] == 0) ? Type::Int : Type::Text;
             c.nullable = s[p++] != 0;
+            c.has_default = s[p++] != 0;  // F4
+            if (c.has_default) {
+                const std::string dv = cat_get_s(s, p);
+                if (c.type == Type::Int) {
+                    c.default_i = std::strtoll(dv.c_str(), nullptr, 10);
+                } else {
+                    c.default_s = dv;
+                }
+            }
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -2861,9 +2876,16 @@ private:
                 if (set[c]) {
                     continue;
                 }
+                // F4: an omitted column with a DEFAULT takes the default value.
+                if (t->columns[c].has_default) {
+                    row[c] = t->columns[c].type == Type::Int
+                                 ? Datum::make_int(t->columns[c].default_i)
+                                 : Datum::make_text(t->columns[c].default_s);
+                    continue;
+                }
                 if (!t->columns[c].nullable) {
                     return "INSERT omits NOT NULL column '" + t->columns[c].name +
-                           "' (provide a value)";
+                           "' (provide a value, or declare a DEFAULT)";
                 }
                 row[c] = Datum::make_null(t->columns[c].type);  // omitted nullable => NULL
             }

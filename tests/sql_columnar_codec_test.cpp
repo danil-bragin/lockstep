@@ -47,9 +47,9 @@ Table make_table(std::uint32_t id, Type pk_type) {
     Table t;
     t.name = "tbl";
     t.id = id;
-    t.columns.push_back(Column{"id", pk_type, false});
-    t.columns.push_back(Column{"a", Type::Int, true});
-    t.columns.push_back(Column{"b", Type::Text, true});
+    t.columns.push_back(Column{.name = "id", .type = pk_type, .nullable = false});
+    t.columns.push_back(Column{.name = "a", .type = Type::Int, .nullable = true});
+    t.columns.push_back(Column{.name = "b", .type = Type::Text, .nullable = true});
     t.pk_index = 0;
     return t;
 }

@@ -571,6 +571,25 @@ private:
             } else if (is_kw("null")) {
                 advance();  // explicit NULL == the default (nullable)
             }
+            // F4: optional DEFAULT <literal> — used when an INSERT omits the column. The literal
+            // must match the column type (checked at INSERT/coerce time).
+            if (is_kw("default")) {
+                advance();
+                Datum dv;
+                if (auto e = expect_literal(dv)) {
+                    return ParseResult{*e};
+                }
+                col.has_default = true;
+                if (dv.type == Type::Int) {
+                    col.default_i = dv.i;
+                } else {
+                    col.default_s = dv.s;
+                }
+                // Remember the literal's type so coerce can validate it against the column.
+                if (dv.type != col.type) {
+                    return err("DEFAULT literal type does not match column '" + col.name + "'");
+                }
+            }
             st.create.columns.push_back(std::move(col));
             if (cur_.kind == Tok::Comma) {
                 advance();
