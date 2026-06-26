@@ -725,6 +725,9 @@ private:
                 return ParseResult{*e};
             }
             st.insert.select_source = std::move(sub);
+            if (auto e = parse_on_conflict(st.insert)) {
+                return ParseResult{*e};
+            }
             return ParseResult{std::move(st)};
         }
         if (auto e = expect_kw("values")) {
@@ -785,7 +788,45 @@ private:
             }
             st.insert.more_rows.push_back(std::move(rowv));
         }
+        if (auto e = parse_on_conflict(st.insert)) {
+            return ParseResult{*e};
+        }
         return ParseResult{std::move(st)};
+    }
+
+    // G2: ON CONFLICT DO NOTHING | DO UPDATE SET <col> = <literal> [, ...]. No-op if absent.
+    [[nodiscard]] std::optional<ParseError> parse_on_conflict(InsertStmt& ins) {
+        if (!is_kw("on")) {
+            return std::nullopt;
+        }
+        advance();
+        if (auto e = expect_kw("conflict")) return e;
+        if (auto e = expect_kw("do")) return e;
+        if (is_kw("nothing")) {
+            advance();
+            ins.on_conflict = InsertStmt::OnConflict::Nothing;
+            return std::nullopt;
+        }
+        if (is_kw("update")) {
+            advance();
+            if (auto e = expect_kw("set")) return e;
+            ins.on_conflict = InsertStmt::OnConflict::Update;
+            for (;;) {
+                std::string col;
+                if (auto e = expect_ident("a column after SET", col)) return e;
+                if (auto e = expect(Tok::Eq, "'=' in ON CONFLICT DO UPDATE SET")) return e;
+                Datum v;
+                if (auto e = expect_value_or_null(v)) return e;
+                ins.conflict_updates.emplace_back(col, v);
+                if (cur_.kind == Tok::Comma) {
+                    advance();
+                    continue;
+                }
+                break;
+            }
+            return std::nullopt;
+        }
+        return make_err("expected NOTHING or UPDATE after ON CONFLICT DO");
     }
 
     // UPDATE t SET c = v WHERE pk = v

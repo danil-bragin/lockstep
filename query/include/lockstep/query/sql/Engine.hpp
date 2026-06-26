@@ -2916,6 +2916,7 @@ private:
         rows.reserve(1 + ins.more_rows.size());
         std::vector<std::pair<Key, Value>> writes;
         std::set<std::string> batch_pks;  // encode_key of PKs seen in this batch (within-batch dup)
+        std::size_t conflict_updated = 0;  // G2: rows updated/skipped by ON CONFLICT (not new inserts)
         auto stage = [&](const std::vector<Datum>& vals) -> std::optional<std::string> {
             std::vector<Datum> row;
             if (auto e = build_row(vals, row)) {
@@ -2927,14 +2928,40 @@ private:
                 return "duplicate primary key within the INSERT batch (table '" + ins.table + "')";
             }
             bool exists;
+            std::vector<Datum> old_row;
             if (t->columnar) {
-                exists = read_columnar_row(*t, pk).has_value();
+                auto rr = read_columnar_row(*t, pk);
+                exists = rr.has_value();
+                if (exists) old_row = std::move(*rr);
             } else {
                 const ReadResult existing = read_committed(pk_key);
                 exists = existing.has_value() && !is_tombstone(*existing);
+                if (exists) old_row = decode_row(*t, pk_key, *existing);
             }
             if (exists) {
-                return "duplicate primary key in table '" + ins.table + "' (row already exists)";
+                // G2 UPSERT: a dup PK is an error (default), a skip (DO NOTHING), or an update.
+                if (ins.on_conflict == InsertStmt::OnConflict::Error) {
+                    return "duplicate primary key in table '" + ins.table + "' (row already exists)";
+                }
+                if (ins.on_conflict == InsertStmt::OnConflict::Nothing) {
+                    return std::nullopt;  // leave the existing row untouched
+                }
+                // DO UPDATE SET: apply each col=literal to the existing row, re-emit (retire the old
+                // index entries, write the new row + new index entries) in this same atomic batch.
+                std::vector<Datum> new_row = old_row;
+                for (const auto& [c, v] : ins.conflict_updates) {
+                    const auto ci = t->column_index(c);
+                    if (!ci) return "unknown column '" + c + "' in ON CONFLICT DO UPDATE";
+                    if (*ci == t->pk_index) return "cannot UPDATE the primary key in ON CONFLICT";
+                    Datum d;
+                    if (auto e = coerce(t->columns[*ci], v, d)) return *e;
+                    new_row[*ci] = d;
+                }
+                index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
+                emit_row_writes(*t, new_row, writes);
+                index_writes_for_row(*t, new_row, /*tombstone=*/false, writes);
+                ++conflict_updated;
+                return std::nullopt;
             }
             emit_row_writes(*t, row, writes);
             index_writes_for_row(*t, row, /*tombstone=*/false, writes);
@@ -2986,6 +3013,11 @@ private:
                 mt->next_auto_id = auto_next;
                 persist_schema(ins.table);
             }
+            // G2: a columnar ON CONFLICT DO UPDATE wrote new delta rows — mark the delta dirty.
+            if (mt->columnar && conflict_updated > 0) {
+                mt->delta_dirty = true;
+                mt->delta_count += conflict_updated;
+            }
             for (const std::vector<Datum>& row : rows) {
                 if (mt->columnar) {
                     mt->delta_dirty = true;
@@ -3012,7 +3044,7 @@ private:
         }
         maybe_auto_flush(ins.table);
         ExecResult r;
-        r.affected = static_cast<std::int64_t>(rows.size());
+        r.affected = static_cast<std::int64_t>(rows.size() + conflict_updated);  // inserts + upserts
         return r;
     }
 

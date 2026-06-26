@@ -86,6 +86,11 @@ struct InsertStmt {
     // D5 INSERT ... SELECT: when set, the rows come from this query instead of VALUES. The SELECT's
     // output arity must match `columns`; each output row becomes one inserted row (atomic, like D6).
     std::shared_ptr<SelectStmt> select_source;
+    // G2 UPSERT: ON CONFLICT behavior on a duplicate PK. Error (default) rejects; Nothing skips the
+    // row; Update applies `conflict_updates` (col=literal) to the existing row.
+    enum class OnConflict : std::uint8_t { Error = 0, Nothing = 1, Update = 2 };
+    OnConflict on_conflict = OnConflict::Error;
+    std::vector<std::pair<std::string, Datum>> conflict_updates;
 };
 
 // UPDATE <t> SET <col> = <v> WHERE <pk> = <v>
