@@ -136,6 +136,16 @@ public:
            core::IDisk& sql_disk)
         : net_(&net), db_(dsched, disk), sql_eng_(sql_dsched, sql_disk) {}
 
+    // As above, but ALSO gives the SQL engine a SEPARATE durable IDisk for its CATALOG (schema
+    // records), distinct from the SQL DATA disk — so DDL keeps its own Seq line/WAL and survives
+    // a restart (recover_sql replays both). Three SQL-side WALs total: keyed (db_), SQL data,
+    // SQL catalog. Use this for a server whose SQL schema must outlive a restart.
+    Server(INetwork& net, core::Scheduler& dsched, core::IDisk& disk, core::Scheduler& sql_dsched,
+           core::IDisk& sql_disk, core::Scheduler& sql_cat_dsched, core::IDisk& sql_cat_disk)
+        : net_(&net),
+          db_(dsched, disk),
+          sql_eng_(sql_dsched, sql_disk, sql_cat_dsched, sql_cat_disk) {}
+
     // Dispatch-only server (no transport): for the round-trip oracle, which calls
     // dispatch() directly with no serve()/recv(). net_ stays null and is NEVER
     // dereferenced on this path.
@@ -145,6 +155,15 @@ public:
     // test that drives dispatch() directly, no transport). `dsched` is the disk's
     // scheduler.
     Server(core::Scheduler& dsched, core::IDisk& disk) : net_(nullptr), db_(dsched, disk) {}
+
+    // Dispatch-only server with DURABLE keyed state + DURABLE SQL data + DURABLE SQL catalog
+    // (each on its own scheduler/IDisk/WAL) — for an in-process test of SQL DDL/data survival
+    // across a restart without a transport. Mirrors the 7-arg network ctor's SQL wiring.
+    Server(core::Scheduler& dsched, core::IDisk& disk, core::Scheduler& sql_dsched,
+           core::IDisk& sql_disk, core::Scheduler& sql_cat_dsched, core::IDisk& sql_cat_disk)
+        : net_(nullptr),
+          db_(dsched, disk),
+          sql_eng_(sql_dsched, sql_disk, sql_cat_dsched, sql_cat_disk) {}
 
     // ---- AUTH/RBAC (Phase: auth-rbac) ----------------------------------------
     // The client-facing wire::Server is one of the two RBAC ENFORCEMENT POINTS (the prod
@@ -277,10 +296,13 @@ public:
         tip_ = db_.tip();
     }
 
-    // Recover the SQL-over-wire engine's durable state (its OWN WAL — separate from db_). Rebuilds
-    // the SQL catalog + data so SQL statements work after a restart. `durable_len` is the SQL WAL's
-    // on-disk byte length.
-    void recover_sql(std::size_t durable_len) { sql_eng_.recover(durable_len); }
+    // Recover the SQL-over-wire engine's durable state (its OWN WALs — separate from db_). Rebuilds
+    // the SQL catalog + data so SQL statements work after a restart. `durable_len` is the SQL DATA
+    // WAL's on-disk byte length; `catalog_len` is the separate SQL CATALOG WAL's length (0 when the
+    // server's SQL engine has an in-memory catalog — the 5-arg ctor).
+    void recover_sql(std::size_t durable_len, std::size_t catalog_len = 0) {
+        sql_eng_.recover(durable_len, catalog_len);
+    }
 
     // Direct (no-wire) dispatch — used by the round-trip oracle to compute the
     // SAME effect the wire path would, against the SAME server state. Pure fn.

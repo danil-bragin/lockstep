@@ -1076,6 +1076,24 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_catalog_recover_test COMMAND lockstep_sql_catalog_recover_test)
 
+  # sql_wire_catalog_recover_test: the wire/prod analogue — a wire::Server with SEPARATE durable
+  # disks for keyed/SQL-data/SQL-catalog runs DDL+INSERT via dispatch(), is dropped (a crash), then
+  # reconstructed over the same disks + recover_sql(data_len, catalog_len). The table + rows must be
+  # back. Validates the durable-catalog wiring (own WAL/Seq line) that ProdServerNode/lockstepd use.
+  add_executable(lockstep_sql_wire_catalog_recover_test sql_wire_catalog_recover_test.cpp)
+  target_include_directories(lockstep_sql_wire_catalog_recover_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_wire_catalog_recover_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_wire_catalog_recover_test COMMAND lockstep_sql_wire_catalog_recover_test)
+
   # sql_columnar_durability_test: the columnar crash/recovery gate (A5). Proves the
   # committed columnar state (blocks + delta) survives a crash + recovery byte-for-byte
   # over a deterministic SimDisk — projection/aggregate/GROUP BY identical post-recovery,

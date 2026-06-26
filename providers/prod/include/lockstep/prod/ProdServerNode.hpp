@@ -124,8 +124,12 @@ public:
           sql_disk_(sql_disk_sched_, cfg.data_dir.empty()
                                          ? std::string("/dev/null")
                                          : (cfg.data_dir + "/lockstepd-sql.wal")),
+          sql_cat_disk_(sql_cat_disk_sched_, cfg.data_dir.empty()
+                                                 ? std::string("/dev/null")
+                                                 : (cfg.data_dir + "/lockstepd-sql-catalog.wal")),
           server_(net_ != nullptr
-                      ? wire::Server(*net_, disk_sched_, disk_, sql_disk_sched_, sql_disk_)
+                      ? wire::Server(*net_, disk_sched_, disk_, sql_disk_sched_, sql_disk_,
+                                     sql_cat_disk_sched_, sql_cat_disk_)
                       : wire::Server(disk_sched_, disk_)),
           cfg_(cfg) {}
 
@@ -180,8 +184,14 @@ public:
     // on-disk WAL file length. After this, a Query returns every committed value
     // WITHOUT replaying the consensus log (S5a closure).
     void recover(std::size_t durable_len) { server_.recover(durable_len); }
-    // Recover the SQL-over-wire engine's separate durable WAL (catalog + data).
-    void recover_sql(std::size_t durable_len) { server_.recover_sql(durable_len); }
+    // Recover the SQL-over-wire engine's separate durable WALs: DATA (`durable_len`) + CATALOG
+    // (`catalog_len`, the schema WAL on its own Seq line). Pass both on-disk file lengths.
+    void recover_sql(std::size_t durable_len, std::size_t catalog_len = 0) {
+        server_.recover_sql(durable_len, catalog_len);
+    }
+    [[nodiscard]] std::uint64_t disk_sql_catalog_logical_len() const noexcept {
+        return sql_cat_disk_.logical_len();
+    }
     [[nodiscard]] std::uint64_t disk_sql_logical_len() const noexcept {
         return sql_disk_.logical_len();
     }
@@ -235,7 +245,10 @@ private:
     core::Scheduler disk_sched_; // mints ProdDisk's inline-ready Futures (harness only)
     ProdDisk disk_;              // durability anchor over the data dir (RAII-closed)
     core::Scheduler sql_disk_sched_; // SQL state's OWN disk scheduler (distinct WAL)
-    ProdDisk sql_disk_;          // SQL-over-wire durability anchor (separate WAL file)
+    ProdDisk sql_disk_;          // SQL-over-wire DATA durability anchor (separate WAL file)
+    core::Scheduler sql_cat_disk_sched_; // SQL CATALOG's OWN disk scheduler (distinct WAL)
+    ProdDisk sql_cat_disk_;      // SQL catalog (schema) durability anchor — keeps DDL on its own
+                                 // Seq line so it never shifts the data MVCC version (separate WAL)
     wire::Server server_;        // the UNCHANGED client-facing protocol server
     ProdServerConfig cfg_;
     std::unique_ptr<AuthPolicy> auth_{};  // RBAC policy (stable box; hooks capture its ptr)

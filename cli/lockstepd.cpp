@@ -441,7 +441,10 @@ int run_wire_server(const Args& args) {
         node.recover(static_cast<std::size_t>(wal_len));
     }
     if (const std::uint64_t sql_len = node.disk_sql_logical_len(); sql_len > 0) {
-        node.recover_sql(static_cast<std::size_t>(sql_len));  // SQL catalog + data (C7)
+        // SQL DATA + its SEPARATE CATALOG WAL (the catalog lives on its own Seq line so DDL never
+        // shifts the data MVCC version — recover both so schema + rows are back after a restart).
+        node.recover_sql(static_cast<std::size_t>(sql_len),
+                         static_cast<std::size_t>(node.disk_sql_catalog_logical_len()));
     }
     // A large recv budget so the bounded serve loop covers a full bench run without
     // re-spawn; the reactor deadline is the real bound.
