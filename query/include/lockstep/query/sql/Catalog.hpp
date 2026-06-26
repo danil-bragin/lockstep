@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -96,6 +97,9 @@ struct Column {
     // F3 FOREIGN KEY: when fk_table is non-empty, a non-NULL value must exist as the PK of fk_table.
     std::string fk_table;
     std::string fk_column;  // the referenced column (the parent's PK)
+    // F9b: a LOGICAL type over INT storage — 0=plain, 1=DECIMAL(scale), 2=DATE, 3=TIMESTAMP.
+    std::uint8_t logical = 0;
+    std::uint8_t scale = 0;
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -202,6 +206,11 @@ struct Datum {
     // ignored when is_null. NULL semantics (three-valued logic, COUNT(col) skips NULL,
     // a comparison with NULL is UNKNOWN==false) are documented in Engine.hpp.
     bool is_null = false;
+    // F9b: a LOGICAL type layered over the physical INT storage so the engine stays byte-deterministic
+    // (all arithmetic/comparison/keys use `i`). 0=raw INT/TEXT, 1=DECIMAL(scale), 2=DATE (days since
+    // 1970-01-01), 3=TIMESTAMP (seconds since the epoch). Only render()/literal-parse use it.
+    std::uint8_t logical = 0;
+    std::uint8_t scale = 0;  // DECIMAL fractional digits
 
     static Datum make_int(std::int64_t v) { return Datum{Type::Int, v, {}, false}; }
     static Datum make_text(std::string v) {
@@ -235,9 +244,113 @@ struct Datum {
         if (is_null) {
             return "NULL";
         }
+        if (type == Type::Int && logical != 0) {  // F9b: DECIMAL / DATE / TIMESTAMP
+            if (logical == 1) return render_decimal(i, scale);
+            if (logical == 2) return render_date(i);
+            if (logical == 3) return render_timestamp(i);
+        }
         return type == Type::Int ? std::to_string(i) : s;
     }
+
+    // --- F9b logical-type formatting (pure, deterministic; no locale, no wall-clock) ---
+    static std::string render_decimal(std::int64_t v, std::uint8_t scale) {
+        if (scale == 0) return std::to_string(v);
+        const bool neg = v < 0;
+        std::uint64_t mag = neg ? static_cast<std::uint64_t>(-(v + 1)) + 1 : static_cast<std::uint64_t>(v);
+        std::uint64_t pow = 1;
+        for (std::uint8_t k = 0; k < scale; ++k) pow *= 10;
+        std::string frac = std::to_string(mag % pow);
+        while (frac.size() < scale) frac.insert(frac.begin(), '0');
+        return (neg ? "-" : "") + std::to_string(mag / pow) + "." + frac;
+    }
+    // Days since 1970-01-01 -> "YYYY-MM-DD" (proleptic Gregorian, integer Howard Hinnant algorithm).
+    static std::string render_date(std::int64_t days) {
+        std::int64_t z = days + 719468;
+        const std::int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+        const std::uint64_t doe = static_cast<std::uint64_t>(z - era * 146097);
+        const std::uint64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        const std::int64_t y = static_cast<std::int64_t>(yoe) + era * 400;
+        const std::uint64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        const std::uint64_t mp = (5 * doy + 2) / 153;
+        const std::uint64_t d = doy - (153 * mp + 2) / 5 + 1;
+        const std::uint64_t m = mp < 10 ? mp + 3 : mp - 9;
+        const std::int64_t yy = y + (m <= 2 ? 1 : 0);
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%04lld-%02llu-%02llu", static_cast<long long>(yy),
+                      (unsigned long long)m, (unsigned long long)d);
+        return std::string(buf);
+    }
+    static std::string render_timestamp(std::int64_t secs) {
+        const std::int64_t days = secs >= 0 ? secs / 86400 : (secs - 86399) / 86400;
+        std::int64_t rem = secs - days * 86400;
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%s %02lld:%02lld:%02lld", render_date(days).c_str(),
+                      (long long)(rem / 3600), (long long)((rem % 3600) / 60), (long long)(rem % 60));
+        return std::string(buf);
+    }
 };
+
+// ----------------------------------------------------------------------------
+// F9b: parse a DECIMAL / DATE / TIMESTAMP literal STRING into its INT representation (pure,
+// deterministic — no locale, no wall-clock). Return false on a malformed literal.
+// ----------------------------------------------------------------------------
+[[nodiscard]] inline bool parse_decimal(const std::string& in, std::uint8_t scale, std::int64_t& out) {
+    std::size_t p = 0;
+    bool neg = false;
+    if (p < in.size() && (in[p] == '+' || in[p] == '-')) { neg = in[p] == '-'; ++p; }
+    std::int64_t intpart = 0;
+    bool any = false;
+    for (; p < in.size() && in[p] >= '0' && in[p] <= '9'; ++p) { intpart = intpart * 10 + (in[p] - '0'); any = true; }
+    std::int64_t frac = 0;
+    std::uint8_t fdig = 0;
+    if (p < in.size() && in[p] == '.') {
+        ++p;
+        for (; p < in.size() && in[p] >= '0' && in[p] <= '9'; ++p) {
+            if (fdig < scale) { frac = frac * 10 + (in[p] - '0'); ++fdig; }
+            any = true;  // a digit past `scale` is truncated (deterministic)
+        }
+    }
+    if (!any || p != in.size()) return false;
+    std::int64_t pow = 1;
+    for (std::uint8_t k = 0; k < scale; ++k) pow *= 10;
+    for (std::uint8_t k = fdig; k < scale; ++k) frac *= 10;  // pad to `scale` digits
+    std::int64_t v = intpart * pow + frac;
+    out = neg ? -v : v;
+    return true;
+}
+inline std::int64_t days_from_civil(std::int64_t y, std::int64_t m, std::int64_t d) {
+    y -= m <= 2;
+    const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const std::int64_t yoe = y - era * 400;
+    const std::int64_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    const std::int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+[[nodiscard]] inline bool parse_date(const std::string& in, std::int64_t& days) {
+    int y = 0, m = 0, d = 0, n = 0;
+    if (std::sscanf(in.c_str(), "%d-%d-%d%n", &y, &m, &d, &n) != 3 ||
+        static_cast<std::size_t>(n) != in.size() || m < 1 || m > 12 || d < 1 || d > 31) {
+        return false;
+    }
+    days = days_from_civil(y, m, d);
+    return true;
+}
+[[nodiscard]] inline bool parse_timestamp(const std::string& in, std::int64_t& secs) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0, n = 0;
+    int got = std::sscanf(in.c_str(), "%d-%d-%d %d:%d:%d%n", &y, &mo, &d, &h, &mi, &s, &n);
+    if (got == 3) {  // date-only timestamp -> midnight
+        std::int64_t days = 0;
+        if (!parse_date(in, days)) return false;
+        secs = days * 86400;
+        return true;
+    }
+    if (got != 6 || static_cast<std::size_t>(n) != in.size() || mo < 1 || mo > 12 || d < 1 ||
+        d > 31 || h > 23 || mi > 59 || s > 59) {
+        return false;
+    }
+    secs = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+    return true;
+}
 
 // ----------------------------------------------------------------------------
 // ORDER-PRESERVING ENCODING PRIMITIVES (pure, deterministic).
@@ -711,6 +824,17 @@ inline void put_index_col(std::string& out, const Datum& d) {
 
 // Decode a full row (every column, PK reconstructed from the key) from a KV pair.
 // Returns the columns in schema order. A pure inverse of encode_key/encode_value.
+// F9b: stamp each row Datum with its column's LOGICAL tag (DECIMAL/DATE/TIMESTAMP) so render()
+// prints the logical form. Storage is raw INT; the tag is read-side presentation only.
+inline void tag_logical_cols(const Table& t, std::vector<Datum>& row) {
+    for (std::size_t c = 0; c < t.columns.size() && c < row.size(); ++c) {
+        if (t.columns[c].logical != 0) {
+            row[c].logical = t.columns[c].logical;
+            row[c].scale = t.columns[c].scale;
+        }
+    }
+}
+
 [[nodiscard]] inline std::vector<Datum> decode_row(const Table& t, const Key& key,
                                                    const Value& value) {
     std::vector<Datum> row(t.columns.size());
@@ -752,6 +876,7 @@ inline void put_index_col(std::string& out, const Datum& d) {
         }
         off += len;
     }
+    tag_logical_cols(t, row);
     return row;
 }
 
@@ -813,6 +938,7 @@ inline void decode_row_projected_into(const Table& t, const Key& key, const Valu
         }
         off += len;
     }
+    tag_logical_cols(t, row);
 }
 
 [[nodiscard]] inline std::vector<Datum> decode_row_projected(
@@ -862,6 +988,7 @@ inline void decode_row_projected_into(const Table& t, const Key& key, const Valu
         // else: SKIP the field bytes (no copy, no parse) — just advance the offset.
         off += len;
     }
+    tag_logical_cols(t, row);
     return row;
 }
 

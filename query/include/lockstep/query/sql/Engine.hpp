@@ -323,6 +323,8 @@ public:
             o.push_back(c.unique ? 1 : 0);           // F2
             cat_put_s(o, c.fk_table);                // F3
             cat_put_s(o, c.fk_column);
+            o.push_back(static_cast<char>(c.logical));  // F9b: DECIMAL/DATE/TIMESTAMP logical tag
+            o.push_back(static_cast<char>(c.scale));
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -368,6 +370,8 @@ public:
             c.unique = s[p++] != 0;          // F2
             c.fk_table = cat_get_s(s, p);    // F3
             c.fk_column = cat_get_s(s, p);
+            c.logical = static_cast<std::uint8_t>(s[p++]);  // F9b
+            c.scale = static_cast<std::uint8_t>(s[p++]);
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -1021,6 +1025,40 @@ private:
                        "'";
             }
             out = Datum::make_null(col.type);
+            out.logical = col.logical;
+            out.scale = col.scale;
+            return std::nullopt;
+        }
+        // F9b: a DECIMAL/DATE/TIMESTAMP column (physical INT). Accept a string literal
+        // ('3.14', '2026-06-27', '2026-06-27 13:45:00') parsed to its INT representation, or
+        // a bare INT (for DECIMAL a whole number scaled by 10^scale; for DATE/TIMESTAMP a raw
+        // days/secs escape hatch). Storage/keys/comparison stay INT → byte-deterministic.
+        if (col.type == Type::Int && col.logical != 0) {
+            std::int64_t v = 0;
+            if (in.type == Type::Text) {
+                bool ok = false;
+                if (col.logical == 1) ok = parse_decimal(in.s, col.scale, v);
+                else if (col.logical == 2) ok = parse_date(in.s, v);
+                else ok = parse_timestamp(in.s, v);
+                if (!ok) {
+                    return std::string("invalid ") + logical_name(col.logical) +
+                           " literal '" + in.s + "' for column '" + col.name + "'";
+                }
+            } else if (in.type == Type::Int) {
+                if (col.logical == 1) {
+                    std::int64_t pow = 1;
+                    for (std::uint8_t k = 0; k < col.scale; ++k) pow *= 10;
+                    v = in.i * pow;  // whole-number literal scaled to fixed-point
+                } else {
+                    v = in.i;  // raw days/secs
+                }
+            } else {
+                return std::string("type mismatch for column '") + col.name + "': expected " +
+                       logical_name(col.logical) + ", got " + type_name(in.type);
+            }
+            out = Datum::make_int(v);
+            out.logical = col.logical;
+            out.scale = col.scale;
             return std::nullopt;
         }
         if (col.type != in.type) {
@@ -1030,6 +1068,15 @@ private:
         }
         out = in;
         return std::nullopt;
+    }
+
+    static const char* logical_name(std::uint8_t lg) {
+        switch (lg) {
+            case 1: return "DECIMAL";
+            case 2: return "DATE";
+            case 3: return "TIMESTAMP";
+            default: return "INT";
+        }
     }
 
     // Append the index-entry writes for `row` (one per secondary index) to `out`.
@@ -3974,21 +4021,42 @@ private:
                 if (l.is_null || r.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
                 if (l.type != Type::Int || r.type != Type::Int)
                     return "arithmetic requires INT operands";
+                // F9b: DECIMAL fixed-point arithmetic — all on int64 (deterministic). The
+                // effective scale of a non-DECIMAL operand is 0. Add/Sub align to the wider
+                // scale; Mul adds scales; Div keeps the left scale. The result is tagged
+                // DECIMAL when either operand is. (DATE/TIMESTAMP arithmetic stays raw INT —
+                // adding days/secs is a sensible, deterministic plain-int operation.)
+                const bool ldec = l.logical == 1, rdec = r.logical == 1;
+                const std::uint8_t ls = ldec ? l.scale : 0, rs = rdec ? r.scale : 0;
+                auto p10 = [](std::uint8_t k) { std::int64_t p = 1; while (k--) p *= 10; return p; };
                 std::int64_t v = 0;
+                std::uint8_t out_sc = 0;
                 switch (e.op) {
-                    case BinOp::Add: v = l.i + r.i; break;
-                    case BinOp::Sub: v = l.i - r.i; break;
-                    case BinOp::Mul: v = l.i * r.i; break;
+                    case BinOp::Add:
+                    case BinOp::Sub: {
+                        const std::uint8_t cs = ls > rs ? ls : rs;
+                        const std::int64_t li = l.i * p10(cs - ls), ri = r.i * p10(cs - rs);
+                        v = e.op == BinOp::Add ? li + ri : li - ri;
+                        out_sc = cs;
+                        break;
+                    }
+                    case BinOp::Mul:
+                        v = l.i * r.i;
+                        out_sc = static_cast<std::uint8_t>(ls + rs);
+                        break;
                     case BinOp::Div:
                         if (r.i == 0) return "division by zero";
-                        v = l.i / r.i;
+                        v = (l.i * p10(rs)) / r.i;  // result scale = ls (numerator pre-scaled by rs)
+                        out_sc = ls;
                         break;
                     case BinOp::Mod:
                         if (r.i == 0) return "modulo by zero";
                         v = l.i % r.i;
+                        out_sc = ls;
                         break;
                 }
                 out = Datum::make_int(v);
+                if (ldec || rdec) { out.logical = 1; out.scale = out_sc; }
                 return std::nullopt;
             }
             case ExprKind::Func:
@@ -6511,6 +6579,19 @@ private:
         } else {
             rhs = n.literal;
         }
+        // F9b: a literal compared against a DECIMAL/DATE/TIMESTAMP column is given as a string
+        // ('2000-01-01') or whole number; coerce it to the column's INT representation so the
+        // comparison is the (deterministic) raw-int compare. (LHS already carries the logical
+        // tag from decode.)
+        if (n.operand == OperandKind::Column && !n.rhs_is_subquery && !n.rhs_is_column &&
+            !rhs.is_null) {
+            const auto cidx = t.column_index(n.column);
+            if (cidx && t.columns[*cidx].logical != 0) {
+                Datum cv;
+                if (auto e = coerce(t.columns[*cidx], rhs, cv)) return e;
+                rhs = cv;
+            }
+        }
         // NULL operand => UNKNOWN => false (three-valued logic collapsed at filter).
         if (lhs.is_null || rhs.is_null) {
             truth = false;
@@ -6639,12 +6720,23 @@ private:
         }
         if (a.kind == AggKind::Sum) {
             out = Datum::make_int(sum);
+            tag_decimal(t.columns[ci], out);  // F9b: SUM keeps the column's DECIMAL scale
             return std::nullopt;
         }
         // AVG: integer truncation toward zero (C++ / divides truncates toward zero).
         const std::int64_t n = static_cast<std::int64_t>(present.size());
         out = Datum::make_int(n == 0 ? 0 : sum / n);
+        tag_decimal(t.columns[ci], out);  // F9b
         return std::nullopt;
+    }
+
+    // F9b: stamp a fresh aggregate result with the source column's DECIMAL scale (DATE/TIMESTAMP
+    // SUM/AVG are nonsensical so they are left raw; MIN/MAX already carry the row's tag verbatim).
+    static void tag_decimal(const Column& col, Datum& d) {
+        if (col.logical == 1 && d.type == Type::Int && !d.is_null) {
+            d.logical = 1;
+            d.scale = col.scale;
+        }
     }
 
     // (5) DISTINCT — drop duplicate OUTPUT rows, keeping the first occurrence. Stable

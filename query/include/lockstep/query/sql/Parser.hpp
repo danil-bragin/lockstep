@@ -509,11 +509,46 @@ private:
     // F9: parse a column type. INT/BIGINT/INTEGER + BOOL/BOOLEAN are INT-backed; TEXT/VARCHAR/CHAR
     // are TEXT (an optional VARCHAR length is parsed + ignored). FLOAT/DOUBLE/DECIMAL/NUMERIC are
     // rejected — they break the engine's byte-deterministic INT model (cross-check/conformance).
-    [[nodiscard]] std::optional<ParseError> parse_column_type(Type& out) {
+    [[nodiscard]] std::optional<ParseError> parse_column_type(Column& col) {
+        Type& out = col.type;
         if (is_kw("int") || is_kw("bigint") || is_kw("integer") || is_kw("bool") ||
             is_kw("boolean")) {
             out = Type::Int;
             advance();
+            return std::nullopt;
+        }
+        // F9b: DATE / TIMESTAMP / DECIMAL — INT-backed logical types (byte-deterministic).
+        if (is_kw("date")) {
+            out = Type::Int;
+            col.logical = 2;
+            advance();
+            return std::nullopt;
+        }
+        if (is_kw("timestamp") || is_kw("datetime")) {
+            out = Type::Int;
+            col.logical = 3;
+            advance();
+            return std::nullopt;
+        }
+        if (is_kw("decimal") || is_kw("numeric")) {
+            out = Type::Int;
+            col.logical = 1;
+            col.scale = 0;
+            advance();
+            if (cur_.kind == Tok::LParen) {  // DECIMAL(precision[, scale]) — precision ignored
+                advance();
+                Datum prec;
+                if (auto e = expect_literal(prec)) return e;
+                if (cur_.kind == Tok::Comma) {
+                    advance();
+                    Datum sc;
+                    if (auto e = expect_literal(sc)) return e;
+                    if (sc.type != Type::Int || sc.i < 0 || sc.i > 18)
+                        return make_err("DECIMAL scale must be 0..18");
+                    col.scale = static_cast<std::uint8_t>(sc.i);
+                }
+                if (auto e = expect(Tok::RParen, "')' after DECIMAL precision/scale")) return e;
+            }
             return std::nullopt;
         }
         if (is_kw("text")) {
@@ -532,12 +567,11 @@ private:
             out = Type::Text;
             return std::nullopt;
         }
-        if (is_kw("float") || is_kw("double") || is_kw("real") || is_kw("decimal") ||
-            is_kw("numeric")) {
-            return make_err("FLOAT/DOUBLE/DECIMAL are OUT — they break the engine's "
-                            "byte-deterministic INT model");
+        if (is_kw("float") || is_kw("double") || is_kw("real")) {
+            return make_err("FLOAT/DOUBLE are OUT — they break byte-determinism; use DECIMAL "
+                            "(exact fixed-point)");
         }
-        return make_err("expected a column type (INT/BIGINT/BOOL or TEXT/VARCHAR)");
+        return make_err("expected a column type (INT/BIGINT/BOOL/DECIMAL/DATE/TIMESTAMP or TEXT)");
     }
 
     // Consume a literal (int or string) into `out`. Used by INSERT/UPDATE/WHERE.
@@ -609,7 +643,7 @@ private:
         if (is_kw("column")) advance();  // optional COLUMN keyword
         Column col;
         if (auto e = expect_ident("a column name", col.name)) return ParseResult{*e};
-        if (auto e = parse_column_type(col.type)) {
+        if (auto e = parse_column_type(col)) {
             return ParseResult{*e};
         }
         col.nullable = true;
@@ -693,7 +727,7 @@ private:
             if (auto e = expect_ident("a column name", col.name)) {
                 return ParseResult{*e};
             }
-            if (auto e = parse_column_type(col.type)) {
+            if (auto e = parse_column_type(col)) {
                 return ParseResult{*e};
             }
             // v4: optional NOT NULL constraint. A column is NULLABLE by default; a
