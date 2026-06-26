@@ -1288,6 +1288,13 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
     PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_window_test COMMAND lockstep_sql_window_test)
+  # sql_types_test (F9): BIGINT/BOOL/VARCHAR (int/text-backed) + TRUE/FALSE; FLOAT/DECIMAL rejected.
+  add_executable(lockstep_sql_types_test sql_types_test.cpp)
+  target_include_directories(lockstep_sql_types_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_types_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_types_test COMMAND lockstep_sql_types_test)
 
   # sql_join_test (SQL v3): the EXTENDED FROM surface — INNER / LEFT [OUTER] / comma-
   # cross joins with ON predicates, qualified columns (table.col + AS alias), multi-

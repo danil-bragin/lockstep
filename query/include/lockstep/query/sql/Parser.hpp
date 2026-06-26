@@ -506,10 +506,50 @@ private:
         return std::nullopt;
     }
 
+    // F9: parse a column type. INT/BIGINT/INTEGER + BOOL/BOOLEAN are INT-backed; TEXT/VARCHAR/CHAR
+    // are TEXT (an optional VARCHAR length is parsed + ignored). FLOAT/DOUBLE/DECIMAL/NUMERIC are
+    // rejected — they break the engine's byte-deterministic INT model (cross-check/conformance).
+    [[nodiscard]] std::optional<ParseError> parse_column_type(Type& out) {
+        if (is_kw("int") || is_kw("bigint") || is_kw("integer") || is_kw("bool") ||
+            is_kw("boolean")) {
+            out = Type::Int;
+            advance();
+            return std::nullopt;
+        }
+        if (is_kw("text")) {
+            out = Type::Text;
+            advance();
+            return std::nullopt;
+        }
+        if (is_kw("varchar") || is_kw("char")) {
+            advance();
+            if (cur_.kind == Tok::LParen) {  // an optional length, parsed + ignored
+                advance();
+                Datum d;
+                if (auto e = expect_literal(d)) return e;
+                if (auto e = expect(Tok::RParen, "')' after the VARCHAR length")) return e;
+            }
+            out = Type::Text;
+            return std::nullopt;
+        }
+        if (is_kw("float") || is_kw("double") || is_kw("real") || is_kw("decimal") ||
+            is_kw("numeric")) {
+            return make_err("FLOAT/DOUBLE/DECIMAL are OUT — they break the engine's "
+                            "byte-deterministic INT model");
+        }
+        return make_err("expected a column type (INT/BIGINT/BOOL or TEXT/VARCHAR)");
+    }
+
     // Consume a literal (int or string) into `out`. Used by INSERT/UPDATE/WHERE.
     [[nodiscard]] std::optional<ParseError> expect_literal(Datum& out) {
         if (cur_.kind == Tok::Bad) {
             return make_err(cur_.bad_msg);
+        }
+        // F9: BOOL literals TRUE/FALSE -> INT 1/0.
+        if (is_kw("true") || is_kw("false")) {
+            out = Datum::make_int(is_kw("true") ? 1 : 0);
+            advance();
+            return std::nullopt;
         }
         if (cur_.kind == Tok::IntLit) {
             out = Datum::make_int(cur_.int_val);
@@ -569,14 +609,8 @@ private:
         if (is_kw("column")) advance();  // optional COLUMN keyword
         Column col;
         if (auto e = expect_ident("a column name", col.name)) return ParseResult{*e};
-        if (is_kw("int")) {
-            col.type = Type::Int;
-            advance();
-        } else if (is_kw("text")) {
-            col.type = Type::Text;
-            advance();
-        } else {
-            return err("expected a column type (INT or TEXT) in ALTER TABLE ADD");
+        if (auto e = parse_column_type(col.type)) {
+            return ParseResult{*e};
         }
         col.nullable = true;
         if (is_kw("not")) {
@@ -654,15 +688,8 @@ private:
             if (auto e = expect_ident("a column name", col.name)) {
                 return ParseResult{*e};
             }
-            if (is_kw("int")) {
-                col.type = Type::Int;
-                advance();
-            } else if (is_kw("text")) {
-                col.type = Type::Text;
-                advance();
-            } else {
-                return err("expected a column type (INT or TEXT) — other types are "
-                           "OUT in v1");
+            if (auto e = parse_column_type(col.type)) {
+                return ParseResult{*e};
             }
             // v4: optional NOT NULL constraint. A column is NULLABLE by default; a
             // NOT NULL column requires a present value at INSERT. (The PK column is
@@ -2038,7 +2065,8 @@ private:
             }
             leaf.rhs_is_subquery = true;
             leaf.subquery = std::move(sub);
-        } else if (!is_agg && cur_.kind == Tok::Ident && !at_clause_boundary()) {
+        } else if (!is_agg && cur_.kind == Tok::Ident && !at_clause_boundary() &&
+                   !is_kw("true") && !is_kw("false")) {  // F9: TRUE/FALSE are literals, not columns
             std::string rq;
             std::string rc;
             if (auto e = expect_qualified_column("a column name on the right of the "
