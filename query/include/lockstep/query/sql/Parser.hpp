@@ -1477,6 +1477,37 @@ private:
             if (auto e = expect_kw("by")) {
                 return e;
             }
+            // C2: GROUP BY GROUPING SETS ( ( cols ), ( cols ), () )
+            if (is_kw("grouping")) {
+                advance();
+                if (auto e = expect_kw("sets")) return e;
+                if (auto e = expect(Tok::LParen, "'(' after GROUPING SETS")) return e;
+                for (;;) {
+                    if (auto e = expect(Tok::LParen, "'(' to open a grouping set")) return e;
+                    std::vector<std::string> set;
+                    if (cur_.kind != Tok::RParen) {
+                        for (;;) {
+                            std::string q, c;
+                            if (auto e = expect_qualified_column("a column in a grouping set", q, c))
+                                return e;
+                            set.push_back(q.empty() ? c : q + "." + c);
+                            if (cur_.kind == Tok::Comma) {
+                                advance();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    if (auto e = expect(Tok::RParen, "')' to close a grouping set")) return e;
+                    sel.grouping_sets.push_back(std::move(set));
+                    if (cur_.kind == Tok::Comma) {
+                        advance();
+                        continue;
+                    }
+                    break;
+                }
+                if (auto e = expect(Tok::RParen, "')' to close GROUPING SETS")) return e;
+            } else
             for (;;) {
                 // v3: a GROUP BY column may be qualified (table.col); we store the
                 // qualified SPELLING ("a.x" or "x") and the engine resolves it.

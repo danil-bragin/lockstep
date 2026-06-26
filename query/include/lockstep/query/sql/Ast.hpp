@@ -341,6 +341,10 @@ struct SelectStmt {
 
     // v2: GROUP BY <cols>, HAVING <agg-pred>, ORDER BY <keys>, LIMIT/OFFSET.
     std::vector<std::string> group_by;
+    // C2: GROUP BY GROUPING SETS ( (a,b), (a), () ) — each inner vector is one grouping. When
+    // non-empty the query runs once per set and UNIONs the rows; a SELECT column not in a given set
+    // renders NULL for that set's rows.
+    std::vector<std::vector<std::string>> grouping_sets;
     Predicate having;            // a predicate over aggregates (root -1 == none)
     std::vector<OrderKey> order_by;
     bool has_limit = false;

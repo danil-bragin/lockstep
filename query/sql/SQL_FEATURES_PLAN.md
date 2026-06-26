@@ -78,7 +78,7 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [ ] A1/A2/A3/A4 WHERE-side
 - [x] D1 UNION/ALL + D2 INTERSECT/EXCEPT (set-op chain; dedup; combined ORDER/LIMIT; arity teeth) — sql_setops_test
 - [ ] E2 CROSS
-- [ ] D3 FROM-subquery · D4 CTE · F9 types · B2 correlated · C3 window · E3 N-way · E4 non-equi · A4 CAST · C2 GROUPING SETS
+- [ ] D3 FROM-subquery · D4 CTE · F9 types · B2 correlated · C3 window · E3 N-way · E4 non-equi · A4 CAST
 - [x] E4 non-equi join — ALREADY PRESENT (theta via nested_loop; verified)
 - [ ] F1 composite PK/index (HIGHEST risk — last)
 - [x] E2 CROSS JOIN — ALREADY PRESENT (catalog miss; verified)
@@ -92,3 +92,4 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] G4 ORDER BY position + computed-column alias (order_key_less resolves position; validation skips it) — sql_orderby_expr_test
 - [x] F3 FOREIGN KEY (REFERENCES; insert-time parent-PK check, NULL allowed; DELETE RESTRICT via child scan; durable) — sql_fk_test
 - [x] F7 ALTER TABLE ADD COLUMN (row mode; decoders pad ALTER-added suffix cols with DEFAULT/NULL — no rewrite; durable; columnar OUT) — sql_alter_test
+- [x] C2 GROUPING SETS (run per set + union; non-set cols NULL; columnar fast-path gated; row+columnar) — sql_grouping_sets_test

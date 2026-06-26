@@ -3603,9 +3603,38 @@ private:
         return out;
     }
 
+    // C2: GROUP BY GROUPING SETS — run the aggregate ONCE per grouping set (each a normal GROUP BY)
+    // and UNION the rows; ORDER BY / LIMIT apply once over the union. A SELECT column not in a given
+    // set renders NULL (gs_mode_ tells exec_aggregate to NULL it instead of requiring it grouped).
+    ExecResult exec_grouping_sets(const SelectStmt& sel) {
+        ExecResult out;
+        for (const std::vector<std::string>& set : sel.grouping_sets) {
+            SelectStmt sub = sel;
+            sub.grouping_sets.clear();
+            sub.group_by = set;
+            sub.order_by.clear();
+            sub.has_limit = false;
+            sub.offset = 0;
+            gs_mode_ = true;
+            ExecResult r = exec_select(sub);
+            gs_mode_ = false;
+            if (!r.ok) return r;
+            out.rows.insert(out.rows.end(), r.rows.begin(), r.rows.end());
+        }
+        if (auto e = apply_order_by_labels(sel, out.rows)) {
+            return ExecResult::failure(*e);
+        }
+        apply_limit(sel, out.rows);
+        out.affected = out.rows.size();
+        return out;
+    }
+
     ExecResult exec_select(const SelectStmt& sel) {
         if (sel.set_op != SetOp::None) {
             return exec_set_operation(sel);
+        }
+        if (!sel.grouping_sets.empty()) {
+            return exec_grouping_sets(sel);
         }
         if (sel.explain) {
             return explain_select(sel);
@@ -3629,7 +3658,7 @@ private:
         // SUM/COUNT/MIN/MAX/AVG DIRECTLY over the SoA column blocks (no AoS row
         // materialisation, the measured win). nullopt => not applicable, fall through to
         // the generic AoS path (which the conformance gate cross-checks this against).
-        if (t->columnar && sel.has_aggregates && !agg_has_distinct(sel)) {
+        if (t->columnar && sel.has_aggregates && !agg_has_distinct(sel) && !gs_mode_) {
             if (auto fast = columnar_vectorized_agg(*t, sel)) {
                 return std::move(*fast);
             }
@@ -4125,7 +4154,7 @@ private:
                     break;
                 }
             }
-            if (!grouped) {
+            if (!grouped && !gs_mode_) {  // C2: in a GROUPING SETS run a non-set column is NULL, not an error
                 return ExecResult::failure(
                     "column '" + item.column +
                     "' must appear in GROUP BY or be used in an aggregate "
@@ -4179,9 +4208,11 @@ private:
             for (const SelectItem& item : sel.items) {
                 if (item.kind == SelectItemKind::Column) {
                     const std::size_t idx = *t.column_index(item.column);
-                    // The grouped column's value is constant across the group; take
-                    // it from key_datums (matched by position).
-                    Datum d = grouped_column_value(gcols, grp, idx);
+                    // C2: a column not in THIS grouping set renders NULL.
+                    bool grouped = false;
+                    for (const std::size_t g : gcols) if (g == idx) { grouped = true; break; }
+                    Datum d = grouped ? grouped_column_value(gcols, grp, idx)
+                                      : Datum::make_null(t.columns[idx].type);
                     out.cells.emplace_back(item.label, d);
                 } else {
                     Datum d;
@@ -6738,6 +6769,7 @@ private:
     bool vectorize_ = true;            // vectorized filter fast path (test-toggleable)
     bool columnar_default_ = false;    // new tables use the columnar layout when set
     bool group_commit_ = false;        // defer write fsync; caller sync()s the burst once
+    bool gs_mode_ = false;             // C2: inside a GROUPING SETS sub-run (NULL-out non-set cols)
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change
