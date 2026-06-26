@@ -93,3 +93,4 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] F3 FOREIGN KEY (REFERENCES; insert-time parent-PK check, NULL allowed; DELETE RESTRICT via child scan; durable) — sql_fk_test
 - [x] F7 ALTER TABLE ADD COLUMN (row mode; decoders pad ALTER-added suffix cols with DEFAULT/NULL — no rewrite; durable; columnar OUT) — sql_alter_test
 - [x] C2 GROUPING SETS (run per set + union; non-set cols NULL; columnar fast-path gated; row+columnar) — sql_grouping_sets_test
+- [x] G1 BEGIN/COMMIT/ROLLBACK (write-buffer txn; read-your-writes via read_committed overlay; atomic commit; rollback discards) — sql_txn_test

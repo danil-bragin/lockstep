@@ -380,6 +380,22 @@ public:
             st.select.explain = true;
             st.select.explain_analyze = analyze;
             r = ParseResult{std::move(st)};
+        } else if (kw == "begin") {
+            advance();
+            if (is_kw("transaction") || is_kw("work")) advance();  // optional
+            Statement st;
+            st.kind = StmtKind::Begin;
+            r = ParseResult{std::move(st)};
+        } else if (kw == "commit") {
+            advance();
+            Statement st;
+            st.kind = StmtKind::Commit;
+            r = ParseResult{std::move(st)};
+        } else if (kw == "rollback") {
+            advance();
+            Statement st;
+            st.kind = StmtKind::Rollback;
+            r = ParseResult{std::move(st)};
         } else if (kw == "alter") {
             r = parse_alter();
         } else if (kw == "drop") {

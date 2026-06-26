@@ -425,6 +425,24 @@ public:
                 return exec_drop_table(st.drop_table);
             case StmtKind::Alter:
                 return exec_alter(st.alter);
+            case StmtKind::Begin:
+                if (in_txn_) return ExecResult::failure("already in a transaction");
+                in_txn_ = true;
+                txn_writes_.clear();
+                return ExecResult{};
+            case StmtKind::Commit: {
+                if (!in_txn_) return ExecResult::failure("COMMIT with no active transaction");
+                in_txn_ = false;
+                std::vector<std::pair<Key, Value>> flush;
+                flush.swap(txn_writes_);
+                if (!flush.empty()) commit_writes(flush);  // now in_txn_ is false -> actually commits
+                return ExecResult{};
+            }
+            case StmtKind::Rollback:
+                if (!in_txn_) return ExecResult::failure("ROLLBACK with no active transaction");
+                in_txn_ = false;
+                txn_writes_.clear();  // discard the buffered writes (nothing was committed)
+                return ExecResult{};
         }
         return ExecResult::failure("unknown statement kind");
     }
@@ -6693,6 +6711,15 @@ private:
     // SELECT WHERE pk = v takes). Returns the committed value (incl. a tombstone
     // marker) or nullopt if absent. Pure function of the committed history + key.
     [[nodiscard]] ReadResult read_committed(const Key& key) {
+        // G1: read-your-writes — inside a transaction, the latest buffered write for `key` shadows
+        // the committed store (so dup-PK / UPDATE / DELETE see uncommitted changes within the txn).
+        if (in_txn_) {
+            for (auto it = txn_writes_.rbegin(); it != txn_writes_.rend(); ++it) {
+                if (it->first == key) {
+                    return it->second;
+                }
+            }
+        }
         Query<Strict> q;
         q.get(key);
         const QueryResult qr = db_.run(q);
@@ -6747,6 +6774,13 @@ private:
     }
 
     void commit_writes(const std::vector<std::pair<Key, Value>>& kvs) {
+        // G1: inside a transaction, BUFFER the writes (read-your-writes via read_committed) and apply
+        // them all atomically at COMMIT; ROLLBACK discards them. (DDL writes the catalog directly via
+        // commit_batch and is not buffered — DDL inside a txn auto-commits.)
+        if (in_txn_) {
+            for (const auto& kv : kvs) txn_writes_.push_back(kv);
+            return;
+        }
         // GROUP COMMIT: defer the fsync when the caller (wire::Server, net-backed) will sync()
         // once for the whole burst — the SQL-write analogue of the keyed path. acked==durable
         // holds because the caller withholds the SqlResult ack until its sync.
@@ -6770,6 +6804,8 @@ private:
     bool columnar_default_ = false;    // new tables use the columnar layout when set
     bool group_commit_ = false;        // defer write fsync; caller sync()s the burst once
     bool gs_mode_ = false;             // C2: inside a GROUPING SETS sub-run (NULL-out non-set cols)
+    bool in_txn_ = false;              // G1: inside an explicit BEGIN..COMMIT transaction
+    std::vector<std::pair<Key, Value>> txn_writes_;  // G1: buffered DML writes (committed at COMMIT)
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change

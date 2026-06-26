@@ -397,6 +397,9 @@ enum class StmtKind : std::uint8_t {
     DropIndex = 6,
     DropTable = 7,
     Alter = 8,
+    Begin = 9,     // G1: BEGIN [TRANSACTION]
+    Commit = 10,   // G1: COMMIT
+    Rollback = 11, // G1: ROLLBACK
 };
 
 struct Statement {

@@ -65,6 +65,9 @@ public:
             case StmtKind::DropIndex:
             case StmtKind::DropTable:
             case StmtKind::Alter:
+            case StmtKind::Begin:
+            case StmtKind::Commit:
+            case StmtKind::Rollback:
                 return broadcast(sql);
             case StmtKind::Insert:
                 return route(sql, pk_value_of(st.insert));
