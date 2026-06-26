@@ -624,6 +624,22 @@ private:
                 advance();
                 col.unique = true;
             }
+            // F3: optional REFERENCES <table> [( <col> )] — a foreign key to the parent's PK.
+            if (is_kw("references")) {
+                advance();
+                if (auto e = expect_ident("a referenced table after REFERENCES", col.fk_table)) {
+                    return ParseResult{*e};
+                }
+                if (cur_.kind == Tok::LParen) {
+                    advance();
+                    if (auto e = expect_ident("a referenced column", col.fk_column)) {
+                        return ParseResult{*e};
+                    }
+                    if (auto e = expect(Tok::RParen, "')' after the referenced column")) {
+                        return ParseResult{*e};
+                    }
+                }
+            }
             // F6: optional AUTO_INCREMENT (INT only) — an omitted value is assigned the table's
             // next monotonic id. May appear before or after NOT NULL/DEFAULT.
             if (is_kw("auto_increment")) {

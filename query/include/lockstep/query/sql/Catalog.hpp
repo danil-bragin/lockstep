@@ -93,6 +93,9 @@ struct Column {
     std::string default_s;
     bool auto_increment = false;  // F6: INT column auto-assigned from Table::next_auto_id when omitted
     bool unique = false;          // F2: UNIQUE constraint (no two non-NULL rows share a value)
+    // F3 FOREIGN KEY: when fk_table is non-empty, a non-NULL value must exist as the PK of fk_table.
+    std::string fk_table;
+    std::string fk_column;  // the referenced column (the parent's PK)
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -845,6 +848,9 @@ public:
     [[nodiscard]] bool has(const std::string& name) const {
         return tables_.count(name) != 0;
     }
+
+    // F3: iterate every table (ordered => deterministic) — used to find FK references on DELETE.
+    [[nodiscard]] const std::map<std::string, Table>& all() const { return tables_; }
 
 private:
     std::map<std::string, Table> tables_;  // ordered => deterministic

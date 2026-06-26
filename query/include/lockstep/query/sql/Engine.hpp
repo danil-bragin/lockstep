@@ -321,6 +321,8 @@ public:
             }
             o.push_back(c.auto_increment ? 1 : 0);  // F6
             o.push_back(c.unique ? 1 : 0);           // F2
+            cat_put_s(o, c.fk_table);                // F3
+            cat_put_s(o, c.fk_column);
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -360,6 +362,8 @@ public:
             }
             c.auto_increment = s[p++] != 0;  // F6
             c.unique = s[p++] != 0;          // F2
+            c.fk_table = cat_get_s(s, p);    // F3
+            c.fk_column = cat_get_s(s, p);
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -3001,6 +3005,10 @@ private:
             if (auto e = eval_checks(*t, row)) {
                 return e;
             }
+            // F3: a NEW row must satisfy every FOREIGN KEY (referenced parent PK exists).
+            if (auto e = eval_foreign_keys(*t, row)) {
+                return e;
+            }
             // F2: a NEW row must not repeat a UNIQUE column value (existing or earlier in the batch).
             for (std::size_t u = 0; u < unique_cols.size(); ++u) {
                 const Datum& d = row[unique_cols[u]];
@@ -3186,6 +3194,12 @@ private:
         Datum pk;
         if (auto e = coerce(t->pk(), del.where_value, pk)) {
             return ExecResult::failure(*e);
+        }
+        // F3 DELETE RESTRICT: refuse to delete a row still referenced by a child FOREIGN KEY.
+        if (fk_referenced(t->name, pk)) {
+            return ExecResult::failure(
+                "FOREIGN KEY violation: row in '" + del.table +
+                "' is still referenced by a child table (DELETE restricted)");
         }
         // INCREMENTAL: read the prior committed row; if a live row exists, commit a
         // tombstone (the verified executor + incremental apply path do the write).
@@ -3871,6 +3885,51 @@ private:
             }
         }
         return "unhandled expression";
+    }
+
+    // F3: does the parent table `tname` have a row whose PK == `v`? (A FOREIGN KEY references the
+    // parent's PK.) Reads the parent over the verified read path (columnar or row).
+    [[nodiscard]] bool fk_parent_has(const std::string& tname, const Datum& v) {
+        const Table* p = catalog_.find(tname);
+        if (p == nullptr) return false;
+        if (p->columnar) return read_columnar_row(*p, v).has_value();
+        const ReadResult r = read_committed(encode_key(*p, v));
+        return r.has_value() && !is_tombstone(*r);
+    }
+
+    // F3: enforce every FOREIGN KEY of a row about to be inserted — a non-NULL FK value must exist as
+    // the referenced parent's PK. A NULL FK is allowed (unenforced, SQL semantics).
+    [[nodiscard]] std::optional<std::string> eval_foreign_keys(const Table& t,
+                                                              const std::vector<Datum>& row) {
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            const Column& col = t.columns[c];
+            if (col.fk_table.empty()) continue;
+            const Datum& v = row[c];
+            if (v.is_null) continue;
+            if (!fk_parent_has(col.fk_table, v)) {
+                return "FOREIGN KEY violation: column '" + col.name +
+                       "' has no matching row in '" + col.fk_table + "'";
+            }
+        }
+        return std::nullopt;
+    }
+
+    // F3 DELETE RESTRICT: true iff some CHILD table has a row whose FK references `parent`'s PK `pk`
+    // (so the parent row may not be deleted). Scans every table that declares such an FK.
+    [[nodiscard]] bool fk_referenced(const std::string& parent, const Datum& pk) {
+        for (const auto& [name, child] : catalog_.all()) {
+            for (std::size_t c = 0; c < child.columns.size(); ++c) {
+                if (child.columns[c].fk_table != parent) continue;
+                SelectStmt scan;
+                scan.table = child.name;
+                std::vector<std::vector<Datum>> rows;
+                if (scan_table(child, scan, rows)) continue;  // unreadable child — skip (best effort)
+                for (const std::vector<Datum>& r : rows) {
+                    if (!r[c].is_null && cmp_datum(r[c], pk) == 0) return true;
+                }
+            }
+        }
+        return false;
     }
 
     // F5: evaluate every CHECK constraint of `t` against a row about to be written. Each check is
