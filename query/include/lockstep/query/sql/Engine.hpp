@@ -327,6 +327,11 @@ public:
             o.push_back(static_cast<char>(c.logical));  // F9b: DECIMAL/DATE/TIMESTAMP/UUID logical tag
             o.push_back(static_cast<char>(c.scale));
             o.push_back(c.uuid_default ? 1 : 0);        // F9c
+            cat_put_u32(o, c.max_len);                  // F10 domain constraints
+            o.push_back(c.fixed_char ? 1 : 0);
+            o.push_back(c.is_unsigned ? 1 : 0);
+            o.push_back(static_cast<char>(c.precision));
+            o.push_back(static_cast<char>(c.int_bits));
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -376,6 +381,11 @@ public:
             c.logical = static_cast<std::uint8_t>(s[p++]);  // F9b
             c.scale = static_cast<std::uint8_t>(s[p++]);
             c.uuid_default = s[p++] != 0;  // F9c
+            c.max_len = cat_get_u32(s, p);  // F10
+            c.fixed_char = s[p++] != 0;
+            c.is_unsigned = s[p++] != 0;
+            c.precision = static_cast<std::uint8_t>(s[p++]);
+            c.int_bits = static_cast<std::uint8_t>(s[p++]);
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -1065,7 +1075,7 @@ private:
             out = Datum::make_int(v);
             out.logical = col.logical;
             out.scale = col.scale;
-            return std::nullopt;
+            return check_domain(col, out);
         }
         // F9c: a UUID column (physical TEXT). Validate + canonicalise (lowercase, dashed) the literal.
         if (col.type == Type::Text && col.logical == 4) {
@@ -1104,7 +1114,7 @@ private:
             out = Datum::make_text(Datum::encode_i128(v));
             out.logical = col.logical;
             out.scale = col.scale;
-            return std::nullopt;
+            return check_domain(col, out);
         }
         if (col.type != in.type) {
             return std::string("type mismatch for column '") + col.name +
@@ -1112,6 +1122,56 @@ private:
                    type_name(in.type);
         }
         out = in;
+        return check_domain(col, out);
+    }
+
+    // F10: enforce a column's DOMAIN constraints on a coerced value (deterministic). Validates the
+    // UNSIGNED sign, the integer-width range (TINYINT/SMALLINT/INT32), the DECIMAL precision, and the
+    // VARCHAR/CHAR/BLOB length; CHAR right-pads to its length. `d` may be mutated (the CHAR pad).
+    static std::optional<std::string> check_domain(const Column& col, Datum& d) {
+        if (d.is_null) return std::nullopt;
+        // Numeric INT-backed (not DATE/TIMESTAMP — sign/width are meaningless there).
+        if (d.type == Type::Int && col.logical != 2 && col.logical != 3) {
+            if (col.is_unsigned && d.i < 0)
+                return "value must be >= 0 (UNSIGNED column '" + col.name + "')";
+            if (col.int_bits != 0 && col.logical == 0) {
+                std::int64_t lo = 0, hi = 0;
+                if (col.is_unsigned) { hi = (static_cast<std::int64_t>(1) << col.int_bits) - 1; }
+                else { hi = (static_cast<std::int64_t>(1) << (col.int_bits - 1)) - 1; lo = -hi - 1; }
+                if (d.i < lo || d.i > hi)
+                    return "value " + std::to_string(d.i) + " out of range for column '" + col.name + "'";
+            }
+            if (col.logical == 1 && col.precision != 0) {  // DECIMAL64 precision
+                std::int64_t pow = 1;
+                bool ovf = false;
+                for (std::uint8_t k = 0; k < col.precision; ++k)
+                    if (mul_ovf(pow, 10, pow)) { ovf = true; break; }
+                const std::uint64_t mag = d.i < 0 ? static_cast<std::uint64_t>(-(d.i + 1)) + 1
+                                                  : static_cast<std::uint64_t>(d.i);
+                if (!ovf && mag >= static_cast<std::uint64_t>(pow))
+                    return "value exceeds DECIMAL(" + std::to_string(col.precision) + ") precision for column '" + col.name + "'";
+            }
+        }
+        // 128-bit (INT128/DECIMAL128) — value is the 16-byte payload in s.
+        if (d.type == Type::Text && col.logical >= 5) {
+            const __int128 v = Datum::decode_i128(d.s);
+            if (col.is_unsigned && v < 0)
+                return "value must be >= 0 (UNSIGNED column '" + col.name + "')";
+            if (col.logical == 6 && col.precision != 0) {
+                __int128 pow = 1;
+                for (std::uint8_t k = 0; k < col.precision; ++k) pow *= 10;  // precision<=38 fits int128
+                const unsigned __int128 mag = Datum::abs_u128(v);
+                if (mag >= static_cast<unsigned __int128>(pow))
+                    return "value exceeds DECIMAL(" + std::to_string(col.precision) + ") precision for column '" + col.name + "'";
+            }
+        }
+        // Plain TEXT / VARCHAR(n) / CHAR(n) / BLOB(n).
+        if (d.type == Type::Text && col.logical < 5) {
+            if (col.max_len != 0 && d.s.size() > col.max_len)
+                return "value too long for column '" + col.name + "' (max " + std::to_string(col.max_len) + ")";
+            if (col.fixed_char && col.max_len != 0 && d.s.size() < col.max_len)
+                d.s.append(col.max_len - d.s.size(), ' ');  // CHAR right-pad
+        }
         return std::nullopt;
     }
 

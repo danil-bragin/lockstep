@@ -105,6 +105,12 @@ struct Column {
     // the table's next_uuid counter (NOT random — random would diverge across the two Raft impls and
     // break the cross-check). Independent of has_default (which holds literal defaults).
     bool uuid_default = false;
+    // F10: DOMAIN constraints (checked at coerce; all deterministic). 0/false == unconstrained.
+    std::uint32_t max_len = 0;     // VARCHAR(n)/CHAR(n)/BLOB(n): max byte length (TEXT columns)
+    bool fixed_char = false;       // CHAR(n): right-pad with spaces to max_len
+    bool is_unsigned = false;      // UNSIGNED: reject a negative value (INT/BIGINT/INT128/DECIMAL*)
+    std::uint8_t precision = 0;    // DECIMAL(p,s): max total significant digits (0 == unconstrained)
+    std::uint8_t int_bits = 0;     // TINYINT/SMALLINT/INT32: width for the range check (0 == 64-bit)
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column

@@ -517,6 +517,14 @@ private:
             advance();
             return std::nullopt;
         }
+        // F10: narrow integer aliases — INT-backed, with a RANGE check (int_bits) at coerce.
+        if (is_kw("tinyint") || is_kw("smallint") || is_kw("int32") || is_kw("int4") ||
+            is_kw("mediumint")) {
+            out = Type::Int;
+            col.int_bits = (is_kw("tinyint")) ? 8 : (is_kw("smallint") ? 16 : 32);
+            advance();
+            return std::nullopt;
+        }
         // F9b: DATE / TIMESTAMP / DECIMAL — INT-backed logical types (byte-deterministic).
         if (is_kw("date")) {
             out = Type::Int;
@@ -561,6 +569,7 @@ private:
                 }
                 if (auto e = expect(Tok::RParen, "')' after DECIMAL precision/scale")) return e;
             }
+            if (precision > 0 && precision <= 38) col.precision = static_cast<std::uint8_t>(precision);  // F10
             if (force128 || precision > 18) {  // promote to 128-bit fixed-point over TEXT
                 out = Type::Text;
                 col.logical = 6;
@@ -578,13 +587,21 @@ private:
             advance();
             return std::nullopt;
         }
-        if (is_kw("varchar") || is_kw("char")) {
+        // F10: VARCHAR(n) / CHAR(n) / BLOB(n) / [VAR]BINARY(n) — TEXT-backed with a LENGTH limit.
+        // CHAR right-pads to n; the rest just bound the length. BLOB/BINARY are byte aliases of TEXT.
+        if (is_kw("varchar") || is_kw("char") || is_kw("blob") || is_kw("bytes") ||
+            is_kw("binary") || is_kw("varbinary")) {
+            const bool is_char = is_kw("char") || is_kw("binary");  // fixed-length forms
             advance();
-            if (cur_.kind == Tok::LParen) {  // an optional length, parsed + ignored
+            if (cur_.kind == Tok::LParen) {  // VARCHAR(n) — enforce n
                 advance();
                 Datum d;
                 if (auto e = expect_literal(d)) return e;
-                if (auto e = expect(Tok::RParen, "')' after the VARCHAR length")) return e;
+                if (d.type != Type::Int || d.i < 0 || d.i > 0xFFFFFFLL)
+                    return make_err("length must be a non-negative integer");
+                col.max_len = static_cast<std::uint32_t>(d.i);
+                col.fixed_char = is_char && col.max_len > 0;
+                if (auto e = expect(Tok::RParen, "')' after the length")) return e;
             }
             out = Type::Text;
             return std::nullopt;
@@ -667,6 +684,10 @@ private:
         if (auto e = expect_ident("a column name", col.name)) return ParseResult{*e};
         if (auto e = parse_column_type(col)) {
             return ParseResult{*e};
+        }
+        if (is_kw("unsigned")) {  // F10
+            advance();
+            col.is_unsigned = true;
         }
         col.nullable = true;
         if (is_kw("not")) {
@@ -751,6 +772,11 @@ private:
             }
             if (auto e = parse_column_type(col)) {
                 return ParseResult{*e};
+            }
+            // F10: optional UNSIGNED (a non-negativity constraint; e.g. `BIGINT UNSIGNED`).
+            if (is_kw("unsigned")) {
+                advance();
+                col.is_unsigned = true;
             }
             // v4: optional NOT NULL constraint. A column is NULLABLE by default; a
             // NOT NULL column requires a present value at INSERT. (The PK column is
