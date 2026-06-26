@@ -4194,6 +4194,11 @@ private:
             }
             index[group_key_field(kd)].push_back(i);
         }
+        // E1: a RIGHT/FULL join must also emit each RIGHT row that no LEFT row matched, with the
+        // LEFT side NULL-filled. Track which right rows got matched.
+        const bool left_fill = je.kind == JoinKind::Left || je.kind == JoinKind::Full;
+        const bool right_fill = je.kind == JoinKind::Right || je.kind == JoinKind::Full;
+        std::vector<bool> rmatched(rt.rows.size(), false);
         for (const auto& ljr : left) {
             const Datum& lk = ljr[left_idx];
             bool matched = false;
@@ -4205,16 +4210,36 @@ private:
                         place(schema, rt.alias, rt.rows[ri], jr);
                         out.push_back(std::move(jr));
                         matched = true;
+                        rmatched[ri] = true;
                     }
                 }
             }
-            if (!matched && je.kind == JoinKind::Left) {
+            if (!matched && left_fill) {
                 std::vector<Datum> jr = ljr;
                 place_null(schema, rt.alias, jr);
                 out.push_back(std::move(jr));
             }
         }
+        if (right_fill) {
+            for (std::size_t i = 0; i < rt.rows.size(); ++i) {
+                if (!rmatched[i]) {
+                    out.push_back(right_unmatched_row(schema, rt, rt.rows[i]));
+                }
+            }
+        }
         return std::nullopt;
+    }
+
+    // E1: build a joined row for a RIGHT/FULL-join's unmatched right row — every column NULL except
+    // the right table's span, which holds `rrow`. (The left side has no matching row.)
+    [[nodiscard]] static std::vector<Datum> right_unmatched_row(
+        const JoinSchema& schema, const ScannedTable& rt, const std::vector<Datum>& rrow) {
+        std::vector<Datum> jr(schema.cols.size());
+        for (std::size_t i = 0; i < jr.size(); ++i) {
+            jr[i] = Datum::make_null(schema.cols[i].type);
+        }
+        place(schema, rt.alias, rrow, jr);
+        return jr;
     }
 
     // Nested-loop: for each left row, scan every right row, evaluate the full ON
@@ -4223,9 +4248,13 @@ private:
         const JoinEntry& je, const JoinSchema& schema,
         const std::vector<std::vector<Datum>>& left, const ScannedTable& rt,
         std::vector<std::vector<Datum>>& out) {
+        const bool left_fill = je.kind == JoinKind::Left || je.kind == JoinKind::Full;
+        const bool right_fill = je.kind == JoinKind::Right || je.kind == JoinKind::Full;
+        std::vector<bool> rmatched(rt.rows.size(), false);
         for (const auto& ljr : left) {
             bool matched = false;
-            for (const auto& rrow : rt.rows) {
+            for (std::size_t rj = 0; rj < rt.rows.size(); ++rj) {
+                const auto& rrow = rt.rows[rj];
                 std::vector<Datum> jr = ljr;
                 place(schema, rt.alias, rrow, jr);
                 bool truth = true;  // CROSS: no ON => always true
@@ -4238,12 +4267,20 @@ private:
                 if (truth) {
                     out.push_back(std::move(jr));
                     matched = true;
+                    rmatched[rj] = true;
                 }
             }
-            if (!matched && je.kind == JoinKind::Left) {
+            if (!matched && left_fill) {
                 std::vector<Datum> jr = ljr;
                 place_null(schema, rt.alias, jr);
                 out.push_back(std::move(jr));
+            }
+        }
+        if (right_fill) {
+            for (std::size_t i = 0; i < rt.rows.size(); ++i) {
+                if (!rmatched[i]) {
+                    out.push_back(right_unmatched_row(schema, rt, rt.rows[i]));
+                }
             }
         }
         return std::nullopt;
@@ -4489,10 +4526,9 @@ private:
         std::stable_sort(rows.begin(), rows.end(),
                          [&](const ResultRow& x, const ResultRow& y) {
                              for (std::size_t i = 0; i < ob.size(); ++i) {
-                                 const int c = cmp_by_label(x, y, keys[i]);
-                                 if (c != 0) {
-                                     return ob[i].descending ? (c > 0) : (c < 0);
-                                 }
+                                 int dir = 0;
+                                 if (order_key_less_label(x, y, keys[i], ob[i], dir)) return true;
+                                 if (dir != 0) return false;  // G3: honor NULLS FIRST/LAST
                              }
                              return render_row(x) < render_row(y);  // total tie-break
                          });
@@ -5937,8 +5973,14 @@ private:
     // placed FIRST/LAST per k.nulls; Default = NULL is the smallest value (FIRST under ASC, LAST
     // under DESC) — byte-identical to the pre-G3 cmp_datum behavior.
     static bool order_key_less(const ResultRow& x, const ResultRow& y, const OrderKey& k, int& dir) {
-        const Datum* dx = cell(x, k.column);
-        const Datum* dy = cell(y, k.column);
+        return order_key_less_label(x, y, k.column, k, dir);
+    }
+    // As above but the cell is looked up by an explicit `label` (the joined path resolves a key to
+    // a qualified output label like "a.x"); direction + NULLS come from `k`.
+    static bool order_key_less_label(const ResultRow& x, const ResultRow& y,
+                                     const std::string& label, const OrderKey& k, int& dir) {
+        const Datum* dx = cell(x, label);
+        const Datum* dy = cell(y, label);
         if (dx == nullptr || dy == nullptr) {
             dir = 0;
             return false;  // label missing on this row — treat as a tie (pre-G3 cmp_by_label==0)
@@ -5995,10 +6037,9 @@ private:
         std::stable_sort(rows.begin(), rows.end(),
                          [&](const ResultRow& x, const ResultRow& y) {
                              for (std::size_t i = 0; i < ob.size(); ++i) {
-                                 const int c = cmp_by_label(x, y, keys[i]);
-                                 if (c != 0) {
-                                     return ob[i].descending ? (c > 0) : (c < 0);
-                                 }
+                                 int dir = 0;
+                                 if (order_key_less_label(x, y, keys[i], ob[i], dir)) return true;
+                                 if (dir != 0) return false;  // G3: honor NULLS FIRST/LAST
                              }
                              return render_row(x) < render_row(y);  // total tie-break
                          });

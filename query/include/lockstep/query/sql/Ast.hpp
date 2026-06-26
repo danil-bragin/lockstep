@@ -246,7 +246,7 @@ struct SelectItem {
 //   Inner — INNER JOIN ... ON p: keep only matched (left,right) pairs.
 //   Left  — LEFT [OUTER] JOIN ... ON p: keep every left row; unmatched ones emit one
 //           output row with the right side's columns NULL-filled.
-enum class JoinKind : std::uint8_t { Cross = 0, Inner = 1, Left = 2 };
+enum class JoinKind : std::uint8_t { Cross = 0, Inner = 1, Left = 2, Right = 3, Full = 4 };
 
 // One FROM/JOIN entry. The FROM clause is a LEFT-DEEP list: entry[0] is the base
 // table (kind ignored), entry[k>0] joins onto the accumulated left side. `on` is the

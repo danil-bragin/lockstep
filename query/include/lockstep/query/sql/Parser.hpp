@@ -832,7 +832,8 @@ private:
                is_kw("by") || is_kw("join") || is_kw("inner") || is_kw("left") ||
                is_kw("right") || is_kw("outer") || is_kw("cross") || is_kw("on") ||
                is_kw("as") || is_kw("is") || is_kw("in") || is_kw("exists") ||
-               is_kw("null") || is_kw("not") || is_kw("between");
+               is_kw("null") || is_kw("not") || is_kw("between") ||
+               is_kw("full") || is_kw("nulls") || is_kw("like") || is_kw("union");
     }
 
     // Try to parse an AGGREGATE call at the cursor: NAME '(' ('*' | col) ')'.
@@ -1581,9 +1582,26 @@ private:
                 }
                 kind = JoinKind::Left;
                 is_join_clause = true;
-            } else if (is_kw("right") || is_kw("full")) {
-                return make_err("only INNER and LEFT [OUTER] joins are supported "
-                                "(RIGHT/FULL are OUT)");
+            } else if (is_kw("right")) {
+                advance();
+                if (is_kw("outer")) {
+                    advance();  // RIGHT OUTER == RIGHT
+                }
+                if (auto e = expect_kw("join")) {
+                    return e;
+                }
+                kind = JoinKind::Right;
+                is_join_clause = true;
+            } else if (is_kw("full")) {
+                advance();
+                if (is_kw("outer")) {
+                    advance();  // FULL OUTER == FULL
+                }
+                if (auto e = expect_kw("join")) {
+                    return e;
+                }
+                kind = JoinKind::Full;
+                is_join_clause = true;
             } else if (is_kw("join")) {
                 advance();  // bare JOIN == INNER JOIN
                 kind = JoinKind::Inner;
