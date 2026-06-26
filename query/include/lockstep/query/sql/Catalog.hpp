@@ -111,6 +111,11 @@ struct Column {
     bool is_unsigned = false;      // UNSIGNED: reject a negative value (INT/BIGINT/INT128/DECIMAL*)
     std::uint8_t precision = 0;    // DECIMAL(p,s): max total significant digits (0 == unconstrained)
     std::uint8_t int_bits = 0;     // TINYINT/SMALLINT/INT32: width for the range check (0 == 64-bit)
+    // F12: ARRAY (logical == 7). The ELEMENT type: its physical type + its own logical/scale tag
+    // (so INT[], TEXT[], DECIMAL[], INT128[], etc. all work). The array payload lives in the value `s`.
+    Type elem_type = Type::Int;
+    std::uint8_t elem_logical = 0;
+    std::uint8_t elem_scale = 0;
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -261,11 +266,91 @@ struct Datum {
             if (logical == 2) return render_date(i);
             if (logical == 3) return render_timestamp(i);
         }
+        if (type == Type::Text && logical == 7) return render_array(s);  // F12: ARRAY
         if (type == Type::Text && logical >= 5) {  // F9e: INT128 / DECIMAL128 (16-byte payload in s)
             if (logical == 5) return render_i128(decode_i128(s));
             if (logical == 6) return render_decimal128(decode_i128(s), scale);
         }
         return type == Type::Int ? std::to_string(i) : s;
+    }
+
+    // --- F12: ARRAY (logical=7) over physical TEXT. Self-describing payload in `s`:
+    //   [elem_logical:u8][elem_scale:u8][count:be32]  then per element:
+    //   [0]                          == SQL NULL
+    //   [1][8-byte be64]             == an INT-backed element (int64 value)
+    //   [2][len:be32][bytes]         == a TEXT-backed element (text, or a 16-byte INT128 payload)
+    // Deterministic; element ordering preserved. The element's logical/scale is the header's (every
+    // element shares the column's element type), re-tagged on decode so render() prints each. ---
+    static void put_be32_(std::string& o, std::uint32_t v) {
+        o.push_back(static_cast<char>((v >> 24) & 0xFF));
+        o.push_back(static_cast<char>((v >> 16) & 0xFF));
+        o.push_back(static_cast<char>((v >> 8) & 0xFF));
+        o.push_back(static_cast<char>(v & 0xFF));
+    }
+    static std::uint32_t get_be32_(const std::string& s, std::size_t off) {
+        return (static_cast<std::uint32_t>(static_cast<unsigned char>(s[off])) << 24) |
+               (static_cast<std::uint32_t>(static_cast<unsigned char>(s[off + 1])) << 16) |
+               (static_cast<std::uint32_t>(static_cast<unsigned char>(s[off + 2])) << 8) |
+               static_cast<std::uint32_t>(static_cast<unsigned char>(s[off + 3]));
+    }
+    static std::string encode_array(std::uint8_t elem_logical, std::uint8_t elem_scale,
+                                    const std::vector<Datum>& elems) {
+        std::string s;
+        s.push_back(static_cast<char>(elem_logical));
+        s.push_back(static_cast<char>(elem_scale));
+        put_be32_(s, static_cast<std::uint32_t>(elems.size()));
+        for (const Datum& e : elems) {
+            if (e.is_null) { s.push_back(0); continue; }
+            if (e.type == Type::Int) {
+                s.push_back(1);
+                for (int k = 7; k >= 0; --k)
+                    s.push_back(static_cast<char>(static_cast<unsigned char>(
+                        static_cast<std::uint64_t>(e.i) >> (8 * k))));
+            } else {
+                s.push_back(2);
+                put_be32_(s, static_cast<std::uint32_t>(e.s.size()));
+                s += e.s;
+            }
+        }
+        return s;
+    }
+    static std::vector<Datum> decode_array(const std::string& s) {
+        std::vector<Datum> out;
+        if (s.size() < 6) return out;
+        const std::uint8_t el = static_cast<unsigned char>(s[0]);
+        const std::uint8_t es = static_cast<unsigned char>(s[1]);
+        const std::uint32_t n = get_be32_(s, 2);
+        std::size_t off = 6;
+        for (std::uint32_t k = 0; k < n && off < s.size(); ++k) {
+            const std::uint8_t tag = static_cast<unsigned char>(s[off++]);
+            Datum d;
+            if (tag == 0) {
+                d = make_null(el >= 5 ? Type::Text : Type::Int);
+            } else if (tag == 1) {
+                std::uint64_t bits = 0;
+                for (int b = 0; b < 8; ++b) bits = (bits << 8) | static_cast<unsigned char>(s[off++]);
+                d = make_int(static_cast<std::int64_t>(bits));
+            } else {
+                const std::uint32_t len = get_be32_(s, off);
+                off += 4;
+                d = make_text(s.substr(off, len));
+                off += len;
+            }
+            d.logical = el;
+            d.scale = es;
+            out.push_back(std::move(d));
+        }
+        return out;
+    }
+    static std::string render_array(const std::string& s) {
+        const std::vector<Datum> elems = decode_array(s);
+        std::string out = "{";
+        for (std::size_t k = 0; k < elems.size(); ++k) {
+            if (k != 0) out.push_back(',');
+            out += elems[k].render();
+        }
+        out.push_back('}');
+        return out;
     }
 
     // --- F9e: 128-bit integer / fixed-point (logical=5/6) over physical TEXT. The value is a 16-byte

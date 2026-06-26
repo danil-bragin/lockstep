@@ -226,7 +226,10 @@ struct Predicate {
 // A1/A2/A3/A4: a SCALAR EXPRESSION tree — arithmetic (+ - * / %), a column reference, a literal,
 // a scalar function (UPPER/LOWER/LENGTH/SUBSTR/CONCAT/COALESCE/ABS/CAST), or a CASE expression.
 // Evaluated to a Datum over a row. Held by shared_ptr so the tree stays copyable.
-enum class ExprKind : std::uint8_t { Col = 0, Lit = 1, Neg = 2, Bin = 3, Func = 4, Case = 5 };
+// F12: Array — ARRAY[e0,e1,...] (elements in `args`). Subscript — arr[idx] (`left`=array, `right`=index).
+enum class ExprKind : std::uint8_t {
+    Col = 0, Lit = 1, Neg = 2, Bin = 3, Func = 4, Case = 5, Array = 6, Subscript = 7
+};
 enum class BinOp : std::uint8_t { Add = 0, Sub = 1, Mul = 2, Div = 3, Mod = 4 };
 
 struct Expr {

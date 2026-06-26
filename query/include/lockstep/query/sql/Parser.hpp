@@ -107,6 +107,8 @@ enum class Tok : std::uint8_t {
     Minus,    // -
     Slash,    // /
     Percent,  // %
+    LBracket, // [  (F12 array literal / subscript)
+    RBracket, // ]
     End,      // end of input
     Bad,      // a lexing error (unterminated string / stray byte)
 };
@@ -153,6 +155,14 @@ public:
             case ')':
                 ++i_;
                 t.kind = Tok::RParen;
+                return t;
+            case '[':
+                ++i_;
+                t.kind = Tok::LBracket;
+                return t;
+            case ']':
+                ++i_;
+                t.kind = Tok::RBracket;
                 return t;
             case ',':
                 ++i_;
@@ -514,7 +524,25 @@ private:
     // F9: parse a column type. INT/BIGINT/INTEGER + BOOL/BOOLEAN are INT-backed; TEXT/VARCHAR/CHAR
     // are TEXT (an optional VARCHAR length is parsed + ignored). FLOAT/DOUBLE/DECIMAL/NUMERIC are
     // rejected — they break the engine's byte-deterministic INT model (cross-check/conformance).
+    // F12: parse a scalar type, then an optional `[]` suffix promoting it to a one-dimensional ARRAY
+    // of that element type (element kept in elem_type/elem_logical/elem_scale; the array itself is
+    // TEXT-backed, logical 7). Nested arrays (T[][]) are rejected.
     [[nodiscard]] std::optional<ParseError> parse_column_type(Column& col) {
+        if (auto e = parse_scalar_column_type(col)) return e;
+        if (cur_.kind == Tok::LBracket) {
+            advance();
+            if (auto e = expect(Tok::RBracket, "']' to close an array type")) return e;
+            col.elem_type = col.type;
+            col.elem_logical = col.logical;
+            col.elem_scale = col.scale;
+            col.type = Type::Text;
+            col.logical = 7;
+            col.scale = 0;
+            if (cur_.kind == Tok::LBracket) return make_err("nested arrays (T[][]) are not supported");
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<ParseError> parse_scalar_column_type(Column& col) {
         Type& out = col.type;
         if (is_kw("int") || is_kw("bigint") || is_kw("integer") || is_kw("bool") ||
             is_kw("boolean")) {
@@ -660,7 +688,29 @@ private:
             advance();
             return std::nullopt;
         }
-        return make_err("expected a literal (integer or 'string')");
+        // F12: an ARRAY[...] constant in a VALUES / WHERE position — its elements are literals, so
+        // build the array Datum here (re-encoded to the column's element type at coerce).
+        if (is_kw("array")) {
+            advance();
+            if (auto e = expect(Tok::LBracket, "'[' after ARRAY")) return e;
+            std::vector<Datum> elems;
+            if (cur_.kind != Tok::RBracket) {
+                for (;;) {
+                    Datum el;
+                    if (auto e = expect_value_or_null(el)) return e;
+                    elems.push_back(el);
+                    if (cur_.kind == Tok::Comma) { advance(); continue; }
+                    break;
+                }
+            }
+            if (auto e = expect(Tok::RBracket, "']' to close an ARRAY literal")) return e;
+            const std::uint8_t el = elems.empty() ? 0 : elems.front().logical;
+            const std::uint8_t es = elems.empty() ? 0 : elems.front().scale;
+            out = Datum::make_text(Datum::encode_array(el, es, elems));
+            out.logical = 7;
+            return std::nullopt;
+        }
+        return make_err("expected a literal (integer, 'string', or ARRAY[...])");
     }
 
     // v4: consume a literal OR the NULL keyword (INSERT VALUES / a comparison RHS).
@@ -1376,6 +1426,10 @@ private:
                 return "-expr";
             case ExprKind::Bin:
                 return "expr";
+            case ExprKind::Array:
+                return "array";
+            case ExprKind::Subscript:
+                return "element";
         }
         return "expr";
     }
@@ -1459,7 +1513,22 @@ private:
         }
         return parse_expr_primary(out);
     }
+    // F12: a primary expression followed by zero or more `[index]` array subscripts (1-based).
     [[nodiscard]] std::optional<ParseError> parse_expr_primary(std::shared_ptr<Expr>& out) {
+        if (auto e = parse_expr_atom(out)) return e;
+        while (cur_.kind == Tok::LBracket) {
+            advance();
+            std::shared_ptr<Expr> idx;
+            if (auto e = parse_scalar_expr(idx)) return e;
+            if (auto e = expect(Tok::RBracket, "']' to close an array subscript")) return e;
+            auto sub = mk_expr(ExprKind::Subscript);
+            sub->left = out;
+            sub->right = idx;
+            out = sub;
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<ParseError> parse_expr_atom(std::shared_ptr<Expr>& out) {
         if (cur_.kind == Tok::LParen) {
             advance();
             if (auto e = parse_scalar_expr(out)) return e;
@@ -1467,8 +1536,27 @@ private:
         }
         if (cur_.kind == Tok::IntLit) {
             auto n = mk_expr(ExprKind::Lit);
-            n->lit = Datum::make_int(cur_.int_val);
+            n->lit = cur_.int_overflow ? Datum::make_text(cur_.text)  // F11
+                                       : Datum::make_int(cur_.int_val);
             advance();
+            out = n;
+            return std::nullopt;
+        }
+        // F12: ARRAY[e0, e1, ...] literal.
+        if (is_kw("array")) {
+            advance();
+            if (auto e = expect(Tok::LBracket, "'[' after ARRAY")) return e;
+            auto n = mk_expr(ExprKind::Array);
+            if (cur_.kind != Tok::RBracket) {
+                for (;;) {
+                    std::shared_ptr<Expr> el;
+                    if (auto e = parse_scalar_expr(el)) return e;
+                    n->args.push_back(el);
+                    if (cur_.kind == Tok::Comma) { advance(); continue; }
+                    break;
+                }
+            }
+            if (auto e = expect(Tok::RBracket, "']' to close an ARRAY literal")) return e;
             out = n;
             return std::nullopt;
         }
@@ -2190,7 +2278,7 @@ private:
             leaf.rhs_is_subquery = true;
             leaf.subquery = std::move(sub);
         } else if (!is_agg && cur_.kind == Tok::Ident && !at_clause_boundary() &&
-                   !is_kw("true") && !is_kw("false")) {  // F9: TRUE/FALSE are literals, not columns
+                   !is_kw("true") && !is_kw("false") && !is_kw("array")) {  // F9/F12: literals, not columns
             std::string rq;
             std::string rc;
             if (auto e = expect_qualified_column("a column name on the right of the "

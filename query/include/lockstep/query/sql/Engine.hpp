@@ -332,6 +332,9 @@ public:
             o.push_back(c.is_unsigned ? 1 : 0);
             o.push_back(static_cast<char>(c.precision));
             o.push_back(static_cast<char>(c.int_bits));
+            o.push_back(static_cast<char>(c.elem_type == Type::Int ? 0 : 1));  // F12
+            o.push_back(static_cast<char>(c.elem_logical));
+            o.push_back(static_cast<char>(c.elem_scale));
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -386,6 +389,9 @@ public:
             c.is_unsigned = s[p++] != 0;
             c.precision = static_cast<std::uint8_t>(s[p++]);
             c.int_bits = static_cast<std::uint8_t>(s[p++]);
+            c.elem_type = (s[p++] == 0) ? Type::Int : Type::Text;  // F12
+            c.elem_logical = static_cast<std::uint8_t>(s[p++]);
+            c.elem_scale = static_cast<std::uint8_t>(s[p++]);
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -1095,9 +1101,38 @@ private:
             out.logical = 4;
             return std::nullopt;
         }
+        // F12: an ARRAY column (logical 7, physical TEXT). Accept an already-built array Datum (from
+        // an ARRAY[...] expression) or a '{...}' text literal; re-encode each element coerced to the
+        // column's element type so the stored payload is canonical.
+        if (col.type == Type::Text && col.logical == 7) {
+            std::vector<Datum> elems;
+            if (in.logical == 7 && in.type == Type::Text) {
+                elems = Datum::decode_array(in.s);  // already an array value
+            } else if (in.type == Type::Text) {
+                if (auto e = parse_array_literal(in.s, elems)) return e;  // '{...}' text
+            } else {
+                return std::string("type mismatch for column '") + col.name + "': expected ARRAY";
+            }
+            Column elem_col;  // a synthetic scalar column for per-element coercion
+            elem_col.name = col.name;
+            elem_col.type = col.elem_type;
+            elem_col.logical = col.elem_logical;
+            elem_col.scale = col.elem_scale;
+            elem_col.nullable = true;
+            std::vector<Datum> coerced;
+            coerced.reserve(elems.size());
+            for (const Datum& e : elems) {
+                Datum ce;
+                if (auto err = coerce(elem_col, e, ce, for_write)) return err;
+                coerced.push_back(std::move(ce));
+            }
+            out = Datum::make_text(Datum::encode_array(col.elem_logical, col.elem_scale, coerced));
+            out.logical = 7;
+            return std::nullopt;
+        }
         // F9e: an INT128 (logical 5) / DECIMAL128 (logical 6) column (physical TEXT, 16-byte payload).
         // Accept a decimal string ('123...' / '12.34'), or a bare INT widened to 128-bit.
-        if (col.type == Type::Text && col.logical >= 5) {
+        if (col.type == Type::Text && (col.logical == 5 || col.logical == 6)) {
             __int128 v = 0;
             if (in.type == Type::Text) {
                 const bool ok = col.logical == 5 ? parse_i128(in.s, v)
@@ -1158,7 +1193,7 @@ private:
             }
         }
         // 128-bit (INT128/DECIMAL128) — value is the 16-byte payload in s.
-        if (d.type == Type::Text && col.logical >= 5) {
+        if (d.type == Type::Text && (col.logical == 5 || col.logical == 6)) {
             const __int128 v = Datum::decode_i128(d.s);
             if (col.is_unsigned && v < 0)
                 return "value must be >= 0 (UNSIGNED column '" + col.name + "')";
@@ -1177,6 +1212,49 @@ private:
             if (col.fixed_char && col.max_len != 0 && d.s.size() < col.max_len)
                 d.s.append(col.max_len - d.s.size(), ' ');  // CHAR right-pad
         }
+        return std::nullopt;
+    }
+
+    // F12: parse a '{a,b,c}' array text literal into raw element Datums (numeric token -> INT, NULL ->
+    // null, else TEXT with optional surrounding quotes stripped). Top-level only (no nested arrays).
+    static std::optional<std::string> parse_array_literal(const std::string& in,
+                                                          std::vector<Datum>& out) {
+        std::size_t p = 0;
+        while (p < in.size() && (in[p] == ' ' || in[p] == '\t')) ++p;
+        if (p >= in.size() || in[p] != '{') return std::string("array literal must start with '{'");
+        ++p;
+        auto trim = [](std::string x) {
+            std::size_t a = 0, b = x.size();
+            while (a < b && (x[a] == ' ' || x[a] == '\t')) ++a;
+            while (b > a && (x[b - 1] == ' ' || x[b - 1] == '\t')) --b;
+            return x.substr(a, b - a);
+        };
+        std::string cur;
+        bool closed = false;
+        auto flush = [&]() {
+            std::string tok = trim(cur);
+            cur.clear();
+            if (tok.empty()) return;  // tolerate trailing/empty (e.g. '{}')
+            if (tok == "NULL" || tok == "null") { out.push_back(Datum::make_null(Type::Int)); return; }
+            if (tok.size() >= 2 && (tok.front() == '\'' || tok.front() == '"') && tok.back() == tok.front()) {
+                out.push_back(Datum::make_text(tok.substr(1, tok.size() - 2)));
+                return;
+            }
+            bool numeric = !tok.empty();
+            for (std::size_t k = (tok[0] == '-' || tok[0] == '+') ? 1 : 0; k < tok.size(); ++k)
+                if (tok[k] < '0' || tok[k] > '9') { numeric = false; break; }
+            if (numeric && tok != "-" && tok != "+")
+                out.push_back(Datum::make_int(std::strtoll(tok.c_str(), nullptr, 10)));
+            else
+                out.push_back(Datum::make_text(tok));
+        };
+        for (; p < in.size(); ++p) {
+            if (in[p] == '}') { closed = true; ++p; break; }
+            if (in[p] == ',') { flush(); continue; }
+            cur.push_back(in[p]);
+        }
+        if (!closed) return std::string("array literal missing closing '}'");
+        flush();
         return std::nullopt;
     }
 
@@ -4309,6 +4387,34 @@ private:
                 out = Datum::make_null(Type::Int);
                 return std::nullopt;
             }
+            case ExprKind::Array: {  // F12: build an array value from the element expressions
+                std::vector<Datum> elems;
+                elems.reserve(e.args.size());
+                for (const auto& a : e.args) {
+                    Datum d;
+                    if (auto er = eval_expr(*a, t, row, d)) return er;
+                    elems.push_back(std::move(d));
+                }
+                const std::uint8_t el = elems.empty() ? 0 : elems.front().logical;
+                const std::uint8_t es = elems.empty() ? 0 : elems.front().scale;
+                out = Datum::make_text(Datum::encode_array(el, es, elems));
+                out.logical = 7;
+                return std::nullopt;
+            }
+            case ExprKind::Subscript: {  // F12: arr[idx] — 1-based; out-of-range / NULL -> NULL
+                Datum arr, idx;
+                if (auto er = eval_expr(*e.left, t, row, arr)) return er;
+                if (auto er = eval_expr(*e.right, t, row, idx)) return er;
+                if (arr.is_null || idx.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+                if (arr.logical != 7) return "subscript ([]) requires an ARRAY operand";
+                if (idx.type != Type::Int) return "array subscript must be an INT";
+                const std::vector<Datum> elems = Datum::decode_array(arr.s);
+                if (idx.i < 1 || idx.i > static_cast<std::int64_t>(elems.size()))
+                    out = Datum::make_null(Type::Int);  // out of range -> NULL (SQL)
+                else
+                    out = elems[static_cast<std::size_t>(idx.i - 1)];
+                return std::nullopt;
+            }
         }
         return "unhandled expression";
     }
@@ -4501,6 +4607,13 @@ private:
                 if (e.case_else)
                     if (auto er = validate_expr_columns(*e.case_else, t)) return er;
                 return std::nullopt;
+            case ExprKind::Array:  // F12
+                for (const auto& a : e.args)
+                    if (auto er = validate_expr_columns(*a, t)) return er;
+                return std::nullopt;
+            case ExprKind::Subscript:
+                if (auto er = validate_expr_columns(*e.left, t)) return er;
+                return validate_expr_columns(*e.right, t);
         }
         return std::nullopt;
     }
@@ -6460,6 +6573,18 @@ private:
             if (a.is_null && b.is_null) return 0;
             return a.is_null ? -1 : 1;  // NULL < any present value (NULLs first)
         }
+        // F12: arrays compare ELEMENT-WISE (then shorter < longer), like Postgres — not a raw byte
+        // compare (the count-prefixed payload wouldn't order correctly).
+        if (a.logical == 7 && b.logical == 7) {
+            const std::vector<Datum> ea = Datum::decode_array(a.s), eb = Datum::decode_array(b.s);
+            for (std::size_t k = 0; k < ea.size() && k < eb.size(); ++k) {
+                const int c = cmp_datum(ea[k], eb[k]);
+                if (c != 0) return c;
+            }
+            if (ea.size() < eb.size()) return -1;
+            if (ea.size() > eb.size()) return 1;
+            return 0;
+        }
         if (a.type == Type::Int) {
             if (a.i < b.i) return -1;
             if (a.i > b.i) return 1;
@@ -6539,6 +6664,9 @@ private:
         }
         const auto ci = t.column_index(n.column);
         if (!ci || t.columns[*ci].nullable) {
+            return false;
+        }
+        if (t.columns[*ci].logical == 7) {  // F12: arrays compare element-wise — not zone/byte vectorizable
             return false;
         }
         // F9b/F9c: a literal compared against a DECIMAL/DATE/TIMESTAMP/UUID column must be coerced to
