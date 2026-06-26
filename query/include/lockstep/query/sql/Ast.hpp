@@ -455,7 +455,10 @@ enum class StmtKind : std::uint8_t {
     Begin = 9,     // G1: BEGIN [TRANSACTION]
     Commit = 10,   // G1: COMMIT
     Rollback = 11, // G1: ROLLBACK
-    Truncate = 12, // E2: TRUNCATE TABLE
+    Truncate = 12,      // E2: TRUNCATE TABLE
+    CreateSchema = 13,  // E4: CREATE SCHEMA [IF NOT EXISTS] s
+    DropSchema = 14,    // E4: DROP SCHEMA [IF EXISTS] s
+    SetSearchPath = 15, // E4: SET search_path TO s | DEFAULT
 };
 
 struct Statement {
@@ -469,6 +472,9 @@ struct Statement {
     DropIndexStmt drop_index;
     DropTableStmt drop_table;
     TruncateStmt truncate;  // E2
+    std::string schema_arg;       // E4: CREATE/DROP SCHEMA name, or SET search_path target
+    bool schema_if_not_exists = false;  // E4
+    bool schema_if_exists = false;      // E4
     AlterStmt alter;
 };
 

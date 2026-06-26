@@ -49,6 +49,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <optional>
 #include <cstdio>
 #include <string>
@@ -1354,8 +1355,10 @@ inline void decode_row_projected_into(const Table& t, const Key& key, const Valu
 // ----------------------------------------------------------------------------
 class Catalog {
 public:
-    // Register a new table. Returns false if the name already exists (dup table).
+    // Register a new table. Returns false if the name already exists (dup table). E4: the name is
+    // schema-qualified through the search_path (bare names unchanged when search_path is empty).
     [[nodiscard]] bool create(Table t) {
+        t.name = qualify(t.name);
         if (tables_.count(t.name) != 0) {
             return false;
         }
@@ -1378,15 +1381,37 @@ public:
         return true;
     }
 
+    // E4: SCHEMAS / namespaces. A `schema.table` name is used verbatim; a bare name resolves through
+    // the current search_path. The DEFAULT search_path is EMPTY, so a bare name stays bare and every
+    // catalog key is byte-identical to the pre-schema behaviour (conformance/cross-check unaffected).
+    [[nodiscard]] std::string qualify(const std::string& name) const {
+        if (name.find('.') != std::string::npos) return name;        // already schema-qualified
+        if (!search_path_.empty()) return search_path_ + "." + name;  // resolve via search_path
+        return name;                                                  // bare (default)
+    }
+    bool create_schema(const std::string& s, bool if_not_exists) {
+        if (schemas_.count(s) != 0) return if_not_exists;  // ok (no-op) iff IF NOT EXISTS
+        schemas_.insert(s);
+        return true;
+    }
+    bool drop_schema(const std::string& s) { return schemas_.erase(s) != 0; }
+    [[nodiscard]] bool has_schema(const std::string& s) const { return schemas_.count(s) != 0; }
+    bool set_search_path(const std::string& s) {
+        if (!s.empty() && schemas_.count(s) == 0) return false;  // unknown schema
+        search_path_ = s;
+        return true;
+    }
+    [[nodiscard]] const std::set<std::string>& schemas() const { return schemas_; }
+
     [[nodiscard]] const Table* find(const std::string& name) const {
-        const auto it = tables_.find(name);
+        const auto it = tables_.find(qualify(name));
         return it == tables_.end() ? nullptr : &it->second;
     }
 
     // Mutable table lookup (for index DDL — CREATE/DROP INDEX edits the schema's
     // `indexes` list). Deterministic: the catalog is an ordered map.
     [[nodiscard]] Table* find_mut(const std::string& name) {
-        const auto it = tables_.find(name);
+        const auto it = tables_.find(qualify(name));
         return it == tables_.end() ? nullptr : &it->second;
     }
 
@@ -1395,22 +1420,23 @@ public:
     // orphaned-but-invisible — matches the no-GC model (DROP INDEX likewise leaves tombstones).
     // Returns false if the table did not exist.
     bool remove(const std::string& name) {
-        return tables_.erase(name) != 0;
+        return tables_.erase(qualify(name)) != 0;
     }
 
     [[nodiscard]] bool has(const std::string& name) const {
-        return tables_.count(name) != 0;
+        return tables_.count(qualify(name)) != 0;
     }
 
     // E1: ALTER TABLE RENAME TO — re-key the table under `to` (its id/data are unchanged). Returns
-    // false if `from` is missing or `to` already exists.
+    // false if `from` is missing or `to` already exists. E4: both names qualify via search_path.
     bool rename(const std::string& from, const std::string& to) {
-        const auto it = tables_.find(from);
-        if (it == tables_.end() || tables_.count(to) != 0) return false;
+        const std::string qf = qualify(from), qt = qualify(to);
+        const auto it = tables_.find(qf);
+        if (it == tables_.end() || tables_.count(qt) != 0) return false;
         Table t = std::move(it->second);
         tables_.erase(it);
-        t.name = to;
-        tables_.emplace(to, std::move(t));
+        t.name = qt;
+        tables_.emplace(qt, std::move(t));
         return true;
     }
 
@@ -1420,6 +1446,8 @@ public:
 private:
     std::map<std::string, Table> tables_;  // ordered => deterministic
     std::uint32_t next_id_ = 1;            // 0 reserved (no table)
+    std::set<std::string> schemas_;        // E4: registered schema names
+    std::string search_path_;              // E4: current schema for bare names ("" == bare/global)
 };
 
 }  // namespace lockstep::query::sql

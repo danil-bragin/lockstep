@@ -428,7 +428,16 @@ public:
             if (is_kw("table")) advance();  // optional TABLE
             Statement st;
             st.kind = StmtKind::Truncate;
-            if (auto e = expect_ident("a table name after TRUNCATE", st.truncate.table)) return ParseResult{*e};
+            if (auto e = expect_table_name("a table name after TRUNCATE", st.truncate.table)) return ParseResult{*e};
+            r = ParseResult{std::move(st)};
+        } else if (kw == "set") {  // E4: SET search_path TO s | DEFAULT
+            advance();
+            if (auto e = expect_kw("search_path")) return ParseResult{*e};
+            if (is_kw("to") || cur_.kind == Tok::Eq) advance();
+            Statement st;
+            st.kind = StmtKind::SetSearchPath;
+            if (is_kw("default")) { advance(); st.schema_arg.clear(); }
+            else if (auto e = expect_ident("a schema name or DEFAULT", st.schema_arg)) return ParseResult{*e};
             r = ParseResult{std::move(st)};
         } else {
             return err("unknown / unsupported statement keyword '" + cur_.text +
@@ -507,6 +516,18 @@ private:
         }
         out = cur_.text;
         advance();
+        return std::nullopt;
+    }
+
+    // E4: a possibly schema-qualified TABLE name: <ident> ['.' <ident>] -> "schema.table" (or bare).
+    [[nodiscard]] std::optional<ParseError> expect_table_name(const char* what, std::string& out) {
+        if (auto e = expect_ident(what, out)) return e;
+        if (cur_.kind == Tok::Dot) {
+            advance();
+            std::string tbl;
+            if (auto e = expect_ident("a table name after the schema", tbl)) return e;
+            out += "." + tbl;
+        }
         return std::nullopt;
     }
 
@@ -803,7 +824,7 @@ private:
         if (auto e = expect_kw("table")) return ParseResult{*e};
         Statement st;
         st.kind = StmtKind::Alter;
-        if (auto e = expect_ident("a table name after ALTER TABLE", st.alter.table)) {
+        if (auto e = expect_table_name("a table name after ALTER TABLE", st.alter.table)) {
             return ParseResult{*e};
         }
         // RENAME TO <newtable>  |  RENAME [COLUMN] <a> TO <b>
@@ -927,6 +948,19 @@ private:
         if (is_kw("index")) {
             return parse_create_index();
         }
+        if (is_kw("schema")) {  // E4: CREATE SCHEMA [IF NOT EXISTS] s
+            advance();
+            Statement st;
+            st.kind = StmtKind::CreateSchema;
+            if (is_kw("if")) {
+                advance();
+                if (auto e = expect_kw("not")) return ParseResult{*e};
+                if (auto e = expect_kw("exists")) return ParseResult{*e};
+                st.schema_if_not_exists = true;
+            }
+            if (auto e = expect_ident("a schema name", st.schema_arg)) return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
         if (auto e = expect_kw("table")) {
             return ParseResult{*e};
         }
@@ -938,13 +972,13 @@ private:
             if (auto e = expect_kw("exists")) return ParseResult{*e};
             st.create.if_not_exists = true;
         }
-        if (auto e = expect_ident("a table name after CREATE TABLE", st.create.table)) {
+        if (auto e = expect_table_name("a table name after CREATE TABLE", st.create.table)) {
             return ParseResult{*e};
         }
         // E2: CREATE TABLE t LIKE other — copy other's schema (no column list, no data).
         if (is_kw("like")) {
             advance();
-            if (auto e = expect_ident("a source table name after LIKE", st.create.like_table)) return ParseResult{*e};
+            if (auto e = expect_table_name("a source table name after LIKE", st.create.like_table)) return ParseResult{*e};
             return ParseResult{std::move(st)};
         }
         // E3: CREATE TABLE t AS SELECT ... — populate from a query.
@@ -1034,7 +1068,7 @@ private:
             // F3: optional REFERENCES <table> [( <col> )] — a foreign key to the parent's PK.
             if (is_kw("references")) {
                 advance();
-                if (auto e = expect_ident("a referenced table after REFERENCES", col.fk_table)) {
+                if (auto e = expect_table_name("a referenced table after REFERENCES", col.fk_table)) {
                     return ParseResult{*e};
                 }
                 if (cur_.kind == Tok::LParen) {
@@ -1131,7 +1165,7 @@ private:
         if (auto e = expect_kw("on")) {
             return ParseResult{*e};
         }
-        if (auto e = expect_ident("a table name after ON", st.create_index.table)) {
+        if (auto e = expect_table_name("a table name after ON", st.create_index.table)) {
             return ParseResult{*e};
         }
         if (auto e = expect(Tok::LParen, "'(' before the indexed column")) {
@@ -1157,12 +1191,20 @@ private:
             if (is_kw("if")) { advance(); (void)expect_kw("exists"); return true; }
             return false;
         };
+        if (is_kw("schema")) {  // E4: DROP SCHEMA [IF EXISTS] s
+            advance();
+            Statement st;
+            st.kind = StmtKind::DropSchema;
+            st.schema_if_exists = parse_if_exists();
+            if (auto e = expect_ident("a schema name", st.schema_arg)) return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
         if (is_kw("table")) {
             advance();  // TABLE
             Statement st;
             st.kind = StmtKind::DropTable;
             st.drop_table.if_exists = parse_if_exists();  // E2
-            if (auto e = expect_ident("a table name after DROP TABLE", st.drop_table.table)) {
+            if (auto e = expect_table_name("a table name after DROP TABLE", st.drop_table.table)) {
                 return ParseResult{*e};
             }
             return ParseResult{std::move(st)};
@@ -1180,7 +1222,7 @@ private:
         if (auto e = expect_kw("on")) {
             return ParseResult{*e};
         }
-        if (auto e = expect_ident("a table name after ON", st.drop_index.table)) {
+        if (auto e = expect_table_name("a table name after ON", st.drop_index.table)) {
             return ParseResult{*e};
         }
         return ParseResult{std::move(st)};
@@ -1194,7 +1236,7 @@ private:
         }
         Statement st;
         st.kind = StmtKind::Insert;
-        if (auto e = expect_ident("a table name after INSERT INTO", st.insert.table)) {
+        if (auto e = expect_table_name("a table name after INSERT INTO", st.insert.table)) {
             return ParseResult{*e};
         }
         if (auto e = expect(Tok::LParen, "'(' to open the column list")) {
@@ -1331,7 +1373,7 @@ private:
         advance();  // UPDATE
         Statement st;
         st.kind = StmtKind::Update;
-        if (auto e = expect_ident("a table name after UPDATE", st.update.table)) {
+        if (auto e = expect_table_name("a table name after UPDATE", st.update.table)) {
             return ParseResult{*e};
         }
         if (auto e = expect_kw("set")) {
@@ -1361,7 +1403,7 @@ private:
         }
         Statement st;
         st.kind = StmtKind::Delete;
-        if (auto e = expect_ident("a table name after DELETE FROM", st.del.table)) {
+        if (auto e = expect_table_name("a table name after DELETE FROM", st.del.table)) {
             return ParseResult{*e};
         }
         if (auto e = parse_pk_eq_where(st.del.where_column, st.del.where_value)) {
@@ -2563,7 +2605,7 @@ private:
     // NOT be used as a bare alias (it would swallow JOIN/WHERE/...); an explicit AS
     // <alias> still requires an identifier.
     [[nodiscard]] std::optional<ParseError> parse_table_ref(JoinEntry& e) {
-        if (auto er = expect_ident("a table name", e.table)) {
+        if (auto er = expect_table_name("a table name", e.table)) {  // E4: schema.table
             return er;
         }
         if (is_kw("as")) {
@@ -2577,7 +2619,9 @@ private:
                 return er;
             }
         } else {
-            e.alias = e.table;  // no alias => bind by the table name
+            // E4: no alias => bind by the UNQUALIFIED table name (the part after a 'schema.').
+            const std::size_t dot = e.table.rfind('.');
+            e.alias = dot == std::string::npos ? e.table : e.table.substr(dot + 1);
         }
         return std::nullopt;
     }

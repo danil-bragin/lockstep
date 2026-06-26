@@ -266,7 +266,21 @@ public:
             }
             Table t = deserialize_schema(kv.second);
             t.delta_dirty = t.columnar;  // force a delta merge for columnar (safe); stats stay 0
+            const std::string nm = t.name;
             (void)catalog_.insert_recovered(std::move(t));
+            const std::size_t dot = nm.find('.');  // E4: re-register the table's schema
+            if (dot != std::string::npos) (void)catalog_.create_schema(nm.substr(0, dot), true);
+        }
+        // E4: recover empty-schema markers ('\x02' + name).
+        std::vector<storage::KeyValue> smarks;
+        {
+            Query<Strict> q;
+            q.scan(std::string(1, '\x02'), std::string(1, '\x03'));
+            collect(catalog_db_.run(q), smarks);
+        }
+        for (const storage::KeyValue& kv : smarks) {
+            if (is_tombstone(kv.second)) continue;
+            (void)catalog_.create_schema(kv.first.substr(1), true);
         }
     }
 
@@ -429,13 +443,20 @@ public:
     void persist_schema(const std::string& name) {
         const Table* t = catalog_.find(name);
         if (t != nullptr) {
-            (void)commit_batch(catalog_db_, {{catalog_key(name), serialize_schema(*t)}},
+            // E4: key by the table's QUALIFIED name (== t->name) so create/drop/rename match keys.
+            (void)commit_batch(catalog_db_, {{catalog_key(t->name), serialize_schema(*t)}},
                                /*nosync=*/false);
         }
     }
+    // E4: durably mark a (possibly empty) schema so CREATE SCHEMA survives a restart.
+    void persist_schema_marker(const std::string& schema) {
+        (void)commit_batch(catalog_db_, {{std::string(1, '\x02') + schema, std::string("1")}},
+                           /*nosync=*/false);
+    }
     // E1: durably retire a schema record (a tombstone), e.g. the old name after RENAME / a DROP.
     void retire_schema(const std::string& name) {
-        (void)commit_batch(catalog_db_, {{catalog_key(name), tombstone_marker()}}, /*nosync=*/false);
+        (void)commit_batch(catalog_db_, {{catalog_key(catalog_.qualify(name)), tombstone_marker()}},
+                           /*nosync=*/false);
     }
 
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
@@ -487,6 +508,19 @@ public:
                 if (!in_txn_) return ExecResult::failure("ROLLBACK with no active transaction");
                 in_txn_ = false;
                 txn_writes_.clear();  // discard the buffered writes (nothing was committed)
+                return ExecResult{};
+            case StmtKind::CreateSchema:
+                if (!catalog_.create_schema(st.schema_arg, st.schema_if_not_exists))
+                    return ExecResult::failure("schema '" + st.schema_arg + "' already exists");
+                persist_schema_marker(st.schema_arg);  // E4: durable empty-schema marker
+                return ExecResult{};
+            case StmtKind::DropSchema:
+                if (!catalog_.drop_schema(st.schema_arg) && !st.schema_if_exists)
+                    return ExecResult::failure("unknown schema '" + st.schema_arg + "'");
+                return ExecResult{};
+            case StmtKind::SetSearchPath:
+                if (!catalog_.set_search_path(st.schema_arg))
+                    return ExecResult::failure("unknown schema '" + st.schema_arg + "'");
                 return ExecResult{};
         }
         return ExecResult::failure("unknown statement kind");

@@ -65,6 +65,9 @@ public:
             case StmtKind::DropIndex:
             case StmtKind::DropTable:
             case StmtKind::Truncate:  // E2: a DDL/all-rows op -> every shard
+            case StmtKind::CreateSchema:  // E4
+            case StmtKind::DropSchema:
+            case StmtKind::SetSearchPath:
             case StmtKind::Alter:
             case StmtKind::Begin:
             case StmtKind::Commit:
