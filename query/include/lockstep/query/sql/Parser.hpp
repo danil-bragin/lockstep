@@ -1420,8 +1420,15 @@ private:
             }
             for (;;) {
                 OrderKey key;
-                if (auto e = expect_qualified_column("a column name in ORDER BY",
-                                                     key.qualifier, key.column)) {
+                // G4: ORDER BY <n> — order by the n-th output column (1-based).
+                if (cur_.kind == Tok::IntLit) {
+                    if (cur_.int_val < 1) {
+                        return make_err("ORDER BY position must be >= 1");
+                    }
+                    key.position = static_cast<int>(cur_.int_val);
+                    advance();
+                } else if (auto e = expect_qualified_column("a column name or position in ORDER BY",
+                                                            key.qualifier, key.column)) {
                     return e;
                 }
                 if (is_kw("asc")) {

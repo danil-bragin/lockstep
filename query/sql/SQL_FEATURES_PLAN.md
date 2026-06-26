@@ -74,7 +74,7 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] B1 LIKE / NOT LIKE (% _; CmpOp::Like + matcher; vectorizer rejects; NOT LIKE wraps Not; teeth) — sql_like_test
 - [x] G3 NULLS FIRST/LAST (order_key_less honors per-key; default=NULL smallest unchanged; teeth) — sql_nulls_order_test
 - [x] A1 scalar arithmetic (projection) + A2 string fns + A3 CASE + A4 CAST — scalar Expr engine in SELECT projection (row+columnar, == exact, teeth) — sql_expr_test. NOTE: WHERE-side arithmetic = follow-on
-- [ ] F5 CHECK · G4 ORDER BY expr (ride on A1) · A1/A2/A3/A4 WHERE-side
+- [ ] F5 CHECK · A1/A2/A3/A4 WHERE-side
 - [x] D1 UNION/ALL + D2 INTERSECT/EXCEPT (set-op chain; dedup; combined ORDER/LIMIT; arity teeth) — sql_setops_test
 - [ ] E2 CROSS
 - [ ] D3 FROM-subquery · D4 CTE · F9 types · B2 correlated · C3 window · F3 FK · F7 ALTER · E3 N-way · E4 non-equi · A4 CAST · C2 GROUPING SETS
@@ -88,3 +88,4 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] F6 AUTO_INCREMENT (monotonic id on omit + explicit bump + persisted counter; TEXT teeth) — sql_auto_increment_test
 - [x] G2 UPSERT — INSERT ... ON CONFLICT DO NOTHING/UPDATE SET (atomic in batch; index-maintained; PK-update teeth) — sql_upsert_test
 - [x] F2 UNIQUE (pre-scan existing + per-batch dedup; NULLs repeat; durable; atomic) — sql_unique_test
+- [x] G4 ORDER BY position + computed-column alias (order_key_less resolves position; validation skips it) — sql_orderby_expr_test

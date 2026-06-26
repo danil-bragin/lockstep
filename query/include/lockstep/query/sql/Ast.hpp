@@ -263,6 +263,7 @@ struct OrderKey {
     std::string column;
     bool descending = false;  // ASC default
     NullsOrder nulls = NullsOrder::Default;  // G3: NULLS FIRST | LAST override
+    int position = 0;          // G4: ORDER BY <n> — the 1-based output column (0 == by name)
 };
 
 // One SELECT-list item: either a plain column or an aggregate expression. A v1

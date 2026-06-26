@@ -6312,7 +6312,7 @@ private:
         // bare column name matches the output). For a non-aggregate SELECT the cells
         // are labelled by column name, so a table column is found by its name.
         for (const OrderKey& k : sel.order_by) {
-            if (!has_label(rows, k.column) && !t.column_index(k.column)) {
+            if (k.position == 0 && !has_label(rows, k.column) && !t.column_index(k.column)) {
                 return std::string("unknown ORDER BY column '" + k.column + "'");
             }
         }
@@ -6341,7 +6341,7 @@ private:
             return std::nullopt;
         }
         for (const OrderKey& k : sel.order_by) {
-            if (!has_label(rows, k.column) && !has_agg_label(sel, k.column)) {
+            if (k.position == 0 && !has_label(rows, k.column) && !has_agg_label(sel, k.column)) {
                 return std::string("ORDER BY '" + k.column +
                                    "' must reference a grouped column or an aggregate "
                                    "in the SELECT list");
@@ -6364,6 +6364,11 @@ private:
     // placed FIRST/LAST per k.nulls; Default = NULL is the smallest value (FIRST under ASC, LAST
     // under DESC) — byte-identical to the pre-G3 cmp_datum behavior.
     static bool order_key_less(const ResultRow& x, const ResultRow& y, const OrderKey& k, int& dir) {
+        if (k.position > 0) {  // G4: ORDER BY <n> — the n-th output column
+            const std::size_t i = static_cast<std::size_t>(k.position - 1);
+            const std::string lbl = i < x.cells.size() ? x.cells[i].first : std::string();
+            return order_key_less_label(x, y, lbl, k, dir);
+        }
         return order_key_less_label(x, y, k.column, k, dir);
     }
     // As above but the cell is looked up by an explicit `label` (the joined path resolves a key to
