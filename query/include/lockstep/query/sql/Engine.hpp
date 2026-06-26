@@ -2616,6 +2616,14 @@ private:
         if (auto e = validate_aggs(sel, t)) {
             return ExecResult::failure(*e);
         }
+        // F9f: a 128-bit (INT128/DECIMAL128) aggregate column isn't handled by the SoA INT folds —
+        // bail to the row-mode AoS path (compute_agg), which decodes the 16-byte payloads.
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
+                if (const auto idx = t.column_index(item.agg.column))
+                    if (t.columns[*idx].logical >= 5) return std::nullopt;
+            }
+        }
         // Decode the needed column blocks: filter + group + aggregate-target columns.
         std::vector<bool> need(t.columns.size(), false);
         for (const VecTerm& vt : vterms) {
@@ -6810,9 +6818,11 @@ private:
             return std::string("unknown column '" + a.column +
                                "' in aggregate over table '" + t.name + "'");
         }
+        // F9f: SUM/AVG over INT, or over a 128-bit column (INT128/DECIMAL128, logical 5/6). A plain
+        // TEXT / UUID column is still an error.
         if ((a.kind == AggKind::Sum || a.kind == AggKind::Avg) &&
-            t.columns[*idx].type != Type::Int) {
-            return std::string("SUM/AVG requires an INT column (got TEXT column '" +
+            t.columns[*idx].type != Type::Int && t.columns[*idx].logical < 5) {
+            return std::string("SUM/AVG requires a numeric column (got TEXT column '" +
                                a.column + "')");
         }
         return std::nullopt;
@@ -6888,6 +6898,20 @@ private:
                 }
             }
             out = best;
+            return std::nullopt;
+        }
+        // F9f: SUM / AVG over a 128-bit column (INT128/DECIMAL128) — accumulate in __int128 (checked).
+        // AVG truncates toward zero. The result keeps the column's logical/scale tag.
+        if (t.columns[ci].logical >= 5) {
+            __int128 acc = 0;
+            for (const Datum* d : present) {
+                if (__builtin_add_overflow(acc, Datum::decode_i128(d->s), &acc))
+                    return "integer overflow in SUM";
+            }
+            if (a.kind == AggKind::Avg) acc /= static_cast<__int128>(present.size());  // present non-empty
+            out = Datum::make_text(Datum::encode_i128(acc));
+            out.logical = t.columns[ci].logical;
+            out.scale = t.columns[ci].scale;
             return std::nullopt;
         }
         // SUM / AVG over INT (validated INT in validate_one_agg). F9d: checked accumulation.

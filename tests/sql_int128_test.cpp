@@ -67,9 +67,42 @@ int main() {
         check(cell0(e.exec("SELECT bal + '0.000000000000000001' FROM acct WHERE id = 1")) ==
                   "123456789.123456789012345679",
               "decimal128 add carries the last wei");
-        check(cell0(e.exec("SELECT SUM(bal) FROM acct WHERE id < 0")) == "<none>" ||
-                  !e.exec("SELECT SUM(bal) FROM acct").ok,
-              "SUM over DECIMAL128 not yet supported (clean reject, not silent-wrong)");
+        // F9f: SUM / AVG / MIN / MAX over DECIMAL128 (sum-of-balances — the crypto case).
+        check(cell0(e.exec("SELECT SUM(bal) FROM acct")) == "123456789.123456789012345679",
+              "SUM(DECIMAL128) = 123456789.123... + 1 wei");
+        check(cell0(e.exec("SELECT MIN(bal) FROM acct")) == "0.000000000000000001", "MIN(DECIMAL128)");
+        check(cell0(e.exec("SELECT MAX(bal) FROM acct")) == "123456789.123456789012345678",
+              "MAX(DECIMAL128)");
+    }
+    // F9f: SUM / AVG over INT128 (exact, past int64).
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE w (id INT, bal INT128 NOT NULL, PRIMARY KEY (id))");
+        e.exec("INSERT INTO w (id, bal) VALUES (1, '10000000000000000000000000000')");  // 1e28
+        e.exec("INSERT INTO w (id, bal) VALUES (2, '20000000000000000000000000000')");  // 2e28
+        e.exec("INSERT INTO w (id, bal) VALUES (3, '30000000000000000000000000000')");  // 3e28
+        check(cell0(e.exec("SELECT SUM(bal) FROM w")) == "60000000000000000000000000000",
+              "SUM(INT128) = 6e28");
+        check(cell0(e.exec("SELECT AVG(bal) FROM w")) == "20000000000000000000000000000",
+              "AVG(INT128) = 2e28");
+        check(cell0(e.exec("SELECT MAX(bal) FROM w")) == "30000000000000000000000000000",
+              "MAX(INT128)");
+        // GROUP BY with an INT128 SUM per group.
+        e.exec("CREATE TABLE g (id INT, k INT NOT NULL, amt INT128 NOT NULL, PRIMARY KEY (id))");
+        e.exec("INSERT INTO g (id, k, amt) VALUES (1, 1, '5000000000000000000000'), "
+               "(2, 1, '5000000000000000000000'), (3, 2, '1000000000000000000000')");
+        const ExecResult gb = e.exec("SELECT k, SUM(amt) FROM g GROUP BY k ORDER BY k");
+        check(gb.ok && gb.rows.size() == 2, "GROUP BY INT128 -> 2 groups");
+        if (gb.rows.size() == 2) {
+            check(gb.rows[0].cells[1].second.render() == "10000000000000000000000", "group k=1 sum");
+            check(gb.rows[1].cells[1].second.render() == "1000000000000000000000", "group k=2 sum");
+        }
+        // SUM overflow past int128 -> clean error.
+        e.exec("CREATE TABLE o (id INT, v INT128 NOT NULL, PRIMARY KEY (id))");
+        e.exec("INSERT INTO o (id, v) VALUES (1, '100000000000000000000000000000000000000')");  // 1e38
+        e.exec("INSERT INTO o (id, v) VALUES (2, '100000000000000000000000000000000000000')");  // 1e38
+        const ExecResult so = e.exec("SELECT SUM(v) FROM o");  // 2e38 > int128 max (~1.7e38)
+        check(!so.ok && so.error.find("overflow") != std::string::npos, "SUM(INT128) overflow -> error");
     }
     // overflow past int128 -> clean error (not UB, not wrap).
     {
