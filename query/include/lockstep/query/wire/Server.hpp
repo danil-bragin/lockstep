@@ -387,6 +387,16 @@ private:
     // incremental write path, NOT the batch re-run), so writes are O(1). Result carries
     // {ok, error, affected, row-count} — rows themselves are not shipped (throughput surface).
     Response handle_sql(const Request& req) {
+        // EXACTLY-ONCE: a dropped reply makes the client re-send the SAME SqlExec (same
+        // submit_key). Without dedup the statement would RE-EXECUTE (CREATE => "already
+        // exists", INSERT => "duplicate pk", an extra UPDATE/DELETE effect). Memoize the first
+        // response by submit_key and replay it for any retry — the statement runs ONCE.
+        const auto it = dedup_.find(req.submit_key);
+        if (it != dedup_.end()) {
+            Response cached = it->second;
+            cached.req_id = req.req_id;  // answer THIS request id (the retry)
+            return cached;
+        }
         const sql::ExecResult er = sql_eng_.exec(req.sql);
         Response r;
         r.kind = MsgKind::SqlResult;
@@ -395,6 +405,7 @@ private:
         r.sql_error = er.error;
         r.sql_affected = er.affected;
         r.sql_rows = static_cast<std::uint64_t>(er.rows.size());
+        dedup_.emplace(req.submit_key, r);  // memoize (exactly-once on retry/dup)
         return r;
     }
 

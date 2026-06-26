@@ -160,6 +160,7 @@ public:
     core::Task sql(std::string statement, CallResult& out) {
         Request req;
         req.kind = MsgKind::SqlExec;
+        req.submit_key = new_submit_key();  // stable across retries => server applies EXACTLY ONCE
         req.sql = std::move(statement);
         co_await round_trip(req, out);
         co_return;

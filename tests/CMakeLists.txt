@@ -1003,6 +1003,25 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_columnar_test COMMAND lockstep_sql_columnar_test)
 
+  # sql_wire_test: SQL-OVER-THE-WIRE end-to-end gate. Drives a CREATE/INSERT/UPDATE/DELETE/
+  # SELECT session through the real ClientStub<->Server wire exchange over SimNetwork; asserts
+  # the per-statement result (ok/error/affected/row-count) is byte-identical to a twin in-process
+  # SqlEngine oracle, and EXACTLY-ONCE under dup/drop/reorder faults (a retried SqlExec must not
+  # re-apply). Proves SQL runs through the wire, not just in-process.
+  add_executable(lockstep_sql_wire_test sql_wire_test.cpp)
+  target_include_directories(lockstep_sql_wire_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_wire_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_wire_test COMMAND lockstep_sql_wire_test)
+
   # sql_columnar_durability_test: the columnar crash/recovery gate (A5). Proves the
   # committed columnar state (blocks + delta) survives a crash + recovery byte-for-byte
   # over a deterministic SimDisk — projection/aggregate/GROUP BY identical post-recovery,

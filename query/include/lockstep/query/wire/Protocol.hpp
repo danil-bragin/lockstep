@@ -419,6 +419,7 @@ inline void seal_crc(std::vector<std::byte>& out) {
             break;
         }
         case MsgKind::SqlExec:
+            put_u64(out, r.submit_key);  // dedup key: a retried SqlExec applies EXACTLY ONCE
             put_str(out, r.sql);
             break;
         default:
@@ -494,7 +495,7 @@ inline void seal_crc(std::vector<std::byte>& out) {
             return rd.consumed() == body.size();
         }
         case MsgKind::SqlExec: {
-            if (!rd.str(r.sql)) {
+            if (!rd.u64(r.submit_key) || !rd.str(r.sql)) {
                 return false;
             }
             return rd.consumed() == body.size();
