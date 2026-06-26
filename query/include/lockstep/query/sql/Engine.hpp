@@ -1740,6 +1740,76 @@ private:
         return p;
     }
 
+    // FUSED column stats (A3-scan): one pass over a column computes total/non-null/sum AND both min
+    // and max, so a SELECT SUM(x),MIN(x),MAX(x) FROM t streams the column ONCE (3x less bandwidth
+    // than three separate folds — the scan_agg DuckDB gap). The INT NOT NULL pass is branchless =>
+    // SIMD. Maps to AggPartial per item for a byte-identical finalize_agg.
+    struct ColStats {
+        std::int64_t total = 0;  // rows
+        std::int64_t n = 0;      // non-null
+        std::int64_t sum = 0;    // sum of non-null (int)
+        bool any = false;
+        std::int64_t imin = 0, imax = 0;  // int min/max
+        Datum dmin, dmax;                 // generic (text) min/max
+    };
+    [[nodiscard]] ColStats fold_col_stats(const std::vector<ColumnChunk>& chunks, Type ty,
+                                          bool no_nulls) {
+        ColStats s;
+        for (const ColumnChunk& ch : chunks) s.total += ch.count;
+        if (ty == Type::Int && no_nulls) {
+            bool seeded = false;
+            for (const ColumnChunk& ch : chunks) {
+                if (ch.count == 0) continue;
+                const std::int64_t* x = ch.ints.data();
+                std::int64_t sm = 0;
+                std::int64_t mn = seeded ? s.imin : x[0];
+                std::int64_t mx = seeded ? s.imax : x[0];
+                for (std::uint32_t r = 0; r < ch.count; ++r) {  // ONE fused branchless pass
+                    sm += x[r];
+                    mn = std::min(mn, x[r]);
+                    mx = std::max(mx, x[r]);
+                }
+                s.sum += sm;
+                s.imin = mn;
+                s.imax = mx;
+                seeded = true;
+            }
+            s.n = s.total;
+            s.any = s.total > 0;
+            return s;
+        }
+        // NULLABLE (or TEXT): MIN/MAX track DATUMS (dmin/dmax) — finalize_agg uses dbest on the
+        // non-(int+NOT NULL) path, so this matches fold_agg_range's generic Datum fold byte-for-
+        // byte. SUM (int) still accumulates the non-null values.
+        for (const ColumnChunk& ch : chunks) {
+            for (std::uint32_t r = 0; r < ch.count; ++r) {
+                if (ch.nulls[r]) continue;
+                ++s.n;
+                const Datum v = ch.at(r);
+                if (ty == Type::Int) s.sum += v.i;
+                if (!s.any) { s.dmin = v; s.dmax = v; s.any = true; }
+                else {
+                    if (cmp_datum(v, s.dmin) < 0) s.dmin = v;
+                    if (cmp_datum(v, s.dmax) > 0) s.dmax = v;
+                }
+            }
+        }
+        return s;
+    }
+
+    // Build an AggPartial for ONE aggregate from a column's fused ColStats (so the SAME finalize_agg
+    // path produces a byte-identical result to the per-aggregate compute_agg_chunked).
+    [[nodiscard]] AggPartial partial_from_stats(const ColStats& s, AggKind kind) {
+        AggPartial p;
+        p.total = s.total;
+        p.n = s.n;
+        p.sum = s.sum;
+        p.any = s.any;
+        if (kind == AggKind::Min) { p.ibest = s.imin; p.dbest = s.dmin; }
+        else if (kind == AggKind::Max) { p.ibest = s.imax; p.dbest = s.dmax; }
+        return p;
+    }
+
     // Combine partition partials in a FIXED order (0..W-1). SUM/COUNT are integer-exact (order
     // independent); MIN/MAX are associative+commutative — so the merged value is byte-identical
     // to the serial single-pass fold.
@@ -2313,12 +2383,44 @@ private:
         // SELECT SUM/COUNT/MIN/MAX FROM t. Placed BEFORE the column decode so the concat is
         // never built for this path.
         if (gcols.empty() && !has_filter && !has_having) {
-            // NB: ONE compute_agg_chunked PER aggregate — each is a TIGHT per-column fold the
-            // compiler auto-vectorizes. A FUSED single pass (sum+min+max per element) measured
-            // SLOWER (branchy loop defeats SIMD — same finding as the running-accumulator).
+            // FUSED per-column fold: stream each distinct aggregate column ONCE computing
+            // total/sum/min/max together (3x less bandwidth than a fold per aggregate — the
+            // scan_agg bandwidth gap). Now a WIN because MIN/MAX are branchless (the prior fusion
+            // was a NEGATIVE only because the branchy min/max defeated SIMD). Maps each item to an
+            // AggPartial so finalize_agg keeps results byte-identical to compute_agg_chunked.
+            std::map<std::size_t, ColStats> col_stats;
+            std::int64_t total_rows = 0;
+            {  // table row count from the pk column (free; also covers COUNT(*))
+                const auto& pkc = col_chunks_cached(t, static_cast<std::uint32_t>(t.pk_index));
+                for (const ColumnChunk& ch : pkc) total_rows += ch.count;
+            }
+            for (const SelectItem& item : sel.items) {
+                if (item.kind != SelectItemKind::Aggregate ||
+                    item.agg.kind == AggKind::CountStar) {
+                    continue;
+                }
+                const std::size_t ci = *t.column_index(item.agg.column);
+                if (col_stats.find(ci) == col_stats.end()) {
+                    col_stats.emplace(ci, fold_col_stats(
+                                              col_chunks_cached(t, static_cast<std::uint32_t>(ci)),
+                                              t.columns[ci].type, !t.columns[ci].nullable));
+                }
+            }
             ResultRow out;
             for (const SelectItem& item : sel.items) {
-                out.cells.emplace_back(item.label, compute_agg_chunked(item.agg, t));
+                if (item.kind != SelectItemKind::Aggregate) {
+                    out.cells.emplace_back(item.label, compute_agg_chunked(item.agg, t));
+                    continue;
+                }
+                if (item.agg.kind == AggKind::CountStar) {
+                    out.cells.emplace_back(item.label, Datum::make_int(total_rows));
+                    continue;
+                }
+                const std::size_t ci = *t.column_index(item.agg.column);
+                const AggPartial p = partial_from_stats(col_stats.at(ci), item.agg.kind);
+                out.cells.emplace_back(
+                    item.label,
+                    finalize_agg(p, item.agg, t.columns[ci].type, !t.columns[ci].nullable));
             }
             ExecResult rr;
             rr.rows.push_back(std::move(out));
