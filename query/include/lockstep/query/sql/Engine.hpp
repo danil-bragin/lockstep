@@ -3337,7 +3337,7 @@ private:
         // SUM/COUNT/MIN/MAX/AVG DIRECTLY over the SoA column blocks (no AoS row
         // materialisation, the measured win). nullopt => not applicable, fall through to
         // the generic AoS path (which the conformance gate cross-checks this against).
-        if (t->columnar && sel.has_aggregates) {
+        if (t->columnar && sel.has_aggregates && !agg_has_distinct(sel)) {
             if (auto fast = columnar_vectorized_agg(*t, sel)) {
                 return std::move(*fast);
             }
@@ -3535,6 +3535,18 @@ private:
     // The grouped/aggregated execution path. `rows` is the post-WHERE row set (full
     // table rows in schema order). Produces one output ROW per group, DETERMINISTIC
     // (groups sorted by their group-key tuple; ungrouped == one synthetic group).
+    // C1: true iff ANY aggregate in the SELECT is DISTINCT. The vectorized/columnar/fused-join
+    // aggregate fast paths fold EVERY value (no per-group dedup), so they must defer to the general
+    // AoS exec_aggregate (which dedups in compute_agg) whenever this holds.
+    [[nodiscard]] static bool agg_has_distinct(const SelectStmt& sel) {
+        for (const SelectItem& it : sel.items) {
+            if (it.kind != SelectItemKind::Column && it.agg.distinct) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     ExecResult exec_aggregate(const SelectStmt& sel, const Table& t,
                               std::vector<std::vector<Datum>>& rows) {
         // Resolve GROUP BY column indices.
@@ -3722,6 +3734,7 @@ private:
     [[nodiscard]] std::optional<ExecResult> try_fused_join_aggregate(const SelectStmt& sel) {
         if (sel.from.size() != 2 || sel.from[1].kind != JoinKind::Inner) return std::nullopt;
         if (sel.filter.present() || sel.having.present()) return std::nullopt;
+        if (agg_has_distinct(sel)) return std::nullopt;  // C1: fold can't dedup → general path
         if (!sel.has_aggregates && sel.group_by.empty()) return std::nullopt;
         const Table* fact = catalog_.find(sel.from[0].table);
         const Table* dim = catalog_.find(sel.from[1].table);
@@ -5709,6 +5722,20 @@ private:
             if (!d.is_null) {
                 present.push_back(&d);
             }
+        }
+        // C1: COUNT/SUM/AVG(DISTINCT col) — keep only the FIRST occurrence of each distinct value
+        // (deterministic: dedup by the order-preserving value encoding). COUNT(DISTINCT) then counts
+        // distinct values, SUM/AVG aggregate over them. (NULLs are already excluded; MIN/MAX never
+        // carry DISTINCT — the parser only allows it for COUNT/SUM/AVG.)
+        if (a.distinct) {
+            std::vector<const Datum*> uniq;
+            std::set<std::string> seen;
+            for (const Datum* d : present) {
+                if (seen.insert(group_key_field(*d)).second) {
+                    uniq.push_back(d);
+                }
+            }
+            present.swap(uniq);
         }
         if (a.kind == AggKind::Count) {
             out = Datum::make_int(static_cast<std::int64_t>(present.size()));

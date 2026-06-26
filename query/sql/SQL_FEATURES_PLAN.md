@@ -70,7 +70,7 @@ HIGHEST RISK LAST → F1 (composite key encoding).
 Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] D6 multi-row INSERT (atomic; row+columnar == N single inserts; teeth=dup-in-batch) — sql_multirow_insert_test
 - [x] F8 DROP TABLE (catalog forget + durable schema tombstone; re-create empty; teeth=unknown) — sql_drop_table_test
-- [ ] C1 COUNT/SUM/AVG(DISTINCT)
+- [x] C1 COUNT/SUM/AVG(DISTINCT) (per-group dedup in compute_agg; fast paths gated; distributed rejects; teeth) — sql_distinct_agg_test
 - [ ] B1 LIKE / NOT LIKE
 - [ ] G3 NULLS FIRST/LAST
 - [ ] A1 scalar arithmetic (foundation)

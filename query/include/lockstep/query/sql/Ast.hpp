@@ -142,6 +142,7 @@ struct AggExpr {
     AggKind kind = AggKind::CountStar;
     std::string qualifier;  // v3: optional table/alias qualifier ("" == unqualified)
     std::string column;     // empty for COUNT(*)
+    bool distinct = false;  // C1: COUNT/SUM/AVG(DISTINCT col) — dedup values per group first
 };
 
 // Forward declaration: a subquery node carries a nested SELECT (defined below). It is

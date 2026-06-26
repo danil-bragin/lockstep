@@ -868,7 +868,17 @@ private:
                             "COUNT/SUM/MIN/MAX/AVG in v2)");
         }
         advance();  // '('
+        // C1: optional DISTINCT inside the aggregate — `COUNT(DISTINCT col)`, SUM/AVG(DISTINCT ..).
+        // Not valid with `*` (COUNT(DISTINCT *) is rejected below). Dedup happens at eval time.
+        bool distinct = false;
+        if (is_kw("distinct")) {
+            advance();
+            distinct = true;
+        }
         if (kind == AggKind::Count && cur_.kind == Tok::Star) {
+            if (distinct) {
+                return make_err("COUNT(DISTINCT *) is not valid — DISTINCT needs a column");
+            }
             advance();
             agg.kind = AggKind::CountStar;
             label = "COUNT(*)";
@@ -879,10 +889,16 @@ private:
                                                  qual, col)) {
                 return e;
             }
+            if (distinct && kind != AggKind::Count && kind != AggKind::Sum &&
+                kind != AggKind::Avg) {
+                return make_err("DISTINCT is only supported for COUNT/SUM/AVG");
+            }
             agg.kind = kind;
             agg.qualifier = qual;
             agg.column = col;
-            label = upper(fn) + "(" + (qual.empty() ? col : qual + "." + col) + ")";
+            agg.distinct = distinct;
+            const std::string body = (qual.empty() ? col : qual + "." + col);
+            label = upper(fn) + "(" + (distinct ? "DISTINCT " : "") + body + ")";
         }
         if (auto e = expect(Tok::RParen, "')' to close the aggregate")) {
             return e;

@@ -403,6 +403,14 @@ private:
                     "distributed: AVG across shards unsupported (needs SUM/COUNT split)");
             }
         }
+        // C1: a DISTINCT aggregate cannot be merged from per-shard partials — a value present on two
+        // shards would be counted/summed twice. Reject (like AVG) until a global-distinct shuffle.
+        for (const SelectItem& it : sel.items) {
+            if (it.kind != SelectItemKind::Column && it.agg.distinct) {
+                return ExecResult::failure(
+                    "distributed: DISTINCT aggregate across shards unsupported (needs a global shuffle)");
+            }
+        }
         struct Group {
             std::vector<Datum> key;  // the group-key column cells (for ordering)
             ResultRow row;           // the merged output row
