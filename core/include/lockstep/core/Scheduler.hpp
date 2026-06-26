@@ -215,6 +215,13 @@ public:
     [[nodiscard]] const Trace& event_trace() const noexcept { return trace_; }
     [[nodiscard]] std::string trace_text() const { return trace_.render(); }
 
+    // Enable/disable event-trace STORAGE (default on). Prod turns it OFF: the trace is a
+    // sim-only replay/debug record never consumed by computation, and storing every
+    // scheduler event is the dominant single-thread hot-path cost + an unbounded memory
+    // growth. Disabling is byte-identical to the computation (observational only).
+    void set_trace_enabled(bool on) noexcept { trace_.set_enabled(on); }
+    [[nodiscard]] bool trace_enabled() const noexcept { return trace_.enabled(); }
+
 private:
     // A pending virtual-time timer. Ordered by (due, arm_seq): earliest due tick
     // first, ties broken by arm order — a deterministic monotonic key (L3/L4),

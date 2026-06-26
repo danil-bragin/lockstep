@@ -25,6 +25,7 @@
 #include <utility>
 
 #include <lockstep/core/Trace.hpp>
+#include <lockstep/core/detail/FramePool.hpp>
 #include <lockstep/core/detail/SchedulerSink.hpp>
 
 namespace lockstep::core {
@@ -32,6 +33,15 @@ namespace lockstep::core {
 class Task {
 public:
     struct promise_type {
+        // FRAME RECYCLING (S8.7 follow-on): route this coroutine's frame allocation
+        // through the thread_local FramePool. The compiler calls promise::operator new
+        // to allocate the frame and the sized promise::operator delete to free it, so
+        // these two functions recycle frame storage instead of hitting the OS allocator
+        // per spawn. Pure memory reuse — invisible to output (no value/order depends on a
+        // frame address), so the deterministic sim stays byte-identical (see FramePool.hpp).
+        static void* operator new(std::size_t n) { return detail::frame_alloc(n); }
+        static void operator delete(void* p, std::size_t n) noexcept { detail::frame_free(p, n); }
+
         // The scheduler sink this task runs under. Set by the scheduler at spawn
         // (and propagated when one task co_awaits another) so final_suspend can
         // SCHEDULE the continuation rather than resume it inline (L1).

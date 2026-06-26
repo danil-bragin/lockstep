@@ -82,9 +82,27 @@ public:
     // assigned seq so callers can cross-reference (e.g. a spawn seq in a payload).
     std::uint64_t record(TraceAction action, Tick vtime, std::string payload = {}) {
         std::uint64_t s = next_seq_++;
+        // OBSERVABILITY GATE (perf): the trace is a replayable record needed ONLY by the
+        // sim determinism self-test + debugging; it is never consumed by computation (the
+        // returned seq is observational — verified no logic captures it). Storing every
+        // scheduler event (spawn/resume/schedule/task_done, ~6+/commit) costs a TraceEvent
+        // push_back into an UNBOUNDEDLY growing vector — the dominant per-event CPU on the
+        // single-thread hot path (>2x in a frame-saturated microbench) AND an unbounded
+        // prod memory growth. When disabled (prod), skip the store; next_seq_ still advances
+        // so any events that ARE recorded keep identical seq semantics. DEFAULT enabled →
+        // every sim test stays byte-identical.
+        if (!enabled_) {
+            return s;
+        }
         events_.push_back(TraceEvent{s, action, vtime, std::move(payload)});
         return s;
     }
+
+    // Enable/disable event STORAGE (default enabled). Prod disables it for throughput +
+    // bounded memory; sim/tests leave it on so traces stay byte-identical. Disabling does
+    // not change any computation — the trace is observational only.
+    void set_enabled(bool on) noexcept { enabled_ = on; }
+    [[nodiscard]] bool enabled() const noexcept { return enabled_; }
 
     [[nodiscard]] const std::vector<TraceEvent>& events() const noexcept { return events_; }
     [[nodiscard]] std::size_t size() const noexcept { return events_.size(); }
@@ -111,6 +129,7 @@ public:
     }
 
 private:
+    bool enabled_ = true;  // event storage gate (prod disables; default on for tests)
     std::vector<TraceEvent> events_{};
     std::uint64_t next_seq_ = 0;
 };
