@@ -338,6 +338,7 @@ public:
             o.push_back(static_cast<char>(c.elem_scale));
             cat_put_u32(o, static_cast<std::uint32_t>(c.enum_labels.size()));  // F13
             for (const std::string& lbl : c.enum_labels) cat_put_s(o, lbl);
+            o.push_back(c.dropped ? 1 : 0);  // E1
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -397,6 +398,7 @@ public:
             c.elem_scale = static_cast<std::uint8_t>(s[p++]);
             const std::uint32_t nlbl = cat_get_u32(s, p);  // F13 ENUM labels
             for (std::uint32_t li = 0; li < nlbl; ++li) c.enum_labels.push_back(cat_get_s(s, p));
+            c.dropped = s[p++] != 0;  // E1
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -430,6 +432,10 @@ public:
             (void)commit_batch(catalog_db_, {{catalog_key(name), serialize_schema(*t)}},
                                /*nosync=*/false);
         }
+    }
+    // E1: durably retire a schema record (a tombstone), e.g. the old name after RENAME / a DROP.
+    void retire_schema(const std::string& name) {
+        (void)commit_batch(catalog_db_, {{catalog_key(name), tombstone_marker()}}, /*nosync=*/false);
     }
 
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
@@ -1004,17 +1010,159 @@ private:
         if (t->columnar) {
             return ExecResult::failure("ALTER TABLE on a columnar table is not supported");
         }
-        if (t->column_index(a.add_col.name)) {
-            return ExecResult::failure("column '" + a.add_col.name + "' already exists");
+        // E1: ALTER TABLE RENAME TO — re-key the catalog (data/id unchanged).
+        if (a.op == AlterOp::RenameTable) {
+            if (catalog_.has(a.new_name)) return ExecResult::failure("table '" + a.new_name + "' already exists");
+            if (!catalog_.rename(a.table, a.new_name)) return ExecResult::failure("rename failed");
+            retire_schema(a.table);
+            persist_schema(a.new_name);
+            return ExecResult{};
         }
-        if (!a.add_col.nullable && !a.add_col.has_default && t->row_count > 0) {
-            return ExecResult::failure(
-                "ADD a NOT NULL column requires a DEFAULT on a non-empty table");
+        // The remaining ops target a column (by name); resolve it (a dropped column is invisible).
+        auto cidx = [&](const std::string& n) -> std::optional<std::size_t> {
+            for (std::size_t i = 0; i < t->columns.size(); ++i)
+                if (!t->columns[i].dropped && t->columns[i].name == n) return i;
+            return std::nullopt;
+        };
+        if (a.op == AlterOp::AddColumn) {
+            if (cidx(a.add_col.name)) return ExecResult::failure("column '" + a.add_col.name + "' already exists");
+            if (!a.add_col.nullable && !a.add_col.has_default && t->row_count > 0)
+                return ExecResult::failure("ADD a NOT NULL column requires a DEFAULT on a non-empty table");
+            t->columns.push_back(a.add_col);
+            t->col_stats.assign(t->columns.size(), Table::ColStat{});
+            persist_schema(a.table);
+            return ExecResult{};
         }
-        t->columns.push_back(a.add_col);
-        t->col_stats.assign(t->columns.size(), Table::ColStat{});  // keep stats sized to the schema
+        if (a.op == AlterOp::AddCheck) {
+            // Validate every existing row passes before adopting the constraint.
+            t->checks.push_back(a.check_src);
+            if (auto e = validate_all_rows_against_checks(*t)) {
+                t->checks.pop_back();
+                return ExecResult::failure(*e);
+            }
+            persist_schema(a.table);
+            return ExecResult{};
+        }
+        if (a.op == AlterOp::AddUnique) {
+            const auto ci = cidx(a.unique_col);
+            if (!ci) return ExecResult::failure("unknown column '" + a.unique_col + "'");
+            if (auto e = check_unique_existing(*t, *ci)) return ExecResult::failure(*e);
+            t->columns[*ci].unique = true;
+            persist_schema(a.table);
+            return ExecResult{};
+        }
+        const auto ci = cidx(a.col_name);
+        if (!ci) return ExecResult::failure("unknown column '" + a.col_name + "' in table '" + a.table + "'");
+        Column& col = t->columns[*ci];
+        switch (a.op) {
+            case AlterOp::RenameColumn:
+                if (cidx(a.new_name)) return ExecResult::failure("column '" + a.new_name + "' already exists");
+                col.name = a.new_name;
+                break;
+            case AlterOp::DropColumn:
+                if (is_pk_col(*t, *ci)) return ExecResult::failure("cannot DROP a PRIMARY KEY column");
+                col.dropped = true;
+                break;
+            case AlterOp::SetDefault: {
+                Datum d;
+                if (auto e = coerce(col, a.default_val, d)) return ExecResult::failure(*e);
+                col.has_default = true;
+                if (col.type == Type::Int) col.default_i = d.i;
+                else col.default_s = d.s;
+                break;
+            }
+            case AlterOp::DropDefault:
+                col.has_default = false;
+                break;
+            case AlterOp::SetNotNull:
+                if (auto e = check_no_nulls_existing(*t, *ci)) return ExecResult::failure(*e);
+                col.nullable = false;
+                break;
+            case AlterOp::DropNotNull:
+                if (is_pk_col(*t, *ci)) return ExecResult::failure("a PRIMARY KEY column is always NOT NULL");
+                col.nullable = true;
+                break;
+            case AlterOp::DropUnique:
+                col.unique = false;
+                break;
+            case AlterOp::AlterType:
+                if (auto e = rewrite_column_type(*t, *ci, a.add_col)) return ExecResult::failure(*e);
+                break;
+            default:
+                return ExecResult::failure("unsupported ALTER operation");
+        }
         persist_schema(a.table);
         return ExecResult{};
+    }
+
+    // E1 helpers — all over the verified row scan/commit path.
+    [[nodiscard]] std::optional<std::string> scan_all_rows(const Table& t,
+                                                           std::vector<std::pair<Datum, std::vector<Datum>>>& out) {
+        SelectStmt scan;
+        scan.table = t.name;
+        std::vector<std::vector<Datum>> rows;
+        if (auto e = scan_table(t, scan, rows)) return e;
+        for (auto& r : rows) { Datum pk = r[t.pk_index]; out.emplace_back(std::move(pk), std::move(r)); }
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<std::string> check_no_nulls_existing(const Table& t, std::size_t ci) {
+        std::vector<std::pair<Datum, std::vector<Datum>>> rows;
+        if (auto e = scan_all_rows(t, rows)) return e;
+        for (const auto& [pk, r] : rows)
+            if (r[ci].is_null) return "SET NOT NULL failed: column '" + t.columns[ci].name + "' has NULLs";
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<std::string> check_unique_existing(const Table& t, std::size_t ci) {
+        std::vector<std::pair<Datum, std::vector<Datum>>> rows;
+        if (auto e = scan_all_rows(t, rows)) return e;
+        std::set<std::string> seen;
+        for (const auto& [pk, r] : rows)
+            if (!r[ci].is_null && !seen.insert(group_key_field(r[ci])).second)
+                return "ADD UNIQUE failed: column '" + t.columns[ci].name + "' has duplicates";
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<std::string> validate_all_rows_against_checks(const Table& t) {
+        std::vector<std::pair<Datum, std::vector<Datum>>> rows;
+        if (auto e = scan_all_rows(t, rows)) return e;
+        for (const auto& [pk, r] : rows)
+            if (auto e = eval_checks(t, r)) return "existing row violates the new CHECK: " + *e;
+        return std::nullopt;
+    }
+    // ALTER COLUMN TYPE — read every row, CAST the column's value to the new type, rewrite the row.
+    [[nodiscard]] std::optional<std::string> rewrite_column_type(Table& t, std::size_t ci,
+                                                                 const Column& newty) {
+        if (is_pk_col(t, ci)) return "ALTER TYPE on a PRIMARY KEY column is not supported";
+        std::vector<std::pair<Datum, std::vector<Datum>>> rows;
+        if (auto e = scan_all_rows(t, rows)) return e;
+        Column target = t.columns[ci];  // keep name/constraints, swap the type
+        target.type = newty.type;
+        target.logical = newty.logical;
+        target.scale = newty.scale;
+        target.is_unsigned = newty.is_unsigned;
+        target.enum_labels = newty.enum_labels;
+        std::vector<std::pair<Key, Value>> writes;
+        for (auto& [pk, r] : rows) {
+            Datum casted;
+            if (r[ci].is_null) {
+                casted = Datum::make_null(target.type);
+            } else {
+                Datum bridge = r[ci];
+                // Bridge across a base-type change: INT -> TEXT renders; TEXT -> plain INT parses;
+                // TEXT -> a logical-INT type (DATE/TIME/...) keeps the text so coerce can parse it.
+                if (target.type == Type::Text && bridge.type == Type::Int) {
+                    bridge = Datum::make_text(r[ci].render());
+                } else if (target.type == Type::Int && target.logical == 0 && bridge.type == Type::Text) {
+                    bridge = Datum::make_int(std::strtoll(bridge.s.c_str(), nullptr, 10));
+                }
+                if (auto e = coerce(target, bridge, casted))
+                    return "ALTER TYPE cast failed for column '" + target.name + "': " + *e;
+            }
+            r[ci] = casted;
+            emit_row_writes(t, r, writes);
+        }
+        t.columns[ci] = target;
+        commit_writes(writes);
+        return std::nullopt;
     }
 
     // DROP TABLE <t> (F8): forget the table (catalog) + durably TOMBSTONE its schema record (so a
@@ -3280,6 +3428,10 @@ private:
                 if (set[c]) {
                     continue;
                 }
+                if (t->columns[c].dropped) {  // E1: a dropped slot is written as NULL (keeps alignment)
+                    row[c] = Datum::make_null(t->columns[c].type);
+                    continue;
+                }
                 // F6: an omitted AUTO_INCREMENT column gets the next monotonic id.
                 if (t->columns[c].auto_increment) {
                     row[c] = Datum::make_int(auto_next++);
@@ -4209,8 +4361,10 @@ private:
             };
             if (sel.star) {
                 ResultRow out;
-                for (std::size_t i = 0; i < t->columns.size(); ++i)
+                for (std::size_t i = 0; i < t->columns.size(); ++i) {
+                    if (t->columns[i].dropped) continue;  // E1: hidden
                     out.cells.emplace_back(t->columns[i].name, row[i]);
+                }
                 r.rows.push_back(std::move(out));
             } else if (unnest_idx < 0) {
                 ResultRow out;

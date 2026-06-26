@@ -403,9 +403,31 @@ struct DropTableStmt {
 };
 
 // ALTER TABLE <t> ADD [COLUMN] <col> <type> [constraints]  (F7)
+// E1: the full ALTER TABLE op set.
+enum class AlterOp : std::uint8_t {
+    AddColumn = 0,
+    DropColumn = 1,
+    RenameColumn = 2,
+    RenameTable = 3,
+    AlterType = 4,      // ALTER COLUMN c TYPE <type> (re-coerce existing rows)
+    SetDefault = 5,
+    DropDefault = 6,
+    SetNotNull = 7,
+    DropNotNull = 8,
+    AddCheck = 9,       // ADD [CONSTRAINT] CHECK (expr)
+    AddUnique = 10,     // ADD [CONSTRAINT] UNIQUE (col)
+    DropCheck = 11,     // DROP CHECK (drops the check whose source text matches, or by index)
+    DropUnique = 12,    // DROP UNIQUE on a column (ALTER COLUMN c DROP UNIQUE)
+};
 struct AlterStmt {
     std::string table;
-    Column add_col;
+    AlterOp op = AlterOp::AddColumn;
+    Column add_col;          // AddColumn; AlterType uses its type/logical/scale fields
+    std::string col_name;    // target column (DropColumn / RenameColumn / AlterType / Set*/Drop* / DropUnique)
+    std::string new_name;    // RenameColumn -> new column name; RenameTable -> new table name
+    Datum default_val;       // SetDefault literal
+    std::string check_src;   // AddCheck / DropCheck predicate source text
+    std::string unique_col;  // AddUnique target column
 };
 
 enum class StmtKind : std::uint8_t {

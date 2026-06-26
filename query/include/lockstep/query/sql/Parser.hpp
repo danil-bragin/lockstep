@@ -799,17 +799,103 @@ private:
         if (auto e = expect_ident("a table name after ALTER TABLE", st.alter.table)) {
             return ParseResult{*e};
         }
+        // RENAME TO <newtable>  |  RENAME [COLUMN] <a> TO <b>
+        if (is_kw("rename")) {
+            advance();
+            if (is_kw("to")) {
+                advance();
+                st.alter.op = AlterOp::RenameTable;
+                if (auto e = expect_ident("a new table name", st.alter.new_name)) return ParseResult{*e};
+                return ParseResult{std::move(st)};
+            }
+            if (is_kw("column")) advance();
+            st.alter.op = AlterOp::RenameColumn;
+            if (auto e = expect_ident("a column name", st.alter.col_name)) return ParseResult{*e};
+            if (auto e = expect_kw("to")) return ParseResult{*e};
+            if (auto e = expect_ident("a new column name", st.alter.new_name)) return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
+        // DROP [COLUMN] <c>  |  DROP CONSTRAINT ... (follow-on)
+        if (is_kw("drop")) {
+            advance();
+            if (is_kw("column")) advance();
+            else if (is_kw("constraint")) return err("DROP CONSTRAINT (named) is not supported yet");
+            st.alter.op = AlterOp::DropColumn;
+            if (auto e = expect_ident("a column name to drop", st.alter.col_name)) return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
+        // ALTER [COLUMN] <c> TYPE <t> | SET/DROP DEFAULT | SET/DROP NOT NULL | DROP UNIQUE
+        if (is_kw("alter")) {
+            advance();
+            if (is_kw("column")) advance();
+            if (auto e = expect_ident("a column name", st.alter.col_name)) return ParseResult{*e};
+            if (is_kw("type") || is_kw("set")) {
+                const bool is_type = is_kw("type");
+                advance();
+                if (is_type) {
+                    st.alter.op = AlterOp::AlterType;
+                    if (auto e = parse_column_type(st.alter.add_col)) return ParseResult{*e};
+                    if (is_kw("unsigned")) { advance(); st.alter.add_col.is_unsigned = true; }
+                    return ParseResult{std::move(st)};
+                }
+                if (is_kw("default")) {
+                    advance();
+                    st.alter.op = AlterOp::SetDefault;
+                    if (auto e = expect_literal(st.alter.default_val)) return ParseResult{*e};
+                    return ParseResult{std::move(st)};
+                }
+                if (is_kw("not")) {
+                    advance();
+                    if (auto e = expect_kw("null")) return ParseResult{*e};
+                    st.alter.op = AlterOp::SetNotNull;
+                    return ParseResult{std::move(st)};
+                }
+                return err("expected DEFAULT or NOT NULL after SET");
+            }
+            if (is_kw("drop")) {
+                advance();
+                if (is_kw("default")) { advance(); st.alter.op = AlterOp::DropDefault; return ParseResult{std::move(st)}; }
+                if (is_kw("unique")) { advance(); st.alter.op = AlterOp::DropUnique; return ParseResult{std::move(st)}; }
+                if (is_kw("not")) {
+                    advance();
+                    if (auto e = expect_kw("null")) return ParseResult{*e};
+                    st.alter.op = AlterOp::DropNotNull;
+                    return ParseResult{std::move(st)};
+                }
+                return err("expected DEFAULT, NOT NULL, or UNIQUE after DROP");
+            }
+            return err("expected TYPE / SET / DROP after ALTER COLUMN");
+        }
+        // ADD [COLUMN] <coldef>  |  ADD [CONSTRAINT name] CHECK (expr) | UNIQUE (col)
         if (auto e = expect_kw("add")) return ParseResult{*e};
+        if (is_kw("constraint")) { advance(); std::string nm; (void)expect_ident("a constraint name", nm); }
+        if (is_kw("check")) {
+            advance();
+            st.alter.op = AlterOp::AddCheck;
+            if (auto e = expect(Tok::LParen, "'(' after CHECK")) return ParseResult{*e};
+            const std::size_t start = cur_.pos;
+            Predicate tmp;
+            if (auto e = parse_predicate(tmp, /*allow_agg=*/false)) return ParseResult{*e};
+            std::string text = lex_.src().substr(start, cur_.pos > start ? cur_.pos - start : 0);
+            while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.pop_back();
+            if (auto e = expect(Tok::RParen, "')' to close CHECK")) return ParseResult{*e};
+            st.alter.check_src = std::move(text);
+            return ParseResult{std::move(st)};
+        }
+        if (is_kw("unique")) {
+            advance();
+            st.alter.op = AlterOp::AddUnique;
+            if (auto e = expect(Tok::LParen, "'(' after UNIQUE")) return ParseResult{*e};
+            if (auto e = expect_ident("a column name", st.alter.unique_col)) return ParseResult{*e};
+            if (auto e = expect(Tok::RParen, "')' after UNIQUE column")) return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
         if (is_kw("column")) advance();  // optional COLUMN keyword
         Column col;
+        st.alter.op = AlterOp::AddColumn;
         if (auto e = expect_ident("a column name", col.name)) return ParseResult{*e};
-        if (auto e = parse_column_type(col)) {
-            return ParseResult{*e};
-        }
-        if (is_kw("unsigned")) {  // F10
-            advance();
-            col.is_unsigned = true;
-        }
+        if (auto e = parse_column_type(col)) return ParseResult{*e};
+        if (is_kw("unsigned")) { advance(); col.is_unsigned = true; }  // F10
         col.nullable = true;
         if (is_kw("not")) {
             advance();
@@ -820,7 +906,6 @@ private:
             advance();
             Datum dv;
             if (auto e = expect_literal(dv)) return ParseResult{*e};
-            if (dv.type != col.type) return err("DEFAULT literal type does not match the column");
             col.has_default = true;
             if (dv.type == Type::Int) col.default_i = dv.i;
             else col.default_s = dv.s;

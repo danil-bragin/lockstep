@@ -119,6 +119,10 @@ struct Column {
     // F13: ENUM (logical == 9). The ordered label set; the stored value is the 0-based ordinal (so
     // comparison follows DECLARATION order, like Postgres/MySQL). Render shows the label.
     std::vector<std::string> enum_labels;
+    // E1: a LOGICALLY DROPPED column (ALTER TABLE DROP COLUMN). The slot is KEPT so the row value
+    // encoding stays positionally aligned (decode still steps over its bytes); it is hidden from
+    // SELECT * / projection / name lookup, and INSERT writes a NULL for it. No data rewrite needed.
+    bool dropped = false;
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -202,6 +206,7 @@ struct Table {
     // Find a column by name; returns its index or nullopt (unknown column).
     [[nodiscard]] std::optional<std::size_t> column_index(const std::string& col) const {
         for (std::size_t i = 0; i < columns.size(); ++i) {
+            if (columns[i].dropped) continue;  // E1: a dropped column is invisible to name lookup
             if (columns[i].name == col) {
                 return i;
             }
@@ -1395,6 +1400,18 @@ public:
 
     [[nodiscard]] bool has(const std::string& name) const {
         return tables_.count(name) != 0;
+    }
+
+    // E1: ALTER TABLE RENAME TO — re-key the table under `to` (its id/data are unchanged). Returns
+    // false if `from` is missing or `to` already exists.
+    bool rename(const std::string& from, const std::string& to) {
+        const auto it = tables_.find(from);
+        if (it == tables_.end() || tables_.count(to) != 0) return false;
+        Table t = std::move(it->second);
+        tables_.erase(it);
+        t.name = to;
+        tables_.emplace(to, std::move(t));
+        return true;
     }
 
     // F3: iterate every table (ordered => deterministic) — used to find FK references on DELETE.
