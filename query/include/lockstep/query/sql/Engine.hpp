@@ -307,6 +307,7 @@ public:
         cat_put_u32(o, static_cast<std::uint32_t>(t.pk_index));
         o.push_back(t.columnar ? 1 : 0);
         cat_put_u32(o, t.next_index_id);
+        cat_put_s(o, std::to_string(t.next_auto_id));  // F6: persist the AUTO_INCREMENT counter
         cat_put_u32(o, static_cast<std::uint32_t>(t.columns.size()));
         for (const Column& c : t.columns) {
             cat_put_s(o, c.name);
@@ -318,6 +319,7 @@ public:
             if (c.has_default) {
                 cat_put_s(o, c.type == Type::Int ? std::to_string(c.default_i) : c.default_s);
             }
+            o.push_back(c.auto_increment ? 1 : 0);  // F6
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -335,6 +337,7 @@ public:
         t.pk_index = cat_get_u32(s, p);
         t.columnar = s[p++] != 0;
         t.next_index_id = cat_get_u32(s, p);
+        t.next_auto_id = std::strtoll(cat_get_s(s, p).c_str(), nullptr, 10);  // F6
         const std::uint32_t nc = cat_get_u32(s, p);
         for (std::uint32_t i = 0; i < nc; ++i) {
             Column c;
@@ -350,6 +353,7 @@ public:
                     c.default_s = dv;
                 }
             }
+            c.auto_increment = s[p++] != 0;  // F6
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -2849,6 +2853,9 @@ private:
         if (t == nullptr) {
             return ExecResult::failure("unknown table '" + ins.table + "'");
         }
+        // F6: a working copy of the AUTO_INCREMENT counter, advanced as rows are built and written
+        // back to the catalog (+ persisted) after a successful commit.
+        std::int64_t auto_next = t->next_auto_id;
         // Build ONE row from a value tuple: a named column is set (type-checked + NULL re-typed);
         // an omitted column defaults to NULL iff NULLABLE, else the INSERT is rejected (NOT NULL
         // REQUIRES a value; the PK is NOT NULL so omitting it always errors). Shared by every row
@@ -2871,9 +2878,19 @@ private:
                 }
                 row[*idx] = d;
                 set[*idx] = true;
+                // F6: an explicit value for an AUTO_INCREMENT column advances the counter past it.
+                if (t->columns[*idx].auto_increment && !d.is_null && d.type == Type::Int &&
+                    d.i >= auto_next) {
+                    auto_next = d.i + 1;
+                }
             }
             for (std::size_t c = 0; c < t->columns.size(); ++c) {
                 if (set[c]) {
+                    continue;
+                }
+                // F6: an omitted AUTO_INCREMENT column gets the next monotonic id.
+                if (t->columns[c].auto_increment) {
+                    row[c] = Datum::make_int(auto_next++);
                     continue;
                 }
                 // F4: an omitted column with a DEFAULT takes the default value.
@@ -2963,6 +2980,12 @@ private:
         // can never lag the rows after a committed INSERT; a multi-row INSERT is all-or-nothing).
         commit_writes(writes);
         if (Table* mt = catalog_.find_mut(ins.table)) {
+            // F6: advance + durably persist the AUTO_INCREMENT counter so a restart never re-issues
+            // an id (persist only when it actually moved — keeps the catalog write off the no-auto path).
+            if (auto_next != mt->next_auto_id) {
+                mt->next_auto_id = auto_next;
+                persist_schema(ins.table);
+            }
             for (const std::vector<Datum>& row : rows) {
                 if (mt->columnar) {
                     mt->delta_dirty = true;

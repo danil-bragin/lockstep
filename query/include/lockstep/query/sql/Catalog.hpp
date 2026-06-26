@@ -91,6 +91,7 @@ struct Column {
     bool has_default = false;
     std::int64_t default_i = 0;
     std::string default_s;
+    bool auto_increment = false;  // F6: INT column auto-assigned from Table::next_auto_id when omitted
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column
@@ -114,6 +115,7 @@ struct Table {
     std::size_t pk_index = 0;  // which column is the (single) PRIMARY KEY
     std::vector<Index> indexes;       // secondary indexes (in CREATE order)
     std::uint32_t next_index_id = 1;  // dense index-id assignment (0 reserved)
+    std::int64_t next_auto_id = 1;    // F6: next AUTO_INCREMENT value (monotonic; persisted)
 
     // COLUMNAR layout (PERF_PLAN columnar rollout): when true, the table is an LSM of a
     // row 'd' delta over flushed column blocks ('B'). Opt-in at CREATE; the durable KV

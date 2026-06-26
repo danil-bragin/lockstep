@@ -76,7 +76,7 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [ ] A1 scalar arithmetic (foundation)
 - [ ] A3 CASE WHEN · A2 string fns · F5 CHECK · G4 ORDER BY expr (ride on A1)
 - [x] D1 UNION/ALL + D2 INTERSECT/EXCEPT (set-op chain; dedup; combined ORDER/LIMIT; arity teeth) — sql_setops_test
-- [ ] E2 CROSS · F6 AUTO_INCREMENT · G2 UPSERT
+- [ ] E2 CROSS · G2 UPSERT
 - [ ] D3 FROM-subquery · D4 CTE · F9 types · B2 correlated · C3 window · F2 UNIQUE · F3 FK · F7 ALTER · E3 N-way · E4 non-equi · A4 CAST · C2 GROUPING SETS
 - [ ] F1 composite PK/index (HIGHEST risk — last)
 - [x] E2 CROSS JOIN — ALREADY PRESENT (catalog miss; verified)
@@ -84,3 +84,4 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] D5 INSERT ... SELECT (rows from a query, atomic; arity+dup teeth; both modes) — sql_insert_select_test
 - [x] E1 RIGHT/FULL OUTER JOIN (unmatched-right NULL-fill in hash+nested; parser boundary fix for FULL/NULLS; G3 joined ORDER BY completed; teeth) — sql_right_join_test
 - [x] F4 DEFAULT (column default fill-on-omit + override + durable catalog; type-mismatch teeth) — sql_default_test
+- [x] F6 AUTO_INCREMENT (monotonic id on omit + explicit bump + persisted counter; TEXT teeth) — sql_auto_increment_test

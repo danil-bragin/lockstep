@@ -571,6 +571,15 @@ private:
             } else if (is_kw("null")) {
                 advance();  // explicit NULL == the default (nullable)
             }
+            // F6: optional AUTO_INCREMENT (INT only) — an omitted value is assigned the table's
+            // next monotonic id. May appear before or after NOT NULL/DEFAULT.
+            if (is_kw("auto_increment")) {
+                advance();
+                if (col.type != Type::Int) {
+                    return err("AUTO_INCREMENT requires an INT column ('" + col.name + "')");
+                }
+                col.auto_increment = true;
+            }
             // F4: optional DEFAULT <literal> — used when an INSERT omits the column. The literal
             // must match the column type (checked at INSERT/coerce time).
             if (is_kw("default")) {
