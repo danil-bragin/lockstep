@@ -1052,7 +1052,9 @@ private:
                 if (col.logical == 1) {
                     std::int64_t pow = 1;
                     for (std::uint8_t k = 0; k < col.scale; ++k) pow *= 10;
-                    v = in.i * pow;  // whole-number literal scaled to fixed-point
+                    if (mul_ovf(in.i, pow, v)) {  // F9d: whole-number literal scaled to fixed-point
+                        return std::string("DECIMAL value out of range for column '") + col.name + "'";
+                    }
                 } else {
                     v = in.i;  // raw days/secs
                 }
@@ -1955,12 +1957,12 @@ private:
         for (std::size_t k = lo; k < hi; ++k) {  // SUM / AVG
             const ColumnChunk& ch = chunks[k];
             if (no_nulls) {
-                for (std::uint32_t r = 0; r < ch.count; ++r) p.sum += ch.ints[r];
+                for (std::uint32_t r = 0; r < ch.count; ++r) p.sum = wrap_add(p.sum, ch.ints[r]);  // F9d
                 p.n += ch.count;
             } else {
                 for (std::uint32_t r = 0; r < ch.count; ++r) {
                     if (ch.nulls[r]) continue;
-                    p.sum += ch.ints[r];
+                    p.sum = wrap_add(p.sum, ch.ints[r]);  // F9d
                     ++p.n;
                 }
             }
@@ -1993,11 +1995,11 @@ private:
                 std::int64_t mn = seeded ? s.imin : x[0];
                 std::int64_t mx = seeded ? s.imax : x[0];
                 for (std::uint32_t r = 0; r < ch.count; ++r) {  // ONE fused branchless pass
-                    sm += x[r];
+                    sm = wrap_add(sm, x[r]);  // F9d (columnar: defined wrap, SIMD-safe)
                     mn = std::min(mn, x[r]);
                     mx = std::max(mx, x[r]);
                 }
-                s.sum += sm;
+                s.sum = wrap_add(s.sum, sm);  // F9d
                 s.imin = mn;
                 s.imax = mx;
                 seeded = true;
@@ -2014,7 +2016,7 @@ private:
                 if (ch.nulls[r]) continue;
                 ++s.n;
                 const Datum v = ch.at(r);
-                if (ty == Type::Int) s.sum += v.i;
+                if (ty == Type::Int) s.sum = wrap_add(s.sum, v.i);  // F9d
                 if (!s.any) { s.dmin = v; s.dmax = v; s.any = true; }
                 else {
                     if (cmp_datum(v, s.dmin) < 0) s.dmin = v;
@@ -2049,7 +2051,7 @@ private:
         for (const AggPartial& p : ps) {
             m.total += p.total;
             m.n += p.n;
-            m.sum += p.sum;
+            m.sum = wrap_add(m.sum, p.sum);  // F9d (columnar)
             if (!p.any) continue;
             if (int_minmax) {
                 if (!m.any || (a.kind == AggKind::Min ? p.ibest < m.ibest : p.ibest > m.ibest)) {
@@ -2277,13 +2279,13 @@ private:
         std::int64_t n = 0;
         if (no_nulls) {
             for (std::uint32_t r = 0; r < count; ++r) {  // contiguous => auto-vectorized
-                sum += cc.ints[r];
+                sum = wrap_add(sum, cc.ints[r]);  // F9d (columnar: defined wrap, no UB, SIMD-safe)
             }
             n = count;
         } else {
             for (std::uint32_t r = 0; r < count; ++r) {
                 if (cc.nulls[r]) continue;
-                sum += cc.ints[r];
+                sum = wrap_add(sum, cc.ints[r]);  // F9d
                 ++n;
             }
         }
@@ -2348,7 +2350,7 @@ private:
             if (cc.nulls[r]) {
                 continue;
             }
-            sum += cc.ints[r];
+            sum = wrap_add(sum, cc.ints[r]);  // F9d (columnar)
             ++n;
         }
         if (n == 0) {
@@ -4019,6 +4021,29 @@ private:
         return false;
     }
 
+    // F9d: CHECKED int64 arithmetic. INT is 64-bit (BIGINT is the same width); an operation whose
+    // true result exceeds int64 is signed overflow == UB (an UBSan trap; a silent 2's-complement wrap
+    // in a release build). These return true ON OVERFLOW so the caller can raise a clean
+    // "integer overflow" error instead. `wrap_add` is a DEFINED 2's-complement add via unsigned (no
+    // UB, no branch — stays SIMD-vectorizable); used on the opt-in columnar accumulator paths (tight
+    // per-element scans), where threading an error through the parallel partial-merge machinery would
+    // both serialize the SIMD folds and race. The wrap is deterministic and UB-free; row/joined/
+    // window/expr paths raise the hard error, and conformance never overflows so row==columnar stays
+    // byte-identical.
+    static bool add_ovf(std::int64_t a, std::int64_t b, std::int64_t& r) {
+        return __builtin_add_overflow(a, b, &r);
+    }
+    static bool sub_ovf(std::int64_t a, std::int64_t b, std::int64_t& r) {
+        return __builtin_sub_overflow(a, b, &r);
+    }
+    static bool mul_ovf(std::int64_t a, std::int64_t b, std::int64_t& r) {
+        return __builtin_mul_overflow(a, b, &r);
+    }
+    static std::int64_t wrap_add(std::int64_t a, std::int64_t b) {
+        return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) +
+                                         static_cast<std::uint64_t>(b));
+    }
+
     // A1-A4: evaluate a scalar expression over a single-table `row` to a Datum. Arithmetic is INT
     // (NULL-propagating; division/mod by zero is an error); string/scalar functions + CAST + CASE.
     [[nodiscard]] std::optional<std::string> eval_expr(const Expr& e, const Table& t,
@@ -4038,7 +4063,11 @@ private:
                 if (auto er = eval_expr(*e.left, t, row, c)) return er;
                 if (c.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
                 if (c.type != Type::Int) return "unary '-' requires an INT operand";
-                out = Datum::make_int(-c.i);
+                std::int64_t neg = 0;
+                if (sub_ovf(0, c.i, neg)) return "integer overflow";  // -INT64_MIN overflows
+                out = Datum::make_int(neg);
+                out.logical = c.logical;
+                out.scale = c.scale;
                 return std::nullopt;
             }
             case ExprKind::Bin: {
@@ -4062,23 +4091,30 @@ private:
                     case BinOp::Add:
                     case BinOp::Sub: {
                         const std::uint8_t cs = ls > rs ? ls : rs;
-                        const std::int64_t li = l.i * p10(cs - ls), ri = r.i * p10(cs - rs);
-                        v = e.op == BinOp::Add ? li + ri : li - ri;
+                        std::int64_t li = 0, ri = 0;
+                        if (mul_ovf(l.i, p10(cs - ls), li) || mul_ovf(r.i, p10(cs - rs), ri))
+                            return "integer overflow";
+                        if (e.op == BinOp::Add ? add_ovf(li, ri, v) : sub_ovf(li, ri, v))
+                            return "integer overflow";
                         out_sc = cs;
                         break;
                     }
                     case BinOp::Mul:
-                        v = l.i * r.i;
+                        if (mul_ovf(l.i, r.i, v)) return "integer overflow";
                         out_sc = static_cast<std::uint8_t>(ls + rs);
                         break;
-                    case BinOp::Div:
+                    case BinOp::Div: {
                         if (r.i == 0) return "division by zero";
-                        v = (l.i * p10(rs)) / r.i;  // result scale = ls (numerator pre-scaled by rs)
+                        std::int64_t num = 0;
+                        if (mul_ovf(l.i, p10(rs), num)) return "integer overflow";  // pre-scale by rs
+                        if (l.i == INT64_MIN && r.i == -1) return "integer overflow";  // INT_MIN/-1 UB
+                        v = num / r.i;  // result scale = ls
                         out_sc = ls;
                         break;
+                    }
                     case BinOp::Mod:
                         if (r.i == 0) return "modulo by zero";
-                        v = l.i % r.i;
+                        v = (l.i == INT64_MIN && r.i == -1) ? 0 : l.i % r.i;  // INT_MIN%-1 UB -> 0
                         out_sc = ls;
                         break;
                 }
@@ -4248,7 +4284,8 @@ private:
                     if (w.kind == WinKind::CountStar) continue;
                     if (d.is_null) continue;
                     ++npres;
-                    sum += d.type == Type::Int ? d.i : 0;
+                    if (d.type == Type::Int && add_ovf(sum, d.i, sum))  // F9d
+                        return "integer overflow in window SUM";
                     if (!any) { best = d; any = true; }
                     else {
                         const int c = cmp_datum(d, best);
@@ -4710,7 +4747,7 @@ private:
                 const Datum v = p.val.is_fact ? p.val.fp->at(rr) : dim_rows[di][p.val.col];
                 if (v.is_null) continue;
                 ++acc.npres;
-                if (p.kind == AggKind::Sum || p.kind == AggKind::Avg) acc.sum += v.i;
+                if (p.kind == AggKind::Sum || p.kind == AggKind::Avg) acc.sum = wrap_add(acc.sum, v.i);  // F9d (columnar)
                 else if (p.kind == AggKind::Min || p.kind == AggKind::Max) {
                     if (!acc.any) { acc.best = v; acc.any = true; }
                     else {
@@ -5519,7 +5556,7 @@ private:
         }
         std::int64_t sum = 0;
         for (const Datum* d : present) {
-            sum += d->i;
+            if (add_ovf(sum, d->i, sum)) return "integer overflow in SUM";  // F9d
         }
         if (a.kind == AggKind::Sum) {
             out = Datum::make_int(sum);
@@ -6753,10 +6790,10 @@ private:
             out = best;
             return std::nullopt;
         }
-        // SUM / AVG over INT (validated INT in validate_one_agg).
+        // SUM / AVG over INT (validated INT in validate_one_agg). F9d: checked accumulation.
         std::int64_t sum = 0;
         for (const Datum* d : present) {
-            sum += d->i;
+            if (add_ovf(sum, d->i, sum)) return "integer overflow in SUM";
         }
         if (a.kind == AggKind::Sum) {
             out = Datum::make_int(sum);
