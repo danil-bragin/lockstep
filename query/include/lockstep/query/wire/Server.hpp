@@ -177,10 +177,17 @@ public:
         // here; when no more frames are immediately readable (or the budget ends) we fsync ONCE
         // and release every parked ack — so acked==durable holds while the barrier is amortized
         // over the whole drained burst (the per-Put fsync was the ~3.3k write cap).
+        sql_eng_.set_group_commit(true);  // SQL writes defer their fsync to the shared flush too
         std::vector<std::pair<Endpoint, std::vector<std::byte>>> parked;
+        bool keyed_dirty = false;  // un-synced keyed Puts buffered in db_
+        bool sql_dirty = false;    // un-synced SQL writes buffered in sql_eng_
         auto flush = [&]() -> Task {
             if (parked.empty()) co_return;
-            db_.sync();  // single durability barrier for every buffered write in the burst
+            // ONE durability barrier per engine that has buffered writes, BEFORE any ack is sent.
+            if (keyed_dirty) db_.sync();
+            if (sql_dirty) sql_eng_.sync();
+            keyed_dirty = false;
+            sql_dirty = false;
             for (auto& [to, bytes] : parked) {
                 (void)co_await net_->send(
                     to, std::span<const std::byte>(bytes.data(), bytes.size()));
@@ -234,13 +241,17 @@ public:
 
             const Response resp = dispatch(req);
             std::vector<std::byte> out = encode_response(resp);
-            // A keyed Put was applied WITHOUT its fsync (group commit): PARK its ack until the
-            // shared barrier (incl. a dedup'd duplicate — its write may still be un-synced, so it
-            // must wait too, else a dup ack could outrun durability). Everything else (reads,
-            // RMW which synced inline, SQL, ping, errors) is durable/durability-free already and
-            // is sent immediately.
-            const bool defer = (req.kind == MsgKind::Submit && req.op == SubmitOp::Put);
-            if (defer) {
+            // A keyed Put (group-commit) or a SQL write applied WITHOUT its fsync: PARK its ack
+            // until the shared barrier (incl. a dedup'd duplicate — its write may still be
+            // un-synced, so it must wait too, else a dup ack could outrun durability), and mark
+            // which engine is dirty so flush() fsyncs it. Reads / RMW (synced inline) / a SELECT /
+            // ping / errors are durable or durability-free already and are sent immediately.
+            const bool keyed_put = (req.kind == MsgKind::Submit && req.op == SubmitOp::Put);
+            const bool sql_write = (req.kind == MsgKind::SqlExec && resp.sql_ok &&
+                                    resp.sql_affected > 0);  // INSERT/UPDATE/DELETE that wrote
+            if (keyed_put || sql_write) {
+                if (keyed_put) keyed_dirty = true;
+                if (sql_write) sql_dirty = true;
                 parked.emplace_back(from, std::move(out));
             } else {
                 (void)co_await net_->send(

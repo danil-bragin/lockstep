@@ -280,6 +280,15 @@ public:
     // unaffected — only wall-clock changes. Threads live in the injected impl, never here.
     void set_parallel_executor(IParallelExecutor* ex) { parallel_executor_ = ex; }
 
+    // GROUP COMMIT (write durability): when set, INSERT/UPDATE/DELETE defer their fsync; the
+    // caller MUST call sync() before acking any of the deferred writes (acked==durable). Lets the
+    // wire server amortize ONE fsync over a burst of SQL writes (the SQL analogue of the keyed
+    // path's 3.3k -> 59k lift). Off by default (every statement fsyncs inline).
+    void set_group_commit(bool v) { group_commit_ = v; }
+
+    // Flush the deferred SQL-write fsync once — after this, all group-committed writes are durable.
+    void sync() { db_.sync(); }
+
     // FLUSH a columnar table's row 'd' delta into column blocks (LSM compaction): read the
     // merged live rows, pack each column into a block (block_no 0, overwrite), and clear
     // the delta — ALL in ONE atomic commit (the durable batch), so a crash leaves either
@@ -5304,7 +5313,12 @@ private:
         const SubmitResult sr = db_.submit(fn, cfg);
         for (const txn::CommitInfo& c : sr.commits) {
             if (c.status == txn::Status::Committed && !c.writes_committed.empty()) {
-                tip_ = db_.apply_committed(c.writes_committed);
+                // GROUP COMMIT: defer the fsync when the caller (wire::Server, net-backed) will
+                // sync() once for the whole burst — the SQL-write analogue of the keyed path,
+                // amortizing the per-statement durability barrier. acked==durable holds because
+                // the caller withholds the SqlResult ack until its sync.
+                tip_ = group_commit_ ? db_.apply_committed_nosync(c.writes_committed)
+                                     : db_.apply_committed(c.writes_committed);
             }
         }
     }
@@ -5321,6 +5335,7 @@ private:
     PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run
     bool vectorize_ = true;            // vectorized filter fast path (test-toggleable)
     bool columnar_default_ = false;    // new tables use the columnar layout when set
+    bool group_commit_ = false;        // defer write fsync; caller sync()s the burst once
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change
