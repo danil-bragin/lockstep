@@ -135,18 +135,25 @@ int main() {
         check(dist.exec(ins).ok, "dist dim insert (routed)");
     }
     const std::vector<std::string> b4_queries = {
-        // distributed JOIN (gather both tables, run locally)
+        // distributed JOIN (gather both tables, run locally) — fact group col => gather path
         "SELECT t.region, dim.label, COUNT(*) FROM t JOIN dim ON t.cat = dim.cat "
         "GROUP BY t.region, dim.label",
         // distributed GLOBAL-ORDER scan (gather the table, ORDER BY locally)
         "SELECT id, amount FROM t ORDER BY amount, id LIMIT 12",
+        // STAR-SCHEMA PUSHDOWN (co-located shuffle): all-dim GROUP BY + fact aggregates => the fact
+        // is aggregated per-key ON THE SHARDS, never gathered. Must equal the single-node oracle.
+        "SELECT dim.label, COUNT(*), SUM(t.amount), MIN(t.amount), MAX(t.amount) "
+        "FROM t JOIN dim ON t.cat = dim.cat GROUP BY dim.label",
     };
+    const std::size_t pd_before = dist.pushdowns();
     for (const std::string& q : b4_queries) {
         const std::string s = render(solo.exec(q));
         const std::string d = render(dist.exec(q));
         check(s == d, "B4 distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" + d +
                           "]");
     }
+    check(dist.pushdowns() > pd_before,
+          "star-schema JOIN actually took the pushdown path (not the gather fallback)");
 
     // Distributed AVG is explicitly rejected (can't merge an averaged value across shards).
     const ExecResult avg = dist.exec("SELECT AVG(amount) FROM t");
