@@ -320,6 +320,7 @@ public:
                 cat_put_s(o, c.type == Type::Int ? std::to_string(c.default_i) : c.default_s);
             }
             o.push_back(c.auto_increment ? 1 : 0);  // F6
+            o.push_back(c.unique ? 1 : 0);           // F2
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.indexes.size()));
         for (const Index& ix : t.indexes) {
@@ -354,6 +355,7 @@ public:
                 }
             }
             c.auto_increment = s[p++] != 0;  // F6
+            c.unique = s[p++] != 0;          // F2
             t.columns.push_back(std::move(c));
         }
         const std::uint32_t ni = cat_get_u32(s, p);
@@ -2856,6 +2858,29 @@ private:
         // F6: a working copy of the AUTO_INCREMENT counter, advanced as rows are built and written
         // back to the catalog (+ persisted) after a successful commit.
         std::int64_t auto_next = t->next_auto_id;
+
+        // F2: UNIQUE constraint enforcement. Pre-scan the table once to collect the existing non-NULL
+        // values of every UNIQUE column; staging then rejects a row that repeats one (existing OR
+        // earlier in this batch). NULLs are allowed to repeat (SQL UNIQUE permits multiple NULLs).
+        std::vector<std::size_t> unique_cols;
+        for (std::size_t c = 0; c < t->columns.size(); ++c) {
+            if (t->columns[c].unique && c != t->pk_index) unique_cols.push_back(c);
+        }
+        std::vector<std::set<std::string>> seen_unique(unique_cols.size());
+        if (!unique_cols.empty()) {
+            SelectStmt scan;
+            scan.table = t->name;
+            std::vector<std::vector<Datum>> existing;
+            if (auto e = scan_table(*t, scan, existing)) {
+                return ExecResult::failure(*e);
+            }
+            for (const std::vector<Datum>& er : existing) {
+                for (std::size_t u = 0; u < unique_cols.size(); ++u) {
+                    const Datum& d = er[unique_cols[u]];
+                    if (!d.is_null) seen_unique[u].insert(group_key_field(d));
+                }
+            }
+        }
         // Build ONE row from a value tuple: a named column is set (type-checked + NULL re-typed);
         // an omitted column defaults to NULL iff NULLABLE, else the INSERT is rejected (NOT NULL
         // REQUIRES a value; the PK is NOT NULL so omitting it always errors). Shared by every row
@@ -2962,6 +2987,15 @@ private:
                 index_writes_for_row(*t, new_row, /*tombstone=*/false, writes);
                 ++conflict_updated;
                 return std::nullopt;
+            }
+            // F2: a NEW row must not repeat a UNIQUE column value (existing or earlier in the batch).
+            for (std::size_t u = 0; u < unique_cols.size(); ++u) {
+                const Datum& d = row[unique_cols[u]];
+                if (d.is_null) continue;  // NULLs may repeat
+                if (!seen_unique[u].insert(group_key_field(d)).second) {
+                    return "UNIQUE constraint violated on column '" +
+                           t->columns[unique_cols[u]].name + "'";
+                }
             }
             emit_row_writes(*t, row, writes);
             index_writes_for_row(*t, row, /*tombstone=*/false, writes);

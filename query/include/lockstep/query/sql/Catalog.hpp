@@ -92,6 +92,7 @@ struct Column {
     std::int64_t default_i = 0;
     std::string default_s;
     bool auto_increment = false;  // F6: INT column auto-assigned from Table::next_auto_id when omitted
+    bool unique = false;          // F2: UNIQUE constraint (no two non-NULL rows share a value)
 };
 
 // A SECONDARY INDEX over ONE column of a table (single-column index — multi-column

@@ -571,6 +571,11 @@ private:
             } else if (is_kw("null")) {
                 advance();  // explicit NULL == the default (nullable)
             }
+            // F2: optional UNIQUE constraint.
+            if (is_kw("unique")) {
+                advance();
+                col.unique = true;
+            }
             // F6: optional AUTO_INCREMENT (INT only) — an omitted value is assigned the table's
             // next monotonic id. May appear before or after NOT NULL/DEFAULT.
             if (is_kw("auto_increment")) {
