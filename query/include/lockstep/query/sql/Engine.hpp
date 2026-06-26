@@ -3474,6 +3474,16 @@ private:
     [[nodiscard]] std::optional<std::string> scan_table(
         const Table& t, const SelectStmt& sel,
         std::vector<std::vector<Datum>>& rows_out) {
+        // COLUMNAR tables store rows in blocks + the row 'd' delta, NOT the row-mode 't' prefix —
+        // a 't'-prefix scan returns EMPTY (the columnar-JOIN bug). Read via the columnar path with
+        // a clean FULL scan (all columns; the JOIN applies ON/WHERE later over the joined rows).
+        if (t.columnar) {
+            SelectStmt full;
+            full.table = t.name;
+            full.star = true;
+            const std::vector<bool> need(t.columns.size(), true);
+            return columnar_build_rows(t, full, need, rows_out);
+        }
         std::vector<storage::KeyValue> kvs;
         if (auto err = run_select_at_level(t, sel, /*pk_fast=*/false, kvs)) {
             return err;

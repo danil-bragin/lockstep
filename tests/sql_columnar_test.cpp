@@ -76,6 +76,38 @@ void both(SqlEngine& col, SqlEngine& row, const std::string& sql, const std::str
     check(rc == rr, tag + ": columnar=[" + rc + "] row=[" + rr + "] for: " + sql);
 }
 
+// JOIN over COLUMNAR tables must equal JOIN over row-mode (regression: a columnar table's rows live
+// in blocks + the 'd' delta, NOT the row-mode 't' prefix — a 't'-scan JOIN returned EMPTY).
+void run_join() {
+    SqlEngine col;
+    col.set_columnar_default(true);
+    SqlEngine row;
+    for (SqlEngine* e : {&col, &row}) {
+        e->exec("CREATE TABLE ord (id INT, cust INT NOT NULL, amt INT NOT NULL, PRIMARY KEY (id))");
+        e->exec("CREATE TABLE cust (cid INT, name TEXT NOT NULL, PRIMARY KEY (cid))");
+        for (int i = 0; i < 60; ++i) {
+            e->exec("INSERT INTO ord (id, cust, amt) VALUES (" + std::to_string(i) + ", " +
+                    std::to_string(i % 6) + ", " + std::to_string((i * 17) % 100) + ")");
+        }
+        for (int c = 0; c < 6; ++c) {
+            e->exec("INSERT INTO cust (cid, name) VALUES (" + std::to_string(c) + ", 'c" +
+                    std::to_string(c) + "')");
+        }
+    }
+    // Flush ONE columnar table (mix of flushed + unflushed — the case that surfaced the bug).
+    col.flush_columnar("ord");
+    both(col, row, "SELECT ord.id, cust.name FROM ord JOIN cust ON ord.cust = cust.cid", "join-proj");
+    both(col, row,
+         "SELECT cust.name, COUNT(*), SUM(ord.amt) FROM ord JOIN cust ON ord.cust = cust.cid "
+         "GROUP BY cust.name",
+         "join-groupby");
+    col.flush_columnar("cust");  // both flushed
+    both(col, row,
+         "SELECT cust.name, SUM(ord.amt) FROM ord JOIN cust ON ord.cust = cust.cid "
+         "WHERE ord.amt > 40 GROUP BY cust.name",
+         "join-filtered");
+}
+
 void run_seed(std::uint64_t seed) {
     SqlEngine col;
     col.set_columnar_default(true);
@@ -363,6 +395,7 @@ int main() {
     run_autoflush();
     run_overlays();
     run_text_zones();
+    run_join();
     if (g_fail == 0) {
         std::printf("sql_columnar_test: ALL PASS (columnar == row-mode across the workload)\n");
     }
