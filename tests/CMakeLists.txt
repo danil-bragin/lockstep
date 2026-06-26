@@ -1022,6 +1022,24 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_providers_sim)
   add_test(NAME sql_wire_test COMMAND lockstep_sql_wire_test)
 
+  # sql_distributed_test: the DISTRIBUTED-SQL (scatter-gather) gate. A table sharded across M
+  # SqlEngines via DistributedSql (CREATE broadcast, INSERT routed by PK hash, aggregate SELECT
+  # scattered + merged by kind) must answer BYTE-IDENTICALLY to one SqlEngine holding all rows —
+  # scalar + GROUP BY aggregates, filtered, point read; rows proven spread across shards.
+  add_executable(lockstep_sql_distributed_test sql_distributed_test.cpp)
+  target_include_directories(lockstep_sql_distributed_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_distributed_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME sql_distributed_test COMMAND lockstep_sql_distributed_test)
+
   # sql_columnar_durability_test: the columnar crash/recovery gate (A5). Proves the
   # committed columnar state (blocks + delta) survives a crash + recovery byte-for-byte
   # over a deterministic SimDisk — projection/aggregate/GROUP BY identical post-recovery,
