@@ -152,6 +152,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <optional>
 #include <string>
 #include <vector>
@@ -2807,93 +2808,113 @@ private:
         if (t == nullptr) {
             return ExecResult::failure("unknown table '" + ins.table + "'");
         }
-        // v4: columns may be OMITTED. A named column is set (with type checking + NULL
-        // re-typing); an omitted column defaults to NULL iff it is NULLABLE, else the
-        // INSERT is rejected (a NOT NULL column REQUIRES a value). The PK is NOT NULL, so
-        // omitting it is always an error.
-        std::vector<Datum> row(t->columns.size());
-        std::vector<bool> set(t->columns.size(), false);
-        for (std::size_t k = 0; k < ins.columns.size(); ++k) {
-            const auto idx = t->column_index(ins.columns[k]);
-            if (!idx) {
-                return ExecResult::failure("unknown column '" + ins.columns[k] +
-                                           "' in table '" + ins.table + "'");
+        // Build ONE row from a value tuple: a named column is set (type-checked + NULL re-typed);
+        // an omitted column defaults to NULL iff NULLABLE, else the INSERT is rejected (NOT NULL
+        // REQUIRES a value; the PK is NOT NULL so omitting it always errors). Shared by every row
+        // of a multi-row INSERT (D6).
+        auto build_row = [&](const std::vector<Datum>& vals,
+                             std::vector<Datum>& row) -> std::optional<std::string> {
+            row.assign(t->columns.size(), Datum{});
+            std::vector<bool> set(t->columns.size(), false);
+            for (std::size_t k = 0; k < ins.columns.size(); ++k) {
+                const auto idx = t->column_index(ins.columns[k]);
+                if (!idx) {
+                    return "unknown column '" + ins.columns[k] + "' in table '" + ins.table + "'";
+                }
+                if (set[*idx]) {
+                    return "column '" + ins.columns[k] + "' specified more than once";
+                }
+                Datum d;
+                if (auto e = coerce(t->columns[*idx], vals[k], d)) {
+                    return *e;
+                }
+                row[*idx] = d;
+                set[*idx] = true;
             }
-            if (set[*idx]) {
-                return ExecResult::failure("column '" + ins.columns[k] +
-                                           "' specified more than once");
+            for (std::size_t c = 0; c < t->columns.size(); ++c) {
+                if (set[c]) {
+                    continue;
+                }
+                if (!t->columns[c].nullable) {
+                    return "INSERT omits NOT NULL column '" + t->columns[c].name +
+                           "' (provide a value)";
+                }
+                row[c] = Datum::make_null(t->columns[c].type);  // omitted nullable => NULL
             }
-            Datum d;
-            if (auto e = coerce(t->columns[*idx], ins.values[k], d)) {
+            return std::nullopt;
+        };
+
+        // D6: a multi-row INSERT is ATOMIC — build EVERY row, detect dup PKs (against the live
+        // store AND against PKs earlier in THIS batch), accumulate all writes, then ONE commit.
+        // A single-row INSERT is the 1-iteration case → byte-identical to the pre-D6 path.
+        std::vector<std::vector<Datum>> rows;
+        rows.reserve(1 + ins.more_rows.size());
+        std::vector<std::pair<Key, Value>> writes;
+        std::set<std::string> batch_pks;  // encode_key of PKs seen in this batch (within-batch dup)
+        auto stage = [&](const std::vector<Datum>& vals) -> std::optional<std::string> {
+            std::vector<Datum> row;
+            if (auto e = build_row(vals, row)) {
+                return e;
+            }
+            const Datum& pk = row[t->pk_index];
+            const Key pk_key = encode_key(*t, pk);
+            if (!batch_pks.insert(pk_key).second) {
+                return "duplicate primary key within the INSERT batch (table '" + ins.table + "')";
+            }
+            bool exists;
+            if (t->columnar) {
+                exists = read_columnar_row(*t, pk).has_value();
+            } else {
+                const ReadResult existing = read_committed(pk_key);
+                exists = existing.has_value() && !is_tombstone(*existing);
+            }
+            if (exists) {
+                return "duplicate primary key in table '" + ins.table + "' (row already exists)";
+            }
+            emit_row_writes(*t, row, writes);
+            index_writes_for_row(*t, row, /*tombstone=*/false, writes);
+            rows.push_back(std::move(row));
+            return std::nullopt;
+        };
+        if (auto e = stage(ins.values)) {
+            return ExecResult::failure(*e);
+        }
+        for (const std::vector<Datum>& extra : ins.more_rows) {
+            if (auto e = stage(extra)) {
                 return ExecResult::failure(*e);
             }
-            row[*idx] = d;
-            set[*idx] = true;
         }
-        for (std::size_t c = 0; c < t->columns.size(); ++c) {
-            if (set[c]) {
-                continue;
-            }
-            if (!t->columns[c].nullable) {
-                return ExecResult::failure(
-                    "INSERT omits NOT NULL column '" + t->columns[c].name +
-                    "' (provide a value)");
-            }
-            row[c] = Datum::make_null(t->columns[c].type);  // omitted nullable => NULL
-        }
-        const Datum& pk = row[t->pk_index];
-
-        // INCREMENTAL write path (see commit_write): the read-modify-write DECISION
-        // (dup-PK detect) runs in the Engine over the VERIFIED read path (the live
-        // committed store), so we never re-submit the whole prior write-log. Columnar
-        // probes the merged block+delta view (read_columnar_row handles the del-marker);
-        // row mode probes the row key.
-        bool exists;
-        if (t->columnar) {
-            exists = read_columnar_row(*t, pk).has_value();
-        } else {
-            const ReadResult existing = read_committed(encode_key(*t, pk));
-            exists = existing.has_value() && !is_tombstone(*existing);
-        }
-        if (exists) {
-            return ExecResult::failure("duplicate primary key in table '" + ins.table +
-                                       "' (row already exists)");
-        }
-        // ATOMIC: the row materialisation (one KV in row mode, one per column family in
-        // columnar) + every secondary-index entry commit in ONE txn (the index/columns
-        // can never lag the row after a committed INSERT).
-        std::vector<std::pair<Key, Value>> writes;
-        emit_row_writes(*t, row, writes);
-        index_writes_for_row(*t, row, /*tombstone=*/false, writes);
+        // ATOMIC: every row's materialisation + secondary-index entries in ONE txn (index/columns
+        // can never lag the rows after a committed INSERT; a multi-row INSERT is all-or-nothing).
         commit_writes(writes);
         if (Table* mt = catalog_.find_mut(ins.table)) {
-            if (mt->columnar) {
-                mt->delta_dirty = true;  // the delta now has a live entry (until next flush)
-                ++mt->delta_count;
-            }
-            ++mt->row_count;  // a committed INSERT adds exactly one new row (dup PK is rejected)
-            // Grow per-column INT min/max (skip NULLs). Stats may lag a DELETE of an extreme —
-            // acceptable for a cost estimate (a slightly-wide range under-estimates selectivity).
-            if (mt->col_stats.size() == row.size()) {
-                for (std::size_t c = 0; c < row.size(); ++c) {
-                    if (row[c].type != Type::Int || row[c].is_null) {
-                        continue;
-                    }
-                    Table::ColStat& cs = mt->col_stats[c];
-                    if (!cs.seen) {
-                        cs.seen = true;
-                        cs.lo = row[c].i;
-                        cs.hi = row[c].i;
-                    } else {
-                        cs.lo = row[c].i < cs.lo ? row[c].i : cs.lo;
-                        cs.hi = row[c].i > cs.hi ? row[c].i : cs.hi;
+            for (const std::vector<Datum>& row : rows) {
+                if (mt->columnar) {
+                    mt->delta_dirty = true;
+                    ++mt->delta_count;
+                }
+                ++mt->row_count;
+                if (mt->col_stats.size() == row.size()) {
+                    for (std::size_t c = 0; c < row.size(); ++c) {
+                        if (row[c].type != Type::Int || row[c].is_null) {
+                            continue;
+                        }
+                        Table::ColStat& cs = mt->col_stats[c];
+                        if (!cs.seen) {
+                            cs.seen = true;
+                            cs.lo = row[c].i;
+                            cs.hi = row[c].i;
+                        } else {
+                            cs.lo = row[c].i < cs.lo ? row[c].i : cs.lo;
+                            cs.hi = row[c].i > cs.hi ? row[c].i : cs.hi;
+                        }
                     }
                 }
             }
         }
         maybe_auto_flush(ins.table);
         ExecResult r;
-        r.affected = 1;
+        r.affected = static_cast<std::int64_t>(rows.size());
         return r;
     }
 

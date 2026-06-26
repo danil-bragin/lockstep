@@ -77,7 +77,10 @@ struct DropIndexStmt {
 struct InsertStmt {
     std::string table;
     std::vector<std::string> columns;  // the named columns, in stated order
-    std::vector<Datum> values;         // one value per named column (parsed literal)
+    std::vector<Datum> values;         // row 0: one value per named column (parsed literal)
+    // D6 multi-row: VALUES (..),(..),... — rows 1..N-1 (row 0 stays in `values` for back-compat).
+    // Empty for a single-row INSERT. Each inner vector has columns.size() values (parser-checked).
+    std::vector<std::vector<Datum>> more_rows;
 };
 
 // UPDATE <t> SET <col> = <v> WHERE <pk> = <v>

@@ -708,6 +708,37 @@ private:
                        ") does not match value count (" +
                        std::to_string(st.insert.values.size()) + ")");
         }
+        // D6: MULTI-ROW INSERT — `VALUES (..),(..),...`. Each extra tuple after the first is
+        // parsed into more_rows; every tuple must match the column count (parser-checked here so
+        // the engine sees a clean, uniform batch).
+        while (cur_.kind == Tok::Comma) {
+            advance();  // ','
+            if (auto e = expect(Tok::LParen, "'(' to open another VALUES tuple")) {
+                return ParseResult{*e};
+            }
+            std::vector<Datum> rowv;
+            for (;;) {
+                Datum v;
+                if (auto e = expect_value_or_null(v)) {
+                    return ParseResult{*e};
+                }
+                rowv.push_back(std::move(v));
+                if (cur_.kind == Tok::Comma) {
+                    advance();
+                    continue;
+                }
+                break;
+            }
+            if (auto e = expect(Tok::RParen, "')' to close the VALUES tuple")) {
+                return ParseResult{*e};
+            }
+            if (rowv.size() != st.insert.columns.size()) {
+                return err("INSERT VALUES tuple has " + std::to_string(rowv.size()) +
+                           " values but " + std::to_string(st.insert.columns.size()) +
+                           " columns were named");
+            }
+            st.insert.more_rows.push_back(std::move(rowv));
+        }
         return ParseResult{std::move(st)};
     }
 
