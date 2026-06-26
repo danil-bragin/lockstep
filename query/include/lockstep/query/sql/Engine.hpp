@@ -163,6 +163,7 @@
 #include <lockstep/query/sql/Ast.hpp>
 #include <lockstep/query/sql/Catalog.hpp>
 #include <lockstep/query/sql/ColumnBlock.hpp>
+#include <lockstep/query/sql/Json.hpp>
 #include <lockstep/query/sql/Parser.hpp>
 #include <lockstep/txn/Transaction.hpp>
 
@@ -1101,6 +1102,20 @@ private:
             out.scale = col.scale;
             if (col.logical == 9) out.s = col.enum_labels[static_cast<std::size_t>(v)];
             return check_domain(col, out, for_write);
+        }
+        // F13: a JSON column (logical 11, physical TEXT). Parse + store the CANONICAL form (sorted
+        // keys, compact, normalized numbers) so equal documents are byte-identical.
+        if (col.type == Type::Text && col.logical == 11) {
+            if (in.type != Type::Text) {
+                return std::string("type mismatch for column '") + col.name + "': expected JSON";
+            }
+            std::string canon;
+            if (!json::canonical(in.s, canon)) {
+                return std::string("invalid JSON for column '") + col.name + "'";
+            }
+            out = Datum::make_text(std::move(canon));
+            out.logical = 11;
+            return std::nullopt;
         }
         // F9c: a UUID column (physical TEXT). Validate + canonicalise (lowercase, dashed) the literal.
         if (col.type == Type::Text && col.logical == 4) {
@@ -4779,6 +4794,45 @@ private:
                 s += d.type == Type::Text ? d.s : std::to_string(d.i);
             }
             out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        // F13: JSON access `json -> key` / `json ->> key` (key = TEXT object member, or INT 0-based
+        // array index). `->` yields JSON (NULL if absent); `->>` yields the value as TEXT.
+        if (f == "->" || f == "->>") {
+            if (a[0].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            json::JVal root;
+            std::size_t jp = 0;
+            if (!json::parse_value(a[0].s, jp, root)) return "left operand of -> is not JSON";
+            const json::JVal* found = nullptr;
+            if (a[1].type == Type::Text) {
+                if (root.kind == json::JVal::Obj)
+                    for (const auto& en : root.obj)
+                        if (en.first == a[1].s) { found = &en.second; break; }
+            } else if (root.kind == json::JVal::Arr && a[1].i >= 0 &&
+                       a[1].i < static_cast<std::int64_t>(root.arr.size())) {
+                found = &root.arr[static_cast<std::size_t>(a[1].i)];
+            }
+            if (!found) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (f == "->>") {
+                if (found->kind == json::JVal::Str) { out = Datum::make_text(found->text); }
+                else if (found->kind == json::JVal::Null) { out = Datum::make_null(Type::Text); }
+                else { std::string s; json::serialize(*found, s); out = Datum::make_text(std::move(s)); }
+            } else {
+                std::string s;
+                json::serialize(*found, s);
+                out = Datum::make_text(std::move(s));
+                out.logical = 11;
+            }
+            return std::nullopt;
+        }
+        if (f == "JSON_ARRAY_LENGTH") {
+            if (!need(1)) return "JSON_ARRAY_LENGTH takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            json::JVal root;
+            std::size_t jp = 0;
+            if (!json::parse_value(a[0].s, jp, root) || root.kind != json::JVal::Arr)
+                return "JSON_ARRAY_LENGTH requires a JSON array";
+            out = Datum::make_int(static_cast<std::int64_t>(root.arr.size()));
             return std::nullopt;
         }
         // F12: array functions. An array argument is logical==7 (16-byte-ish self-describing payload).

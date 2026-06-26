@@ -109,6 +109,8 @@ enum class Tok : std::uint8_t {
     Percent,  // %
     LBracket, // [  (F12 array literal / subscript)
     RBracket, // ]
+    Arrow,    // ->   (F13 JSON get)
+    ArrowText,// ->>  (F13 JSON get as text)
     End,      // end of input
     Bad,      // a lexing error (unterminated string / stray byte)
 };
@@ -221,6 +223,12 @@ public:
                 return t;
             case '-':
                 ++i_;
+                if (i_ < src_.size() && src_[i_] == '>') {  // F13: -> or ->>
+                    ++i_;
+                    if (i_ < src_.size() && src_[i_] == '>') { ++i_; t.kind = Tok::ArrowText; }
+                    else t.kind = Tok::Arrow;
+                    return t;
+                }
                 t.kind = Tok::Minus;
                 return t;
             case '/':
@@ -650,6 +658,12 @@ private:
         if (is_kw("uuid")) {  // F9c: UUID over TEXT (validated, canonicalised string)
             out = Type::Text;
             col.logical = 4;
+            advance();
+            return std::nullopt;
+        }
+        if (is_kw("json") || is_kw("jsonb")) {  // F13: JSON over TEXT (canonical form stored)
+            out = Type::Text;
+            col.logical = 11;
             advance();
             return std::nullopt;
         }
@@ -1549,15 +1563,30 @@ private:
     // F12: a primary expression followed by zero or more `[index]` array subscripts (1-based).
     [[nodiscard]] std::optional<ParseError> parse_expr_primary(std::shared_ptr<Expr>& out) {
         if (auto e = parse_expr_atom(out)) return e;
-        while (cur_.kind == Tok::LBracket) {
-            advance();
-            std::shared_ptr<Expr> idx;
-            if (auto e = parse_scalar_expr(idx)) return e;
-            if (auto e = expect(Tok::RBracket, "']' to close an array subscript")) return e;
-            auto sub = mk_expr(ExprKind::Subscript);
-            sub->left = out;
-            sub->right = idx;
-            out = sub;
+        for (;;) {
+            if (cur_.kind == Tok::LBracket) {
+                advance();
+                std::shared_ptr<Expr> idx;
+                if (auto e = parse_scalar_expr(idx)) return e;
+                if (auto e = expect(Tok::RBracket, "']' to close an array subscript")) return e;
+                auto sub = mk_expr(ExprKind::Subscript);
+                sub->left = out;
+                sub->right = idx;
+                out = sub;
+            } else if (cur_.kind == Tok::Arrow || cur_.kind == Tok::ArrowText) {
+                // F13: JSON access `json -> key`/`json ->> key` -> a Func over (json, key).
+                const bool as_text = cur_.kind == Tok::ArrowText;
+                advance();
+                std::shared_ptr<Expr> key;
+                if (auto e = parse_expr_atom(key)) return e;
+                auto g = mk_expr(ExprKind::Func);
+                g->func = as_text ? "->>" : "->";
+                g->args.push_back(out);
+                g->args.push_back(key);
+                out = g;
+            } else {
+                break;
+            }
         }
         return std::nullopt;
     }
