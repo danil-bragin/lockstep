@@ -183,6 +183,39 @@ int main() {
           "all 9 star-schema queries (base + 3 WHERE + 2 AVG + 3 HAVING) took the pushdown path, "
           "not the gather fallback (got " + std::to_string(dist.pushdowns() - pd_before) + ")");
 
+    // ---- MULTI-DIM STAR (1 fact + 2 dims): the fact is aggregated by the COMPOSITE join key, each
+    // dim gathered + joined, rolled up by group cols spanning BOTH dims ----
+    const char* rgDDL = "CREATE TABLE rg (region TEXT, zone TEXT NOT NULL, PRIMARY KEY (region))";
+    check(solo.exec(rgDDL).ok, "solo create rg");
+    check(dist.exec(rgDDL).ok, "dist create rg");
+    const char* zones[] = {"N", "S", "E", "W", "C"};
+    for (int i = 0; i < 5; ++i) {
+        const std::string ins = "INSERT INTO rg (region, zone) VALUES ('" + std::string(regs[i]) +
+                                "', '" + zones[i] + "')";
+        check(solo.exec(ins).ok, "solo rg insert");
+        check(dist.exec(ins).ok, "dist rg insert");
+    }
+    const std::size_t md_before = dist.pushdowns();
+    const std::vector<std::string> md_queries = {
+        // 2-dim star: GROUP BY columns from BOTH dims, aggregates over the fact.
+        "SELECT dim.label, rg.zone, COUNT(*), SUM(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
+        "JOIN rg ON t.region = rg.region GROUP BY dim.label, rg.zone",
+        // 2-dim star + WHERE on the fact AND each dim + AVG + HAVING (full stack over a snowflake-ish
+        // multi-dim shape; still a pure star — every dim joins the fact).
+        "SELECT rg.zone, dim.label, AVG(t.amount), COUNT(*) FROM t JOIN dim ON t.cat = dim.cat "
+        "JOIN rg ON t.region = rg.region WHERE t.amount > 100 AND dim.label != 'h' AND rg.zone != 'C' "
+        "GROUP BY rg.zone, dim.label HAVING COUNT(*) > 20",
+    };
+    for (const std::string& q : md_queries) {
+        const std::string s = render(solo.exec(q));
+        const std::string d = render(dist.exec(q));
+        check(s == d, "multi-dim distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" +
+                          d + "]");
+    }
+    check(dist.pushdowns() - md_before == 2,
+          "both multi-dim (2-dim) star queries took the pushdown path (got " +
+              std::to_string(dist.pushdowns() - md_before) + ")");
+
     // ---- DISTINCT-aggregate GLOBAL SHUFFLE: COUNT(DISTINCT) merged across shards ----
     const std::size_t ds_before = dist.distinct_shuffles();
     const std::vector<std::string> distinct_queries = {

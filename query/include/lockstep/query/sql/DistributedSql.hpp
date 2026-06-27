@@ -280,67 +280,96 @@ private:
         }
     }
 
-    // CO-LOCATED SHUFFLE for a star-schema JOIN+aggregate: each shard aggregates its FACT rows BY
-    // THE JOIN KEY (no join / no dim needed there); the small per-key partials merge; then the tiny
-    // dim is gathered + joined + the result rolled up by the dim group columns. The large fact is
-    // NEVER gathered. Returns nullopt (fall back to gather-and-run) unless the shape fits: 2 tables,
-    // INNER equi-join (fact.fk = dim.key), GROUP BY only DIM columns, aggregates only over the FACT
-    // (or COUNT(*)) with additive/min/max kinds (no AVG), no WHERE/HAVING. Byte-identical to
-    // single-node (the aggregates roll up exactly); the distributed conformance gate cross-checks.
+    // CO-LOCATED SHUFFLE for a star-schema JOIN+aggregate (1 FACT + N DIMS). Each shard aggregates
+    // its FACT rows BY THE COMPOSITE JOIN KEY (all the foreign keys; no join / no dim there); the
+    // small per-key partials merge; then each (tiny) dim is gathered + joined + the result rolled up
+    // by the dim group columns. The large fact is NEVER gathered. Supports WHERE (split fact/per-dim),
+    // HAVING (coordinator post-filter), and AVG (SUM/COUNT split). Returns nullopt (fall back to
+    // gather-and-run) unless the shape fits: >=2 tables, every dim an INNER equi-join to the FACT
+    // (fact.fk = dim.key) — a dim joining ANOTHER dim (snowflake chain) bails; GROUP BY only DIM
+    // columns; aggregates only over the FACT (or COUNT(*)); no DISTINCT / ARRAY_AGG / JSON_AGG.
+    // Byte-identical to single-node (the aggregates roll up exactly); the conformance gate checks.
     std::optional<ExecResult> try_star_join_pushdown(const SelectStmt& sel) {
-        if (sel.from.size() != 2 || sel.from[1].kind != JoinKind::Inner) return std::nullopt;
-        if (!sel.has_aggregates) return std::nullopt;
-        if (sel.group_by.empty()) return std::nullopt;
-        if (!sel.from[1].on.present() || sel.from[1].on.root < 0) return std::nullopt;
-        const PredNode& on = sel.from[1].on.nodes[static_cast<std::size_t>(sel.from[1].on.root)];
-        if (on.kind != PredNodeKind::Cmp || on.op != CmpOp::Eq ||
-            on.operand != OperandKind::Column || !on.rhs_is_column) {
-            return std::nullopt;
-        }
+        const std::size_t nt = sel.from.size();
+        if (nt < 2 || !sel.has_aggregates || sel.group_by.empty()) return std::nullopt;
         const std::string& fa = sel.from[0].alias;  // fact (streamed/large)
-        const std::string& da = sel.from[1].alias;  // dim (small)
-        std::string fk_col;
-        std::string dim_key_col;
-        if (on.qualifier == fa && on.rhs_qualifier == da) {
-            fk_col = on.column;
-            dim_key_col = on.rhs_column;
-        } else if (on.qualifier == da && on.rhs_qualifier == fa) {
-            fk_col = on.rhs_column;
-            dim_key_col = on.column;
-        } else {
-            return std::nullopt;
+
+        // Collect the dims (from[1..]). Each must be an INNER equi-join fact.fk = dim.key; an ON
+        // that references another dim (snowflake) or a non-equi shape -> bail to gather.
+        struct Dim {
+            std::string alias;
+            std::string table;
+            std::string fk_col;   // FACT column joining this dim
+            std::string key_col;  // this dim's key column
+            std::vector<std::string> gcols;  // this dim's GROUP BY columns (in GROUP BY order)
+            std::map<std::string, std::vector<Datum>> by_key;  // key-render -> gcol datums (gcols order)
+        };
+        std::vector<Dim> dims;
+        for (std::size_t i = 1; i < nt; ++i) {
+            const JoinEntry& je = sel.from[i];
+            if (je.kind != JoinKind::Inner || !je.on.present() || je.on.root < 0) return std::nullopt;
+            const PredNode& on = je.on.nodes[static_cast<std::size_t>(je.on.root)];
+            if (on.kind != PredNodeKind::Cmp || on.op != CmpOp::Eq ||
+                on.operand != OperandKind::Column || !on.rhs_is_column) {
+                return std::nullopt;
+            }
+            Dim d;
+            d.alias = je.alias;
+            d.table = je.table;
+            if (on.qualifier == fa && on.rhs_qualifier == d.alias) {
+                d.fk_col = on.column;
+                d.key_col = on.rhs_column;
+            } else if (on.qualifier == d.alias && on.rhs_qualifier == fa) {
+                d.fk_col = on.rhs_column;
+                d.key_col = on.column;
+            } else {
+                return std::nullopt;  // ON not fact<->this-dim (snowflake / cross-dim) -> gather
+            }
+            dims.push_back(std::move(d));
         }
-        std::vector<std::string> dim_gcols;  // GROUP BY columns (must all be dim)
+
+        // Map each GROUP BY column to its dim; build the global group-col order (== GROUP BY order).
+        std::vector<std::pair<std::string, std::string>> group_cols;  // (qualifier, column), gkey order
+        std::vector<std::pair<std::size_t, std::size_t>> gkey_src;    // (dim index, pos in dim.gcols)
         for (const std::string& gc : sel.group_by) {
             std::string q;
             std::string c;
             split_qual(gc, q, c);
-            if (q != da) return std::nullopt;
-            dim_gcols.push_back(c);
+            std::size_t di = dims.size();
+            for (std::size_t k = 0; k < dims.size(); ++k) if (dims[k].alias == q) { di = k; break; }
+            if (di == dims.size()) return std::nullopt;  // group col not a known dim -> bail
+            gkey_src.emplace_back(di, dims[di].gcols.size());
+            dims[di].gcols.push_back(c);
+            group_cols.emplace_back(q, c);
         }
+        auto gkey_pos_of = [&](const std::string& q, const std::string& c) -> std::int64_t {
+            for (std::size_t i = 0; i < group_cols.size(); ++i)
+                if (group_cols[i].second == c && (q.empty() || group_cols[i].first == q))
+                    return static_cast<std::int64_t>(i);
+            return -1;
+        };
+
         // Plan each SELECT item; build the fact-side aggregate list (in SELECT order). An AVG output
         // expands to TWO fact-side aggregates (SUM + COUNT of the column) merged independently and
         // divided at the end — SUM/COUNT both skip NULL, so SUM/COUNT == single-node AVG exactly.
         struct Plan {
             bool is_col = false;
             bool is_avg = false;
-            std::string dim_col;
+            std::size_t gpos = 0;          // is_col: index into the global group key
             std::size_t agg_pos = 0;       // non-AVG: index of the single fact aggregate
             std::size_t avg_sum_pos = 0;   // AVG: index of the pushed SUM(col)
             std::size_t avg_cnt_pos = 0;   // AVG: index of the pushed COUNT(col)
         };
         std::vector<Plan> plans;
-        std::vector<int> agg_kinds;  // fact-side aggregate kinds (== order in fact_sql after fk)
+        std::vector<int> agg_kinds;  // fact-side aggregate kinds (== order in fact_sql after the fks)
         std::string agg_sql;
         for (const SelectItem& item : sel.items) {
             Plan p;
             if (item.kind == SelectItemKind::Column) {
-                if (item.qualifier != da) return std::nullopt;
-                bool grouped = false;
-                for (const std::string& g : dim_gcols) if (g == item.column) grouped = true;
-                if (!grouped) return std::nullopt;
+                const std::int64_t gp = gkey_pos_of(item.qualifier, item.column);
+                if (gp < 0) return std::nullopt;  // a selected column that isn't a dim group column
                 p.is_col = true;
-                p.dim_col = item.column;
+                p.gpos = static_cast<std::size_t>(gp);
             } else {
                 const AggExpr& a = item.agg;
                 // Only additive/min/max/avg kinds merge from partials; DISTINCT and the collection
@@ -376,80 +405,111 @@ private:
         std::map<std::int32_t, std::size_t> hv_agg_at;
         std::map<std::int32_t, std::size_t> hv_key_at;
         if (sel.having.present() &&
-            !plan_having(sel.having, fa, da, dim_gcols, agg_kinds, agg_sql, hv_agg_at, hv_key_at)) {
+            !plan_having(sel.having, fa, group_cols, agg_kinds, agg_sql, hv_agg_at, hv_key_at)) {
             return std::nullopt;
         }
 
-        // WHERE PUSHDOWN: split the filter into a fact-side and a dim-side fragment. Fact
-        // predicates filter rows BEFORE the per-shard aggregate (row-local, commutes with the
-        // PK partition); dim predicates filter the gathered dim (inner join drops the unmatched
-        // fact partials). A filter that doesn't split cleanly falls back to gather-and-run.
+        // WHERE PUSHDOWN: split the filter into a fact-side fragment and a per-dim fragment. Fact
+        // predicates filter rows BEFORE the per-shard aggregate (row-local, commutes with the PK
+        // partition); dim predicates filter that gathered dim (inner join drops the unmatched fact
+        // partials). A filter that doesn't split cleanly falls back to gather-and-run.
+        std::vector<std::string> dim_aliases;
+        dim_aliases.reserve(dims.size());
+        for (const Dim& d : dims) dim_aliases.push_back(d.alias);
         std::string fact_where;
-        std::string dim_where;
-        if (sel.filter.present() && !split_where(sel.filter, fa, da, fact_where, dim_where)) {
+        std::vector<std::string> dim_wheres(dims.size());
+        if (sel.filter.present() &&
+            !split_where(sel.filter, fa, dim_aliases, fact_where, dim_wheres)) {
             return std::nullopt;
         }
 
-        // FACT-SIDE per-key aggregate, pushed to every shard; merge the (small) per-key partials.
-        const std::string fact_sql = "SELECT " + fk_col + agg_sql + " FROM " + sel.from[0].table +
+        // FACT-SIDE per-composite-key aggregate, pushed to every shard; merge the per-key partials.
+        std::string fk_list;
+        for (std::size_t i = 0; i < dims.size(); ++i) {
+            if (i != 0) fk_list += ", ";
+            fk_list += dims[i].fk_col;
+        }
+        const std::string fact_sql = "SELECT " + fk_list + agg_sql + " FROM " + sel.from[0].table +
                                      (fact_where.empty() ? "" : " WHERE " + fact_where) +
-                                     " GROUP BY " + fk_col;
-        std::map<std::string, std::vector<Datum>> per_fk;  // fk-render -> [agg datums]
+                                     " GROUP BY " + fk_list;
+        struct FP { std::vector<Datum> fks; std::vector<Datum> aggs; };
+        std::map<std::string, FP> per;  // composite-fk-render -> partial
         for (ISqlShard* s : shards_) {
             ExecResult part = s->exec(fact_sql);
             if (!part.ok) return std::nullopt;  // shard can't run it -> fall back
             for (const ResultRow& row : part.rows) {
-                if (row.cells.size() != agg_kinds.size() + 1) return std::nullopt;
-                const std::string k = row.cells[0].second.render();
-                auto it = per_fk.find(k);
-                if (it == per_fk.end()) {
+                if (row.cells.size() != dims.size() + agg_kinds.size()) return std::nullopt;
+                std::string ck;
+                std::vector<Datum> fks;
+                fks.reserve(dims.size());
+                for (std::size_t j = 0; j < dims.size(); ++j) {
+                    ck += row.cells[j].second.render();
+                    ck.push_back('\x1f');
+                    fks.push_back(row.cells[j].second);
+                }
+                auto it = per.find(ck);
+                if (it == per.end()) {
                     std::vector<Datum> av;
                     av.reserve(agg_kinds.size());
-                    for (std::size_t i = 0; i < agg_kinds.size(); ++i) av.push_back(row.cells[i + 1].second);
-                    per_fk.emplace(k, std::move(av));
+                    for (std::size_t i = 0; i < agg_kinds.size(); ++i)
+                        av.push_back(row.cells[dims.size() + i].second);
+                    per.emplace(ck, FP{std::move(fks), std::move(av)});
                 } else {
                     for (std::size_t i = 0; i < agg_kinds.size(); ++i)
-                        combine(it->second[i], row.cells[i + 1].second, agg_kinds[i]);
+                        combine(it->second.aggs[i], row.cells[dims.size() + i].second, agg_kinds[i]);
                 }
             }
         }
-        // Gather the small DIM (key-render -> the dim group-column datums), applying any dim-side
-        // WHERE so only surviving keys join (inner-join semantics, byte-identical to single-node).
-        const std::string dim_sql = "SELECT * FROM " + sel.from[1].table +
-                                    (dim_where.empty() ? "" : " WHERE " + dim_where);
-        std::map<std::string, std::vector<Datum>> dim_by_key;
-        for (ISqlShard* s : shards_) {
-            ExecResult part = s->exec(dim_sql);
-            if (!part.ok) return std::nullopt;
-            for (const ResultRow& row : part.rows) {
-                std::string keyr;
-                std::vector<Datum> gvals;
-                gvals.reserve(dim_gcols.size());
-                for (const auto& [label, d] : row.cells) {
-                    if (label == dim_key_col) keyr = d.render();
-                    for (const std::string& g : dim_gcols)
-                        if (label == g) { gvals.push_back(d); break; }
+        // Gather each (small) DIM, applying its dim-side WHERE so only surviving keys join. A dim row
+        // with a NULL key can never inner-join (NULL = anything is UNKNOWN) — skip it.
+        for (std::size_t di = 0; di < dims.size(); ++di) {
+            Dim& d = dims[di];
+            const std::string dim_sql = "SELECT * FROM " + d.table +
+                                        (dim_wheres[di].empty() ? "" : " WHERE " + dim_wheres[di]);
+            for (ISqlShard* s : shards_) {
+                ExecResult part = s->exec(dim_sql);
+                if (!part.ok) return std::nullopt;
+                for (const ResultRow& row : part.rows) {
+                    std::string keyr;
+                    bool key_null = true;
+                    std::vector<Datum> gvals(d.gcols.size());
+                    for (const auto& [label, dv] : row.cells) {
+                        if (label == d.key_col) { keyr = dv.render(); key_null = dv.is_null; }
+                        for (std::size_t k = 0; k < d.gcols.size(); ++k)
+                            if (label == d.gcols[k]) { gvals[k] = dv; break; }
+                    }
+                    if (!key_null) d.by_key[keyr] = std::move(gvals);
                 }
-                if (!keyr.empty() || true) dim_by_key[keyr] = std::move(gvals);
             }
         }
-        // ROLL UP: each merged per-key partial -> its dim group -> combine the aggregates.
+        // ROLL UP: each merged fact partial -> look up every dim by its fk -> assemble the global
+        // group key -> combine the aggregates. A miss in ANY dim drops the partial (inner join).
         struct G { std::vector<Datum> gkey; std::vector<Datum> aggs; };
         std::map<std::string, G> groups;
-        for (const auto& [fkr, av] : per_fk) {
-            const auto dit = dim_by_key.find(fkr);
-            if (dit == dim_by_key.end()) continue;  // inner join: no dim match
+        for (const auto& [ck, fp] : per) {
+            (void)ck;
+            std::vector<const std::vector<Datum>*> dvals(dims.size(), nullptr);
+            bool matched = true;
+            for (std::size_t di = 0; di < dims.size(); ++di) {
+                const auto it = dims[di].by_key.find(fp.fks[di].render());
+                if (it == dims[di].by_key.end()) { matched = false; break; }
+                dvals[di] = &it->second;
+            }
+            if (!matched) continue;
+            std::vector<Datum> gkey;
+            gkey.reserve(group_cols.size());
+            for (const auto& [di, pos] : gkey_src) gkey.push_back((*dvals[di])[pos]);
             std::string gk;
-            for (const Datum& d : dit->second) { gk += d.render(); gk.push_back('\x1f'); }
+            for (const Datum& d : gkey) { gk += d.render(); gk.push_back('\x1f'); }
             auto git = groups.find(gk);
             if (git == groups.end()) {
-                groups.emplace(gk, G{dit->second, av});
+                groups.emplace(gk, G{std::move(gkey), fp.aggs});
             } else {
                 for (std::size_t i = 0; i < agg_kinds.size(); ++i)
-                    combine(git->second.aggs[i], av[i], agg_kinds[i]);
+                    combine(git->second.aggs[i], fp.aggs[i], agg_kinds[i]);
             }
         }
-        // Order the groups by the dim group key (matches single-node GROUP BY order).
+        // Order the groups by the group key (matches single-node GROUP BY order).
         std::vector<const G*> ordered;
         ordered.reserve(groups.size());
         for (const auto& [k, g] : groups) { (void)k; ordered.push_back(&g); }
@@ -470,10 +530,7 @@ private:
                 const Plan& p = plans[i];
                 const std::string& label = sel.items[i].label;  // match single-node output labels
                 if (p.is_col) {
-                    std::size_t gi = 0;
-                    for (std::size_t k = 0; k < dim_gcols.size(); ++k)
-                        if (dim_gcols[k] == p.dim_col) { gi = k; break; }
-                    out.cells.emplace_back(label, g->gkey[gi]);
+                    out.cells.emplace_back(label, g->gkey[p.gpos]);
                 } else if (p.is_avg) {
                     // AVG = Σsum / Σcount (non-null), INT trunc toward zero (== single-node). A
                     // count==0 (all-NULL) group renders a TYPED NULL single-node; rather than
@@ -508,19 +565,20 @@ private:
         return nullptr;
     }
 
-    // Split a star-join WHERE into a fact-side and a dim-side SQL fragment so each can be
+    // Split a star-join WHERE into a fact-side fragment and a per-dim fragment so each can be
     // pushed to its table independently. Returns false (caller falls back to gather) on ANY
     // shape that does not split cleanly into single-table simple comparisons ANDed together:
     //   * a non-AND/non-Cmp node (OR / NOT / IS NULL / IN / EXISTS) — can't safely route,
     //   * a Cmp whose LHS is not a plain column (Agg / scalar Expr), or whose RHS is a column
     //     / subquery / ANY|ALL array, or a LIKE/Contains op,
     //   * a NULL / non-Int-non-Text literal (sql_literal may not round-trip it),
-    //   * a leaf qualified by neither the fact nor the dim alias.
-    // Each leaf goes WHOLE to ONE table's fragment (no leaf spans both tables), so filtering
-    // each side then inner-joining is byte-identical to filtering the joined rows (AND only).
+    //   * a leaf qualified by neither the fact nor any dim alias.
+    // Each leaf goes WHOLE to ONE table's fragment (no leaf spans tables), so filtering each side
+    // then inner-joining is byte-identical to filtering the joined rows (AND only).
     [[nodiscard]] static bool split_where(const Predicate& pred, const std::string& fa,
-                                          const std::string& da, std::string& fact_where,
-                                          std::string& dim_where) {
+                                          const std::vector<std::string>& dim_aliases,
+                                          std::string& fact_where,
+                                          std::vector<std::string>& dim_wheres) {
         std::vector<std::int32_t> stack{pred.root};
         while (!stack.empty()) {
             const std::int32_t idx = stack.back();
@@ -544,11 +602,11 @@ private:
             std::string* side = nullptr;
             if (n.qualifier == fa) {
                 side = &fact_where;
-            } else if (n.qualifier == da) {
-                side = &dim_where;
             } else {
-                return false;  // unqualified / unknown table — can't route safely
+                for (std::size_t i = 0; i < dim_aliases.size(); ++i)
+                    if (n.qualifier == dim_aliases[i]) { side = &dim_wheres[i]; break; }
             }
+            if (side == nullptr) return false;  // unqualified / unknown table — can't route safely
             if (!side->empty()) *side += " AND ";
             *side += n.column + " " + ops + " " + sql_literal(n.literal);
         }
@@ -578,17 +636,18 @@ private:
 
     // Plan a star-join HAVING for coordinator post-filtering. Every aggregate the HAVING references
     // is pushed onto the FACT side too (so each rolled-up group carries its value), and each Cmp leaf
-    // is resolved to an aggregate position (agg_at) or a dim group-key index (key_at). Returns false
-    // (caller falls back to gather, which runs HAVING single-node — byte-identical incl any error) on
-    // any shape that isn't pushdown-safe: a non-And/Or/Not/Cmp node, a fact aggregate that is AVG /
-    // DISTINCT / a collection agg / not over the fact, a column that is not a dim group column, a
-    // column/subquery/quantifier RHS, a LIKE/Contains op, or a NULL / non-Int-non-Text literal.
-    [[nodiscard]] static bool plan_having(const Predicate& pred, const std::string& fa,
-                                          const std::string& da,
-                                          const std::vector<std::string>& dim_gcols,
-                                          std::vector<int>& agg_kinds, std::string& agg_sql,
-                                          std::map<std::int32_t, std::size_t>& agg_at,
-                                          std::map<std::int32_t, std::size_t>& key_at) {
+    // is resolved to an aggregate position (agg_at) or a group-key index (key_at) into the global
+    // group columns. Returns false (caller falls back to gather, which runs HAVING single-node —
+    // byte-identical incl any error) on any shape that isn't pushdown-safe: a non-And/Or/Not/Cmp
+    // node, a fact aggregate that is AVG / DISTINCT / a collection agg / not over the fact, a column
+    // that is not a GROUP BY column, a column/subquery/quantifier RHS, a LIKE/Contains op, or a
+    // NULL / non-Int-non-Text literal.
+    [[nodiscard]] static bool plan_having(
+        const Predicate& pred, const std::string& fa,
+        const std::vector<std::pair<std::string, std::string>>& group_cols,
+        std::vector<int>& agg_kinds, std::string& agg_sql,
+        std::map<std::int32_t, std::size_t>& agg_at,
+        std::map<std::int32_t, std::size_t>& key_at) {
         std::vector<std::int32_t> stack{pred.root};
         while (!stack.empty()) {
             const std::int32_t idx = stack.back();
@@ -626,13 +685,17 @@ private:
                 agg_at[idx] = agg_kinds.size();
                 agg_kinds.push_back(static_cast<int>(a.kind));
             } else if (n.operand == OperandKind::Column) {
-                if (!n.qualifier.empty() && n.qualifier != da) return false;
                 std::size_t gi = 0;
                 bool found = false;
-                for (std::size_t k = 0; k < dim_gcols.size(); ++k) {
-                    if (dim_gcols[k] == n.column) { gi = k; found = true; break; }
+                for (std::size_t k = 0; k < group_cols.size(); ++k) {
+                    if (group_cols[k].second == n.column &&
+                        (n.qualifier.empty() || group_cols[k].first == n.qualifier)) {
+                        gi = k;
+                        found = true;
+                        break;
+                    }
                 }
-                if (!found) return false;  // HAVING column must be a dim GROUP BY column
+                if (!found) return false;  // HAVING column must be a GROUP BY column
                 key_at[idx] = gi;
             } else {
                 return false;  // scalar Expr LHS
