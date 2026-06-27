@@ -76,6 +76,7 @@ struct CreateIndexStmt {
     bool unique = false;               // E5: CREATE UNIQUE INDEX
     bool hash = false;                 // I7: USING HASH (equality-only)
     std::string partial_src;           // I5: CREATE INDEX ... WHERE <pred> (partial index)
+    std::string expr_src;              // I5/J2: CREATE INDEX ... ON t ((expr)) — the indexed expression
 };
 
 // DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).

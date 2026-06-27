@@ -1205,17 +1205,37 @@ private:
         if (auto e = expect(Tok::LParen, "'(' before the indexed column")) {
             return ParseResult{*e};
         }
-        // E5: one OR MORE indexed columns (composite index).
-        for (;;) {
-            std::string col;
-            if (auto e = expect_ident("an indexed column name", col)) return ParseResult{*e};
-            st.create_index.columns.push_back(col);
-            if (cur_.kind == Tok::Comma) { advance(); continue; }
-            break;
-        }
-        st.create_index.column = st.create_index.columns.front();  // leading column
-        if (auto e = expect(Tok::RParen, "')' after the indexed columns")) {
-            return ParseResult{*e};
+        // J2: EXPRESSION index — `CREATE INDEX ... ON t ((expr))`. The double paren (an inner '('
+        // right after the outer one) disambiguates an expression from a column list. We capture the
+        // BARE expression source (without the inner parens) so it matches the per-row LHS a query
+        // writes (`WHERE doc->>'k' = 'red'` => leaf expr source "doc->>'k'").
+        if (cur_.kind == Tok::LParen) {
+            advance();  // consume the inner '('
+            const std::size_t start = cur_.pos;
+            std::shared_ptr<Expr> ex;
+            if (auto e = parse_scalar_expr(ex)) return ParseResult{*e};
+            std::string text = lex_.src().substr(start, cur_.pos > start ? cur_.pos - start : 0);
+            while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.pop_back();
+            st.create_index.expr_src = std::move(text);
+            if (auto e = expect(Tok::RParen, "')' to close the indexed expression")) {
+                return ParseResult{*e};
+            }
+            if (auto e = expect(Tok::RParen, "')' after the indexed expression")) {
+                return ParseResult{*e};
+            }
+        } else {
+            // E5: one OR MORE indexed columns (composite index).
+            for (;;) {
+                std::string col;
+                if (auto e = expect_ident("an indexed column name", col)) return ParseResult{*e};
+                st.create_index.columns.push_back(col);
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
+            st.create_index.column = st.create_index.columns.front();  // leading column
+            if (auto e = expect(Tok::RParen, "')' after the indexed columns")) {
+                return ParseResult{*e};
+            }
         }
         if (is_kw("using")) {  // I7: USING HASH | BTREE
             advance();

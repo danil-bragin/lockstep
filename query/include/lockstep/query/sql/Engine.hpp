@@ -364,6 +364,8 @@ public:
             cat_put_s(o, ix.partial_src);    // I5
             cat_put_u32(o, static_cast<std::uint32_t>(ix.columns.size()));
             for (const std::size_t c : ix.columns) cat_put_u32(o, static_cast<std::uint32_t>(c));
+            cat_put_s(o, ix.expr_src);  // J2: expression index source
+            o.push_back(ix.expr_type == Type::Int ? 0 : 1);
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
         for (const std::string& chk : t.checks) {
@@ -431,6 +433,8 @@ public:
             ix.partial_src = cat_get_s(s, p);  // I5
             const std::uint32_t nic = cat_get_u32(s, p);
             for (std::uint32_t k = 0; k < nic; ++k) ix.columns.push_back(cat_get_u32(s, p));
+            ix.expr_src = cat_get_s(s, p);  // J2: expression index source
+            ix.expr_type = (s[p++] == 0) ? Type::Int : Type::Text;
             t.indexes.push_back(std::move(ix));
         }
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
@@ -1113,23 +1117,10 @@ private:
             return ExecResult::failure("index '" + ci.index + "' already exists on '" +
                                        ci.table + "'");
         }
-        const auto col = t->column_index(ci.column);
-        if (!col) {
-            return ExecResult::failure("unknown column '" + ci.column +
-                                       "' in table '" + ci.table + "'");
-        }
-        // Indexing the PK is pointless (the PK already has the table-row order index)
-        // and would never be chosen over the PK fast path — reject it fail-closed so a
-        // redundant index can never diverge.
-        if (*col == t->pk_index) {
-            return ExecResult::failure(
-                "cannot CREATE INDEX on the PRIMARY KEY column '" + ci.column +
-                "' (the PK is already an ordered access path)");
-        }
+        const bool is_expr = !ci.expr_src.empty();  // J2: CREATE INDEX ... ON t ((expr))
         Index ix;
         ix.name = ci.index;
         ix.id = t->next_index_id++;
-        ix.column = *col;
         ix.unique = ci.unique;  // E5
         ix.hash = ci.hash;      // I7: equality-only index
         ix.partial_src = ci.partial_src;  // I5: partial index predicate
@@ -1137,15 +1128,40 @@ private:
             const ParseResult pr = parse_sql("SELECT * FROM " + ci.table + " WHERE " + ix.partial_src);
             if (!pr.ok()) return ExecResult::failure("invalid partial index WHERE: " + pr.error().render());
         }
-        for (const std::string& cn : ci.columns) {  // E5: resolve the covered column list
-            const auto c = t->column_index(cn);
-            if (!c) return ExecResult::failure("unknown column '" + cn + "' in index");
-            ix.columns.push_back(*c);
+        if (is_expr) {
+            // J2: EXPRESSION index. `columns` stays empty; the entry's leading token is the
+            // evaluated expression value. Validate the expression parses + evaluates against the
+            // table, then infer its physical type (authoritatively from a live row when one exists;
+            // structurally for an empty table). The write path re-checks the type per row.
+            ix.expr_src = ci.expr_src;
+            ix.hash = false;  // an expression index is ordered (range-capable); HASH is moot here
+            std::shared_ptr<Expr> ex;
+            if (auto e = parse_index_expr(*t, ix.expr_src, ex)) return ExecResult::failure(*e);
+            ix.expr_type = infer_index_expr_type(*ex, *t);
+        } else {
+            const auto col = t->column_index(ci.column);
+            if (!col) {
+                return ExecResult::failure("unknown column '" + ci.column +
+                                           "' in table '" + ci.table + "'");
+            }
+            // Indexing the PK is pointless (the PK already has the table-row order index)
+            // and would never be chosen over the PK fast path — reject it fail-closed so a
+            // redundant index can never diverge.
+            if (*col == t->pk_index) {
+                return ExecResult::failure(
+                    "cannot CREATE INDEX on the PRIMARY KEY column '" + ci.column +
+                    "' (the PK is already an ordered access path)");
+            }
+            ix.column = *col;
+            for (const std::string& cn : ci.columns) {  // E5: resolve the covered column list
+                const auto c = t->column_index(cn);
+                if (!c) return ExecResult::failure("unknown column '" + cn + "' in index");
+                ix.columns.push_back(*c);
+            }
         }
         t->indexes.push_back(ix);
         persist_schema(ci.table);  // C7: the new index is part of the durable schema
         const std::uint32_t table_id = t->id;
-        const std::size_t pk_index = t->pk_index;
 
         // BACKFILL: scan every live row and write its index entry. Read through the
         // verified scan path (a full table scan), then commit one index-entry write per
@@ -1163,11 +1179,15 @@ private:
             }
             std::set<std::string> uniq_seen;  // E5: UNIQUE backfill dedup (value prefix)
             for (const std::vector<Datum>& row : rows) {
-                if (!row_matches_partial(*t, ix, row)) continue;  // I5
-                if (index_row_null(ix, row)) continue;
-                if (ix.unique && !uniq_seen.insert(index_value_key(*t, ix, row)).second)
+                bool skip = true;
+                Key entry;
+                std::string uk;
+                if (auto e = index_backfill_entry(*t, t->indexes.back(), row, skip, entry, uk))
+                    { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure(*e); }
+                if (skip) continue;
+                if (ix.unique && !uniq_seen.insert(uk).second)
                     { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure("CREATE UNIQUE INDEX failed: duplicate value"); }
-                commit_writes({{encode_index_entry_row(table_id, ix, row, row[pk_index]), std::string{}}});
+                commit_writes({{entry, std::string{}}});
             }
             return ExecResult{};
         }
@@ -1183,11 +1203,15 @@ private:
                 continue;
             }
             const std::vector<Datum> row = decode_row(*t, kv.first, kv.second);
-            if (!row_matches_partial(*t, ix, row)) continue;  // I5
-            if (index_row_null(ix, row)) continue;
-            if (ix.unique && !uniq_seen.insert(index_value_key(*t, ix, row)).second)
+            bool skip = true;
+            Key entry;
+            std::string uk;
+            if (auto e = index_backfill_entry(*t, t->indexes.back(), row, skip, entry, uk))
+                { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure(*e); }
+            if (skip) continue;
+            if (ix.unique && !uniq_seen.insert(uk).second)
                 { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure("CREATE UNIQUE INDEX failed: duplicate value"); }
-            commit_writes({{encode_index_entry_row(table_id, ix, row, row[pk_index]), std::string{}}});
+            commit_writes({{entry, std::string{}}});
         }
         return ExecResult{};
     }
@@ -1198,6 +1222,50 @@ private:
     }
     static std::string index_value_key(const Table& t, const Index& ix, const std::vector<Datum>& row) {
         return encode_index_value_prefix(t.id, ix, row);  // bytes that identify the indexed tuple
+    }
+    // J2: build ONE backfill entry for `row`. Sets `skip` when the row gets no entry (NULL value /
+    // outside the partial set). Returns an error string only for an expression index whose row cannot
+    // be soundly evaluated — the CREATE then aborts (fail-closed), so a stored row is never missing
+    // from the index. `uniq_key` identifies the indexed value for the UNIQUE backfill dedup.
+    // J2: the dedup key for a UNIQUE index, handling an expression index (its key is the evaluated
+    // expression value; a NULL value is exempt from UNIQUE, like a NULL column). `skip` => no key.
+    [[nodiscard]] std::optional<std::string> index_unique_key(const Table& t, const Index& ix,
+                                                              const std::vector<Datum>& row,
+                                                              bool& skip, std::string& key) {
+        skip = true;
+        if (!ix.expr_src.empty()) {
+            Datum v;
+            bool s = true;
+            if (auto e = eval_index_expr(t, ix, row, s, v)) return e;
+            if (s) return std::nullopt;
+            key = encode_index_col(v);
+            skip = false;
+            return std::nullopt;
+        }
+        if (index_row_null(ix, row)) return std::nullopt;
+        key = index_value_key(t, ix, row);
+        skip = false;
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<std::string> index_backfill_entry(
+        const Table& t, const Index& ix, const std::vector<Datum>& row, bool& skip, Key& entry,
+        std::string& uniq_key) {
+        skip = true;
+        if (!row_matches_partial(t, ix, row)) return std::nullopt;
+        if (!ix.expr_src.empty()) {
+            Datum v;
+            if (auto e = eval_index_expr(t, ix, row, skip, v)) return e;
+            if (skip) return std::nullopt;
+            entry = encode_index_entry(t.id, ix, v, row[t.pk_index]);
+            uniq_key = encode_index_col(v);
+            return std::nullopt;
+        }
+        if (index_row_null(ix, row)) return std::nullopt;
+        skip = false;
+        entry = encode_index_entry_row(t.id, ix, row, row[t.pk_index]);
+        uniq_key = index_value_key(t, ix, row);
+        return std::nullopt;
     }
 
     // --- DROP INDEX <name> ON <table> -----------------------------------------
@@ -1714,10 +1782,124 @@ private:
         return truth;
     }
 
+    // J2: re-parse an expression index's stored source into an Expr tree (validated at CREATE; this
+    // re-parse mirrors the partial-index / CHECK pattern). The source is the bare scalar expression,
+    // so it is parsed as the single projection of a SELECT over the index's table.
+    [[nodiscard]] std::optional<std::string> parse_index_expr(const Table& t, const std::string& src,
+                                                              std::shared_ptr<Expr>& out) {
+        const ParseResult pr = parse_sql("SELECT " + src + " FROM " + t.name);
+        if (!pr.ok()) return "invalid expression index '" + src + "': " + pr.error().render();
+        const SelectStmt& s = pr.stmt().select;
+        if (s.items.size() != 1) {
+            return "expression index must be a single scalar expression";
+        }
+        const SelectItem& it = s.items[0];
+        if (it.kind == SelectItemKind::Expr && it.expr) {
+            out = it.expr;
+            return std::nullopt;
+        }
+        if (it.kind == SelectItemKind::Column) {  // a bare column wrapped in (( )) — degenerate but legal
+            auto c = std::make_shared<Expr>();
+            c->kind = ExprKind::Col;
+            c->qualifier = it.qualifier;
+            c->column = it.column;
+            out = c;
+            return std::nullopt;
+        }
+        return "expression index must be a scalar expression (no aggregate / window)";
+    }
+
+    // J2: the physical type (Int / Text) an index expression yields — needed by the entry codec to
+    // know its leading token's width. Mirrors eval_func's result types structurally (the only two
+    // physical types are Int and Text; logical tags like DECIMAL/DATE are Int-backed). Used only to
+    // seed an EMPTY-table index; once rows exist every write re-validates against the live value.
+    [[nodiscard]] Type infer_index_expr_type(const Expr& e, const Table& t) {
+        switch (e.kind) {
+            case ExprKind::Lit:
+                return e.lit.type;
+            case ExprKind::Col: {
+                const auto idx = t.column_index(e.column);
+                return idx ? t.columns[*idx].type : Type::Int;
+            }
+            case ExprKind::Neg:
+            case ExprKind::Bin:
+                return Type::Int;  // all arithmetic results are physically Int (DECIMAL/temporal too)
+            case ExprKind::Array:
+                return Type::Text;  // an array payload is Text-backed (logical 7)
+            case ExprKind::Subscript:
+                return e.left ? Type::Int : Type::Int;  // element type unknown statically; live value rules
+            case ExprKind::Case: {
+                if (!e.case_then.empty() && e.case_then[0]) return infer_index_expr_type(*e.case_then[0], t);
+                if (e.case_else) return infer_index_expr_type(*e.case_else, t);
+                return Type::Int;
+            }
+            case ExprKind::Func: {
+                const std::string& f = e.func;
+                if (f == "CAST") return e.cast_type;
+                if (f == "COALESCE" && !e.args.empty() && e.args[0])
+                    return infer_index_expr_type(*e.args[0], t);
+                if (f == "UPPER" || f == "LOWER" || f == "SUBSTR" || f == "SUBSTRING" ||
+                    f == "CONCAT" || f == "TRIM" || f == "REPLACE" || f == "->" || f == "->>")
+                    return Type::Text;
+                if (f == "ARRAY_APPEND" || f == "ARRAY_CAT") return Type::Text;  // array payload
+                return Type::Int;  // LENGTH/ABS/*_LENGTH/CARDINALITY/ARRAY_CONTAINS/ARRAY_POSITION/...
+            }
+        }
+        return Type::Int;
+    }
+
+    // J2: evaluate an expression index's value for `row`. `skip` is set when the row gets NO entry
+    // (NULL result). Returns an error string only when the expression cannot be evaluated for the row
+    // (e.g. division by zero) or its physical type drifts from the recorded expr_type — both are
+    // soundness violations the WRITE path rejects, so the index never diverges from a full scan.
+    [[nodiscard]] std::optional<std::string> eval_index_expr(const Table& t, const Index& ix,
+                                                             const std::vector<Datum>& row,
+                                                             bool& skip, Datum& out) {
+        skip = true;
+        std::shared_ptr<Expr> ex;
+        if (auto e = parse_index_expr(t, ix.expr_src, ex)) return e;
+        if (auto e = eval_expr(*ex, t, row, out)) return e;
+        if (out.is_null) return std::nullopt;  // NULL is simply not indexed (like a NULL column)
+        if (out.type != ix.expr_type) {
+            return "expression index '" + ix.name + "' value changed physical type (" +
+                   type_name(out.type) + " vs " + type_name(ix.expr_type) +
+                   "); the indexed expression must yield a stable type";
+        }
+        skip = false;
+        return std::nullopt;
+    }
+
+    // J2: reject a write whose row cannot be soundly placed in every expression index (the
+    // expression errors, or its result type drifts). Called at INSERT / UPDATE alongside CHECK / FK
+    // validation — guarantees every stored row is evaluable, so the index path == the full scan.
+    [[nodiscard]] std::optional<std::string> validate_index_exprs(const Table& t,
+                                                                  const std::vector<Datum>& row) {
+        for (const Index& ix : t.indexes) {
+            if (ix.expr_src.empty()) continue;
+            if (!row_matches_partial(t, ix, row)) continue;
+            bool skip = false;
+            Datum v;
+            if (auto e = eval_index_expr(t, ix, row, skip, v)) return e;
+        }
+        return std::nullopt;
+    }
+
     void index_writes_for_row(const Table& t, const std::vector<Datum>& row, bool tombstone,
                               std::vector<std::pair<Key, Value>>& out) {
         for (const Index& ix : t.indexes) {
             if (!row_matches_partial(t, ix, row)) continue;  // I5: outside the partial set
+            // J2: an EXPRESSION index entry's leading token is the evaluated expression value. A NULL
+            // (or, defensively, a type-drifted) result gets no entry — same as a NULL column below.
+            // validate_index_exprs already rejected an un-evaluable row at the write entry, so the
+            // eval here cannot error for a stored row.
+            if (!ix.expr_src.empty()) {
+                bool skip = true;
+                Datum v;
+                if (eval_index_expr(t, ix, row, skip, v) || skip) continue;
+                out.emplace_back(encode_index_entry(t.id, ix, v, row[t.pk_index]),
+                                 tombstone ? tombstone_marker() : std::string{});
+                continue;
+            }
             // v4: a NULL column value gets NO index entry (a NULL is never matched by an
             // `indexed_col = v` / BETWEEN lookup — comparison-with-NULL is UNKNOWN). So a
             // NULL row is simply absent from the index; the residual full-predicate (run
@@ -3659,9 +3841,12 @@ private:
                     const Datum& d = er[unique_cols[u]];
                     if (!d.is_null) seen_unique[u].insert(group_key_field(d));
                 }
-                for (std::size_t u = 0; u < uniq_indexes.size(); ++u)
-                    if (!index_row_null(*uniq_indexes[u], er))
-                        seen_uidx[u].insert(index_value_key(*t, *uniq_indexes[u], er));
+                for (std::size_t u = 0; u < uniq_indexes.size(); ++u) {
+                    bool uskip = true;
+                    std::string ukey;
+                    if (index_unique_key(*t, *uniq_indexes[u], er, uskip, ukey)) continue;  // J2 (existing row)
+                    if (!uskip) seen_uidx[u].insert(ukey);
+                }
             }
         }
         // Build ONE row from a value tuple: a named column is set (type-checked + NULL re-typed);
@@ -3776,6 +3961,7 @@ private:
                     if (auto e = coerce(t->columns[*ci], v, d)) return *e;
                     new_row[*ci] = d;
                 }
+                if (auto e = validate_index_exprs(*t, new_row)) return e;  // J2
                 index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
                 emit_row_writes(*t, new_row, writes);
                 index_writes_for_row(*t, new_row, /*tombstone=*/false, writes);
@@ -3784,6 +3970,11 @@ private:
             }
             // F5: a NEW row must satisfy every CHECK constraint.
             if (auto e = eval_checks(*t, row)) {
+                return e;
+            }
+            // J2: a NEW row must be soundly placeable in every EXPRESSION index (its expression must
+            // evaluate and yield the recorded physical type) — else the index path could diverge.
+            if (auto e = validate_index_exprs(*t, row)) {
                 return e;
             }
             // F3: a NEW row must satisfy every FOREIGN KEY (referenced parent PK exists).
@@ -3801,8 +3992,11 @@ private:
             }
             // E5: a NEW row must not repeat a UNIQUE INDEX tuple (a NULL in any covered column exempts).
             for (std::size_t u = 0; u < uniq_indexes.size(); ++u) {
-                if (index_row_null(*uniq_indexes[u], row)) continue;
-                if (!seen_uidx[u].insert(index_value_key(*t, *uniq_indexes[u], row)).second)
+                bool uskip = true;
+                std::string ukey;
+                if (auto e = index_unique_key(*t, *uniq_indexes[u], row, uskip, ukey)) return e;  // J2
+                if (uskip) continue;
+                if (!seen_uidx[u].insert(ukey).second)
                     return "UNIQUE index '" + uniq_indexes[u]->name + "' violated";
             }
             emit_row_writes(*t, row, writes);
@@ -3954,6 +4148,7 @@ private:
         // — empty re-write). The row + all index deltas land in one committed write-set.
         // (Columnar rewrites all column families for the row — correct + atomic; a
         // single-column write optimisation can come later.)
+        if (auto e = validate_index_exprs(*t, row)) return ExecResult::failure(*e);  // J2
         std::vector<std::pair<Key, Value>> writes;
         emit_row_writes(*t, row, writes);
         index_writes_for_row(*t, old_row, /*tombstone=*/true, writes);
@@ -7048,6 +7243,68 @@ private:
         return true;
     }
 
+    // J2: structural equality of two scalar expression trees — used to match a query's `WHERE <expr>
+    // = literal` against an EXPRESSION index's stored expression. Compares kind + the per-kind payload
+    // recursively (column name/qualifier, literal value, operator, function name, CAST target, args,
+    // CASE arms). Whitespace / parenthesisation differences in the original source are irrelevant
+    // because both sides are compared as parsed trees.
+    static bool expr_equal(const Expr* a, const Expr* b) {
+        if (a == nullptr || b == nullptr) return a == b;
+        if (a->kind != b->kind) return false;
+        switch (a->kind) {
+            case ExprKind::Lit:
+                return a->lit == b->lit && a->lit.is_null == b->lit.is_null;
+            case ExprKind::Col:
+                return a->column == b->column && a->qualifier == b->qualifier;
+            case ExprKind::Neg:
+                return expr_equal(a->left.get(), b->left.get());
+            case ExprKind::Bin:
+                return a->op == b->op && expr_equal(a->left.get(), b->left.get()) &&
+                       expr_equal(a->right.get(), b->right.get());
+            case ExprKind::Func:
+                if (a->func != b->func || a->cast_type != b->cast_type ||
+                    a->args.size() != b->args.size())
+                    return false;
+                for (std::size_t i = 0; i < a->args.size(); ++i)
+                    if (!expr_equal(a->args[i].get(), b->args[i].get())) return false;
+                return true;
+            case ExprKind::Array:
+                if (a->args.size() != b->args.size()) return false;
+                for (std::size_t i = 0; i < a->args.size(); ++i)
+                    if (!expr_equal(a->args[i].get(), b->args[i].get())) return false;
+                return true;
+            case ExprKind::Subscript:
+                return expr_equal(a->left.get(), b->left.get()) &&
+                       expr_equal(a->right.get(), b->right.get());
+            case ExprKind::Case: {
+                if (a->case_when.size() != b->case_when.size() ||
+                    a->case_then.size() != b->case_then.size() ||
+                    static_cast<bool>(a->case_else) != static_cast<bool>(b->case_else))
+                    return false;
+                for (std::size_t i = 0; i < a->case_then.size(); ++i)
+                    if (!expr_equal(a->case_then[i].get(), b->case_then[i].get())) return false;
+                return !a->case_else || expr_equal(a->case_else.get(), b->case_else.get());
+            }
+        }
+        return false;
+    }
+
+    // J2: find an EXPRESSION index whose stored expression structurally equals `qe` (the query's LHS
+    // expression). The index is usable for `qe = literal` only when the index is not partial-or-the
+    // -query-implies-it. Returns the index (or null).
+    [[nodiscard]] const Index* match_expr_index(const SelectStmt& sel, const Table& t,
+                                                const Expr* qe) {
+        if (qe == nullptr) return nullptr;
+        for (const Index& ix : t.indexes) {
+            if (ix.expr_src.empty()) continue;
+            if (!query_implies_partial(sel, t, ix)) continue;
+            std::shared_ptr<Expr> ie;
+            if (parse_index_expr(t, ix.expr_src, ie)) continue;  // defensive (validated at create)
+            if (expr_equal(qe, ie.get())) return &ix;
+        }
+        return nullptr;
+    }
+
     [[nodiscard]] std::optional<IndexPlan> choose_index_access(const SelectStmt& sel,
                                                               const Table& t) {
         const Predicate& p = sel.filter;
@@ -7098,6 +7355,28 @@ private:
                 }
                 if (!matched) break;
             }
+            return plan;
+        }
+        // J2: an EXPRESSION-index equality — `WHERE <expr> = literal` where <expr> matches an index's
+        // stored expression. The lookup value is the literal (it must be the index's physical type;
+        // the entry was built by encoding the SAME-typed evaluated value). The residual WHERE still
+        // re-checks `<expr> = literal` over the fetched rows, so the result is byte-identical to a scan.
+        for (const std::int32_t li : leaves) {
+            const PredNode& n = p.nodes[static_cast<std::size_t>(li)];
+            if (n.kind != PredNodeKind::Cmp || n.operand != OperandKind::Expr ||
+                n.rhs_is_column || n.rhs_is_subquery || n.literal.is_null ||
+                n.op != CmpOp::Eq || n.any_quant || n.all_quant) {
+                continue;
+            }
+            const Index* ix = match_expr_index(sel, t, n.expr.get());
+            if (ix == nullptr || n.literal.type != ix->expr_type) {
+                continue;
+            }
+            IndexPlan plan;
+            plan.index = ix;
+            plan.is_eq = true;
+            plan.eq = n.literal;
+            plan.eq_prefix.push_back(n.literal);
             return plan;
         }
         // Second pass: an indexed BETWEEN (col >= lo AND col <= hi over ONE column).
@@ -7324,6 +7603,13 @@ private:
                                                                     const Key& entry) {
         std::vector<Datum> row(t.columns.size());
         std::size_t off = index_prefix(t.id, ix.id).size();
+        // J2: an expression index covers no column, so this covering-decode is never selected for one;
+        // guard anyway — the PK still follows the (here unused) expression-value token.
+        if (!ix.expr_src.empty()) {
+            row[t.pk_index] = decode_index_entry_pk(t, ix.id, entry);
+            tag_logical_cols(t, row);
+            return row;
+        }
         for (const std::size_t cidx : ix.columns) {
             if (t.columns[cidx].type == Type::Int) {
                 std::uint64_t bits = 0;
@@ -7368,22 +7654,28 @@ private:
                                                      const Key& entry) {
         const std::size_t prefix_len = index_prefix(t.id, index_id).size();
         std::size_t off = prefix_len;
-        // I1: skip EVERY covered column token (a composite index has >1) using each column's TYPE.
         const Index* ixp = nullptr;
         for (const Index& ix : t.indexes) if (ix.id == index_id) { ixp = &ix; break; }
-        for (const std::size_t cidx : ixp->columns) {
-            if (t.columns[cidx].type == Type::Int) {
+        // The leading key tokens are either the covered columns' values (one each, possibly composite)
+        // or — for a J2 EXPRESSION index (columns empty) — the single evaluated expression value.
+        const auto skip_token = [&](Type ty) {
+            if (ty == Type::Int) {
                 off += 9;  // put_pk_int width (sign byte + be64)
-            } else {
-                while (off + 1 < entry.size()) {  // escaped TEXT token up to the 0x00 0x00 terminator
-                    if (entry[off] == '\0') {
-                        if (entry[off + 1] == '\0') { off += 2; break; }
-                        off += 2;  // escaped 0x00 0x01
-                    } else {
-                        off += 1;
-                    }
+                return;
+            }
+            while (off + 1 < entry.size()) {  // escaped TEXT token up to the 0x00 0x00 terminator
+                if (entry[off] == '\0') {
+                    if (entry[off + 1] == '\0') { off += 2; break; }
+                    off += 2;  // escaped 0x00 0x01
+                } else {
+                    off += 1;
                 }
             }
+        };
+        if (!ixp->expr_src.empty()) {
+            skip_token(ixp->expr_type);  // J2: one expression-value token
+        } else {
+            for (const std::size_t cidx : ixp->columns) skip_token(t.columns[cidx].type);  // I1: composite
         }
         // The remaining suffix is encode_pk(pk). Reuse decode_pk by reconstructing a
         // full row key: table_prefix ++ suffix (decode_pk strips the 6-byte prefix).
