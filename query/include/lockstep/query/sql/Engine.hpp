@@ -5345,6 +5345,44 @@ private:
                 // except DATE = days). DATE is normalised to seconds. Supported: temporal ± INTERVAL
                 // -> same temporal (TIME wraps into a day; DATE+interval promotes to TIMESTAMP);
                 // INTERVAL ± INTERVAL; TIMESTAMP/TIME/DATE difference -> INTERVAL; INTERVAL */ INT.
+                // F13b: MONTH-INTERVAL (logical 12) arithmetic — calendar (variable-length) months,
+                // kept SEPARATE from the seconds-based temporal math below (we don't store a composite
+                // months+seconds interval, so a month interval mixed with a seconds value is rejected).
+                if (l.logical == 12 || r.logical == 12) {
+                    const bool lm = l.logical == 12, rm = r.logical == 12;
+                    if (e.op == BinOp::Mul || e.op == BinOp::Div) {  // month-interval * / int
+                        const bool other_int = (lm ? r.logical : l.logical) == 0;
+                        if (!(lm ^ rm) || !other_int) return "unsupported MONTH interval operation";
+                        const std::int64_t mv = lm ? l.i : r.i, k = lm ? r.i : l.i;
+                        if (e.op == BinOp::Div && k == 0) return "division by zero";
+                        std::int64_t v = 0;
+                        if (e.op == BinOp::Mul ? mul_ovf(mv, k, v) : (v = mv / k, false))
+                            return "integer overflow";
+                        out = Datum::make_int(v); out.logical = 12; return std::nullopt;
+                    }
+                    if (lm && rm) {  // month-interval ± month-interval
+                        std::int64_t v = 0;
+                        if (e.op == BinOp::Add ? add_ovf(l.i, r.i, v) : sub_ovf(l.i, r.i, v))
+                            return "integer overflow";
+                        out = Datum::make_int(v); out.logical = 12; return std::nullopt;
+                    }
+                    // DATE / TIMESTAMP ± month-interval (calendar add, day clamped to month length).
+                    if (lm && e.op == BinOp::Sub)
+                        return "cannot subtract a date/timestamp from a MONTH interval";
+                    const std::uint8_t base_lg = lm ? r.logical : l.logical;
+                    const std::int64_t base = lm ? r.i : l.i;
+                    std::int64_t mon = lm ? l.i : r.i;
+                    if (e.op == BinOp::Sub) mon = -mon;  // date - interval
+                    if (base_lg == 2) {
+                        out = Datum::make_int(add_months_days(base, mon));
+                        out.logical = 2; return std::nullopt;
+                    }
+                    if (base_lg == 3) {
+                        out = Datum::make_int(add_months_secs(base, mon));
+                        out.logical = 3; return std::nullopt;
+                    }
+                    return "a MONTH interval may only be combined with a DATE / TIMESTAMP / MONTH interval";
+                }
                 auto temporal = [](std::uint8_t lg) { return lg == 2 || lg == 3 || lg == 8 || lg == 10; };
                 if (temporal(l.logical) || temporal(r.logical)) {
                     if (e.op == BinOp::Mul || e.op == BinOp::Div) {  // INTERVAL scaled by a number

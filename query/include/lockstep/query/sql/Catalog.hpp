@@ -309,6 +309,7 @@ struct Datum {
             if (logical == 8) return render_time(i);
             if (logical == 9) return s;  // ENUM: label populated at decode (ordinal kept in i)
             if (logical == 10) return render_interval(i);
+            if (logical == 12) return render_month_interval(i);  // F13b: MONTH-INTERVAL (year/month)
         }
         if (type == Type::Text && logical == 7) return render_array(s);  // F12: ARRAY
         if (type == Type::Text && logical >= 5) {  // F9e: INT128 / DECIMAL128 (16-byte payload in s)
@@ -414,6 +415,21 @@ struct Datum {
                       static_cast<long long>(days), static_cast<long long>(a / 3600),
                       static_cast<long long>((a % 3600) / 60), static_cast<long long>(a % 60));
         return std::string(buf);
+    }
+    // F13b: render a MONTH-INTERVAL (logical=12) — a signed month count -> "[-]Y years M mons"
+    // (Postgres style; omits a zero part, "0 mons" only when the whole value is zero). Pure.
+    static std::string render_month_interval(std::int64_t months) {
+        if (months == 0) return "0 mons";
+        const bool neg = months < 0;
+        const std::int64_t m = neg ? -months : months;
+        const std::int64_t years = m / 12, mons = m % 12;
+        std::string out = neg ? "-" : "";
+        if (years != 0) out += std::to_string(years) + (years == 1 ? " year" : " years");
+        if (mons != 0) {
+            if (years != 0) out += " ";
+            out += std::to_string(mons) + (mons == 1 ? " mon" : " mons");
+        }
+        return out;
     }
 
     // --- F9e: 128-bit integer / fixed-point (logical=5/6) over physical TEXT. The value is a 16-byte
@@ -566,11 +582,13 @@ inline std::int64_t days_from_civil(std::int64_t y, std::int64_t m, std::int64_t
     secs = h * 3600 + m * 60 + s;
     return true;
 }
-// F13: INTERVAL — a count + unit phrases ('1 day', '2 hours 30 minutes', '90 seconds'), and/or an
-// embedded clock 'HH:MM:SS'. Units: week/day/hour/minute/second (+ common abbrevs). Months/years are
-// NOT supported (calendar-variable). Sums to a signed SECOND count. Pure.
-[[nodiscard]] inline bool parse_interval(const std::string& in, std::int64_t& secs) {
-    std::int64_t total = 0;
+// F13b: INTERVAL parse yielding a MONTHS component (year/month units) AND a SECONDS component
+// (week/day/hour/minute/second + an embedded clock). The two are independent (Postgres keeps months
+// separate because a calendar month is variable-length). The caller decides the logical type: a
+// pure-months interval is logical 12 (the int holds months), a pure-seconds interval is logical 10.
+[[nodiscard]] inline bool parse_interval_my(const std::string& in, std::int64_t& months,
+                                            std::int64_t& secs) {
+    std::int64_t mon = 0, total = 0;
     bool any = false;
     std::size_t p = 0;
     bool neg = false;
@@ -580,7 +598,6 @@ inline std::int64_t days_from_civil(std::int64_t y, std::int64_t m, std::int64_t
     while (p < in.size()) {
         skip_ws();
         if (p >= in.size()) break;
-        // an embedded clock part HH:MM:SS (no unit word).
         std::size_t q = p;
         std::int64_t num = 0;
         bool has_num = false;
@@ -602,19 +619,80 @@ inline std::int64_t days_from_civil(std::int64_t y, std::int64_t m, std::int64_t
         while (p < in.size() && in[p] >= 'a' && in[p] <= 'z') unit.push_back(in[p++]);
         while (p < in.size() && in[p] >= 'A' && in[p] <= 'Z') unit.push_back(static_cast<char>(in[p++] - 'A' + 'a'));
         if (!unit.empty() && unit.back() == 's' && unit.size() > 1) unit.pop_back();  // plural -> singular
+        if (unit == "year" || unit == "yr" || unit == "y") { mon += num * 12; any = true; continue; }
+        if (unit == "month" || unit == "mon" || unit == "mo") { mon += num; any = true; continue; }
         std::int64_t mult = 0;
         if (unit == "second" || unit == "sec" || unit == "s") mult = 1;
         else if (unit == "minute" || unit == "min") mult = 60;
         else if (unit == "hour" || unit == "hr" || unit == "h") mult = 3600;
         else if (unit == "day" || unit == "d") mult = 86400;
         else if (unit == "week" || unit == "w") mult = 604800;
-        else return false;  // unknown / month / year
+        else return false;  // unknown unit
         total += num * mult;
         any = true;
     }
     if (!any) return false;
+    months = neg ? -mon : mon;
     secs = neg ? -total : total;
     return true;
+}
+
+// F13: INTERVAL over a SECOND count only (week/day/hour/minute/second). A year/month component is
+// rejected here (the caller that wants months uses parse_interval_my). Pure.
+[[nodiscard]] inline bool parse_interval(const std::string& in, std::int64_t& secs) {
+    std::int64_t months = 0, s = 0;
+    if (!parse_interval_my(in, months, s) || months != 0) return false;
+    secs = s;
+    return true;
+}
+
+// F13b: proleptic Gregorian civil <-> days-since-epoch (Howard Hinnant's algorithms). Pure,
+// deterministic, branch-light. Used for calendar (month/year) interval arithmetic.
+inline std::int64_t civil_to_days(std::int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+inline void days_to_civil(std::int64_t z, std::int64_t& y, unsigned& m, unsigned& d) {
+    z += 719468;
+    const std::int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = static_cast<unsigned>(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    y = static_cast<std::int64_t>(yoe) + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2);
+}
+inline unsigned days_in_month(std::int64_t y, unsigned m) {
+    static const unsigned dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return dim[m - 1];
+}
+// Add `months` to a day count (DATE), clamping the day-of-month to the target month's length
+// (e.g. Jan 31 + 1 month = Feb 28/29). Returns the new day count.
+inline std::int64_t add_months_days(std::int64_t days, std::int64_t months) {
+    std::int64_t y = 0;
+    unsigned m = 0, d = 0;
+    days_to_civil(days, y, m, d);
+    std::int64_t tot = static_cast<std::int64_t>(m - 1) + months;  // 0-based month index from year y
+    std::int64_t yadd = tot >= 0 ? tot / 12 : -((-tot + 11) / 12);
+    y += yadd;
+    const unsigned nm = static_cast<unsigned>(((tot % 12) + 12) % 12) + 1;
+    const unsigned dim = days_in_month(y, nm);
+    const unsigned nd = d > dim ? dim : d;
+    return civil_to_days(y, nm, nd);
+}
+// Add `months` to a TIMESTAMP (seconds since epoch): split into date + intra-day seconds, add the
+// months to the date, recombine (the clock part is preserved).
+inline std::int64_t add_months_secs(std::int64_t secs, std::int64_t months) {
+    std::int64_t days = secs >= 0 ? secs / 86400 : -((-secs + 86399) / 86400);  // floor division
+    std::int64_t rem = secs - days * 86400;
+    return add_months_days(days, months) * 86400 + rem;
 }
 
 // F9c: validate a UUID string (8-4-4-4-12 hex, optionally braced/uppercased) and write its

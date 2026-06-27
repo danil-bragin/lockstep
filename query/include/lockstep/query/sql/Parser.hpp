@@ -1900,11 +1900,16 @@ private:
         if (is_kw("interval")) {
             advance();
             if (cur_.kind != Tok::StrLit) return make_err("INTERVAL requires a 'string' literal");
-            std::int64_t secs = 0;
-            if (!parse_interval(cur_.text, secs)) return make_err("invalid INTERVAL literal '" + cur_.text + "'");
+            std::int64_t months = 0, secs = 0;
+            if (!parse_interval_my(cur_.text, months, secs))
+                return make_err("invalid INTERVAL literal '" + cur_.text + "'");
+            if (months != 0 && secs != 0)
+                return make_err("an INTERVAL literal cannot mix months/years with days/time ('" +
+                                cur_.text + "'); use separate INTERVALs");
             auto n = mk_expr(ExprKind::Lit);
-            n->lit = Datum::make_int(secs);
-            n->lit.logical = 10;
+            // F13b: a year/month interval is logical 12 (the int holds months); else logical 10 (secs).
+            n->lit = Datum::make_int(months != 0 ? months : secs);
+            n->lit.logical = months != 0 ? 12 : 10;
             advance();
             out = n;
             return std::nullopt;
