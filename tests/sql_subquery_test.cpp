@@ -160,6 +160,7 @@ bool cmp_true(const Cell& lhs, std::int64_t rhs_present, bool rhs_null, CmpOp op
         case CmpOp::Gt: return a > b;
         case CmpOp::Ge: return a >= b;
         case CmpOp::Like: return false;  // LIKE is TEXT-only; this INT reference model never sees it
+        case CmpOp::Contains: return false;  // @> is JSON-only; this INT reference model never sees it
     }
     return false;
 }

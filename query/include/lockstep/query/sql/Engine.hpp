@@ -2610,7 +2610,8 @@ private:
                     case CmpOp::Le: if (cz.lo > x) return true; break;
                     case CmpOp::Eq: if (x < cz.lo || x > cz.hi) return true; break;
                     case CmpOp::Ne: break;
-                    case CmpOp::Like: break;  // LIKE is TEXT — never an INT zone term
+                    case CmpOp::Like:
+                    case CmpOp::Contains: break;  // LIKE / @> — never an INT zone term
                 }
             } else if (vt.lit.type == Type::Text && cz.is_text) {
                 if (!cz.has) {
@@ -2624,7 +2625,8 @@ private:
                     case CmpOp::Le: if (cz.tlo > x) return true; break;
                     case CmpOp::Eq: if (x < cz.tlo || x > cz.thi) return true; break;
                     case CmpOp::Ne: break;
-                    case CmpOp::Like: break;  // LIKE handled in the general path, not zone-skipped
+                    case CmpOp::Like:
+                    case CmpOp::Contains: break;  // LIKE / @> handled in the general path, not zone-skipped
                 }
             }
         }
@@ -3346,7 +3348,8 @@ private:
                     case CmpOp::Le: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] <= b); break;
                     case CmpOp::Gt: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] > b); break;
                     case CmpOp::Ge: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] >= b); break;
-                    case CmpOp::Like: break;
+                    case CmpOp::Like:
+                    case CmpOp::Contains: break;
                 }
             } else {
                 const std::int64_t* a = cols[vt.col]->ints.data();
@@ -3358,7 +3361,8 @@ private:
                     case CmpOp::Le: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] <= b); break;
                     case CmpOp::Gt: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] > b); break;
                     case CmpOp::Ge: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] >= b); break;
-                    case CmpOp::Like: break;
+                    case CmpOp::Like:
+                    case CmpOp::Contains: break;
                 }
             }
         }
@@ -3395,7 +3399,8 @@ private:
                     for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] >= b);
                     break;
                 case CmpOp::Like:
-                    break;  // LIKE is never an INT-vectorizable term (extractor rejects it)
+                case CmpOp::Contains:
+                    break;  // LIKE / @> are never INT-vectorizable terms (the extractor rejects them)
             }
         }
         std::int64_t n = 0;
@@ -3640,7 +3645,8 @@ private:
         bool has_i128_agg = false;
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
-                if (item.agg.kind == AggKind::ArrayAgg) return std::nullopt;  // F12: row-AoS only
+                if (item.agg.kind == AggKind::ArrayAgg || item.agg.kind == AggKind::JsonAgg)
+                    return std::nullopt;  // F12 / JSON_AGG: row-AoS only
                 if (const auto idx = t.column_index(item.agg.column))
                     if (t.columns[*idx].logical >= 5) has_i128_agg = true;
             }
@@ -5764,6 +5770,54 @@ private:
             }
             return std::nullopt;
         }
+        // JSON path access `json #> path` / `json #>> path`: the path is a TEXT/INT array of
+        // object keys / array indices walked left-to-right. `#>` yields JSON, `#>>` yields TEXT.
+        if (f == "#>" || f == "#>>") {
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            json::JVal root;
+            std::size_t jp = 0;
+            if (!json::parse_value(a[0].s, jp, root)) return "left operand of #> is not JSON";
+            std::vector<Datum> path;
+            if (a[1].logical == 7 && a[1].type == Type::Text) path = Datum::decode_array(a[1].s);
+            else path.push_back(a[1]);  // a bare key/index is a one-element path
+            const json::JVal* cur = &root;
+            for (const Datum& step : path) {
+                if (cur == nullptr || step.is_null) { cur = nullptr; break; }
+                if (cur->kind == json::JVal::Obj) {
+                    const std::string key = step.type == Type::Text ? step.s : std::to_string(step.i);
+                    const json::JVal* nx = nullptr;
+                    for (const auto& en : cur->obj)
+                        if (en.first == key) { nx = &en.second; break; }
+                    cur = nx;
+                } else if (cur->kind == json::JVal::Arr) {
+                    const std::int64_t idx =
+                        step.type == Type::Int ? step.i : std::strtoll(step.s.c_str(), nullptr, 10);
+                    cur = (idx >= 0 && idx < static_cast<std::int64_t>(cur->arr.size()))
+                              ? &cur->arr[static_cast<std::size_t>(idx)] : nullptr;
+                } else {
+                    cur = nullptr;
+                }
+            }
+            if (cur == nullptr) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (f == "#>>") {
+                if (cur->kind == json::JVal::Str) out = Datum::make_text(cur->text);
+                else if (cur->kind == json::JVal::Null) out = Datum::make_null(Type::Text);
+                else { std::string s; json::serialize(*cur, s); out = Datum::make_text(std::move(s)); }
+            } else {
+                std::string s;
+                json::serialize(*cur, s);
+                out = Datum::make_text(std::move(s));
+                out.logical = 11;  // JSON
+            }
+            return std::nullopt;
+        }
+        // JSON_CONTAINS(doc, sub) -> 1/0 — the function form of the `@>` containment operator.
+        if (f == "JSON_CONTAINS") {
+            if (!need(2)) return "JSON_CONTAINS takes (json, json)";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            out = Datum::make_int(json_contains(a[0].s, a[1].s) ? 1 : 0);
+            return std::nullopt;
+        }
         if (f == "JSON_ARRAY_LENGTH") {
             if (!need(1)) return "JSON_ARRAY_LENGTH takes one argument";
             if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
@@ -7004,7 +7058,8 @@ private:
             return std::string("SUM/AVG requires a numeric column (got TEXT column '" +
                                a.column + "')");
         }
-        if (a.kind == AggKind::ArrayAgg) return std::string("ARRAY_AGG is not supported in a join yet");
+        if (a.kind == AggKind::ArrayAgg || a.kind == AggKind::JsonAgg)
+            return std::string("ARRAY_AGG / JSON_AGG are not supported in a join yet");
         return std::nullopt;
     }
 
@@ -8264,6 +8319,7 @@ private:
             case CmpOp::Gt: return c > 0;
             case CmpOp::Ge: return c >= 0;
             case CmpOp::Like: return false;  // never reached: leaf_truth handles Like before apply_cmp
+            case CmpOp::Contains: return false;  // never reached: leaf_truth handles @> before apply_cmp
         }
         return false;
     }
@@ -8293,11 +8349,67 @@ private:
         return pi == pat.size();
     }
 
-    // Evaluate ONE comparison leaf (lhs OP rhs) to a bool — the single place LIKE diverges from the
+    // JSON containment (`@>`): does `doc` deeply contain `sub`? Objects: every key of `sub` is present
+    // in `doc` with a contained value. Arrays: every element of `sub` is contained by some element of
+    // `doc`; a scalar/object `sub` is contained by an array `doc` if some element contains it. Scalars
+    // match when canonically equal. Recursive, pure function (mirrors PostgreSQL jsonb `@>`).
+    static bool json_contained(const json::JVal& doc, const json::JVal& sub) {
+        if (doc.kind == json::JVal::Obj && sub.kind == json::JVal::Obj) {
+            for (const auto& [k, sv] : sub.obj) {
+                const json::JVal* dv = nullptr;
+                for (const auto& en : doc.obj)
+                    if (en.first == k) { dv = &en.second; break; }
+                if (dv == nullptr || !json_contained(*dv, sv)) return false;
+            }
+            return true;
+        }
+        if (doc.kind == json::JVal::Arr && sub.kind == json::JVal::Arr) {
+            for (const json::JVal& se : sub.arr) {
+                bool found = false;
+                for (const json::JVal& de : doc.arr)
+                    if (json_contained(de, se)) { found = true; break; }
+                if (!found) return false;
+            }
+            return true;
+        }
+        if (doc.kind == json::JVal::Arr) {  // a scalar / object contained in some array element
+            for (const json::JVal& de : doc.arr)
+                if (json_contained(de, sub)) return true;
+            return false;
+        }
+        if (doc.kind != sub.kind) return false;  // scalars: canonical-equality
+        std::string a, b;
+        json::serialize(doc, a);
+        json::serialize(sub, b);
+        return a == b;
+    }
+    // Render one column value as a JSON value (for JSON_AGG). NULL => null; a JSON value embeds as-is;
+    // plain INT / DECIMAL / 128-bit render as JSON numbers; everything else (TEXT/DATE/TIME/UUID/ENUM/
+    // ARRAY) renders as a JSON string. The result is fed through parse+serialize for canonical form.
+    static std::string datum_to_json(const Datum& d) {
+        if (d.is_null) return "null";
+        if (d.logical == 11) return d.s;  // already canonical JSON
+        if (d.type == Type::Int && d.logical == 0) return std::to_string(d.i);
+        if (d.logical == 1 || d.logical == 5 || d.logical == 6) return d.render();  // DECIMAL / 128-bit number
+        std::string out;
+        json::escape_into(d.render(), out);  // a JSON string (quoted + escaped)
+        return out;
+    }
+    static bool json_contains(const std::string& doc, const std::string& sub) {
+        json::JVal d, s;
+        std::size_t pd = 0, ps = 0;
+        if (!json::parse_value(doc, pd, d) || !json::parse_value(sub, ps, s)) return false;
+        return json_contained(d, s);
+    }
+
+    // Evaluate ONE comparison leaf (lhs OP rhs) to a bool — the single place LIKE / @> diverge from the
     // 3-way ordered comparators. Both operands are already NULL-checked + type-equal by the caller.
     static bool leaf_truth(CmpOp op, const Datum& lhs, const Datum& rhs) {
         if (op == CmpOp::Like) {
             return lhs.type == Type::Text && rhs.type == Type::Text && like_match(lhs.s, rhs.s);
+        }
+        if (op == CmpOp::Contains) {  // @> JSON containment (both operands are JSON text)
+            return lhs.type == Type::Text && rhs.type == Type::Text && json_contains(lhs.s, rhs.s);
         }
         return apply_cmp(op, cmp_datum(lhs, rhs));
     }
@@ -8319,7 +8431,8 @@ private:
         }
         if (n.kind != PredNodeKind::Cmp || n.operand != OperandKind::Column ||
             n.rhs_is_column || n.rhs_is_subquery || !n.qualifier.empty() ||
-            n.literal.is_null || n.op == CmpOp::Like) {  // B1: LIKE is not zone/mask-vectorizable
+            n.literal.is_null || n.op == CmpOp::Like ||
+            n.op == CmpOp::Contains) {  // B1: LIKE / @> are not zone/mask-vectorizable
             return false;
         }
         const auto ci = t.column_index(n.column);
@@ -8773,6 +8886,24 @@ private:
             out = Datum::make_text(
                 Datum::encode_array(t.columns[ci].logical, t.columns[ci].scale, elems));
             out.logical = 7;
+            return std::nullopt;
+        }
+        // JSON_AGG — collect the group's values (scan order, NULLs included as JSON null) into a JSON
+        // array. Built then re-parsed + canonically re-serialized so it byte-matches a stored JSON value.
+        if (a.kind == AggKind::JsonAgg) {
+            std::string js = "[";
+            for (std::size_t i = 0; i < grp.rows.size(); ++i) {
+                if (i != 0) js += ",";
+                js += datum_to_json((*grp.rows[i])[ci]);
+            }
+            js += "]";
+            json::JVal v;
+            std::size_t jp = 0;
+            if (!json::parse_value(js, jp, v)) return std::string("JSON_AGG produced invalid JSON");
+            std::string canon;
+            json::serialize(v, canon);
+            out = Datum::make_text(std::move(canon));
+            out.logical = 11;  // JSON
             return std::nullopt;
         }
         // Collect the PRESENT (non-NULL) values of the aggregated column.

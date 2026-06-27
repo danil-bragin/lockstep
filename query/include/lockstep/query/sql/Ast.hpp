@@ -149,6 +149,7 @@ enum class CmpOp : std::uint8_t {
     Gt = 4,  // >
     Ge = 5,  // >=
     Like = 6,  // B1: SQL LIKE pattern match (% any run, _ one char); TEXT only
+    Contains = 7,  // @> JSON containment: left JSON deeply contains the right JSON
 };
 
 // What the left-hand side of a comparison REFERENCES.
@@ -166,6 +167,7 @@ enum class AggKind : std::uint8_t {
     Max = 4,        // MAX(col)
     Avg = 5,        // AVG(col) — INT truncation toward zero (documented; see Engine)
     ArrayAgg = 6,   // F12: ARRAY_AGG(col) — collect the group's values (in scan order) into an array
+    JsonAgg = 7,    // JSON_AGG(col) — collect the group's values into a JSON array (canonical text)
 };
 
 // One aggregate expression: a kind + (for non-CountStar) the target column name.

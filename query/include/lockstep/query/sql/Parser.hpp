@@ -111,6 +111,9 @@ enum class Tok : std::uint8_t {
     RBracket, // ]
     Arrow,    // ->   (F13 JSON get)
     ArrowText,// ->>  (F13 JSON get as text)
+    Contains, // @>   (JSON containment)
+    PathArrow,    // #>   (JSON get by path -> JSON)
+    PathArrowText,// #>>  (JSON get by path -> text)
     End,      // end of input
     Bad,      // a lexing error (unterminated string / stray byte)
 };
@@ -238,6 +241,23 @@ public:
             case '%':
                 ++i_;
                 t.kind = Tok::Percent;
+                return t;
+            case '@':
+                ++i_;
+                if (i_ < src_.size() && src_[i_] == '>') { ++i_; t.kind = Tok::Contains; return t; }  // @>
+                t.kind = Tok::Bad;
+                t.bad_msg = "expected '>' after '@' (the only '@' use is '@>')";
+                return t;
+            case '#':
+                ++i_;
+                if (i_ < src_.size() && src_[i_] == '>') {  // #> or #>>
+                    ++i_;
+                    if (i_ < src_.size() && src_[i_] == '>') { ++i_; t.kind = Tok::PathArrowText; }
+                    else t.kind = Tok::PathArrow;
+                    return t;
+                }
+                t.kind = Tok::Bad;
+                t.bad_msg = "expected '>' after '#' (the only '#' uses are '#>' and '#>>')";
                 return t;
             default:
                 break;
@@ -1565,6 +1585,8 @@ private:
             kind = AggKind::Avg;
         } else if (fn == "array_agg") {
             kind = AggKind::ArrayAgg;  // F12
+        } else if (fn == "json_agg") {
+            kind = AggKind::JsonAgg;
         } else {
             return std::nullopt;  // not an aggregate name
         }
@@ -1841,6 +1863,18 @@ private:
                 g->func = as_text ? "->>" : "->";
                 g->args.push_back(out);
                 g->args.push_back(key);
+                out = g;
+            } else if (cur_.kind == Tok::PathArrow || cur_.kind == Tok::PathArrowText) {
+                // JSON path access `json #> path` / `json #>> path` -> a Func over (json, path). The
+                // path is a TEXT array of keys/indices ('{a,1,b}' or ARRAY['a','1','b']).
+                const bool as_text = cur_.kind == Tok::PathArrowText;
+                advance();
+                std::shared_ptr<Expr> path;
+                if (auto e = parse_expr_atom(path)) return e;
+                auto g = mk_expr(ExprKind::Func);
+                g->func = as_text ? "#>>" : "#>";
+                g->args.push_back(out);
+                g->args.push_back(path);
                 out = g;
             } else {
                 break;
@@ -2309,6 +2343,7 @@ private:
             case Tok::Le: out = CmpOp::Le; return true;
             case Tok::Gt: out = CmpOp::Gt; return true;
             case Tok::Ge: out = CmpOp::Ge; return true;
+            case Tok::Contains: out = CmpOp::Contains; return true;  // @> JSON containment
             default: return false;
         }
     }
