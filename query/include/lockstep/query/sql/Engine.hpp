@@ -3244,6 +3244,67 @@ private:
         return Datum::make_int(sum / n);  // AVG: trunc toward zero
     }
 
+    // AGGREGATE FUSION: SUM/MIN/MAX of an INT NOT NULL column folded in ONE branchless gather pass,
+    // so a query selecting several aggregates of the same column (SUM(a),MIN(a),MAX(a)) reads the
+    // column ONCE instead of once per aggregate, and MIN/MAX run on raw int64 (no per-element Datum
+    // like the generic gather). Byte-identical to compute_agg_soa over the same idxs.
+    struct IntFold {
+        std::int64_t sum = 0;
+        std::int64_t mn = INT64_MAX;
+        std::int64_t mx = INT64_MIN;
+    };
+    static IntFold fold_int_col(const ColumnChunk& cc, const std::vector<std::uint32_t>& idxs) {
+        const std::int64_t* v = cc.ints.data();
+        std::int64_t s = 0, mn = INT64_MAX, mx = INT64_MIN;
+        for (const std::uint32_t r : idxs) {
+            const std::int64_t x = v[r];
+            s = wrap_add(s, x);          // F9d: defined wrap, matches compute_agg_soa's SUM order
+            mn = mn < x ? mn : x;        // branchless min (cmov)
+            mx = mx > x ? mx : x;        // branchless max
+        }
+        return IntFold{s, mn, mx};
+    }
+    // Fused masked fold for the ungrouped filtered fast path: SUM/MIN/MAX over the rows where
+    // mask[r]==1, branchless, in ONE pass. Byte-identical to compute_masked_agg per aggregate (the
+    // SUM via v*mask, MIN/MAX via masked-out-keeps-best select). Caller guarantees nmatch > 0.
+    static IntFold fold_masked_col(const ColumnChunk& cc, std::uint32_t count,
+                                   const std::vector<std::uint8_t>& mask) {
+        const std::int64_t* v = cc.ints.data();
+        std::int64_t s = 0, mn = INT64_MAX, mx = INT64_MIN;
+        for (std::uint32_t r = 0; r < count; ++r) {
+            const std::int64_t x = v[r];
+            const std::int64_t m = mask[r];
+            s += x * m;
+            const std::int64_t lo = m ? x : INT64_MAX;
+            const std::int64_t hi = m ? x : INT64_MIN;
+            mn = mn < lo ? mn : lo;
+            mx = mx > hi ? mx : hi;
+        }
+        return IntFold{s, mn, mx};
+    }
+    // Satisfy one fusable aggregate (idxs NON-empty, INT NOT NULL column) from a precomputed fold.
+    static Datum agg_from_fold(AggKind k, const IntFold& f, std::size_t cnt) {
+        switch (k) {
+            case AggKind::Sum: return Datum::make_int(f.sum);
+            case AggKind::Min: return Datum::make_int(f.mn);
+            case AggKind::Max: return Datum::make_int(f.mx);
+            case AggKind::Avg: return Datum::make_int(f.sum / static_cast<std::int64_t>(cnt));
+            case AggKind::Count: return Datum::make_int(static_cast<std::int64_t>(cnt));  // NOT NULL
+            default: return Datum::make_int(0);
+        }
+    }
+    // Is this aggregate fusable — a foldable kind over an INT NOT NULL column (so the fold == the
+    // generic gather, but cheaper)?
+    [[nodiscard]] bool agg_fusable(const AggExpr& a, const Table& t) const {
+        if (a.kind != AggKind::Sum && a.kind != AggKind::Min && a.kind != AggKind::Max &&
+            a.kind != AggKind::Avg && a.kind != AggKind::Count) {
+            return false;
+        }
+        const auto ci = t.column_index(a.column);
+        return ci && t.columns[*ci].type == Type::Int && t.columns[*ci].logical == 0 &&
+               !t.columns[*ci].nullable;
+    }
+
     // Fold ONE aggregate over a SoA index subset (a group's member rows, or the whole
     // selection for an ungrouped query). Replicates compute_agg's semantics EXACTLY: NULL
     // skipping, empty-group=0, all-NULL group => SUM 0 / MIN/MAX/AVG typed NULL, AVG int
@@ -3850,10 +3911,36 @@ private:
             if (vec_ok && !any_i128) {
                 std::vector<std::uint8_t> mask;
                 const std::int64_t nmatch = build_filter_mask(cols, count, vterms, mask);
+                // AGGREGATE FUSION: fold each DISTINCT aggregated INT column once over the mask, so
+                // SUM(a),MIN(a),MAX(a) read column a a single time. (Every agg column is INT NOT NULL
+                // here — the vec_ok gate guarantees it.) The empty-match case keeps the per-aggregate
+                // int-0 rule via compute_masked_agg.
+                std::vector<int> col_to_fuse(t.columns.size(), -1);
+                std::vector<IntFold> folds;
+                if (nmatch > 0) {
+                    for (const SelectItem& item : sel.items) {
+                        if (item.kind != SelectItemKind::Aggregate ||
+                            item.agg.kind == AggKind::CountStar)
+                            continue;
+                        const std::size_t ci = *t.column_index(item.agg.column);
+                        if (col_to_fuse[ci] < 0) {
+                            col_to_fuse[ci] = static_cast<int>(folds.size());
+                            folds.push_back(fold_masked_col(*cols[ci], count, mask));
+                        }
+                    }
+                }
                 ResultRow out;
                 for (const SelectItem& item : sel.items) {
-                    out.cells.emplace_back(
-                        item.label, compute_masked_agg(item.agg, t, cols, count, mask, nmatch));
+                    if (nmatch > 0 && item.agg.kind != AggKind::CountStar) {
+                        const std::size_t ci = *t.column_index(item.agg.column);
+                        out.cells.emplace_back(
+                            item.label, agg_from_fold(item.agg.kind,
+                                                      folds[static_cast<std::size_t>(col_to_fuse[ci])],
+                                                      static_cast<std::size_t>(nmatch)));
+                    } else {
+                        out.cells.emplace_back(
+                            item.label, compute_masked_agg(item.agg, t, cols, count, mask, nmatch));
+                    }
                 }
                 ExecResult rr;
                 rr.rows.push_back(std::move(out));
@@ -3902,6 +3989,19 @@ private:
         // shared CONST state (cols / sel / catalog) + writes its own `out`, so groups can be
         // folded in PARALLEL across workers (compute_agg_soa / having_eval_soa mutate no engine
         // state). Returns an error string, or nullopt (keep=false => the group is dropped).
+        // AGGREGATE FUSION: collect the DISTINCT INT-NOT-NULL columns aggregated by SUM/MIN/MAX/AVG/
+        // COUNT, so each is folded ONCE per group (one gather pass shared across its aggregates).
+        std::vector<std::size_t> fuse_cols;
+        std::vector<int> col_to_fuse(t.columns.size(), -1);
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Aggregate && agg_fusable(item.agg, t)) {
+                const std::size_t ci = *t.column_index(item.agg.column);
+                if (col_to_fuse[ci] < 0) {
+                    col_to_fuse[ci] = static_cast<int>(fuse_cols.size());
+                    fuse_cols.push_back(ci);
+                }
+            }
+        }
         auto compute_group_row = [&](const std::vector<Datum>& keyd,
                                      const std::vector<std::uint32_t>& idxs, ResultRow& out,
                                      bool& keep) -> std::optional<std::string> {
@@ -3915,6 +4015,15 @@ private:
                     return std::nullopt;
                 }
             }
+            // Fold each fusable column once for this group (idxs non-empty groups only; the synthetic
+            // empty group falls through to compute_agg_soa, which encodes the empty-group result).
+            std::vector<IntFold> folds;
+            const bool fused = !idxs.empty() && !fuse_cols.empty();
+            if (fused) {
+                folds.resize(fuse_cols.size());
+                for (std::size_t k = 0; k < fuse_cols.size(); ++k)
+                    folds[k] = fold_int_col(*cols[fuse_cols[k]], idxs);
+            }
             for (const SelectItem& item : sel.items) {
                 if (item.kind == SelectItemKind::Column) {
                     const std::size_t ci = *t.column_index(item.column);
@@ -3926,6 +4035,11 @@ private:
                         }
                     }
                     out.cells.emplace_back(item.label, d);
+                } else if (fused && agg_fusable(item.agg, t)) {
+                    const std::size_t ci = *t.column_index(item.agg.column);
+                    out.cells.emplace_back(
+                        item.label, agg_from_fold(item.agg.kind, folds[static_cast<std::size_t>(col_to_fuse[ci])],
+                                                  idxs.size()));
                 } else {
                     out.cells.emplace_back(item.label, compute_agg_soa(item.agg, t, cols, idxs));
                 }

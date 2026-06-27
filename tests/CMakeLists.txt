@@ -1343,6 +1343,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_columnar_i128_test COMMAND lockstep_sql_columnar_i128_test)
 
+  # sql_agg_fusion_test: fused multi-aggregate over one INT column == row store (columnar).
+  add_executable(lockstep_sql_agg_fusion_test sql_agg_fusion_test.cpp)
+  target_include_directories(lockstep_sql_agg_fusion_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_agg_fusion_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_agg_fusion_test COMMAND lockstep_sql_agg_fusion_test)
+
   # sql_drop_constraint_test: ALTER TABLE DROP CONSTRAINT <name> (CHECK / UNIQUE / FK by name).
   add_executable(lockstep_sql_drop_constraint_test sql_drop_constraint_test.cpp)
   target_include_directories(lockstep_sql_drop_constraint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
