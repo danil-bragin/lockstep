@@ -44,6 +44,11 @@
 #     are DISABLED: heuristic style smells that here fire on intentional code
 #     (a loop `i++` in a test's bounds check; adjacent string-literal
 #     concatenation in a test's query list; a teeth value used only via push_back).
+#   - clang-analyzer-optin.performance.Padding is DISABLED: an OPT-IN check that
+#     flags struct field ordering for fewer padding bytes — a micro-optimization,
+#     not a bug. Reordering AST/struct fields for cache packing is not worth the
+#     churn or the WarningsAsErrors block (this is a bug-finding gate, not a layout
+#     gate). The rest of clang-analyzer-* (the real bug finders) stay ERRORS.
 #   The static analyzer (clang-analyzer-*, the real bug finder) stays an ERROR and
 #   is clean; performance-* stays a warning (not a merge blocker).
 Checks: >
@@ -68,6 +73,7 @@ Checks: >
   -bugprone-suspicious-missing-comma,
   -bugprone-inc-dec-in-conditions,
   -bugprone-unused-local-non-trivial-variable,
+  -clang-analyzer-optin.performance.Padding,
   -concurrency-mt-unsafe
 
 WarningsAsErrors: 'clang-analyzer-*,bugprone-*,concurrency-*,cppcoreguidelines-*'

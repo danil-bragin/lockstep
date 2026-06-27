@@ -123,10 +123,12 @@ jobs:
           # entry, so the include paths resolve. Headers are NOT analyzed standalone
           # (they have no compile command -> spurious "file not found"); their diagnostics
           # surface through the .cpp that includes them, gated by HeaderFilterRegex.
-          # Exempt providers/ (cardinal rule 1) and tools/lint/fixtures/ (deliberately
-          # dirty lint fixtures — same exemption the forbidden-call lint applies).
+          # Exempt providers/ (cardinal rule 1), tools/lint/fixtures/ (deliberately
+          # dirty lint fixtures), and bench/compare/ (the competitive harness — built
+          # standalone outside the CMake project, so it has no compile_commands entry
+          # and its includes don't resolve here). Same exemptions the forbidden lint uses.
           git ls-files '*.cpp' '*.cc' \
-            | grep -vE '^(providers|tools/lint/fixtures)/' \
+            | grep -vE '^(providers|tools/lint/fixtures|bench/compare)/' \
             | xargs -r clang-tidy -p build/debug
 
   scan-build:
