@@ -85,10 +85,18 @@ write, so confirm its fsync semantics before quoting as durable.)
 - **Horizontal:** real — 635k/s on one node across 6 shards; the architecture scales, now shown live.
 - **SQL is no longer in-process-only:** runs over the wire (verified exactly-once) at ~105k/s.
 
+## Since delivered (were open levers here)
+- **Distributed SQL across shards — DONE.** Scatter-gather + a co-located-shuffle star-JOIN pushdown
+  (the large fact is aggregated by the join key on each shard and never gathered) with
+  WHERE/AVG/HAVING/COUNT(DISTINCT)-shuffle/multi-dim/broadcast-dim variants, each byte-identical to
+  single-node (DistributedSql.hpp; tests/sql_distributed_test.cpp). Not yet re-benchmarked here.
+- **Vectorized hash-aggregate (the GROUP BY gap) — DONE.** Columnar one-pass INT/TEXT hash-aggregate
+  + aggregate fusion (1.6–4.7×, byte-identical). The SQL-analytics numbers below predate it.
+
 ## Open levers (documented, fresh-session)
 wire write-path GROUP COMMIT (turn the 3.3k durable keyed write into a win — the ⭐1 follow-up) ·
-distributed SQL across shards (scatter-gather; single-node SQL-over-wire is the foundation) ·
-vectorized hash-aggregate / dictionary-RLE / vectorized JOIN (close the residual DuckDB analytics gap).
+dictionary-RLE TEXT storage / vectorized JOIN · distributed-JOIN competitive benchmark (the feature
+exists but has no head-to-head number yet).
 
 Reproduce: `bench/compare/run.sh` (KV) · `bench/compare/multi_shard_ceiling.sh` (horizontal) ·
 `bench/compare/sql_analytics/run_analytics.sh 1000000 20` (SQL analytics) · `lockstep_sqlbench` /

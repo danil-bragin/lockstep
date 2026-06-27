@@ -71,15 +71,14 @@
 
 ## Known asymmetry to handle explicitly (do NOT paper over)
 
-- **Lockstep SQL is IN-PROCESS today**, not over the wire (KV is over TCP via `lockstepd`).
-  Postgres/Cockroach SQL is over a socket. So a naive "SQL txn/s" head-to-head would either
-  (a) unfairly FAVOR Lockstep (no network/parse-protocol cost) or (b) be impossible at parity.
-  RESOLUTION (decided per the infra map): either expose SQL over the existing `wire::Server`
-  (a SQL verb) so the comparison is socket-to-socket, OR — if that is a large build — report
-  the SQL vector as **Lockstep in-process SQL pipeline cost** vs **Postgres/Cockroach
-  over-socket**, CLEARLY LABELED as not-same-harness (Lockstep's number is a *lower bound*, it
-  omits network), and lean the SQL story on correctness/isolation rather than raw txn/s.
-  This asymmetry is named in every SQL-vector result, never hidden.
+- **SQL-over-wire asymmetry — since RESOLVED.** When this charter was written Lockstep SQL ran
+  in-process only, so a "SQL txn/s" head-to-head was either unfair or impossible at parity. The
+  resolution (expose SQL over `wire::Server` via a SQL verb) was taken: SQL now runs over the
+  socket (verified exactly-once, ~105k/s) and across shards (distributed JOIN). A socket-to-socket
+  SQL head-to-head against Postgres/Cockroach is now *possible* but **not yet run** — that
+  benchmark is the remaining open item, not an architectural blocker. Until it lands, the SQL
+  story still leans on correctness/isolation, and any in-process SQL number is labeled a lower
+  bound (omits network).
 - **etcd/TiKV are KV, not SQL**; they appear only in vectors 1–3, not 4.
 - **Postgres is single-node**; in the scaling vector it scales via processes/connections on K
   cores, not via replication — that is the honest single-node-scaling point, labeled as such.
@@ -90,11 +89,11 @@
 bench/compare/
   SPEC.md            — this file (methodology + honest framing)
   docker-compose.yml — one service per competitor, parametrized cpus/mem
-  driver.py          — unified workload generator + common-schema metric collector
-  adapters/          — one per system (lockstep, postgres, etcd, cockroach, tikv)
   run.sh             — orchestrator: for each (system × cpu-level × vector): pin, run, collect, teardown
+  adapters/          — one per system (lockstep, postgres, etcd, cockroach, tikv); drive go-ycsb / native
   report.py          — results/*.json → comparison tables + honest narrative
   results/           — per-cell JSON (resumable: skip completed cells)
+  sql_analytics/     — the 5-way single-CPU SQL-analytics comparison (vs DuckDB/ClickHouse/PG/SQLite)
 ```
 
 ## Resource discipline (this laptop froze before on heavy builds)

@@ -1,9 +1,18 @@
 # Lockstep Query Model & Developer Surface
 
-This is the external-facing guide to Lockstep's developer surface: how you author
-transactions, how the read/query model works, what the four consistency levels
-mean and how they are made visible at every call site, the wire protocol, and how
-to use the reference driver and the CLI. It covers Phase 6 (C6.1–C6.6).
+This is the external-facing guide to Lockstep's **KV / typed-query** developer
+surface: how you author transactions, how the read/query model works, what the
+four consistency levels mean and how they are made visible at every call site, the
+wire protocol, and how to use the reference driver and the CLI. It covers the
+Phase-6 foundation (C6.1–C6.6).
+
+> **SQL is a layer above this.** A from-scratch SQL engine
+> (`query/include/lockstep/query/sql/`) was built on top of the `Database` /
+> `TxnFn` model documented here — 30+ features (joins, aggregates, GROUP BY/HAVING,
+> subqueries, window fns, constraints, indexes, a rich type system, row + columnar
+> execution) plus **distributed SQL** (`DistributedSql.hpp`, co-located-shuffle
+> star-JOIN pushdown). This doc describes the substrate the SQL layer compiles down
+> to; for the SQL feature set see `query/sql/SQL_FEATURES_PLAN.md`.
 
 Lockstep is a C++23 **deterministic** distributed database. Everything below is a
 pure function of its inputs: given the same seed and the same operations, you get
@@ -136,8 +145,9 @@ the whole body. On decode the CRC is re-derived and the frame is **rejected** on
 mismatch — a torn, truncated, or bit-rotted frame is a clean decode failure, never
 a mis-decoded or fabricated message. A bad frame is dropped and the sender retries.
 
-**Requests:** `Ping`, `Submit`, `Query`.
-**Responses:** `Pong`, `SubmitOk`, `QueryOk`, `Error`.
+**Requests:** `Ping`, `Submit`, `Query`, `SqlExec` (a SQL statement string — the
+SQL-over-wire path).
+**Responses:** `Pong`, `SubmitOk`, `QueryOk`, `SqlResult` (rows blob), `Error`.
 
 `Submit` never ships executable code (that would be neither encodable nor safe).
 It names one of a fixed catalogue of **deterministic ops** — `Put`, `Transfer`,

@@ -137,3 +137,23 @@ SQL layer cannot do because it only sees kvs AFTER the copy). The fused decode p
 fewer allocs, the substrate that pays off ONCE storage stops dominating) but is not the win NOW.
 NEXT: instrument + attack the storage range scan. The profile-first methodology refuted two SQL-
 layer hypotheses before spending real effort there — exactly its purpose.
+
+### Progress since (roadmap phases that have LANDED)
+The "NEXT: storage range scan" lever above was taken, and several roadmap phases shipped:
+- **Storage read path FIXED (the standing FLAG above is RESOLVED).** The WalEngine memtable is
+  no longer a linear key scan: it is a sorted structure with `std::lower_bound` then an ordered
+  `std::map` (O(log N) get/insert, no shift), so get/versions_for/scan all binary-search
+  (commits `284a6d2`, `9d7e009`; the O(N²) bulk-load was `707dc8c`). A namespace-aware selective
+  flush (`7ea3801`) then bounds the row/index memtable via the SSTable LSM while keeping columnar
+  blocks resident — removing the map's point-get cost without a columnar/LSM flush cliff.
+- **Phase 2 (stats + cost model) DONE** — `ANALYZE` recomputes n_distinct; the planner uses
+  n/n_distinct selectivity for index-vs-scan and descending index order (sql_analyze_test).
+- **Phase 5 (morsel parallelism) DONE** — `query::IParallelExecutor` / `prod::ProdParallelExecutor`
+  drive the columnar scalar-aggregate fast path with a deterministic fixed-order merge
+  (sql_parallel_agg_test). Threads are confined to providers/prod.
+- **Columnar one-pass GROUP BY overhaul DONE** — aggregate fusion + one-pass INT/TEXT hash-aggregate
+  (no idx vectors, dense dict-code path for TEXT), 1.6–4.7× and byte-identical (`8fbf176`,
+  `8b75215`, `0aa5bb2`, `e2ffc68`). This is the vectorized hash-aggregate the analytics gap wanted.
+- **Distributed analytic SQL DONE** — co-located-shuffle star-JOIN pushdown (the large fact is never
+  gathered) with WHERE/AVG/HAVING/COUNT(DISTINCT)/multi-dim/broadcast-dim variants; see
+  `query/sql/SQL_FEATURES_PLAN.md` (distributed-SQL section) and DistributedSql.hpp.

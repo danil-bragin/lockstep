@@ -70,15 +70,15 @@ HIGHEST RISK LAST → F1 (composite key encoding).
 Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] D6 multi-row INSERT (atomic; row+columnar == N single inserts; teeth=dup-in-batch) — sql_multirow_insert_test
 - [x] F8 DROP TABLE (catalog forget + durable schema tombstone; re-create empty; teeth=unknown) — sql_drop_table_test
-- [x] C1 COUNT/SUM/AVG(DISTINCT) (per-group dedup in compute_agg; fast paths gated; distributed rejects; teeth) — sql_distinct_agg_test
+- [x] C1 COUNT/SUM/AVG(DISTINCT) (per-group dedup in compute_agg; fast paths gated; teeth) — sql_distinct_agg_test. NOTE: distributed COUNT(DISTINCT) now SHUFFLES (no longer rejected) — see the distributed-SQL section below
 - [x] B1 LIKE / NOT LIKE (% _; CmpOp::Like + matcher; vectorizer rejects; NOT LIKE wraps Not; teeth) — sql_like_test
 - [x] G3 NULLS FIRST/LAST (order_key_less honors per-key; default=NULL smallest unchanged; teeth) — sql_nulls_order_test
 - [x] A1 scalar arithmetic (projection) + A2 string fns + A3 CASE + A4 CAST — scalar Expr engine in SELECT projection (row+columnar, == exact, teeth) — sql_expr_test. NOTE: WHERE-side arithmetic = follow-on
 - [x] F5 CHECK (column+table level; source-text captured, persisted, re-parsed+eval per write; atomic; durable) — sql_check_test
-- [ ] A1/A2/A3/A4 WHERE-side
+- [x] A1/A2/A3/A4 WHERE-side — J1 expression operands in WHERE/CHECK (scalar Expr as a Cmp LHS: `a+b=10`, `doc->>'k'='v'`, `UPPER(name)='BOB'`; row+columnar) — sql_expr_pred_test
 - [x] D1 UNION/ALL + D2 INTERSECT/EXCEPT (set-op chain; dedup; combined ORDER/LIMIT; arity teeth) — sql_setops_test
-- [ ] E2 CROSS
-- [ ] D3 FROM-subquery · D4 CTE · E3 N-way · E4 non-equi · A4 CAST
+- [x] E2 CROSS — ALREADY PRESENT (see below)
+- [ ] D3 FROM-subquery · D4 CTE/WITH — the only two still open (E3 N-way, E4 non-equi, A4 CAST are all DONE below)
 - [x] E4 non-equi join — ALREADY PRESENT (theta via nested_loop; verified)
 - [x] F1 composite PRIMARY KEY (all-INT, row-mode): order-preserving concatenated key codec; single-col path byte-identical (conformance/columnar gates green); durable; teeth=TEXT/columnar/dup; UPDATE/DELETE-by-composite + multi-col INDEX = follow-on — sql_composite_pk_test
 - [x] E2 CROSS JOIN — ALREADY PRESENT (catalog miss; verified)
@@ -106,3 +106,31 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] F9d checked int64 arithmetic — INT/BIGINT is 64-bit; an op whose true result exceeds int64 was signed-overflow UB (UBSan trap / silent release wrap). Row-mode + joined + window + scalar-expr paths now raise a clean `"integer overflow"` error (`__builtin_*_overflow`): eval_expr +/-/*/÷ (+ unary `-` on INT64_MIN, ÷ INT64_MIN/-1, % INT64_MIN/-1), DECIMAL scale-mul in coerce, compute_agg/compute_agg_joined/compute_window SUM. Opt-in COLUMNAR accumulators use a DEFINED unsigned `wrap_add` (no UB, no branch — SIMD-preserved) since threading an error through the parallel partial-merge machinery would serialize the folds and race; deterministic, UBSan-clean, and conformance never overflows so row==columnar stays byte-identical. Literal beyond int64 still saturates at parse (parse_i64). Teeth: v+v / v*v / SUM overflow → error, normal arithmetic unaffected, huge literal saturates, DECIMAL out-of-range rejected — sql_overflow_test (UBSan: no trap; previously aborted)
 - [x] F9c UUID — LOGICAL type over physical TEXT (logical=4). Value = validated, canonicalised (lowercase, dashed) 36-char string; storage/keys/comparison stay TEXT => byte-deterministic. Two sources: client-supplied (coerce validates+canonicalises; braces/uppercase accepted) and DETERMINISTIC `DEFAULT gen_uuid()`/`gen_random_uuid()` — a v4-shaped id (splitmix64 of table_id+counter, version/variant nibbles set) from the per-table next_uuid counter (NOT random — random would diverge across the two Raft impls; persisted+recovered like AUTO_INCREMENT). WHERE literal coerced (case-insensitive match); the conjunct-extraction (vectorized) path now coerces logical-column literals too (also hardened DECIMAL/DATE NOT-NULL WHERE). Teeth: malformed/short rejected, gen_uuid on non-UUID rejected, reproducible, durable. Follow-on: ALTER ADD UUID DEFAULT gen_uuid() (literal-only there) — sql_uuid_test
 - [x] F9b DECIMAL(p,s) fixed-point + DATE + TIMESTAMP — LOGICAL types over physical INT (scaled int64 / days-since-epoch / secs-since-epoch). Storage/keys/comparison/ordering stay raw INT => byte-deterministic (FLOAT still OUT). Literal-parse (string '3.14'/'2026-06-27'/'... HH:MM:SS' or whole-number) -> INT via coerce; render() -> logical form (Howard-Hinnant proleptic Gregorian); WHERE literal coerced to the column's INT; DECIMAL +/-/*/÷ fixed-point in eval_expr; SUM/AVG keep scale, MIN/MAX carry the row tag; schema logical/scale persisted+recovered. Follow-on: columnar/joined/access-path literal coercion (row-mode done) — sql_decimal_date_test
+
+## J-series + later follow-ons (all DONE; were "follow-on" above)
+- [x] J1 expression operands in WHERE/CHECK (scalar Expr LHS of a comparison) — sql_expr_pred_test
+- [x] J2 expression / JSON-path index `((expr))` (functional index over a computed key) — sql_expr_index_test
+- [x] J3 array-element GIN index `USING GIN` (membership over array columns) — sql_array_gin_test
+- [x] DROP CONSTRAINT by name (drop FK/UNIQUE/CHECK by name; NamedConstraint registry) — sql_drop_constraint_test
+- [x] JSON `@>` containment + `#>`/`#>>` path ops + `json_agg` — sql_json_ops_test
+- [x] INTERVAL months/years (logical month-interval, 12-month logical year; calendar add) — sql_interval_month_test
+- [x] UINT256 (logical 13; 32-byte big-endian payload; crypto-scale beyond 128-bit) — sql_uint256_test
+- [x] secondary / composite / partial / merge indexes + ANALYZE stats + cost-based planning — sql_index_test, sql_analyze_test
+- [ ] D3 FROM-subquery (derived tables) · D4 CTE / `WITH` — the remaining single-node gaps
+
+## Distributed SQL (DistributedSql.hpp — scatter/gather over M shards)
+A coordinator fans a statement across shards and merges results byte-identically to a
+single node holding all rows (gate: tests/sql_distributed_test.cpp). DDL broadcasts;
+INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + merge.
+- [x] scatter-gather aggregates + GROUP BY merge (COUNT/SUM/MIN/MAX recombine; re-sorted)
+- [x] co-located-shuffle STAR-JOIN pushdown — fact aggregated by the join key ON EACH SHARD,
+      per-key partials merged, tiny dim gathered + rolled up; the large fact is NEVER gathered
+- [x] WHERE pushdown — split a pure-AND filter into fact-side (per-shard) + dim-side (dim gather)
+- [x] AVG pushdown — SUM/COUNT split, divided at the coordinator
+- [x] HAVING — coordinator post-filter on rolled-up groups (+ scatter-path single-table HAVING fix)
+- [x] COUNT(DISTINCT) global shuffle — ship distinct (group,value) tuples, dedup at coordinator
+- [x] multi-dimension star (1 fact + N dims; composite join key; snowflake chains → gather)
+- [x] broadcast-dim join — a replicated dim (set_replicated → writes broadcast) joined per-shard,
+      partial group aggregates merged (better when the join key has ≫ more values than #groups)
+- [ ] open: SUM/AVG(DISTINCT) shuffle (only COUNT shuffles now) · true snowflake (dim→dim) ·
+      projection broadcast-join + global ORDER BY merge-sort · cost-based pushdown-vs-broadcast choice

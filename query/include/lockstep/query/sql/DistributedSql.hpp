@@ -10,9 +10,12 @@
 //     aggregates recombine by kind (COUNT/COUNT(*) -> Σ, SUM -> Σ, MIN -> min, MAX -> max), the
 //     final groups re-sorted by the group key to match single-node order.
 //
-// Scope: distributed AVG (needs sum+count, not the averaged value) and distributed JOIN are
-// rejected (a larger follow-on). A plain projection scan's GLOBAL row order needs a merge-sort
-// (each shard is locally pk-ordered) — also a follow-on; aggregates + point ops are exact here.
+// Scope: distributed JOIN is supported via a co-located-shuffle star-join pushdown (the fact is
+// aggregated by the join key on each shard, never gathered) with WHERE / AVG (sum+count split) /
+// HAVING / COUNT(DISTINCT)-shuffle / multi-dimension / broadcast-dim (replicated dim) variants;
+// anything outside those shapes falls back to gather-and-run. Single-table distributed AVG (no
+// SUM/COUNT to split) is still rejected, as is DISTINCT SUM/AVG. A plain projection scan's GLOBAL
+// row order needs a merge-sort (each shard is locally pk-ordered) — still a follow-on.
 //
 // Verified by tests/sql_distributed_test.cpp: the SAME workload over M shards yields results
 // BYTE-IDENTICAL to one SqlEngine holding all the rows.

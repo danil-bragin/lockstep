@@ -1,5 +1,14 @@
 # Lockstep — Master Execution Plan (v2, complete)
 
+> **HISTORICAL — founding plan (pre-code, 2026-06-21).** The architecture (D1/D2/D5),
+> the cardinal rules (§4), and the verification doctrine (§6) remain accurate and
+> load-bearing. Three scope decisions have since been **superseded**: D3 ("non-SQL read
+> surface") — a 30+ feature SQL surface was built; D4 ("columnar out of scope") — a
+> columnar storage + vectorized analytic engine exists; and the §7 roadmap ceiling
+> (Phase 7) — Phases 8–9 (perf, multi-shard, io_uring, replicated + cross-shard) plus
+> TLS/RBAC and distributed SQL all shipped beyond it. Current state lives in `README.md`,
+> `specs/`, and `query/sql/SQL_FEATURES_PLAN.md`; this doc is kept as the origin record.
+
 > Working name: **Lockstep** (rename = find-replace one token).
 > This document supersedes the earlier draft. It is self-contained and built for the operating model below:
 > **AI agents write all code. The human writes nothing — they architect, specify, and gate.** Read §2 and §4 before any task.

@@ -28,15 +28,21 @@ rows the DuckDB gap is smaller (scan_agg 0.79×); DuckDB/ClickHouse scale better
   show a ~1 ms floor, so ClickHouse's true (faster) times are UNDER-reported for the small queries
   (e.g. zone_skip's "1.4× Lockstep faster" is an artifact of the floor). Treat ClickHouse cells as
   an upper bound on its time. DuckDB + SQLite are in-process (accurate); Postgres is EXPLAIN ANALYZE.
-- Single CPU (`--cpuset-cpus=0` / `taskset`, ClickHouse/DuckDB forced 1 thread). Lockstep's multi-shard
-  parallelism is NOT used — morsel parallelism is the open multi-core lever.
+- Single CPU (`--cpuset-cpus=0` / `taskset`, ClickHouse/DuckDB forced 1 thread). This run is serial
+  (no `workers` arg). Morsel parallelism is NO LONGER an open lever — it shipped
+  (`ProdParallelExecutor`, `lockstep_analytics N iters WORKERS`); this comparison just doesn't pass it.
 - In-memory, no secondary indexes (raw analytical scan/aggregate). Filter columns NOT NULL (so
   Lockstep's vectorized + zone-skip fast paths apply). Data generated from one formula on all sides.
 
 **Takeaway.** Lockstep beats mature single-node ROW stores on analytics by a wide margin (the
 project's "beat Postgres" goal — met 5–60×), and is in the same order of magnitude as the dedicated
-COLUMNAR engines, trailing them mainly on GROUP BY (their full vectorized hash-aggregate) — the
-documented next lever.
+COLUMNAR engines.
+
+> **Note (this snapshot predates the GROUP BY overhaul).** The "trailing on GROUP BY — the next
+> lever" framing and the `groupby_*` cells above were measured before the columnar one-pass hash-
+> aggregate landed (aggregate fusion + one-pass INT/TEXT, dense dict-code path; commits `8fbf176`,
+> `8b75215`, `0aa5bb2`, `e2ffc68`; 1.6–4.7× and byte-identical). A re-run at 1M against the current
+> columnar GROUP BY is the outstanding refresh; the methodology below is unchanged.
 
 Reproduce: `bench/compare/sql_analytics/run_analytics.sh 1000000 20` (docker + lockstep-dev +
 postgres:16 + clickhouse/clickhouse-server:24.8 + a python image with duckdb).

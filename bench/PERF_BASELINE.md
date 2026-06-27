@@ -1049,16 +1049,14 @@ is gone. **BUILD-N before/after (build-only, best-of-n, Release):**
 The quadratic CURVE is flattened: the BEFORE column blows up ~6×/doubling and hangs at
 N=4000; the AFTER column is dominated by the residual below.
 
-**RESIDUAL FLAG (storage, PROTECTED — not changed here).** The AFTER build-only curve still
-grows ~3.8×/doubling (≈O(N^1.9)): N=4000 0.14s → 8000 0.49s → 16000 1.88s → 32000 7.38s.
-This is **not** the SQL re-submit (that is gone) — it is the `storage::WalEngine` memtable
-doing a **LINEAR scan over keys** on every `get`/insert (`WalEngine.hpp` `find` /
-`versions_for`: *"keys_ sorted ⇒ a binary search would do; a linear scan is fine + clear"*),
-so each point-get + each apply is O(N) keys ⇒ a residual O(N^2). It is **pre-existing**,
-affects EVERY query workload (not introduced by this stage), and lives in the **protected,
-verified** storage dir. Per the brief (prefer SQL-layer; FLAG any storage/Database change)
-it is **FLAGGED, not touched**. A binary-search / map lookup in the memtable would make the
-SQL build genuinely O(N log N) — a future storage stage with the full methodology.
+**RESIDUAL FLAG (storage) — RESOLVED (commits `284a6d2`, `9d7e009`, `707dc8c`).** At the time
+of this snapshot the AFTER build-only curve still grew ~3.8×/doubling (≈O(N^1.9)): N=4000 0.14s →
+8000 0.49s → 16000 1.88s → 32000 7.38s, because the `storage::WalEngine` memtable did a **LINEAR
+scan over keys** on every `get`/insert. That was the flagged next storage lever — and it was
+subsequently taken: the memtable became a `std::lower_bound`-searched sorted structure and then an
+ordered `std::map` (O(log N) get/insert, no shift), and the bulk-load O(N²) version-count check
+became O(1). A namespace-aware selective flush (`7ea3801`) then bounds the row/index memtable via
+the SSTable LSM. The linear-scan / O(N²)-build numbers above are a historical pre-fix snapshot.
 
 ## Fix 2 — LAZY / PROJECTED scan decode (skip unreferenced columns)
 
@@ -1120,9 +1118,9 @@ LOCKSTEP_SQL_SEEDS=300 build/sqlopt/tests/lockstep_sql_conformance_test
 - **The headline win is the write path** (~460× at N=2000, the quadratic flattened). The
   lazy-decode win is proven on the decode step (~2×) but is **secondary / masked** end-to-end
   by the storage scan cost — reported honestly, not inflated.
-- **The residual near-quadratic is storage (protected) — FLAGGED, not fixed**: the WalEngine
-  memtable linear-scan lookup. Fixing it (binary search) is the next lever and needs the full
-  verified-dir methodology.
+- **The residual near-quadratic was storage (protected) — since RESOLVED**: the WalEngine
+  memtable linear-scan lookup was flagged here as the next lever, then fixed (binary search →
+  `std::map`; commits `284a6d2` / `9d7e009`), so this residual no longer applies.
 
 # SQL-INDEXES — secondary-index access path (O(N) full scan → O(log N + matches))
 

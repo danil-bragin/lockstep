@@ -48,9 +48,11 @@ that govern how C++ is written in this repo, plus the supporting conventions.
   `explicit` constructors. Rule of zero: let the compiler generate special
   members; if you write one, you justify all of them.
 
-Enforced by: `cmake/Warnings.cmake` (`-Wall -Wextra -Werror -Wpedantic`), the
-`cppcoreguidelines-*` / `modernize-*` clang-tidy families, and the sanitizer
-matrix (ASan/TSan/UBSan/MSan).
+Enforced by: `cmake/Warnings.cmake` (`-Wall -Wextra -Werror -Wpedantic`, with one
+suppression — `-Wno-missing-field-initializers`, since designated-init that omits
+trailing fields is idiomatic here and the omitted fields use their in-struct
+defaults), the `cppcoreguidelines-*` / `modernize-*` clang-tidy families, and the
+sanitizer matrix (ASan/TSan/UBSan/MSan).
 
 ---
 
@@ -103,7 +105,8 @@ byte-identical trace) from Phase 1 on.
   `clang-format -i` before committing.
 - **Errors.** Fallible operations return the shared `Error` type
   (`<lockstep/core/Error.hpp>`), not exceptions across the abstraction boundary.
-- **The lint-exempt zone is `providers/` only** (cardinal rule 1). Every other
-  directory is scanned by the forbidden-call lint; nondeterministic primitives
-  (clock/network/disk/random/threads) are permitted **only** inside provider
-  implementations, behind the interface headers.
+- **The lint-exempt zone is `providers/`** (cardinal rule 1; plus
+  `tools/lint/fixtures/`, the deliberately-dirty test fixtures, so the lint's own
+  tests don't self-trip). Every other directory is scanned by the forbidden-call
+  lint; nondeterministic primitives (clock/network/disk/random/threads) are
+  permitted **only** inside provider implementations, behind the interface headers.

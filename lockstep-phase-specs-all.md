@@ -1,5 +1,11 @@
 # Lockstep — Detailed Phase Specs (Phases 0–7)
 
+> **HISTORICAL — accurate spec of Phases 0–7, but not a current-state map.** The project
+> continued past this document: Phases 8–9 (perf, multi-shard, io_uring, replicated +
+> cross-shard txns), a 30+ feature SQL surface (C6.x's "non-SQL" framing was superseded),
+> SQL-over-wire, columnar storage, TLS/RBAC, and distributed SQL all shipped. Do not read
+> the Phase-7 ceiling as the project ceiling. Current state: `README.md`, `specs/`, MEMORY.
+
 > Companion to `lockstep-master-plan.md`. Each phase is a ticket at the depth agents execute against.
 > Operating model: **agents write all code; trust comes from mechanical verification, not human review.**
 > Universal merge gate (every PR, every phase): compiles → lint + static analysis + ASan/TSan/UBSan/MSan →

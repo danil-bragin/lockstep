@@ -260,7 +260,8 @@ fix the test (or accept + document the gap), then re-run.
 
 ### Same-tick timer ordering — gap closed (`tests/scheduler_timer_order_test.cpp`)
 
-A mutation survived at `core/include/lockstep/core/Scheduler.hpp:238`, the timer
+A mutation survived at `core/include/lockstep/core/Scheduler.hpp` (the `due_now[b-1]`
+timer insertion-sort, ~line 265), the timer
 insertion-sort that orders timers due at the **same virtual tick** by `arm_seq`.
 The Phase-1 determinism suite never armed **multiple timers due at the same tick**
 and pinned their fire order, so any bug in that ordering went undetected — the
@@ -271,7 +272,7 @@ every *observable* same-tick-ordering mutation of that line — `ROR >`→`<=`,
 `LCR &&`→`||`, `AOR -`→`+`, `NEG` — each of which corrupts the fire order or trips
 the scheduler's own assertions / the suite's liveness ceiling.
 
-### Documented EQUIVALENT mutant: `Scheduler.hpp:238 ABS '1'->'0'`
+### Documented EQUIVALENT mutant: `Scheduler.hpp due_now[b-1] ABS '1'->'0'`
 
 The specific survivor the suite still reports — `due_now[b - 1]` → `due_now[b -
 0]` — is a **proven equivalent mutant** through the scheduler's public surface,
