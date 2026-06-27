@@ -549,6 +549,8 @@ public:
     // (row,column) in the 'c' namespace). Existing tables are unaffected. A/B + the
     // columnar conformance gate run the SAME workload with this on vs off.
     void set_columnar_default(bool v) { columnar_default_ = v; }
+    // I4 TEST: did the most recent join take the index nested-loop fast path?
+    [[nodiscard]] bool last_join_used_index_nl() const { return last_join_index_nl_; }
 
     // Auto-flush a columnar table once its delta exceeds `rows` live writes (0 = off,
     // manual flush only). Makes columnar self-managing — no explicit flush_columnar needed.
@@ -5772,8 +5774,16 @@ private:
         // materializing the joined AoS row set (the ~100ms cost for a 500k-row join). Returns
         // nullopt to fall back to the general AoS join below; the columnar==row-mode JOIN
         // conformance gate cross-checks it byte-identical (row-mode takes the AoS path).
+        last_join_index_nl_ = false;  // I4 test signal (reset per join)
         if (auto fused = try_fused_join_aggregate(sel)) {
             return std::move(*fused);
+        }
+        // I4: index nested-loop — a 2-table INNER equi-join whose INNER table is indexed on the join
+        // key. Scan the outer; probe the inner's index per outer row (no inner full scan). Produces
+        // the SAME joined rows as the hash path (left-major, inner matches PK-ascending), so the
+        // result is byte-identical (the join conformance gate proves it).
+        if (auto nl = try_index_nl_join(sel)) {
+            return std::move(*nl);
         }
         // (0) Validate aliases unique + tables exist; build the joined schema.
         JoinSchema schema;
@@ -5820,23 +5830,87 @@ private:
             acc = std::move(next);
         }
 
-        // (2) WHERE — filter the joined rows by the general predicate (three-valued:
-        // a row is kept iff the predicate evaluates TRUE; NULL/UNKNOWN drops it).
+        return finish_joined(sel, schema, acc);
+    }
+
+    // I4: index nested-loop join fast path. 2-table INNER equi-join where the INNER (from[1]) is a
+    // row-mode table with a single/leading-column index on the join key. Scans the OUTER once and
+    // index-probes the inner per outer row (no inner full scan); returns nullopt to fall back to the
+    // general AoS join. The joined-row order (outer-major, inner matches PK-ascending) is identical to
+    // hash_join's, so finish_joined yields a byte-identical result.
+    [[nodiscard]] std::optional<ExecResult> try_index_nl_join(const SelectStmt& sel) {
+        if (sel.from.size() != 2 || sel.from[1].kind != JoinKind::Inner) return std::nullopt;
+        if (sel.from[0].alias == sel.from[1].alias) return std::nullopt;  // self-join: general path
+        const Table* outer = catalog_.find(sel.from[0].table);
+        const Table* inner = catalog_.find(sel.from[1].table);
+        if (outer == nullptr || inner == nullptr || inner->columnar) return std::nullopt;
+        // Build the joined schema (outer cols then inner cols) — same layout as exec_select_joined.
+        JoinSchema schema;
+        for (const Column& c : outer->columns)
+            schema.cols.push_back(JoinColumn{sel.from[0].alias, c.name, c.type, c.logical, c.scale});
+        schema.alias_span.emplace(sel.from[0].alias, std::make_pair(std::size_t{0}, outer->columns.size()));
+        const std::size_t in_lo = schema.cols.size();
+        for (const Column& c : inner->columns)
+            schema.cols.push_back(JoinColumn{sel.from[1].alias, c.name, c.type, c.logical, c.scale});
+        schema.alias_span.emplace(sel.from[1].alias, std::make_pair(in_lo, schema.cols.size()));
+        // The ON must be a single equi key resolvable to (outer col, inner col).
+        std::optional<std::pair<std::size_t, std::size_t>> equi;
+        if (!sel.from[1].on.present() || detect_equi_key(sel.from[1].on, schema, sel.from[1].alias, equi))
+            return std::nullopt;
+        if (!equi) return std::nullopt;
+        const std::size_t outer_col = equi->first;            // flat schema idx (in the outer span)
+        const std::size_t inner_local = equi->second - in_lo;  // inner table local column
+        if (equi->first >= in_lo) return std::nullopt;         // expect (outer, inner) orientation
+        // The inner must have a single/leading-column index on the join column (eq lookup).
+        const Index* ix = inner->index_for_column(inner_local);
+        if (ix == nullptr || ix->columns.empty() || ix->columns[0] != inner_local) return std::nullopt;
+
+        last_join_index_nl_ = true;  // TEST signal: the index-NL path was taken
+        // Scan the outer once; probe the inner index per outer row.
+        std::vector<std::vector<Datum>> orows;
+        if (auto e = scan_table(*outer, sel, orows)) return ExecResult::failure(*e);
+        const std::vector<bool> in_need(inner->columns.size(), true);
+        std::vector<std::vector<Datum>> acc;
+        for (const auto& orow : orows) {
+            const Datum& key = orow[outer_col];
+            if (key.is_null) continue;  // a NULL join key matches nothing (SQL)
+            IndexPlan plan;
+            plan.index = ix;
+            plan.is_eq = true;
+            plan.eq = key;
+            plan.eq_prefix.push_back(key);
+            std::vector<std::vector<Datum>> matches;
+            if (auto e = read_via_index(*inner, sel, plan, in_need, matches)) return ExecResult::failure(*e);
+            for (auto& m : matches) {
+                // The index entry's leading column equals the encoded key; a TEXT/logical key could
+                // collide on encoding only if equal, but guard with an exact compare for safety.
+                if (cmp_datum(m[inner_local], key) != 0) continue;
+                std::vector<Datum> jr(schema.cols.size(), Datum{});
+                place(schema, sel.from[0].alias, orow, jr);
+                place(schema, sel.from[1].alias, m, jr);
+                acc.push_back(std::move(jr));
+            }
+        }
+        return finish_joined(sel, schema, acc);
+    }
+
+    // The post-COMBINE pipeline shared by the general join and the I4 index-NL fast path: (2) WHERE
+    // over the joined rows, then (3) GROUP/AGGREGATE/HAVING or a plain projection (+ DISTINCT/ORDER/
+    // LIMIT inside those). `acc` is the joined AoS row set in the deterministic left-major order.
+    [[nodiscard]] ExecResult finish_joined(const SelectStmt& sel, const JoinSchema& schema,
+                                           std::vector<std::vector<Datum>>& acc) {
+        // (2) WHERE — keep a row iff the predicate is TRUE (NULL/UNKNOWN drops it).
         if (sel.filter.present()) {
             std::vector<std::vector<Datum>> kept;
             for (auto& jr : acc) {
                 bool truth = false;
-                if (auto e = eval_pred_joined(sel.filter, sel.filter.root, schema, jr,
-                                              truth)) {
+                if (auto e = eval_pred_joined(sel.filter, sel.filter.root, schema, jr, truth)) {
                     return ExecResult::failure(*e);
                 }
-                if (truth) {
-                    kept.push_back(std::move(jr));
-                }
+                if (truth) kept.push_back(std::move(jr));
             }
             acc = std::move(kept);
         }
-
         // (3) GROUP/AGGREGATE/HAVING, else plain projection; then DISTINCT/ORDER/LIMIT.
         if (sel.has_aggregates || !sel.group_by.empty()) {
             return exec_aggregate_joined(sel, schema, acc);
@@ -8381,6 +8455,7 @@ private:
     std::uint64_t next_txn_id_ = 1;
     PlanStats* plan_stats_ = nullptr;  // non-null during an EXPLAIN ANALYZE run
     bool vectorize_ = true;            // vectorized filter fast path (test-toggleable)
+    bool last_join_index_nl_ = false;  // I4: set when a join took the index nested-loop path
     bool columnar_default_ = false;    // new tables use the columnar layout when set
     bool group_commit_ = false;        // defer write fsync; caller sync()s the burst once
     bool gs_mode_ = false;             // C2: inside a GROUPING SETS sub-run (NULL-out non-set cols)
