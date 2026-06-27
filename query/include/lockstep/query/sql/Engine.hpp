@@ -4094,14 +4094,15 @@ private:
             return std::nullopt;
         };
         // ONE-PASS INT-KEY HASH-AGGREGATE: a single PLAIN-INT NOT NULL group key + every aggregate
-        // fusable (SUM/MIN/MAX/AVG/COUNT over INT NOT NULL) or COUNT(*), no filter, no HAVING. The
-        // dominant GROUP BY cost is the grouping pass (1M idx-vector appends) + the scattered fold
-        // gather; this accumulates each group's {count, per-column IntFold} DIRECTLY in one sequential
-        // pass — no idx vectors, no gather. Output sorted by key (== the byte-identical group order).
+        // fusable (SUM/MIN/MAX/AVG/COUNT over INT NOT NULL) or COUNT(*), no HAVING. The WHERE (if any)
+        // is evaluated INLINE per row (no materialized mask) — for a GROUPED aggregate the win is
+        // avoiding the per-group idx-vector appends + the scattered fold gather, which dominates here
+        // (unlike the ungrouped scalar case, where the two tight SIMD passes win). One sequential pass
+        // accumulates each group's {count, per-column IntFold} DIRECTLY. Output sorted by key.
         const bool would_parallelize =
             parallel_executor_ != nullptr && parallel_executor_->workers() > 1 &&
             static_cast<std::int64_t>(count) >= kParallelMinRows;
-        if (!has_filter && !has_having && !gs_mode_ && !would_parallelize && gcols.size() == 1 &&
+        if (!has_having && !gs_mode_ && !would_parallelize && gcols.size() == 1 &&
             t.columns[gcols[0]].type == Type::Int && t.columns[gcols[0]].logical == 0 &&
             !t.columns[gcols[0]].nullable) {
             bool all_ok = true;
@@ -4130,6 +4131,7 @@ private:
                     slots[p] = gi;
                 };
                 for (std::uint32_t r = 0; r < count; ++r) {
+                    if (has_filter && !passes(r)) continue;  // inline WHERE — no idx vectors, no gather
                     const std::int64_t k = gk[r];
                     std::size_t p = H(k) & (cap - 1);
                     std::int32_t gi = -1;
