@@ -183,6 +183,26 @@ int main() {
           "all 9 star-schema queries (base + 3 WHERE + 2 AVG + 3 HAVING) took the pushdown path, "
           "not the gather fallback (got " + std::to_string(dist.pushdowns() - pd_before) + ")");
 
+    // ---- DISTINCT-aggregate GLOBAL SHUFFLE: COUNT(DISTINCT) merged across shards ----
+    const std::size_t ds_before = dist.distinct_shuffles();
+    const std::vector<std::string> distinct_queries = {
+        // COUNT(DISTINCT col) + GROUP BY -> the global-distinct SHUFFLE (ships distinct tuples).
+        "SELECT cat, COUNT(DISTINCT region) FROM t GROUP BY cat",
+        "SELECT region, COUNT(DISTINCT cat) FROM t GROUP BY region",
+        // SUM(DISTINCT) and scalar COUNT(DISTINCT) -> gather fallback (still byte-identical).
+        "SELECT cat, SUM(DISTINCT amount) FROM t GROUP BY cat",
+        "SELECT COUNT(DISTINCT region) FROM t",
+    };
+    for (const std::string& q : distinct_queries) {
+        const std::string s = render(solo.exec(q));
+        const std::string d = render(dist.exec(q));
+        check(s == d, "DISTINCT distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" +
+                          d + "]");
+    }
+    check(dist.distinct_shuffles() - ds_before == 2,
+          "the 2 COUNT(DISTINCT)+GROUP BY queries took the shuffle path; SUM(DISTINCT)/scalar "
+          "gathered (got " + std::to_string(dist.distinct_shuffles() - ds_before) + ")");
+
     // Distributed AVG is explicitly rejected (can't merge an averaged value across shards).
     const ExecResult avg = dist.exec("SELECT AVG(amount) FROM t");
     check(!avg.ok && avg.error.find("AVG") != std::string::npos,

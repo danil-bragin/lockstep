@@ -156,6 +156,16 @@ private:
         if (sel.has_aggregates && sel.having.present()) {
             return gather_and_run(sql, {sel.table});
         }
+        // DISTINCT aggregate: a per-shard partial can't be merged (a value on two shards would be
+        // counted/summed twice). Ship the DISTINCT (group, value) tuples and dedup globally (a true
+        // shuffle) for the common single-DISTINCT shape; gather-and-run (correct) for anything else.
+        if (sel.has_aggregates && has_distinct_agg(sel)) {
+            if (auto shuffled = try_distinct_shuffle(sel)) {
+                ++distinct_shuffles_;
+                return std::move(*shuffled);
+            }
+            return gather_and_run(sql, {sel.table});
+        }
         std::vector<ExecResult> parts;
         parts.reserve(shards_.size());
         for (ISqlShard* s : shards_) {
@@ -164,6 +174,101 @@ private:
         }
         if (sel.has_aggregates) return merge_aggregate(parts, sel);
         return merge_scan(parts, sel);  // unordered projection scan: concat (order unspecified)
+    }
+
+    [[nodiscard]] static bool has_distinct_agg(const SelectStmt& sel) {
+        for (const SelectItem& it : sel.items) {
+            if (it.kind != SelectItemKind::Column && it.agg.distinct) return true;
+        }
+        return false;
+    }
+
+    // GLOBAL-DISTINCT SHUFFLE for a single-table COUNT(DISTINCT col) with GROUP BY: scatter the
+    // DISTINCT (group-cols, value) tuples, UNION them at the coordinator (cross-shard dedup), then
+    // count the per-group distinct value SET. Only distinct tuples cross the network — a value
+    // present on K shards ships K times (deduped here) instead of every row. Byte-identical to
+    // single-node COUNT(DISTINCT) (which SKIPS NULL — we skip null values too).
+    //
+    // Returns nullopt (caller falls back to gather-and-run, correct for every shape) unless it fits:
+    // single table, GROUP BY present, items are GROUP BY cols + EXACTLY ONE COUNT(DISTINCT col), no
+    // other aggregate, no WHERE, no HAVING. SUM/AVG(DISTINCT) and scalar (no GROUP BY) go to gather
+    // (they need typed-NULL / int-only handling the coordinator can't prove here).
+    std::optional<ExecResult> try_distinct_shuffle(const SelectStmt& sel) {
+        if (sel.filter.present() || sel.having.present()) return std::nullopt;
+        if (sel.group_by.empty()) return std::nullopt;  // scalar -> gather (empty-table rendering)
+        std::vector<std::string> gcols;
+        for (const std::string& gc : sel.group_by) {
+            std::string q;
+            std::string c;
+            split_qual(gc, q, c);
+            gcols.push_back(c);
+        }
+        const AggExpr* da = nullptr;
+        for (const SelectItem& it : sel.items) {
+            if (it.kind == SelectItemKind::Column) {
+                bool grouped = false;
+                for (const std::string& g : gcols) if (g == it.column) grouped = true;
+                if (!grouped) return std::nullopt;
+            } else {
+                const AggExpr& a = it.agg;
+                if (!a.distinct || a.kind != AggKind::Count || a.column.empty()) return std::nullopt;
+                if (da != nullptr) return std::nullopt;  // >1 distinct aggregate -> gather
+                da = &a;
+            }
+        }
+        if (da == nullptr) return std::nullopt;
+        // Scatter the distinct (gcols, col) tuples (each shard's local DISTINCT via GROUP BY).
+        std::string proj;
+        std::string group;
+        for (const std::string& g : gcols) { proj += g + ", "; group += g + ", "; }
+        proj += da->column;
+        group += da->column;
+        const std::string tuple_sql =
+            "SELECT " + proj + " FROM " + sel.table + " GROUP BY " + group;
+        struct Grp { std::vector<Datum> gkey; std::map<std::string, char> vals; };
+        std::map<std::string, Grp> groups;
+        for (ISqlShard* s : shards_) {
+            ExecResult part = s->exec(tuple_sql);
+            if (!part.ok) return std::nullopt;
+            for (const ResultRow& row : part.rows) {
+                if (row.cells.size() != gcols.size() + 1) return std::nullopt;
+                std::string gk;
+                std::vector<Datum> gkey;
+                gkey.reserve(gcols.size());
+                for (std::size_t j = 0; j < gcols.size(); ++j) {
+                    gk += row.cells[j].second.render();
+                    gk.push_back('\x1f');
+                    gkey.push_back(row.cells[j].second);
+                }
+                const Datum& val = row.cells[gcols.size()].second;
+                Grp& grp = groups[gk];
+                if (grp.gkey.empty()) grp.gkey = std::move(gkey);
+                if (!val.is_null) grp.vals.emplace(val.render(), 0);  // COUNT(DISTINCT) SKIPS NULL
+            }
+        }
+        std::vector<const Grp*> ordered;
+        ordered.reserve(groups.size());
+        for (const auto& [k, g] : groups) { (void)k; ordered.push_back(&g); }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const Grp* a, const Grp* b) { return key_less(a->gkey, b->gkey); });
+        ExecResult r;
+        for (const Grp* g : ordered) {
+            ResultRow out;
+            for (const SelectItem& it : sel.items) {
+                if (it.kind == SelectItemKind::Column) {
+                    std::size_t gi = 0;
+                    for (std::size_t k = 0; k < gcols.size(); ++k)
+                        if (gcols[k] == it.column) { gi = k; break; }
+                    out.cells.emplace_back(it.label, g->gkey[gi]);
+                } else {
+                    out.cells.emplace_back(it.label,
+                                           Datum::make_int(static_cast<std::int64_t>(g->vals.size())));
+                }
+            }
+            r.rows.push_back(std::move(out));
+        }
+        r.affected = r.rows.size();
+        return r;
     }
 
     static std::string agg_name(AggKind k) {
@@ -750,9 +855,11 @@ private:
     std::map<std::string, std::string> pk_;          // table -> PK column (for INSERT routing)
     std::map<std::string, std::string> create_sql_;  // table -> CREATE (to rebuild a local copy)
     std::size_t pushdowns_ = 0;  // star-schema pushdowns taken (vs the gather fallback)
+    std::size_t distinct_shuffles_ = 0;  // global-distinct shuffles taken (vs the gather fallback)
 
 public:
     [[nodiscard]] std::size_t pushdowns() const { return pushdowns_; }
+    [[nodiscard]] std::size_t distinct_shuffles() const { return distinct_shuffles_; }
 };
 
 }  // namespace lockstep::query::sql
