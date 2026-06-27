@@ -233,6 +233,7 @@ public:
     // observable key order + MVCC version lists are byte-identical (V-DET unaffected).
     void insert(const Key& key, Seq seq, Value value, bool tombstone, bool vlog = false) {
         map_[key].push_back(Version{seq, std::move(value), tombstone, vlog});
+        ++total_versions_;  // running count: version_count() is O(1), not an O(N) scan per put
     }
 
     // MVCC read: newest version of key with seq <= at; ∅ if none or it is a
@@ -286,17 +287,15 @@ public:
         return hit_from(it->second, at);
     }
 
-    void clear() { map_.clear(); }
-
-    // Total version count across all keys (the flush-threshold metric).
-    [[nodiscard]] std::size_t version_count() const noexcept {
-        std::size_t n = 0;
-        for (const auto& [k, versions] : map_) {
-            (void)k;
-            n += versions.size();
-        }
-        return n;
+    void clear() {
+        map_.clear();
+        total_versions_ = 0;
     }
+
+    // Total version count across all keys (the flush-threshold metric) — O(1) via a running counter
+    // (it is checked on EVERY put, so an O(N) scan here makes a bulk load O(N^2) once LSM flushing
+    // is on; the counter keeps the threshold check O(1)).
+    [[nodiscard]] std::size_t version_count() const noexcept { return total_versions_; }
 
     [[nodiscard]] bool empty() const noexcept { return map_.empty(); }
 
@@ -306,6 +305,7 @@ public:
 
 private:
     std::map<Key, Versions> map_;  // sorted by key; each version list Seq-ascending
+    std::size_t total_versions_ = 0;  // running Σ versions (version_count() O(1))
 };
 
 // ---------------------------------------------------------------------------
