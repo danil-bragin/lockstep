@@ -84,6 +84,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -234,6 +235,26 @@ public:
     void insert(const Key& key, Seq seq, Value value, bool tombstone, bool vlog = false) {
         map_[key].push_back(Version{seq, std::move(value), tombstone, vlog});
         ++total_versions_;  // running count: version_count() is O(1), not an O(N) scan per put
+        if (!is_resident(key)) {
+            ++flushable_versions_;  // versions of FLUSH-ELIGIBLE keys (the threshold metric)
+        }
+    }
+
+    // SELECTIVE FLUSH (columnar/LSM composition): mark a leading key-byte as
+    // "keep-resident" — versions of any key starting with `b` are NEVER flushed to
+    // an SSTable; the higher layer (the SQL columnar engine) manages those key
+    // namespaces ('B'/'M'/'R'/'T'/'Z'/'d' block/overlay/delta) itself, doing its own
+    // bulk rewrites, so LSM-flushing them only churns. With NO byte marked resident
+    // (the default) every key is flushable and the flush is the original
+    // whole-memtable flush (byte-identical). Set before the first insert.
+    void set_resident_byte(unsigned char b) noexcept {
+        resident_[b] = true;
+        any_resident_ = true;
+    }
+    [[nodiscard]] bool any_resident() const noexcept { return any_resident_; }
+    [[nodiscard]] bool is_resident(const Key& key) const noexcept {
+        return any_resident_ && !key.empty() &&
+               resident_[static_cast<unsigned char>(key[0])];
     }
 
     // MVCC read: newest version of key with seq <= at; ∅ if none or it is a
@@ -290,12 +311,40 @@ public:
     void clear() {
         map_.clear();
         total_versions_ = 0;
+        flushable_versions_ = 0;
     }
 
-    // Total version count across all keys (the flush-threshold metric) — O(1) via a running counter
-    // (it is checked on EVERY put, so an O(N) scan here makes a bulk load O(N^2) once LSM flushing
-    // is on; the counter keeps the threshold check O(1)).
+    // Erase every FLUSH-ELIGIBLE (non-resident) key, keeping resident keys in place.
+    // Called after a selective flush: only the just-flushed (non-resident) versions
+    // leave the memtable; the columnar-managed resident namespaces stay. With no
+    // resident byte set this is exactly clear() (the whole-memtable flush —
+    // byte-identical). O(M) over the M keys (std::map node erase, no shift).
+    void erase_flushable() {
+        if (!any_resident_) {
+            clear();
+            return;
+        }
+        for (auto it = map_.begin(); it != map_.end();) {
+            if (it->first.empty() ||
+                !resident_[static_cast<unsigned char>(it->first[0])]) {
+                total_versions_ -= it->second.size();
+                it = map_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        flushable_versions_ = 0;  // every flushable key was just erased
+    }
+
+    // Total version count across all keys (compaction/GC accounting) — O(1) via a running counter.
     [[nodiscard]] std::size_t version_count() const noexcept { return total_versions_; }
+
+    // Versions of FLUSH-ELIGIBLE (non-resident) keys only — the flush-threshold metric. Without
+    // selective flush this equals version_count(). It is checked on EVERY put, so it MUST stay O(1)
+    // (an O(N) scan makes a bulk load O(N^2) once LSM flushing is on). Counting only flushable keys
+    // is what makes selective flush converge: a flush drives this back to 0, so it does NOT re-trip
+    // every put once the resident (columnar) versions alone exceed the threshold.
+    [[nodiscard]] std::size_t flushable_version_count() const noexcept { return flushable_versions_; }
 
     [[nodiscard]] bool empty() const noexcept { return map_.empty(); }
 
@@ -306,6 +355,9 @@ public:
 private:
     std::map<Key, Versions> map_;  // sorted by key; each version list Seq-ascending
     std::size_t total_versions_ = 0;  // running Σ versions (version_count() O(1))
+    std::size_t flushable_versions_ = 0;  // running Σ versions of NON-resident keys (threshold metric)
+    std::array<bool, 256> resident_{};  // leading bytes kept resident (never flushed)
+    bool any_resident_ = false;  // fast path: skip the resident check entirely when unset
 };
 
 // ---------------------------------------------------------------------------
@@ -367,6 +419,21 @@ public:
     // Set the SIZE-TIERED compaction trigger: when the LIVE SSTable count reaches
     // `n` (n>=2), the next flush merges them all into one. 0 disables compaction.
     void set_compaction_trigger(std::size_t n) noexcept { compaction_trigger_ = n; }
+
+    // SELECTIVE FLUSH: mark each leading byte in `prefixes` as keep-resident — keys
+    // in those namespaces stay in the memtable forever (never flushed to an SSTable),
+    // because a higher layer manages their bulk lifecycle (the SQL columnar engine's
+    // 'B'/'M'/'R'/'T'/'Z'/'d' blocks/overlays/delta). LSM flush then bounds ONLY the
+    // remaining (row-mode / index) keys — the actual OLTP memtable — while columnar
+    // keys behave exactly as in the no-LSM build. Recovery stays correct because, with
+    // resident keys present, WAL truncation is DISABLED (compaction never advances
+    // wal_trunc_seq_) so the full WAL replays the resident keys back (they are never
+    // SSTable-covered). Set before the first put.
+    void set_keep_resident_prefixes(std::string_view prefixes) noexcept {
+        for (const char c : prefixes) {
+            mem_.set_resident_byte(static_cast<unsigned char>(c));
+        }
+    }
 
     // Enable WiscKey LARGE-VALUE SEPARATION (C3.6): a value whose byte length is
     // STRICTLY GREATER than `threshold` is written to the value log and the LSM
@@ -843,7 +910,7 @@ private:
         // already assigned + WAL-durable-on-next-sync, so flushing now never loses
         // it. A flush failure (io fault) leaves the memtable intact — the versions
         // remain readable from memory + WAL; the next flush retries.
-        if (flush_threshold_ > 0 && mem_.version_count() > flush_threshold_) {
+        if (flush_threshold_ > 0 && mem_.flushable_version_count() > flush_threshold_) {
             co_await do_flush();
             // SIZE-TIERED COMPACTION (C3.4): once the live SSTable count reaches
             // the trigger, merge them all into one (deterministic, inline on the
@@ -903,8 +970,14 @@ private:
             }
         }
         // (1) snapshot the memtable → entries (key-asc, seq-asc — its native order).
+        // SELECTIVE FLUSH: skip keep-resident namespaces (the columnar engine manages
+        // those; flushing them only churns). With no resident byte set, every key is
+        // taken (the original whole-memtable snapshot, byte-identical).
         std::vector<SstEntry> entries;
         for (const auto& [k, versions] : mem_.entries()) {
+            if (mem_.is_resident(k)) {
+                continue;
+            }
             for (const Memtable::Version& v : versions) {
                 // Carry the WiscKey vlog flag so a separated value's POINTER (not
                 // the value) is what flushes to the SSTable (no value rewrite).
@@ -965,7 +1038,9 @@ private:
         if (SSTableLoader::parse(built.bytes, sstable_id, *reader)) {
             sstables_.push_back(std::move(reader));
         }
-        mem_.clear();  // everything was flushed (we snapshot the WHOLE memtable).
+        // Drop only the flushed (non-resident) versions; resident (columnar) keys
+        // stay. With no resident byte set this erases the whole memtable (== clear()).
+        mem_.erase_flushable();
         co_return;
     }
 
@@ -1219,7 +1294,14 @@ private:
         // reproducible from SSTables. covered_max is the max seq of the inputs we
         // just merged; the merged output covers the same [.., covered_max] (GC
         // never drops the newest-visible version). We never lower the watermark.
-        if (covered_max > wal_trunc_seq_) {
+        //
+        // SELECTIVE FLUSH: when keep-resident namespaces are active, WAL truncation is
+        // DISABLED. Resident keys are NEVER written to an SSTable, so a truncation
+        // watermark advanced past their WAL records would make recovery skip them and
+        // lose committed data. Keeping the full WAL (never truncating) lets recovery
+        // replay the resident keys back. The trade is an un-truncated (in-memory)
+        // WAL — acceptable for the in-memory default backing where recovery is rare.
+        if (covered_max > wal_trunc_seq_ && !mem_.any_resident()) {
             const std::vector<std::byte> tr =
                 encode_manifest_wal_trunc(++manifest_tip_, covered_max);
             Offset toff = 0;

@@ -834,6 +834,120 @@ void test_determinism() {
                  a.probe_reads.size());
 }
 
+// ===========================================================================
+// (F) SELECTIVE FLUSH — keep-resident namespaces NEVER flush to an SSTable; the
+//     higher layer (the SQL columnar engine) manages those keys itself. WAL
+//     truncation is DISABLED while resident keys are active, so recovery replays
+//     the full WAL and reconstructs the resident keys (which are never SSTable-
+//     covered). Flushable keys still flush + compact normally. Models the SQL
+//     columnar/LSM composition: row/index keys bound the memtable, columnar
+//     ('B'/'M'/'R'/'T'/'Z'/'d') keys stay resident.
+// ===========================================================================
+Task sel_writes(WalEngine& eng, std::uint64_t n) {
+    for (std::uint64_t i = 0; i < n; ++i) {
+        // Flushable namespace ('f'): each key written once → spills to SSTables.
+        co_await eng.put(std::string("f") + std::to_string(i),
+                         std::string("fv") + std::to_string(i));
+        // Resident namespace ('R'): 5 keys, repeatedly OVERWRITTEN → must stay in
+        // the memtable (never flushed) and survive recovery via the full WAL.
+        co_await eng.put(std::string("R") + std::to_string(i % 5),
+                         std::string("Rv") + std::to_string(i));
+    }
+    co_await eng.sync();
+    co_return;
+}
+
+Task sel_reads(WalEngine& eng, const std::vector<std::pair<Key, Value>>& ks,
+               std::vector<std::optional<Value>>& out) {
+    for (const auto& [k, v] : ks) {
+        (void)v;
+        out.push_back(co_await eng.get(k, Snapshot{eng.last_seq()}));
+    }
+    co_return;
+}
+
+void test_selective_flush_recovery() {
+    Scheduler sched;
+    SimClock clock(sched);
+    SeededRandom rng(424242);
+    DiskFaultConfig dc;  // HONEST disk (no faults) — isolates the selective-flush logic.
+    dc.latency_min = 0;
+    dc.latency_max = 0;
+    SimDisk wal(sched, clock, rng, dc);
+    SimDisk manifest(sched, clock, rng, dc);
+    VecDiskFactory factory(sched, clock, rng, dc);
+
+    // LSM with a tiny threshold + compact-at-2: flushable keys flush + compact mid-
+    // stream; resident keys are excluded from every flush.
+    WalEngine eng(sched, wal, manifest, factory, /*flush_threshold=*/4);
+    eng.set_compaction_trigger(2);
+    eng.set_keep_resident_prefixes("R");
+
+    const std::uint64_t n = 60;
+    sched.spawn(sel_writes(eng, n));
+    sched.run();
+
+    // Expected latest values (computed deterministically, no map): each 'f' key once,
+    // each 'R'<j> last written at the max i<n with i%5==j.
+    std::vector<std::pair<Key, Value>> expect;
+    for (std::uint64_t i = 0; i < n; ++i) {
+        expect.emplace_back(std::string("f") + std::to_string(i),
+                            std::string("fv") + std::to_string(i));
+    }
+    for (std::uint64_t j = 0; j < 5; ++j) {
+        std::uint64_t last = j;
+        for (std::uint64_t i = j; i < n; i += 5) {
+            last = i;
+        }
+        expect.emplace_back(std::string("R") + std::to_string(j),
+                            std::string("Rv") + std::to_string(last));
+    }
+
+    CHECK(factory.count() > 0,
+          "(F) selective flush: expected >=1 SSTable from flushable keys");
+    // WAL truncation MUST stay disabled while resident keys are active (else recovery
+    // would skip the resident keys' WAL records and lose committed data).
+    CHECK(eng.wal_trunc_seq() == lockstep::storage::kNoSeq,
+          "(F) selective flush: wal_trunc_seq must stay kNoSeq with resident keys (got %llu)",
+          static_cast<unsigned long long>(eng.wal_trunc_seq()));
+
+    // Recover a FRESH engine from the SAME backings.
+    WalEngine rec(sched, wal, manifest, factory, /*flush_threshold=*/4);
+    rec.set_compaction_trigger(2);
+    rec.set_keep_resident_prefixes("R");
+    sched.spawn([](WalEngine& e, std::size_t wl, std::size_t ml) -> Task {
+        co_await e.recover_lsm(wl, ml);
+        co_return;
+    }(rec, wal.durable_len(), manifest.durable_len()));
+    sched.run();
+
+    std::vector<std::optional<Value>> got;
+    sched.spawn(sel_reads(rec, expect, got));
+    sched.run();
+
+    std::size_t ok = 0;
+    std::size_t resident_ok = 0;
+    for (std::size_t i = 0; i < expect.size(); ++i) {
+        const bool match = got[i].has_value() && *got[i] == expect[i].second;
+        CHECK(match, "(F) selective flush recovery: key '%s' lost/wrong",
+              expect[i].first.c_str());
+        if (match) {
+            ++ok;
+            if (expect[i].first[0] == 'R') {
+                ++resident_ok;
+            }
+        }
+    }
+    CHECK(ok == expect.size(),
+          "(F) selective flush recovery: %zu/%zu keys recovered", ok, expect.size());
+    CHECK(resident_ok == 5,
+          "(F) selective flush: %zu/5 resident keys reconstructed from WAL", resident_ok);
+    std::fprintf(stderr,
+                 "[ok] (F) selective flush: %zu SSTables flushed, wal-trunc disabled, "
+                 "%zu/%zu keys recovered (%zu resident reconstructed from WAL)\n",
+                 factory.count(), ok, expect.size(), resident_ok);
+}
+
 }  // namespace
 
 int main() {
@@ -844,6 +958,7 @@ int main() {
     test_gc_safety_end_to_end();
     test_gc_live_snapshot_preserved();
     test_crash_during_compaction();
+    test_selective_flush_recovery();
     test_determinism();
     if (g_failures != 0) {
         std::fprintf(stderr, "storage_compaction_test: %d FAILURE(S)\n", g_failures);

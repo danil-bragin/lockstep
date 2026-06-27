@@ -55,6 +55,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -220,7 +221,20 @@ public:
           owned_disk_(std::make_unique<sim::SimDisk>(*sched_, *owned_clock_,
                                                      *owned_rng_, fault_free_cfg())),
           disk_(owned_disk_.get()),
-          engine_(std::make_unique<storage::WalEngine>(*sched_, *disk_)) {}
+          owned_manifest_(std::make_unique<sim::SimDisk>(*sched_, *owned_clock_,
+                                                         *owned_rng_, fault_free_cfg())),
+          owned_factory_(std::make_unique<StoreDiskFactory>(*sched_, *owned_clock_,
+                                                            *owned_rng_)),
+          engine_(std::make_unique<storage::WalEngine>(
+              *sched_, *disk_, *owned_manifest_, *owned_factory_, kFlushThreshold)) {
+        // SELECTIVE-FLUSH LSM: bound the FLUSH-ELIGIBLE (row-mode / index) memtable
+        // via SSTable flush + size-tiered compaction, while the SQL columnar
+        // namespaces stay resident (never flushed; the columnar engine manages them).
+        // This removes the std::map memtable's point-get cost on row tables without
+        // the columnar/LSM flush churn. The injected backing stays WAL+memtable-only.
+        engine_->set_compaction_trigger(kCompactionTrigger);
+        engine_->set_keep_resident_prefixes(kColumnarResident);
+    }
 
     // Injected backing: the committed query state is a durable WalEngine over the
     // caller's IDisk (a ProdDisk for real on-disk recovery, or a SimDisk for a
@@ -315,6 +329,43 @@ private:
         return dc;
     }
 
+    // SSTable disk factory for the DEFAULT in-memory backing's LSM: mints one
+    // fault-free SimDisk per sstable_id (and the vlog ids), all on the store's owned
+    // Scheduler/clock/rng so the whole engine stays single-threaded + deterministic.
+    // Disks are kept alive for the run (a manifest-referenced SSTable's backing must
+    // survive). Only the default backing uses this; the injected backing is
+    // WAL+memtable-only (no factory).
+    class StoreDiskFactory final : public storage::IDiskFactory {
+    public:
+        StoreDiskFactory(core::Scheduler& sched, core::SimClock& clock,
+                         sim::SeededRandom& rng) noexcept
+            : sched_(&sched), clock_(&clock), rng_(&rng) {}
+        storage::IDisk& disk_for(std::uint64_t id) override {
+            std::unique_ptr<sim::SimDisk>& slot = disks_[id];
+            if (!slot) {
+                slot = std::make_unique<sim::SimDisk>(*sched_, *clock_, *rng_,
+                                                      fault_free_cfg());
+            }
+            return *slot;
+        }
+
+    private:
+        core::Scheduler* sched_;
+        core::SimClock* clock_;
+        sim::SeededRandom* rng_;
+        std::map<std::uint64_t, std::unique_ptr<sim::SimDisk>> disks_;
+    };
+
+    // Default-backing LSM tuning. flush_threshold bounds the FLUSH-ELIGIBLE (row-mode
+    // / index) memtable; columnar namespaces stay resident (see kColumnarResident).
+    static constexpr std::size_t kFlushThreshold = 50'000;
+    static constexpr std::size_t kCompactionTrigger = 4;
+    // Leading bytes of the SQL columnar block/overlay/delta namespaces (Catalog.hpp:
+    // 'B' blocks, 'M' overlay manifest, 'R' overlay runs, 'T' overlay tombstones,
+    // 'Z' zone map, 'd' row delta, 'c' reserved). The columnar engine bulk-manages
+    // these; LSM-flushing them only churns, so they are kept resident.
+    static constexpr std::string_view kColumnarResident = "BMRTZdc";
+
     core::Task apply_task(const txn::WriteSet& ws) {
         for (const auto& [k, v] : ws) {
             if (v == delete_sentinel()) {
@@ -372,6 +423,11 @@ private:
     std::unique_ptr<sim::SeededRandom> owned_rng_;
     std::unique_ptr<sim::SimDisk> owned_disk_;
     core::IDisk* disk_;
+    // Default-backing LSM only (null for the injected backing). Declared BEFORE
+    // engine_ so member-init order constructs the manifest disk + SSTable factory
+    // before the engine that references them.
+    std::unique_ptr<sim::SimDisk> owned_manifest_;
+    std::unique_ptr<StoreDiskFactory> owned_factory_;
     std::unique_ptr<storage::WalEngine> engine_;
 
     // prefix p -> engine Snapshot Seq after applying the first p write-sets.
