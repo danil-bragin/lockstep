@@ -37,12 +37,12 @@ int main() {
     col.set_columnar_default(true);
     col.set_vectorize(true);
     for (SqlEngine* e : {&col, &row}) {
-        e->exec("CREATE TABLE t (id INT, g INT NOT NULL, a INT NOT NULL, b INT NOT NULL, "
-                "av INT, PRIMARY KEY (id))");
+        e->exec("CREATE TABLE t (id INT, g INT NOT NULL, g2 INT NOT NULL, a INT NOT NULL, "
+                "b INT NOT NULL, av INT, PRIMARY KEY (id))");
         for (int i = 0; i < 4000; ++i) {
             char q[200];
             std::snprintf(q, sizeof q,
-                          "INSERT INTO t (id,g,a,b,av) VALUES (%d,%d,%d,%d,%s)", i, i % 7,
+                          "INSERT INTO t (id,g,g2,a,b,av) VALUES (%d,%d,%d,%d,%d,%s)", i, i % 7, i % 97,
                           (i * 31) % 1000 - 500, (i * 17) % 400, (i % 4 == 0) ? "NULL" : std::to_string(i % 90).c_str());
             e->exec(q);
         }
@@ -70,6 +70,13 @@ int main() {
         // single aggregate (fusion path with one column) still matches.
         "SELECT g, MIN(a) FROM t GROUP BY g",
         "SELECT MAX(a) FROM t WHERE a < 0",
+        // one-pass int-key hash-aggregate (unfiltered, single INT key, all-fusable): COUNT-only,
+        // AVG-only, mixed, and a higher-cardinality key (97 groups).
+        "SELECT g, COUNT(*) FROM t GROUP BY g",
+        "SELECT g, AVG(a) FROM t GROUP BY g",
+        "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a), AVG(a), COUNT(a) FROM t GROUP BY g",
+        "SELECT g2, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY g2",
+        "SELECT g2, SUM(a), SUM(b) FROM t GROUP BY g2",
     };
     for (const char* q : qs) same(col, row, q);
 

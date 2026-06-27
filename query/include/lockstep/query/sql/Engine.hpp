@@ -4093,6 +4093,107 @@ private:
             }
             return std::nullopt;
         };
+        // ONE-PASS INT-KEY HASH-AGGREGATE: a single PLAIN-INT NOT NULL group key + every aggregate
+        // fusable (SUM/MIN/MAX/AVG/COUNT over INT NOT NULL) or COUNT(*), no filter, no HAVING. The
+        // dominant GROUP BY cost is the grouping pass (1M idx-vector appends) + the scattered fold
+        // gather; this accumulates each group's {count, per-column IntFold} DIRECTLY in one sequential
+        // pass — no idx vectors, no gather. Output sorted by key (== the byte-identical group order).
+        const bool would_parallelize =
+            parallel_executor_ != nullptr && parallel_executor_->workers() > 1 &&
+            static_cast<std::int64_t>(count) >= kParallelMinRows;
+        if (!has_filter && !has_having && !gs_mode_ && !would_parallelize && gcols.size() == 1 &&
+            t.columns[gcols[0]].type == Type::Int && t.columns[gcols[0]].logical == 0 &&
+            !t.columns[gcols[0]].nullable) {
+            bool all_ok = true;
+            for (const SelectItem& item : sel.items) {
+                if (item.kind == SelectItemKind::Column) {
+                    if (*t.column_index(item.column) != gcols[0]) { all_ok = false; break; }
+                } else if (item.agg.kind != AggKind::CountStar && !agg_fusable(item.agg, t)) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
+                const std::int64_t* gk = cols[gcols[0]]->ints.data();
+                const std::size_t nf = fuse_cols.size();
+                std::vector<const std::int64_t*> ap(nf);
+                for (std::size_t k = 0; k < nf; ++k) ap[k] = cols[fuse_cols[k]]->ints.data();
+                std::size_t cap = 256;  // power of 2
+                std::vector<std::int32_t> slots(cap, -1);
+                std::vector<std::int64_t> keys;
+                std::vector<std::int64_t> cnt;
+                std::vector<IntFold> folds;  // G*nf flat (group g, col k => folds[g*nf+k])
+                const std::hash<std::int64_t> H;
+                auto reinsert = [&](std::int32_t gi) {
+                    std::size_t p = H(keys[static_cast<std::size_t>(gi)]) & (cap - 1);
+                    while (slots[p] >= 0) p = (p + 1) & (cap - 1);
+                    slots[p] = gi;
+                };
+                for (std::uint32_t r = 0; r < count; ++r) {
+                    const std::int64_t k = gk[r];
+                    std::size_t p = H(k) & (cap - 1);
+                    std::int32_t gi = -1;
+                    while (true) {
+                        if (slots[p] < 0) {
+                            if ((keys.size() + 1) * 10 >= cap * 7) {  // grow + rehash at load 0.7
+                                cap *= 2;
+                                slots.assign(cap, -1);
+                                for (std::int32_t g = 0; g < static_cast<std::int32_t>(keys.size()); ++g)
+                                    reinsert(g);
+                                p = H(k) & (cap - 1);
+                                continue;
+                            }
+                            gi = static_cast<std::int32_t>(keys.size());
+                            slots[p] = gi;
+                            keys.push_back(k);
+                            cnt.push_back(0);
+                            folds.insert(folds.end(), nf, IntFold{0, INT64_MAX, INT64_MIN});
+                            break;
+                        }
+                        if (keys[static_cast<std::size_t>(slots[p])] == k) { gi = slots[p]; break; }
+                        p = (p + 1) & (cap - 1);
+                    }
+                    ++cnt[static_cast<std::size_t>(gi)];
+                    if (nf > 0) {  // (a COUNT(*)-only query has no fold columns)
+                        IntFold* f = &folds[static_cast<std::size_t>(gi) * nf];
+                        for (std::size_t kk = 0; kk < nf; ++kk) {
+                            const std::int64_t x = ap[kk][r];
+                            f[kk].sum = wrap_add(f[kk].sum, x);
+                            f[kk].mn = f[kk].mn < x ? f[kk].mn : x;
+                            f[kk].mx = f[kk].mx > x ? f[kk].mx : x;
+                        }
+                    }
+                }
+                std::vector<std::size_t> order(keys.size());
+                for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+                std::sort(order.begin(), order.end(),
+                          [&](std::size_t a, std::size_t b) { return keys[a] < keys[b]; });
+                for (const std::size_t oi : order) {
+                    ResultRow out;
+                    for (const SelectItem& item : sel.items) {
+                        if (item.kind == SelectItemKind::Column) {
+                            out.cells.emplace_back(item.label, Datum::make_int(keys[oi]));
+                        } else if (item.agg.kind == AggKind::CountStar) {
+                            out.cells.emplace_back(item.label,
+                                                   Datum::make_int(cnt[oi]));
+                        } else {
+                            const std::size_t ci = *t.column_index(item.agg.column);
+                            out.cells.emplace_back(
+                                item.label,
+                                agg_from_fold(item.agg.kind,
+                                              folds[oi * nf + static_cast<std::size_t>(col_to_fuse[ci])],
+                                              static_cast<std::size_t>(cnt[oi])));
+                        }
+                    }
+                    r.rows.push_back(std::move(out));
+                }
+                apply_distinct(sel, r.rows);
+                if (auto e = apply_order_by_labels(sel, r.rows)) return ExecResult::failure(*e);
+                apply_limit(sel, r.rows);
+                r.affected = r.rows.size();
+                return r;
+            }
+        }
         // RAW-INT-KEY fast path: a single NOT NULL INT group column keys the map by the raw
         // int64 — no per-row group_key_field STRING + no vector<string> key. The map is ordered
         // by int, which equals the order-preserving group_key_field order, so output order is
