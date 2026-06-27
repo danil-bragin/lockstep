@@ -704,7 +704,7 @@ public:
         if (!old_overlays.empty()) {
             writes.emplace_back(overlay_manifest_key(t->id), tombstone_marker());
         }
-        commit_writes(writes);  // ATOMIC: base + delta clear + overlay retire, one batch
+        commit_writes(writes, /*blind=*/true);  // ATOMIC blind overwrite: base + delta clear + overlay retire
         t->delta_dirty = false;  // delta is now empty (compacted into blocks)
         t->delta_count = 0;
         ++t->flush_gen;          // invalidate the decoded-block + zone cache for this table
@@ -806,7 +806,7 @@ public:
         for (const storage::KeyValue& kv : delta) {
             writes.emplace_back(kv.first, tombstone_marker());  // clear the delta
         }
-        commit_writes(writes);
+        commit_writes(writes, /*blind=*/true);  // blind bulk overwrite (no read-conflict footprint)
         t.delta_dirty = false;
         t.delta_count = 0;
         ++t.flush_gen;
@@ -886,7 +886,7 @@ public:
         for (const storage::KeyValue& kv : delta) {
             writes.emplace_back(kv.first, tombstone_marker());  // clear the delta
         }
-        commit_writes(writes);
+        commit_writes(writes, /*blind=*/true);  // blind bulk overwrite (no read-conflict footprint)
         t.delta_dirty = false;
         t.delta_count = 0;
         ++t.flush_gen;
@@ -9735,16 +9735,25 @@ private:
     // Returns the target's new tip Seq. `nosync` defers the fsync (group commit). Used for
     // BOTH the data store (db_) and the separate catalog store (catalog_db_) — see commit_writes
     // / persist_schema. Factoring this out is what lets the catalog live in its OWN Seq line.
-    Seq commit_batch(Database& target, const std::vector<std::pair<Key, Value>>& kvs, bool nosync) {
+    Seq commit_batch(Database& target, const std::vector<std::pair<Key, Value>>& kvs, bool nosync,
+                     bool blind = false) {
         TxnFn fn;
         fn.id = next_txn_id_++;
-        std::vector<txn::Read> decl;
-        decl.reserve(kvs.size());
-        for (const auto& [k, v] : kvs) {
-            (void)v;
-            decl.push_back(declare::strict(k));
+        // A txn body NEVER reads via ctx (it writes pre-computed values), so the declared strict
+        // reads on the write keys only provide write-write conflict detection for CONCURRENT txns.
+        // For a BLIND bulk overwrite (a columnar flush: it rewrites whole blocks + tombstones the
+        // delta from an already-consistent snapshot) under the single-threaded SQL engine there is no
+        // concurrent writer, so declaring N reads is pure O(N log N) overhead — skip it. The write
+        // versioning (a new committed prefix) is unchanged, so MVCC / recovery are unaffected.
+        if (!blind) {
+            std::vector<txn::Read> decl;
+            decl.reserve(kvs.size());
+            for (const auto& [k, v] : kvs) {
+                (void)v;
+                decl.push_back(declare::strict(k));
+            }
+            fn.declared = std::move(decl);
         }
-        fn.declared = std::move(decl);
         const std::vector<std::pair<Key, Value>> writes = kvs;
         fn.body = [writes](TxnContext& ctx) {
             for (const auto& [k, v] : writes) {
@@ -9764,7 +9773,7 @@ private:
         return t;
     }
 
-    void commit_writes(const std::vector<std::pair<Key, Value>>& kvs) {
+    void commit_writes(const std::vector<std::pair<Key, Value>>& kvs, bool blind = false) {
         // G1: inside a transaction, BUFFER the writes (read-your-writes via read_committed) and apply
         // them all atomically at COMMIT; ROLLBACK discards them. (DDL writes the catalog directly via
         // commit_batch and is not buffered — DDL inside a txn auto-commits.)
@@ -9775,7 +9784,9 @@ private:
         // GROUP COMMIT: defer the fsync when the caller (wire::Server, net-backed) will sync()
         // once for the whole burst — the SQL-write analogue of the keyed path. acked==durable
         // holds because the caller withholds the SqlResult ack until its sync.
-        tip_ = commit_batch(db_, kvs, /*nosync=*/group_commit_);
+        // `blind` skips the (here-redundant) per-write-key read declaration for a bulk blind
+        // overwrite (a columnar flush) — O(N) instead of O(N log N) read validations.
+        tip_ = commit_batch(db_, kvs, /*nosync=*/group_commit_, blind);
     }
 
     // Convenience: a single-key write (back-compat for the index-only DDL paths).
