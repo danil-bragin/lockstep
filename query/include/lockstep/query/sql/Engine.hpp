@@ -4079,7 +4079,10 @@ private:
         if (sel.distinct) {
             node = wrap(PlanNode::Kind::Distinct, "", std::move(node));
         }
-        if (!sel.order_by.empty()) {
+        // I2: omit the Sort node when the index scan already yields the ORDER BY order.
+        const bool order_via_index = ap.kind == AccessPath::Kind::Index &&
+                                     order_by_matches_index(sel, ap.index, t);
+        if (!sel.order_by.empty() && !order_via_index) {
             node = wrap(PlanNode::Kind::Sort,
                         "ORDER BY " + std::to_string(sel.order_by.size()) +
                             " key(s) (stable, PK tie-break)",
@@ -4390,11 +4393,13 @@ private:
         const bool vectorizable = sel.filter.present() && !pk_fast && vectorize_ &&
                                   try_extract_conjuncts(sel.filter, sel.filter.root, *t, vterms);
         bool filter_applied = false;
+        // I2: if the index's order already satisfies ORDER BY, scan in index order + skip the sort.
+        const bool order_via_index = used_index && order_by_matches_index(sel, ap.index, *t);
         if (used_index) {
             // Index scan: range-scan the index for the PKs, point-get each row; the full
             // predicate still runs as the residual filter in (2). (read_via_index assembles
             // columnar rows from their column families when t is columnar.)
-            if (auto err = read_via_index(*t, sel, ap.index, need, rows)) {
+            if (auto err = read_via_index(*t, sel, ap.index, need, rows, order_via_index)) {
                 return ExecResult::failure(*err);
             }
         } else if (t->columnar) {
@@ -4614,8 +4619,10 @@ private:
 
         // (5) DISTINCT, (6) ORDER BY, (7) LIMIT/OFFSET.
         apply_distinct(sel, r.rows);
-        if (auto e = apply_order_by(sel, *t, r.rows)) {
-            return ExecResult::failure(*e);
+        if (!order_via_index) {  // I2: skip the sort when the index already produced ORDER BY order
+            if (auto e = apply_order_by(sel, *t, r.rows)) {
+                return ExecResult::failure(*e);
+            }
         }
         apply_limit(sel, r.rows);
         r.affected = r.rows.size();
@@ -6871,9 +6878,35 @@ private:
     // range to collect the (col, PK) entries, then POINT-GET each row + decode. The
     // residual predicate (the whole WHERE) is applied by the caller in step (2), so
     // this only narrows WHICH rows are fetched. Reads run at the SELECT's D5 level.
+    // I2: can the chosen index's scan order SATISFY the query's ORDER BY (so the sort is skipped)?
+    // True when: a plain projection (no agg/group/distinct); an eq-prefix index plan; every covered
+    // column is NOT NULL (so the index covers EVERY matching row — a NULL would be missing); and the
+    // ORDER BY keys are exactly the index columns AFTER the eq-prefix, contiguous, ASC, by name. The
+    // index entry is (cols asc, pk asc), which matches ORDER BY <cols> with the pipeline's PK
+    // tie-break — byte-identical to the sorted full-scan result (the cross-check proves it).
+    [[nodiscard]] static bool order_by_matches_index(const SelectStmt& sel, const IndexPlan& plan,
+                                                     const Table& t) {
+        if (sel.has_aggregates || !sel.group_by.empty() || sel.distinct || sel.order_by.empty())
+            return false;
+        if (!plan.is_eq || plan.index == nullptr) return false;
+        const Index& ix = *plan.index;
+        for (const std::size_t c : ix.columns) if (t.columns[c].nullable) return false;
+        const std::size_t base = plan.eq_prefix.empty() ? 1 : plan.eq_prefix.size();
+        if (base + sel.order_by.size() > ix.columns.size()) return false;
+        for (std::size_t i = 0; i < sel.order_by.size(); ++i) {
+            const OrderKey& k = sel.order_by[i];
+            if (k.position != 0 || k.descending || !k.qualifier.empty() ||
+                k.nulls != NullsOrder::Default)
+                return false;
+            if (k.column != t.columns[ix.columns[base + i]].name) return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<std::string> read_via_index(
         const Table& t, const SelectStmt& sel, const IndexPlan& plan,
-        const std::vector<bool>& need, std::vector<std::vector<Datum>>& rows_out) {
+        const std::vector<bool>& need, std::vector<std::vector<Datum>>& rows_out,
+        bool preserve_index_order = false) {
         // (a) The index range [lo, hi): col-ascending entries for the matching values.
         Key lo = index_prefix(t.id, plan.index->id);
         Key hi;
@@ -6926,10 +6959,13 @@ private:
         // full-scan path (which yields PK-ascending) BEFORE the pipeline's ORDER BY /
         // DISTINCT / aggregation. The conformance gate compares the two — same rows,
         // same order. Sort by the order-preserving PK key bytes (total + deterministic).
-        std::stable_sort(fetched.begin(), fetched.end(),
-                         [](const auto& x, const auto& y) {
-                             return encode_pk(x.first) < encode_pk(y.first);
-                         });
+        // I2: when the caller will SKIP the ORDER BY because the index already yields the
+        // requested order, KEEP the index (column-ascending, PK-tie-broken) scan order instead.
+        if (!preserve_index_order)
+            std::stable_sort(fetched.begin(), fetched.end(),
+                             [](const auto& x, const auto& y) {
+                                 return encode_pk(x.first) < encode_pk(y.first);
+                             });
         rows_out.reserve(fetched.size());
         for (auto& [pk, row] : fetched) {
             (void)pk;

@@ -76,6 +76,35 @@ int main() {
               [&] { std::int64_t c = 0; for (int i = 0; i < 300; ++i) if (i % 10 == 2 && i % 5 == 1) ++c; return c; }(),
           "3-col 2-prefix matches truth");
 
+    // I2: index satisfies ORDER BY -> the sort is skipped (no Sort node) and the result is ordered.
+    {
+        // u has index (x,y,z), all NOT NULL. WHERE x=2 ORDER BY y -> ordered by y via the index.
+        const ExecResult r = e.exec("SELECT y, z FROM u WHERE x = 2 ORDER BY y");
+        check(r.ok && !r.rows.empty(), "WHERE x=2 ORDER BY y ok");
+        bool sorted = true;
+        for (std::size_t i = 1; i < r.rows.size(); ++i)
+            if (r.rows[i].cells[0].second.i < r.rows[i - 1].cells[0].second.i) sorted = false;
+        check(sorted, "result is y-ascending (index order)");
+        check(!explain_has(e, "SELECT y FROM u WHERE x = 2 ORDER BY y", "Sort"),
+              "ORDER BY y uses the index -> no Sort node");
+        // a multi-key ORDER BY y, z on the trailing index columns.
+        const ExecResult r2 = e.exec("SELECT y, z FROM u WHERE x = 2 ORDER BY y, z");
+        bool sorted2 = true;
+        for (std::size_t i = 1; i < r2.rows.size(); ++i) {
+            const auto& a = r2.rows[i - 1].cells;
+            const auto& b = r2.rows[i].cells;
+            if (a[0].second.i > b[0].second.i ||
+                (a[0].second.i == b[0].second.i && a[1].second.i > b[1].second.i))
+                sorted2 = false;
+        }
+        check(sorted2, "result is (y,z)-ascending");
+        check(!explain_has(e, "SELECT y FROM u WHERE x = 2 ORDER BY y, z", "Sort"),
+              "ORDER BY y,z uses the index -> no Sort node");
+        // a DESCENDING order still sorts (index is ascending-only) -> Sort node present.
+        check(explain_has(e, "SELECT y FROM u WHERE x = 2 ORDER BY y DESC", "Sort"),
+              "ORDER BY y DESC still sorts");
+    }
+
     if (g_fail) { std::printf("sql_index_composite_test: FAILED\n"); return 1; }
     std::printf("sql_index_composite_test: OK (composite prefix lookup: index chosen, results == "
                 "full-scan truth, 2- and 3-column)\n");
