@@ -75,6 +75,7 @@ struct CreateIndexStmt {
     std::vector<std::string> columns;  // E5: composite index column list (>=1)
     bool unique = false;               // E5: CREATE UNIQUE INDEX
     bool hash = false;                 // I7: USING HASH (equality-only)
+    std::string partial_src;           // I5: CREATE INDEX ... WHERE <pred> (partial index)
 };
 
 // DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).

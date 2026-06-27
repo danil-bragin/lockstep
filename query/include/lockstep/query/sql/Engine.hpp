@@ -361,6 +361,7 @@ public:
             cat_put_u32(o, static_cast<std::uint32_t>(ix.column));
             o.push_back(ix.unique ? 1 : 0);  // E5
             o.push_back(ix.hash ? 1 : 0);    // I7
+            cat_put_s(o, ix.partial_src);    // I5
             cat_put_u32(o, static_cast<std::uint32_t>(ix.columns.size()));
             for (const std::size_t c : ix.columns) cat_put_u32(o, static_cast<std::uint32_t>(c));
         }
@@ -427,6 +428,7 @@ public:
             ix.column = cat_get_u32(s, p);
             ix.unique = s[p++] != 0;  // E5
             ix.hash = s[p++] != 0;    // I7
+            ix.partial_src = cat_get_s(s, p);  // I5
             const std::uint32_t nic = cat_get_u32(s, p);
             for (std::uint32_t k = 0; k < nic; ++k) ix.columns.push_back(cat_get_u32(s, p));
             t.indexes.push_back(std::move(ix));
@@ -1130,6 +1132,11 @@ private:
         ix.column = *col;
         ix.unique = ci.unique;  // E5
         ix.hash = ci.hash;      // I7: equality-only index
+        ix.partial_src = ci.partial_src;  // I5: partial index predicate
+        if (!ix.partial_src.empty()) {    // validate it parses against this table
+            const ParseResult pr = parse_sql("SELECT * FROM " + ci.table + " WHERE " + ix.partial_src);
+            if (!pr.ok()) return ExecResult::failure("invalid partial index WHERE: " + pr.error().render());
+        }
         for (const std::string& cn : ci.columns) {  // E5: resolve the covered column list
             const auto c = t->column_index(cn);
             if (!c) return ExecResult::failure("unknown column '" + cn + "' in index");
@@ -1156,6 +1163,7 @@ private:
             }
             std::set<std::string> uniq_seen;  // E5: UNIQUE backfill dedup (value prefix)
             for (const std::vector<Datum>& row : rows) {
+                if (!row_matches_partial(*t, ix, row)) continue;  // I5
                 if (index_row_null(ix, row)) continue;
                 if (ix.unique && !uniq_seen.insert(index_value_key(*t, ix, row)).second)
                     { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure("CREATE UNIQUE INDEX failed: duplicate value"); }
@@ -1175,6 +1183,7 @@ private:
                 continue;
             }
             const std::vector<Datum> row = decode_row(*t, kv.first, kv.second);
+            if (!row_matches_partial(*t, ix, row)) continue;  // I5
             if (index_row_null(ix, row)) continue;
             if (ix.unique && !uniq_seen.insert(index_value_key(*t, ix, row)).second)
                 { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure("CREATE UNIQUE INDEX failed: duplicate value"); }
@@ -1691,10 +1700,24 @@ private:
     // Append the index-entry writes for `row` (one per secondary index) to `out`.
     // `make` decides the value: a new entry (empty value) on INSERT/UPDATE-new, or a
     // tombstone on DELETE/UPDATE-old. The PK is read from row[pk_index].
-    static void index_writes_for_row(const Table& t, const std::vector<Datum>& row,
-                                     bool tombstone,
-                                     std::vector<std::pair<Key, Value>>& out) {
+    // I5: a partial index only contains rows satisfying its predicate (re-parsed; like a CHECK). An
+    // empty predicate = a full index (always true).
+    [[nodiscard]] bool row_matches_partial(const Table& t, const Index& ix,
+                                           const std::vector<Datum>& row) {
+        if (ix.partial_src.empty()) return true;
+        const ParseResult pr = parse_sql("SELECT * FROM " + t.name + " WHERE " + ix.partial_src);
+        if (!pr.ok()) return true;  // defensive: a broken predicate indexes everything (validated at create)
+        bool truth = false;
+        if (eval_pred(pr.stmt().select.filter, pr.stmt().select.filter.root, t, row,
+                      /*group=*/nullptr, truth))
+            return true;
+        return truth;
+    }
+
+    void index_writes_for_row(const Table& t, const std::vector<Datum>& row, bool tombstone,
+                              std::vector<std::pair<Key, Value>>& out) {
         for (const Index& ix : t.indexes) {
+            if (!row_matches_partial(t, ix, row)) continue;  // I5: outside the partial set
             // v4: a NULL column value gets NO index entry (a NULL is never matched by an
             // `indexed_col = v` / BETWEEN lookup — comparison-with-NULL is UNKNOWN). So a
             // NULL row is simply absent from the index; the residual full-predicate (run
@@ -5863,7 +5886,9 @@ private:
         if (equi->first >= in_lo) return std::nullopt;         // expect (outer, inner) orientation
         // The inner must have a single/leading-column index on the join column (eq lookup).
         const Index* ix = inner->index_for_column(inner_local);
-        if (ix == nullptr || ix->columns.empty() || ix->columns[0] != inner_local) return std::nullopt;
+        if (ix == nullptr || ix->columns.empty() || ix->columns[0] != inner_local ||
+            !ix->partial_src.empty())  // I5: a partial inner index can't serve an arbitrary join key
+            return std::nullopt;
 
         last_join_index_nl_ = true;  // TEST signal: the index-NL path was taken
         // Scan the outer once; probe the inner index per outer row.
@@ -6915,7 +6940,9 @@ private:
             if (!col || *col == t.pk_index || n.literal.type != t.columns[*col].type) continue;
             const Index* ix = t.index_for_column(*col);
             // a SINGLE-column index on the leading column (a composite is the I1 prefix path instead).
-            if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col) continue;
+            if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col ||
+                !query_implies_partial(sel, t, *ix))
+                continue;
             bool dup = false;
             for (const IndexPlan& p : eqs) if (p.index->column == *col) { dup = true; break; }
             if (dup) continue;
@@ -6971,6 +6998,36 @@ private:
     // which we also recognize. Returns the first usable plan (deterministic left-to-
     // right scan) or nullopt. The PK fast path is checked FIRST by the caller, so a PK
     // term never reaches here (and the PK has no secondary index anyway).
+    // I5: a PARTIAL index is sound for a query ONLY if the query's WHERE IMPLIES the index predicate
+    // (so the index contains every row the query can match). Conservative + sound: every AND-conjunct
+    // leaf of the index predicate must appear as an identical AND-conjunct of the query's WHERE
+    // (same column, op, literal). An empty predicate (a full index) is always usable.
+    [[nodiscard]] bool query_implies_partial(const SelectStmt& sel, const Table& t, const Index& ix) {
+        if (ix.partial_src.empty()) return true;
+        if (!sel.filter.present()) return false;
+        const ParseResult pr = parse_sql("SELECT * FROM " + t.name + " WHERE " + ix.partial_src);
+        if (!pr.ok()) return false;
+        const Predicate& pp = pr.stmt().select.filter;
+        std::vector<std::int32_t> pleaves, qleaves;
+        gather_and_leaves(pp, pp.root, pleaves);
+        gather_and_leaves(sel.filter, sel.filter.root, qleaves);
+        auto same = [](const PredNode& a, const PredNode& b) {
+            return a.kind == PredNodeKind::Cmp && b.kind == PredNodeKind::Cmp &&
+                   a.operand == OperandKind::Column && b.operand == OperandKind::Column &&
+                   !a.rhs_is_column && !b.rhs_is_column && !a.rhs_is_subquery && !b.rhs_is_subquery &&
+                   a.column == b.column && a.op == b.op && a.qualifier.empty() && b.qualifier.empty() &&
+                   a.literal == b.literal;
+        };
+        for (const std::int32_t pl : pleaves) {
+            const PredNode& pn = pp.nodes[static_cast<std::size_t>(pl)];
+            bool found = false;
+            for (const std::int32_t ql : qleaves)
+                if (same(pn, sel.filter.nodes[static_cast<std::size_t>(ql)])) { found = true; break; }
+            if (!found) return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<IndexPlan> choose_index_access(const SelectStmt& sel,
                                                               const Table& t) {
         const Predicate& p = sel.filter;
@@ -6989,9 +7046,14 @@ private:
             if (!col || *col == t.pk_index || n.literal.type != t.columns[*col].type) {
                 continue;
             }
-            const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr || ix->columns.empty() || ix->columns[0] != *col) {
-                continue;  // the eq must be on the index's LEADING column
+            // I5: pick the first USABLE index whose LEADING column is *col — a partial index that the
+            // query doesn't imply is skipped (a full index on the same column can still serve).
+            const Index* ix = nullptr;
+            for (const Index& cand : t.indexes)
+                if (!cand.columns.empty() && cand.columns[0] == *col &&
+                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }
+            if (ix == nullptr) {
+                continue;
             }
             IndexPlan plan;
             plan.index = ix;
@@ -7031,7 +7093,7 @@ private:
                 continue;
             }
             const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr || ix->hash) {  // I7: a HASH index is equality-only, never for a range
+            if (ix == nullptr || ix->hash || !query_implies_partial(sel, t, *ix)) {  // I7 hash; I5 partial
                 continue;
             }
             // Find a matching `col <= hi` conjunct on the SAME column.

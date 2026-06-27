@@ -145,6 +145,15 @@ struct Index {
     // I7: USING HASH — an equality-only index (no range scans). Storage is identical to the ordered
     // index; the flag just keeps the planner from using it for a BETWEEN/range.
     bool hash = false;
+    // I5: PARTIAL index — `CREATE INDEX ... WHERE <pred>`. Only rows satisfying the predicate are
+    // indexed (re-parsed source text, like a CHECK). The planner uses it only when the query's WHERE
+    // implies the index predicate (so the index covers every row the query can match).
+    std::string partial_src;
+    // I5: EXPRESSION index — `CREATE INDEX ... ON t ((expr))`. The indexed value is the expression's
+    // result (source text re-parsed). `expr_type` is its physical type (for the entry codec). When
+    // set, `columns` is empty and the entry's leading token is the expression value.
+    std::string expr_src;
+    Type expr_type = Type::Int;
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).

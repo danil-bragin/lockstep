@@ -1223,6 +1223,15 @@ private:
             else if (is_kw("btree")) { advance(); }
             else return err("USING expects HASH or BTREE");
         }
+        if (is_kw("where")) {  // I5: PARTIAL index — capture the predicate's source text (re-parsed).
+            advance();
+            const std::size_t start = cur_.pos;
+            Predicate tmp;
+            if (auto e = parse_predicate(tmp, /*allow_agg=*/false)) return ParseResult{*e};
+            std::string text = lex_.src().substr(start, cur_.pos > start ? cur_.pos - start : 0);
+            while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.pop_back();
+            st.create_index.partial_src = std::move(text);
+        }
         return ParseResult{std::move(st)};
     }
 
