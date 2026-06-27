@@ -142,6 +142,9 @@ struct Index {
     // before). `unique` rejects a second row with the same indexed tuple.
     std::vector<std::size_t> columns;
     bool unique = false;
+    // I7: USING HASH — an equality-only index (no range scans). Storage is identical to the ordered
+    // index; the flag just keeps the planner from using it for a BETWEEN/range.
+    bool hash = false;
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).

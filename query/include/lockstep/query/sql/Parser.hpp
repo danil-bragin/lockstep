@@ -1217,6 +1217,12 @@ private:
         if (auto e = expect(Tok::RParen, "')' after the indexed columns")) {
             return ParseResult{*e};
         }
+        if (is_kw("using")) {  // I7: USING HASH | BTREE
+            advance();
+            if (is_kw("hash")) { advance(); st.create_index.hash = true; }
+            else if (is_kw("btree")) { advance(); }
+            else return err("USING expects HASH or BTREE");
+        }
         return ParseResult{std::move(st)};
     }
 

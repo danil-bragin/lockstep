@@ -360,6 +360,7 @@ public:
             cat_put_u32(o, ix.id);
             cat_put_u32(o, static_cast<std::uint32_t>(ix.column));
             o.push_back(ix.unique ? 1 : 0);  // E5
+            o.push_back(ix.hash ? 1 : 0);    // I7
             cat_put_u32(o, static_cast<std::uint32_t>(ix.columns.size()));
             for (const std::size_t c : ix.columns) cat_put_u32(o, static_cast<std::uint32_t>(c));
         }
@@ -425,6 +426,7 @@ public:
             ix.id = cat_get_u32(s, p);
             ix.column = cat_get_u32(s, p);
             ix.unique = s[p++] != 0;  // E5
+            ix.hash = s[p++] != 0;    // I7
             const std::uint32_t nic = cat_get_u32(s, p);
             for (std::uint32_t k = 0; k < nic; ++k) ix.columns.push_back(cat_get_u32(s, p));
             t.indexes.push_back(std::move(ix));
@@ -1125,6 +1127,7 @@ private:
         ix.id = t->next_index_id++;
         ix.column = *col;
         ix.unique = ci.unique;  // E5
+        ix.hash = ci.hash;      // I7: equality-only index
         for (const std::string& cn : ci.columns) {  // E5: resolve the covered column list
             const auto c = t->column_index(cn);
             if (!c) return ExecResult::failure("unknown column '" + cn + "' in index");
@@ -4089,6 +4092,11 @@ private:
                               (ap.index.is_eq ? " (= const)" : " (range)") + " on " + t.name;
                 break;
             }
+            case AccessPath::Kind::IndexMerge:
+                node.kind = PlanNode::Kind::IndexScan;
+                node.detail = "Index Merge: " + ap.index.index->name + " ∩ " +
+                              ap.index2.index->name + " on " + t.name;
+                break;
             case AccessPath::Kind::Seq:
                 node.kind = PlanNode::Kind::SeqScan;
                 node.detail = t.name;
@@ -4421,6 +4429,7 @@ private:
         std::vector<bool> need = needed_columns(*t, sel);
         std::vector<std::vector<Datum>> rows;
         const bool used_index = ap.kind == AccessPath::Kind::Index;
+        const bool used_merge = ap.kind == AccessPath::Kind::IndexMerge;  // I7
         // Phase 3: pre-extract a vectorizable conjunctive filter ONCE. On a seq scan it FUSES
         // into the decode (decode-into-scratch + push only survivors → no per-row alloc for a
         // filtered-out row, the measured bottleneck). On the index path it applies post-fetch.
@@ -4434,7 +4443,11 @@ private:
         // I3: index-only (covering) scan — serve from the index when it covers every needed column.
         const bool covering = used_index && !t->columnar &&
                               index_covers_need(*ap.index.index, need, t->pk_index);
-        if (used_index) {
+        if (used_merge) {  // I7: intersect two single-column eq indexes
+            if (auto err = read_via_index_merge(*t, sel, ap.index, ap.index2, need, rows)) {
+                return ExecResult::failure(*err);
+            }
+        } else if (used_index) {
             // Index scan: range-scan the index for the PKs, point-get each row; the full
             // predicate still runs as the residual filter in (2). (read_via_index assembles
             // columnar rows from their column families when t is columnar.)
@@ -4465,7 +4478,7 @@ private:
             }
         }
 
-        if (!used_index && !t->columnar) {
+        if (!used_index && !used_merge && !t->columnar) {
             std::vector<storage::KeyValue> kvs;
             if (auto err = run_select_at_level(*t, sel, pk_fast, kvs)) {
                 return ExecResult::failure(*err);
@@ -6704,8 +6717,9 @@ private:
     // is EXACTLY the plan that runs. Phase 2 makes this COST-BASED (statistics-driven); today
     // it is the rule-based choice extracted verbatim from the old inline logic (byte-identical).
     struct AccessPath {
-        enum class Kind : std::uint8_t { PkPoint, PkRange, Index, Seq } kind = Kind::Seq;
-        IndexPlan index;  // valid iff kind == Index
+        enum class Kind : std::uint8_t { PkPoint, PkRange, Index, IndexMerge, Seq } kind = Kind::Seq;
+        IndexPlan index;   // valid iff kind == Index or IndexMerge (first index)
+        IndexPlan index2;  // I7: the SECOND index of an IndexMerge (PK-set intersection)
         [[nodiscard]] bool pk_fast() const {
             return kind == Kind::PkPoint || kind == Kind::PkRange;
         }
@@ -6789,8 +6803,63 @@ private:
                     ap.index = *plan;
                 }
             }
+            // I7: INDEX MERGE — two single-column eq indexes on different columns intersected; cheaper
+            // than either alone when both are selective. Only when it beats the chosen single path.
+            if (auto m = choose_index_merge(sel, t)) {
+                const std::size_t n = t.row_count;
+                const std::size_t m1 = est_eq_matches_col(t, m->first.index->column, n);
+                const std::size_t m2 = est_eq_matches_col(t, m->second.index->column, n);
+                const std::size_t isect = std::max<std::size_t>(1, (m1 * m2) / std::max<std::size_t>(1, n));
+                const std::size_t merge_cost = 2 * ilog2(n) + (m1 + m2) +
+                                               isect * 3;  // scan both indexes + fetch the intersection
+                const std::size_t cur_cost = ap.kind == AccessPath::Kind::Index
+                                                 ? ilog2(n) + est_path_rows(ap, t) * 3
+                                                 : n;  // seq otherwise
+                if (n > 1 && merge_cost < cur_cost) {
+                    ap.kind = AccessPath::Kind::IndexMerge;
+                    ap.index = m->first;
+                    ap.index2 = m->second;
+                }
+            }
         }
         return ap;
+    }
+
+    // I7: find two `col = literal` AND-conjuncts on DIFFERENT columns, each with its own single-column
+    // index, for an index-merge intersection. Deterministic (first two by leaf order).
+    [[nodiscard]] std::optional<std::pair<IndexPlan, IndexPlan>> choose_index_merge(
+        const SelectStmt& sel, const Table& t) {
+        std::vector<std::int32_t> leaves;
+        gather_and_leaves(sel.filter, sel.filter.root, leaves);
+        std::vector<IndexPlan> eqs;
+        for (const std::int32_t li : leaves) {
+            const PredNode& n = sel.filter.nodes[static_cast<std::size_t>(li)];
+            if (n.kind != PredNodeKind::Cmp || n.operand != OperandKind::Column || !n.qualifier.empty() ||
+                n.rhs_is_column || n.rhs_is_subquery || n.literal.is_null || n.op != CmpOp::Eq)
+                continue;
+            const auto col = t.column_index(n.column);
+            if (!col || *col == t.pk_index || n.literal.type != t.columns[*col].type) continue;
+            const Index* ix = t.index_for_column(*col);
+            // a SINGLE-column index on the leading column (a composite is the I1 prefix path instead).
+            if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col) continue;
+            bool dup = false;
+            for (const IndexPlan& p : eqs) if (p.index->column == *col) { dup = true; break; }
+            if (dup) continue;
+            IndexPlan p;
+            p.index = ix;
+            p.is_eq = true;
+            p.eq = n.literal;
+            p.eq_prefix.push_back(n.literal);
+            eqs.push_back(p);
+            if (eqs.size() == 2) {
+                const std::size_t n = t.row_count;  // fetch from the MORE selective index first
+                if (est_eq_matches_col(t, eqs[1].index->column, n) <
+                    est_eq_matches_col(t, eqs[0].index->column, n))
+                    std::swap(eqs[0], eqs[1]);
+                return std::make_pair(eqs[0], eqs[1]);
+            }
+        }
+        return std::nullopt;
     }
 
     // Estimated rows OUT of a single-table access path (for EXPLAIN's estimated-vs-actual).
@@ -6807,6 +6876,11 @@ private:
                 if (ap.index.eq_prefix.size() > 1)  // I1: composite prefix selectivity
                     m = std::max<std::size_t>(1, m >> (ap.index.eq_prefix.size() - 1));
                 return m;
+            }
+            case AccessPath::Kind::IndexMerge: {  // I7: intersection ~ the smaller of the two
+                const std::size_t m1 = est_eq_matches_col(t, ap.index.index->column, t.row_count);
+                const std::size_t m2 = est_eq_matches_col(t, ap.index2.index->column, t.row_count);
+                return std::max<std::size_t>(1, std::min(m1, m2));
             }
             case AccessPath::Kind::Seq:
                 return t.row_count;
@@ -6883,7 +6957,7 @@ private:
                 continue;
             }
             const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr) {
+            if (ix == nullptr || ix->hash) {  // I7: a HASH index is equality-only, never for a range
                 continue;
             }
             // Find a matching `col <= hi` conjunct on the SAME column.
@@ -6960,6 +7034,52 @@ private:
         // I7: a uniform DESC needs a UNIQUE index fully covered by eq-prefix + ORDER BY (no ties).
         if (all_desc && ix.unique && base + sel.order_by.size() == ix.columns.size()) return 2;
         return 0;
+    }
+
+    // I7: collect the PK SET of an eq index plan's entries (no row fetch) — for an index-merge.
+    [[nodiscard]] std::optional<std::string> index_pk_set(const Table& t, const SelectStmt& sel,
+                                                          const IndexPlan& plan,
+                                                          std::set<std::string>& out) {
+        Key lo = index_prefix(t.id, plan.index->id);
+        if (plan.eq_prefix.empty()) put_index_col(lo, plan.eq);
+        else for (const Datum& d : plan.eq_prefix) put_index_col(lo, d);
+        const Key hi = key_successor(lo);
+        std::vector<storage::KeyValue> kvs;
+        if (auto e = run_index_scan_at_level(sel, lo, hi, kvs)) return e;
+        for (const storage::KeyValue& kv : kvs) {
+            if (is_tombstone(kv.second)) continue;
+            out.insert(encode_pk(decode_index_entry_pk(t, plan.index->id, kv.first)));
+        }
+        return std::nullopt;
+    }
+    // I7: INDEX MERGE — fetch rows of the more-selective index, keep those whose PK is also in the
+    // second index's PK set (the AND intersection). The residual WHERE still runs, so correctness ==
+    // a full scan (the indexed==full-scan cross-check proves it).
+    [[nodiscard]] std::optional<std::string> read_via_index_merge(
+        const Table& t, const SelectStmt& sel, const IndexPlan& p1, const IndexPlan& p2,
+        const std::vector<bool>& need, std::vector<std::vector<Datum>>& rows_out) {
+        // Intersect the two PK sets FIRST (index entries only, no row fetch), then fetch ONLY the
+        // intersection — so the merge touches far fewer rows than either index alone.
+        std::set<std::string> set1, set2;
+        if (auto e = index_pk_set(t, sel, p1, set1)) return e;
+        if (auto e = index_pk_set(t, sel, p2, set2)) return e;
+        std::vector<std::pair<Datum, std::vector<Datum>>> fetched;
+        for (const std::string& pkenc : set1) {
+            if (set2.count(pkenc) == 0) continue;
+            const Datum pk = decode_pk(t, table_prefix(t.id) + pkenc);
+            if (t.columnar) {
+                if (auto row = read_columnar_row(t, pk)) fetched.emplace_back(pk, std::move(*row));
+                continue;
+            }
+            const Key rkey = encode_key(t, pk);
+            const ReadResult rv = point_get_at_level(sel, rkey);
+            if (!rv.has_value() || is_tombstone(*rv)) continue;
+            fetched.emplace_back(pk, decode_row_projected(t, rkey, *rv, need));
+        }
+        // Emit PK-ascending for byte-identity with the full-scan path (a std::set of encode_pk keys
+        // is already PK-ascending, so this preserves it).
+        for (auto& [pk, row] : fetched) { (void)pk; rows_out.push_back(std::move(row)); }
+        return std::nullopt;
     }
 
     [[nodiscard]] std::optional<std::string> read_via_index(
