@@ -176,6 +176,16 @@ struct Table {
     std::int64_t next_auto_id = 1;    // F6: next AUTO_INCREMENT value (monotonic; persisted)
     std::uint64_t next_uuid = 0;      // F9c: next DEFAULT gen_uuid() counter (monotonic; persisted)
     std::vector<std::string> checks;  // F5: CHECK predicate source texts (re-parsed + eval'd on write)
+    // NAMED CONSTRAINTS: a droppable-by-name registry over the CHECK / column-UNIQUE / column-FK
+    // constraints. Enforcement still uses `checks` + Column.unique / Column.fk_table; this registry
+    // maps a (deterministic or explicit) NAME to the thing to remove on ALTER TABLE DROP CONSTRAINT.
+    struct NamedConstraint {
+        std::string name;
+        std::uint8_t kind = 0;   // 0 = Check, 1 = Unique, 2 = ForeignKey
+        std::size_t column = 0;  // Unique / ForeignKey: the column index
+        std::string check_src;   // Check: the predicate source (matches an entry in `checks`)
+    };
+    std::vector<NamedConstraint> constraints;
 
     // COLUMNAR layout (PERF_PLAN columnar rollout): when true, the table is an LSM of a
     // row 'd' delta over flushed column blocks ('B'). Opt-in at CREATE; the durable KV

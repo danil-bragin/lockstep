@@ -376,6 +376,13 @@ public:
         for (const std::size_t c : t.pk_columns) {
             cat_put_u32(o, static_cast<std::uint32_t>(c));
         }
+        cat_put_u32(o, static_cast<std::uint32_t>(t.constraints.size()));  // named-constraint registry
+        for (const Table::NamedConstraint& nc : t.constraints) {
+            cat_put_s(o, nc.name);
+            o.push_back(static_cast<char>(nc.kind));
+            cat_put_u32(o, static_cast<std::uint32_t>(nc.column));
+            cat_put_s(o, nc.check_src);
+        }
         return o;
     }
     static Table deserialize_schema(const std::string& s) {
@@ -446,6 +453,15 @@ public:
         const std::uint32_t npk = cat_get_u32(s, p);  // F1
         for (std::uint32_t i = 0; i < npk; ++i) {
             t.pk_columns.push_back(cat_get_u32(s, p));
+        }
+        const std::uint32_t ncons = cat_get_u32(s, p);  // named-constraint registry
+        for (std::uint32_t i = 0; i < ncons; ++i) {
+            Table::NamedConstraint nc;
+            nc.name = cat_get_s(s, p);
+            nc.kind = static_cast<std::uint8_t>(s[p++]);
+            nc.column = cat_get_u32(s, p);
+            nc.check_src = cat_get_s(s, p);
+            t.constraints.push_back(std::move(nc));
         }
         t.col_stats.assign(t.columns.size(), Table::ColStat{});
         return t;
@@ -890,6 +906,42 @@ public:
     }
 
 private:
+    // Append ONE named constraint to a table's registry. An explicit name is used as-is (deduped if it
+    // somehow collides); an empty name is auto-generated Postgres-style (`<t>_check`, `<t>_<col>_key`,
+    // `<t>_<col>_fkey`) with a numeric suffix on collision. Returns the assigned name.
+    static std::string add_named_constraint(Table& t, std::uint8_t kind, std::size_t column,
+                                            const std::string& check_src,
+                                            const std::string& explicit_name) {
+        std::set<std::string> used;
+        for (const auto& c : t.constraints) used.insert(c.name);
+        std::string base = explicit_name;
+        if (base.empty()) {
+            base = kind == 1   ? t.name + "_" + t.columns[column].name + "_key"
+                   : kind == 2 ? t.name + "_" + t.columns[column].name + "_fkey"
+                               : t.name + "_check";
+        }
+        std::string nm = base;
+        int k = 1;
+        while (used.count(nm) != 0) nm = base + std::to_string(++k);
+        t.constraints.push_back(Table::NamedConstraint{nm, kind, column, check_src});
+        return nm;
+    }
+
+    // Build the named-constraint registry from a freshly created table's columns + checks. Explicit
+    // CHECK names come from `check_names` (parallel to t.checks; "" => auto). Column UNIQUE / FOREIGN
+    // KEY constraints are auto-named. Deterministic (a pure function of the schema).
+    static void build_constraints(Table& t, const std::vector<std::string>& check_names) {
+        t.constraints.clear();
+        for (std::size_t i = 0; i < t.checks.size(); ++i) {
+            const std::string nm = (i < check_names.size()) ? check_names[i] : std::string();
+            add_named_constraint(t, 0, 0, t.checks[i], nm);  // kind 0 = Check
+        }
+        for (std::size_t c = 0; c < t.columns.size(); ++c) {
+            if (t.columns[c].unique) add_named_constraint(t, 1, c, "", "");  // kind 1 = Unique
+            if (!t.columns[c].fk_table.empty()) add_named_constraint(t, 2, c, "", "");  // kind 2 = FK
+        }
+    }
+
     // --- CREATE TABLE ---------------------------------------------------------
     ExecResult exec_create(const CreateStmt& c) {
         if (catalog_.has(c.table)) {
@@ -939,6 +991,7 @@ private:
         // regardless of any NOT NULL spelling in the DDL.
         t.columns[t.pk_index].nullable = false;
         t.col_stats.assign(t.columns.size(), Table::ColStat{});  // per-column stats (Phase 2)
+        build_constraints(t, c.check_names);  // name the CHECK / UNIQUE / FK constraints (droppable)
         (void)catalog_.create(std::move(t));
         persist_schema(c.table);  // C7: durable schema record (survives a restart)
         return ExecResult{};
@@ -956,6 +1009,7 @@ private:
         t.checks = src->checks;
         t.next_auto_id = 1;  // a copy of the SCHEMA only — counters reset, no data, no indexes
         t.col_stats.assign(t.columns.size(), Table::ColStat{});
+        build_constraints(t, {});  // re-derive names for the copied schema (no explicit names)
         (void)catalog_.create(std::move(t));
         persist_schema(c.table);
         return ExecResult{};
@@ -1381,6 +1435,7 @@ private:
                 t->checks.pop_back();
                 return ExecResult::failure(*e);
             }
+            add_named_constraint(*t, 0, 0, a.check_src, a.constraint_name);  // droppable by name
             persist_schema(a.table);
             return ExecResult{};
         }
@@ -1389,6 +1444,30 @@ private:
             if (!ci) return ExecResult::failure("unknown column '" + a.unique_col + "'");
             if (auto e = check_unique_existing(*t, *ci)) return ExecResult::failure(*e);
             t->columns[*ci].unique = true;
+            add_named_constraint(*t, 1, *ci, "", a.constraint_name);  // droppable by name
+            persist_schema(a.table);
+            return ExecResult{};
+        }
+        if (a.op == AlterOp::DropConstraint) {
+            std::size_t found = t->constraints.size();
+            for (std::size_t i = 0; i < t->constraints.size(); ++i)
+                if (t->constraints[i].name == a.constraint_name) { found = i; break; }
+            if (found == t->constraints.size())
+                return ExecResult::failure("constraint '" + a.constraint_name + "' does not exist on '" +
+                                           a.table + "'");
+            const Table::NamedConstraint nc = t->constraints[found];
+            if (nc.kind == 0) {  // CHECK — remove the matching source from the enforced set
+                for (std::size_t i = 0; i < t->checks.size(); ++i)
+                    if (t->checks[i] == nc.check_src) { t->checks.erase(t->checks.begin() + i); break; }
+            } else if (nc.kind == 1) {  // UNIQUE — clear the column flag
+                if (nc.column < t->columns.size()) t->columns[nc.column].unique = false;
+            } else if (nc.kind == 2) {  // FOREIGN KEY — clear the column's reference
+                if (nc.column < t->columns.size()) {
+                    t->columns[nc.column].fk_table.clear();
+                    t->columns[nc.column].fk_column.clear();
+                }
+            }
+            t->constraints.erase(t->constraints.begin() + static_cast<std::ptrdiff_t>(found));
             persist_schema(a.table);
             return ExecResult{};
         }

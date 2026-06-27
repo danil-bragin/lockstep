@@ -830,7 +830,7 @@ private:
 
     // F5: CHECK ( <predicate> ) — capture the predicate's RAW SOURCE TEXT (so it persists in the
     // catalog and is re-parsed + evaluated on every write). Validates the predicate parses here.
-    [[nodiscard]] std::optional<ParseError> parse_check(CreateStmt& cr) {
+    [[nodiscard]] std::optional<ParseError> parse_check(CreateStmt& cr, const std::string& name) {
         advance();  // CHECK
         if (auto e = expect(Tok::LParen, "'(' after CHECK")) return e;
         const std::size_t start = cur_.pos;
@@ -843,6 +843,7 @@ private:
         }
         if (auto e = expect(Tok::RParen, "')' to close CHECK")) return e;
         cr.checks.push_back(std::move(text));
+        cr.check_names.push_back(name);  // "" => the engine auto-names it
         return std::nullopt;
     }
 
@@ -871,11 +872,18 @@ private:
             if (auto e = expect_ident("a new column name", st.alter.new_name)) return ParseResult{*e};
             return ParseResult{std::move(st)};
         }
-        // DROP [COLUMN] <c>  |  DROP CONSTRAINT ... (follow-on)
+        // DROP [COLUMN] <c>  |  DROP CONSTRAINT <name>
         if (is_kw("drop")) {
             advance();
+            if (is_kw("constraint")) {
+                advance();
+                st.alter.op = AlterOp::DropConstraint;
+                if (auto e = expect_ident("a constraint name to drop", st.alter.constraint_name)) {
+                    return ParseResult{*e};
+                }
+                return ParseResult{std::move(st)};
+            }
             if (is_kw("column")) advance();
-            else if (is_kw("constraint")) return err("DROP CONSTRAINT (named) is not supported yet");
             st.alter.op = AlterOp::DropColumn;
             if (auto e = expect_ident("a column name to drop", st.alter.col_name)) return ParseResult{*e};
             return ParseResult{std::move(st)};
@@ -924,7 +932,12 @@ private:
         }
         // ADD [COLUMN] <coldef>  |  ADD [CONSTRAINT name] CHECK (expr) | UNIQUE (col)
         if (auto e = expect_kw("add")) return ParseResult{*e};
-        if (is_kw("constraint")) { advance(); std::string nm; (void)expect_ident("a constraint name", nm); }
+        if (is_kw("constraint")) {
+            advance();
+            if (auto e = expect_ident("a constraint name", st.alter.constraint_name)) {
+                return ParseResult{*e};
+            }
+        }
         if (is_kw("check")) {
             advance();
             st.alter.op = AlterOp::AddCheck;
@@ -1057,9 +1070,21 @@ private:
                 seen_pk_clause = true;
                 break;  // PRIMARY KEY is the last clause
             }
-            // F5: a TABLE-level CHECK constraint (must precede the PRIMARY KEY clause, which breaks).
-            if (is_kw("check")) {
-                if (auto e = parse_check(st.create)) return ParseResult{*e};
+            // F5: a TABLE-level CHECK constraint (must precede the PRIMARY KEY clause, which breaks),
+            // optionally named: `CONSTRAINT <name> CHECK (...)`.
+            if (is_kw("constraint") || is_kw("check")) {
+                std::string cname;
+                if (is_kw("constraint")) {
+                    advance();
+                    if (auto e = expect_ident("a constraint name after CONSTRAINT", cname)) {
+                        return ParseResult{*e};
+                    }
+                }
+                if (!is_kw("check")) {
+                    return err("only named CHECK constraints are supported at the table level "
+                               "(name a UNIQUE / FOREIGN KEY at the column, or use ALTER)");
+                }
+                if (auto e = parse_check(st.create, cname)) return ParseResult{*e};
                 if (cur_.kind == Tok::Comma) {
                     advance();
                     continue;
@@ -1155,7 +1180,7 @@ private:
             }
             // F5: a COLUMN-level CHECK (e.g. `age INT CHECK (age >= 0)`) — same store as table-level.
             if (is_kw("check")) {
-                if (auto e = parse_check(st.create)) return ParseResult{*e};
+                if (auto e = parse_check(st.create, /*name=*/"")) return ParseResult{*e};
             }
             st.create.columns.push_back(std::move(col));
             if (cur_.kind == Tok::Comma) {

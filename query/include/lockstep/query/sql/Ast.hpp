@@ -61,6 +61,7 @@ struct CreateStmt {
     std::string pk_column;  // the FIRST PK column name (== pk_columns[0])
     std::vector<std::string> pk_columns;  // F1: the PK column list (1 = single, >1 = composite)
     std::vector<std::string> checks;  // F5: CHECK predicate source texts (column- or table-level)
+    std::vector<std::string> check_names;  // parallel to `checks`: explicit CONSTRAINT name ("" = auto)
     bool if_not_exists = false;       // E2: CREATE TABLE IF NOT EXISTS — no-op if it already exists
     std::string like_table;           // E2: CREATE TABLE t LIKE other — copy other's schema (no data)
     std::shared_ptr<SelectStmt> as_select;  // E3: CREATE TABLE t AS SELECT ... (populate from a query)
@@ -440,6 +441,7 @@ enum class AlterOp : std::uint8_t {
     AddUnique = 10,     // ADD [CONSTRAINT] UNIQUE (col)
     DropCheck = 11,     // DROP CHECK (drops the check whose source text matches, or by index)
     DropUnique = 12,    // DROP UNIQUE on a column (ALTER COLUMN c DROP UNIQUE)
+    DropConstraint = 13,  // DROP CONSTRAINT <name> (removes a named CHECK / UNIQUE / FOREIGN KEY)
 };
 struct AlterStmt {
     std::string table;
@@ -450,6 +452,7 @@ struct AlterStmt {
     Datum default_val;       // SetDefault literal
     std::string check_src;   // AddCheck / DropCheck predicate source text
     std::string unique_col;  // AddUnique target column
+    std::string constraint_name;  // DropConstraint target; AddCheck/AddUnique explicit name ("" = auto)
 };
 
 enum class StmtKind : std::uint8_t {
