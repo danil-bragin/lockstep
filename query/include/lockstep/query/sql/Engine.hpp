@@ -3909,12 +3909,13 @@ private:
                 }
             }
             if (vec_ok && !any_i128) {
+                // build_filter_mask + per-column fold are tight SIMD passes; a fused one-pass
+                // filter+fold was MEASURED SLOWER (nested per-row loops + cmov selects defeat
+                // vectorization — same lesson as the reverted running-accumulator). AGGREGATE FUSION:
+                // fold each DISTINCT aggregated INT column ONCE over the mask (so SUM(a),MIN(a),MAX(a)
+                // read column a a single time). The empty-match case keeps the int-0 rule.
                 std::vector<std::uint8_t> mask;
                 const std::int64_t nmatch = build_filter_mask(cols, count, vterms, mask);
-                // AGGREGATE FUSION: fold each DISTINCT aggregated INT column once over the mask, so
-                // SUM(a),MIN(a),MAX(a) read column a a single time. (Every agg column is INT NOT NULL
-                // here — the vec_ok gate guarantees it.) The empty-match case keeps the per-aggregate
-                // int-0 rule via compute_masked_agg.
                 std::vector<int> col_to_fuse(t.columns.size(), -1);
                 std::vector<IntFold> folds;
                 if (nmatch > 0) {
