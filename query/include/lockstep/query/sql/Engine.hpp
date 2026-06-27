@@ -359,6 +359,9 @@ public:
             cat_put_s(o, ix.name);
             cat_put_u32(o, ix.id);
             cat_put_u32(o, static_cast<std::uint32_t>(ix.column));
+            o.push_back(ix.unique ? 1 : 0);  // E5
+            cat_put_u32(o, static_cast<std::uint32_t>(ix.columns.size()));
+            for (const std::size_t c : ix.columns) cat_put_u32(o, static_cast<std::uint32_t>(c));
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
         for (const std::string& chk : t.checks) {
@@ -421,6 +424,9 @@ public:
             ix.name = cat_get_s(s, p);
             ix.id = cat_get_u32(s, p);
             ix.column = cat_get_u32(s, p);
+            ix.unique = s[p++] != 0;  // E5
+            const std::uint32_t nic = cat_get_u32(s, p);
+            for (std::uint32_t k = 0; k < nic; ++k) ix.columns.push_back(cat_get_u32(s, p));
             t.indexes.push_back(std::move(ix));
         }
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
@@ -522,6 +528,10 @@ public:
                 if (!catalog_.set_search_path(st.schema_arg))
                     return ExecResult::failure("unknown schema '" + st.schema_arg + "'");
                 return ExecResult{};
+            case StmtKind::ShowTables:
+                return exec_show_tables();
+            case StmtKind::Describe:
+                return exec_describe(st.truncate.table);
         }
         return ExecResult::failure("unknown statement kind");
     }
@@ -996,6 +1006,45 @@ private:
         return ExecResult{};
     }
 
+    // E5: SHOW TABLES — one row per table (in deterministic catalog order), column "table".
+    ExecResult exec_show_tables() {
+        ExecResult r;
+        for (const auto& [name, t] : catalog_.all()) {
+            (void)t;
+            ResultRow row;
+            row.cells.emplace_back("table", Datum::make_text(name));
+            r.rows.push_back(std::move(row));
+        }
+        r.affected = r.rows.size();
+        return r;
+    }
+    // E5: DESCRIBE t — one row per visible column: (column, type, nullable, key).
+    ExecResult exec_describe(const std::string& table) {
+        const Table* t = catalog_.find(table);
+        if (t == nullptr) return ExecResult::failure("unknown table '" + table + "'");
+        ExecResult r;
+        for (std::size_t i = 0; i < t->columns.size(); ++i) {
+            const Column& c = t->columns[i];
+            if (c.dropped) continue;
+            ResultRow row;
+            row.cells.emplace_back("column", Datum::make_text(c.name));
+            row.cells.emplace_back("type", Datum::make_text(describe_type(c)));
+            row.cells.emplace_back("nullable", Datum::make_text(c.nullable ? "YES" : "NO"));
+            row.cells.emplace_back("key", Datum::make_text(is_pk_col(*t, i) ? "PK" : (c.unique ? "UNIQUE" : "")));
+            r.rows.push_back(std::move(row));
+        }
+        r.affected = r.rows.size();
+        return r;
+    }
+    static std::string describe_type(const Column& c) {
+        if (c.logical != 0) {
+            std::string base = logical_name(c.logical);
+            if ((c.logical == 1 || c.logical == 6) && c.scale) base += "(s=" + std::to_string(c.scale) + ")";
+            return base;
+        }
+        return c.type == Type::Int ? "INT" : "TEXT";
+    }
+
     // E2: TRUNCATE TABLE — delete every row (schema kept). Tombstones each row + its index entries.
     ExecResult exec_truncate(const TruncateStmt& tr) {
         Table* t = catalog_.find_mut(tr.table);
@@ -1044,6 +1093,12 @@ private:
         ix.name = ci.index;
         ix.id = t->next_index_id++;
         ix.column = *col;
+        ix.unique = ci.unique;  // E5
+        for (const std::string& cn : ci.columns) {  // E5: resolve the covered column list
+            const auto c = t->column_index(cn);
+            if (!c) return ExecResult::failure("unknown column '" + cn + "' in index");
+            ix.columns.push_back(*c);
+        }
         t->indexes.push_back(ix);
         persist_schema(ci.table);  // C7: the new index is part of the durable schema
         const std::uint32_t table_id = t->id;
@@ -1063,10 +1118,12 @@ private:
             if (auto e = columnar_build_rows(*t, full, all, rows)) {
                 return ExecResult::failure(*e);
             }
+            std::set<std::string> uniq_seen;  // E5: UNIQUE backfill dedup (value prefix)
             for (const std::vector<Datum>& row : rows) {
-                const Key ikey =
-                    encode_index_entry(table_id, ix, row[ix.column], row[pk_index]);
-                commit_writes({{ikey, std::string{}}});
+                if (index_row_null(ix, row)) continue;
+                if (ix.unique && !uniq_seen.insert(index_value_key(*t, ix, row)).second)
+                    { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure("CREATE UNIQUE INDEX failed: duplicate value"); }
+                commit_writes({{encode_index_entry_row(table_id, ix, row, row[pk_index]), std::string{}}});
             }
             return ExecResult{};
         }
@@ -1076,16 +1133,26 @@ private:
             q.scan(table_prefix(table_id), table_prefix_end(table_id));
             collect(db_.run(q), kvs);
         }
+        std::set<std::string> uniq_seen;  // E5
         for (const storage::KeyValue& kv : kvs) {
             if (is_tombstone(kv.second)) {
                 continue;
             }
             const std::vector<Datum> row = decode_row(*t, kv.first, kv.second);
-            const Key ikey =
-                encode_index_entry(table_id, ix, row[ix.column], row[pk_index]);
-            commit_writes({{ikey, std::string{}}});
+            if (index_row_null(ix, row)) continue;
+            if (ix.unique && !uniq_seen.insert(index_value_key(*t, ix, row)).second)
+                { t->indexes.pop_back(); persist_schema(ci.table); return ExecResult::failure("CREATE UNIQUE INDEX failed: duplicate value"); }
+            commit_writes({{encode_index_entry_row(table_id, ix, row, row[pk_index]), std::string{}}});
         }
         return ExecResult{};
+    }
+    // E5 helpers.
+    static bool index_row_null(const Index& ix, const std::vector<Datum>& row) {
+        for (const std::size_t c : ix.columns) if (row[c].is_null) return true;
+        return false;
+    }
+    static std::string index_value_key(const Table& t, const Index& ix, const std::vector<Datum>& row) {
+        return encode_index_value_prefix(t.id, ix, row);  // bytes that identify the indexed tuple
     }
 
     // --- DROP INDEX <name> ON <table> -----------------------------------------
@@ -1598,11 +1665,12 @@ private:
             // over point-got rows) still excludes it. This keeps the index == the table's
             // matchable rows. (UPDATE removes the OLD entry only if the old value was
             // non-NULL — symmetric, so a NULL<->value transition is maintained correctly.)
-            if (row[ix.column].is_null) {
+            bool any_null = false;  // E5: skip the entry if ANY covered column is NULL
+            for (const std::size_t c : ix.columns) if (row[c].is_null) { any_null = true; break; }
+            if (any_null) {
                 continue;
             }
-            const Key ikey =
-                encode_index_entry(t.id, ix, row[ix.column], row[t.pk_index]);
+            const Key ikey = encode_index_entry_row(t.id, ix, row, row[t.pk_index]);
             out.emplace_back(ikey, tombstone ? tombstone_marker() : std::string{});
         }
     }
@@ -3516,7 +3584,11 @@ private:
             if (t->columns[c].unique && c != t->pk_index) unique_cols.push_back(c);
         }
         std::vector<std::set<std::string>> seen_unique(unique_cols.size());
-        if (!unique_cols.empty()) {
+        // E5: UNIQUE INDEXES — enforce like a UNIQUE column, but over the index's (composite) tuple.
+        std::vector<const Index*> uniq_indexes;
+        for (const Index& ix : t->indexes) if (ix.unique) uniq_indexes.push_back(&ix);
+        std::vector<std::set<std::string>> seen_uidx(uniq_indexes.size());
+        if (!unique_cols.empty() || !uniq_indexes.empty()) {
             SelectStmt scan;
             scan.table = t->name;
             std::vector<std::vector<Datum>> existing;
@@ -3528,6 +3600,9 @@ private:
                     const Datum& d = er[unique_cols[u]];
                     if (!d.is_null) seen_unique[u].insert(group_key_field(d));
                 }
+                for (std::size_t u = 0; u < uniq_indexes.size(); ++u)
+                    if (!index_row_null(*uniq_indexes[u], er))
+                        seen_uidx[u].insert(index_value_key(*t, *uniq_indexes[u], er));
             }
         }
         // Build ONE row from a value tuple: a named column is set (type-checked + NULL re-typed);
@@ -3664,6 +3739,12 @@ private:
                     return "UNIQUE constraint violated on column '" +
                            t->columns[unique_cols[u]].name + "'";
                 }
+            }
+            // E5: a NEW row must not repeat a UNIQUE INDEX tuple (a NULL in any covered column exempts).
+            for (std::size_t u = 0; u < uniq_indexes.size(); ++u) {
+                if (index_row_null(*uniq_indexes[u], row)) continue;
+                if (!seen_uidx[u].insert(index_value_key(*t, *uniq_indexes[u], row)).second)
+                    return "UNIQUE index '" + uniq_indexes[u]->name + "' violated";
             }
             emit_row_writes(*t, row, writes);
             index_writes_for_row(*t, row, /*tombstone=*/false, writes);

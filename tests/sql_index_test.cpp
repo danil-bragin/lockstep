@@ -360,7 +360,9 @@ bool run_errors() {
     must_fail("CREATE INDEX x ON nope (dept)", "index on unknown table errors");
     must_fail("CREATE INDEX x ON emp (bogus)", "index on unknown column errors");
     must_fail("CREATE INDEX x ON emp (id)", "index on the PK errors");
-    must_fail("CREATE INDEX x ON emp (dept, sal)", "multi-column index errors");
+    // E5: multi-column (composite) index is now SUPPORTED.
+    CHECK(e.exec("CREATE INDEX xc ON emp (dept, sal)").ok, "composite index now ok");
+    ok = ok && e.exec("CREATE INDEX xc2 ON emp (sal, dept)").ok;
     const ExecResult ok1 = e.exec("CREATE INDEX idx_dept ON emp (dept)");
     CHECK(ok1.ok, "first CREATE INDEX must succeed");
     must_fail("CREATE INDEX idx_dept ON emp (sal)", "duplicate index name errors");

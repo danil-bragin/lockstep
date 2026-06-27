@@ -81,6 +81,9 @@ public:
                 return route(sql, st.del.where_value);
             case StmtKind::Select:
                 return exec_select(sql, st.select);
+            case StmtKind::ShowTables:  // E5: introspection -> any shard (schema is replicated)
+            case StmtKind::Describe:
+                return shards_.front()->exec(sql);
         }
         return ExecResult::failure("distributed: unsupported statement");
     }

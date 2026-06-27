@@ -136,7 +136,12 @@ struct Column {
 struct Index {
     std::string name;           // the index name (unique within the table)
     std::uint32_t id = 0;       // dense per-table index id => the index key namespace
-    std::size_t column = 0;     // the indexed column (its schema index)
+    std::size_t column = 0;     // the LEADING indexed column (== columns[0]; the planner's eq path)
+    // E5: a COMPOSITE index covers multiple columns (entry = each column's order-preserving encoding
+    // concatenated, then the PK). A single-column index has columns == {column} (byte-identical to
+    // before). `unique` rejects a second row with the same indexed tuple.
+    std::vector<std::size_t> columns;
+    bool unique = false;
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).
@@ -1105,6 +1110,23 @@ inline void put_index_col(std::string& out, const Datum& d) {
     Key k = index_prefix(table_id, ix.id);
     put_index_col(k, col_value);
     k += encode_pk(pk);
+    return k;
+}
+// E5: COMPOSITE index entry — each covered column's order-preserving encoding concatenated (in index
+// order), then the PK. Byte-identical to the single-column form when columns == {column}.
+[[nodiscard]] inline Key encode_index_entry_row(std::uint32_t table_id, const Index& ix,
+                                                const std::vector<Datum>& row, const Datum& pk) {
+    Key k = index_prefix(table_id, ix.id);
+    for (const std::size_t c : ix.columns) put_index_col(k, row[c]);
+    k += encode_pk(pk);
+    return k;
+}
+// E5: the index-prefix range covering all entries whose COVERED columns equal `row`'s (for a unique
+// check, or a composite eq lookup). Returns the [lo, hi) the caller scans.
+[[nodiscard]] inline Key encode_index_value_prefix(std::uint32_t table_id, const Index& ix,
+                                                   const std::vector<Datum>& row) {
+    Key k = index_prefix(table_id, ix.id);
+    for (const std::size_t c : ix.columns) put_index_col(k, row[c]);
     return k;
 }
 

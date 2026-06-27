@@ -430,6 +430,27 @@ public:
             st.kind = StmtKind::Truncate;
             if (auto e = expect_table_name("a table name after TRUNCATE", st.truncate.table)) return ParseResult{*e};
             r = ParseResult{std::move(st)};
+        } else if (kw == "show") {  // E5: SHOW TABLES | SHOW COLUMNS FROM t
+            advance();
+            Statement st;
+            if (is_kw("tables")) {
+                advance();
+                st.kind = StmtKind::ShowTables;
+            } else if (is_kw("columns")) {
+                advance();
+                if (auto e = expect_kw("from")) return *e;
+                st.kind = StmtKind::Describe;
+                if (auto e = expect_table_name("a table name", st.truncate.table)) return ParseResult{*e};
+            } else {
+                return err("expected TABLES or COLUMNS after SHOW");
+            }
+            r = ParseResult{std::move(st)};
+        } else if (kw == "describe" || kw == "desc") {  // E5: DESCRIBE t
+            advance();
+            Statement st;
+            st.kind = StmtKind::Describe;
+            if (auto e = expect_table_name("a table name after DESCRIBE", st.truncate.table)) return ParseResult{*e};
+            r = ParseResult{std::move(st)};
         } else if (kw == "set") {  // E4: SET search_path TO s | DEFAULT
             advance();
             if (auto e = expect_kw("search_path")) return ParseResult{*e};
@@ -945,8 +966,13 @@ private:
     // CREATE TABLE t (...) | CREATE INDEX name ON t (col)
     ParseResult parse_create() {
         advance();  // CREATE
+        if (is_kw("unique")) {  // E5: CREATE UNIQUE INDEX
+            advance();  // UNIQUE
+            if (!is_kw("index")) return err("expected INDEX after CREATE UNIQUE");
+            return parse_create_index(/*unique=*/true);  // consumes INDEX itself
+        }
         if (is_kw("index")) {
-            return parse_create_index();
+            return parse_create_index(/*unique=*/false);
         }
         if (is_kw("schema")) {  // E4: CREATE SCHEMA [IF NOT EXISTS] s
             advance();
@@ -1154,10 +1180,11 @@ private:
 
     // CREATE INDEX <name> ON <table> (<col>) — single-column secondary index. A
     // multi-column list (a comma after the column) is a clean "OUT in v1" error.
-    ParseResult parse_create_index() {
+    ParseResult parse_create_index(bool unique) {
         advance();  // INDEX
         Statement st;
         st.kind = StmtKind::CreateIndex;
+        st.create_index.unique = unique;  // E5
         if (auto e = expect_ident("an index name after CREATE INDEX",
                                   st.create_index.index)) {
             return ParseResult{*e};
@@ -1171,14 +1198,16 @@ private:
         if (auto e = expect(Tok::LParen, "'(' before the indexed column")) {
             return ParseResult{*e};
         }
-        if (auto e = expect_ident("the indexed column name", st.create_index.column)) {
-            return ParseResult{*e};
+        // E5: one OR MORE indexed columns (composite index).
+        for (;;) {
+            std::string col;
+            if (auto e = expect_ident("an indexed column name", col)) return ParseResult{*e};
+            st.create_index.columns.push_back(col);
+            if (cur_.kind == Tok::Comma) { advance(); continue; }
+            break;
         }
-        if (cur_.kind == Tok::Comma) {
-            return err("multi-column INDEX is OUT in v1 (single-column secondary "
-                       "index only)");
-        }
-        if (auto e = expect(Tok::RParen, "')' after the indexed column")) {
+        st.create_index.column = st.create_index.columns.front();  // leading column
+        if (auto e = expect(Tok::RParen, "')' after the indexed columns")) {
             return ParseResult{*e};
         }
         return ParseResult{std::move(st)};

@@ -71,7 +71,9 @@ struct CreateStmt {
 struct CreateIndexStmt {
     std::string index;   // the index name (unique within the table)
     std::string table;   // the table it indexes
-    std::string column;  // the single indexed column
+    std::string column;  // the LEADING indexed column (== columns[0])
+    std::vector<std::string> columns;  // E5: composite index column list (>=1)
+    bool unique = false;               // E5: CREATE UNIQUE INDEX
 };
 
 // DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).
@@ -459,6 +461,8 @@ enum class StmtKind : std::uint8_t {
     CreateSchema = 13,  // E4: CREATE SCHEMA [IF NOT EXISTS] s
     DropSchema = 14,    // E4: DROP SCHEMA [IF EXISTS] s
     SetSearchPath = 15, // E4: SET search_path TO s | DEFAULT
+    ShowTables = 16,    // E5: SHOW TABLES
+    Describe = 17,      // E5: DESCRIBE t / SHOW COLUMNS FROM t
 };
 
 struct Statement {
