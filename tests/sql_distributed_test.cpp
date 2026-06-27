@@ -236,6 +236,65 @@ int main() {
           "the 2 COUNT(DISTINCT)+GROUP BY queries took the shuffle path; SUM(DISTINCT)/scalar "
           "gathered (got " + std::to_string(dist.distinct_shuffles() - ds_before) + ")");
 
+    // ---- BROADCAST-DIM JOIN: a REPLICATED dim joined per-shard, partial aggregates merged ----
+    {
+        SqlEngine bsolo;
+        std::vector<SqlEngine> bshards(kShards);
+        std::vector<EngineSqlShard> bwraps;
+        bwraps.reserve(kShards);
+        for (SqlEngine& s : bshards) {
+            s.set_columnar_default(true);
+            bwraps.emplace_back(&s);
+        }
+        std::vector<ISqlShard*> bptrs;
+        for (EngineSqlShard& w : bwraps) bptrs.push_back(&w);
+        DistributedSql bdist(bptrs);
+        bdist.set_replicated("d");  // dim replicated -> writes broadcast -> per-shard join is valid
+        const char* fddl = "CREATE TABLE f (id INT, k INT NOT NULL, v INT NOT NULL, PRIMARY KEY (id))";
+        const char* dddl = "CREATE TABLE d (k INT, lbl TEXT NOT NULL, PRIMARY KEY (k))";
+        check(bsolo.exec(fddl).ok && bsolo.exec(dddl).ok, "bsolo create");
+        check(bdist.exec(fddl).ok && bdist.exec(dddl).ok, "bdist create");
+        for (int kk = 0; kk < 4; ++kk) {
+            const std::string ins = "INSERT INTO d (k, lbl) VALUES (" + std::to_string(kk) + ", '" +
+                                    labels[kk] + "')";
+            check(bsolo.exec(ins).ok && bdist.exec(ins).ok, "d insert");
+        }
+        SplitMix br(99);
+        for (int i = 0; i < 400; ++i) {
+            const std::string ins = "INSERT INTO f (id, k, v) VALUES (" + std::to_string(i) + ", " +
+                                    std::to_string(i % 4) + ", " +
+                                    std::to_string(br.next() % 500) + ")";
+            check(bsolo.exec(ins).ok && bdist.exec(ins).ok, "f insert");
+        }
+        for (SqlEngine& s : bshards) s.flush_columnar("f");
+        // The replicated dim is FULL on every shard (4 rows each); the fact is spread.
+        std::size_t dim_total = 0;
+        std::size_t fact_nonempty = 0;
+        for (SqlEngine& s : bshards) {
+            const ExecResult dc = s.exec("SELECT COUNT(*) FROM d");
+            dim_total += static_cast<std::size_t>(dc.rows[0].cells[0].second.i);
+            const ExecResult fc = s.exec("SELECT COUNT(*) FROM f");
+            if (fc.rows[0].cells[0].second.i > 0) ++fact_nonempty;
+        }
+        check(dim_total == kShards * 4, "replicated dim is FULL on every shard (got " +
+                                            std::to_string(dim_total) + ")");
+        check(fact_nonempty == kShards, "fact spread across shards");
+        const std::size_t bj = bdist.broadcast_joins();
+        const std::vector<std::string> bq = {
+            "SELECT d.lbl, COUNT(*), SUM(f.v) FROM f JOIN d ON f.k = d.k GROUP BY d.lbl",
+            "SELECT d.lbl, MIN(f.v), MAX(f.v) FROM f JOIN d ON f.k = d.k GROUP BY d.lbl",
+        };
+        for (const std::string& q : bq) {
+            const std::string ss = render(bsolo.exec(q));
+            const std::string dd = render(bdist.exec(q));
+            check(ss == dd, "broadcast-dim join != solo for [" + q + "]\n  solo=[" + ss +
+                                "]\n  dist=[" + dd + "]");
+        }
+        check(bdist.broadcast_joins() - bj == 2,
+              "both broadcast-dim joins took the per-shard-join path (got " +
+                  std::to_string(bdist.broadcast_joins() - bj) + ")");
+    }
+
     // Distributed AVG is explicitly rejected (can't merge an averaged value across shards).
     const ExecResult avg = dist.exec("SELECT AVG(amount) FROM t");
     check(!avg.ok && avg.error.find("AVG") != std::string::npos,

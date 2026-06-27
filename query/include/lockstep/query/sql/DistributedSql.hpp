@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,14 @@ class DistributedSql {
 public:
     explicit DistributedSql(std::vector<ISqlShard*> shards) : shards_(std::move(shards)) {}
 
+    // Mark `table` REPLICATED: it lives in FULL on every shard (writes broadcast instead of route by
+    // PK hash). A small dimension declared replicated lets a star JOIN run ENTIRELY on each shard
+    // (fact-shard ⋈ the local full dim -> partial group aggregates), which the coordinator merges —
+    // the broadcast-dim alternative to the pre-aggregate pushdown. Better when the join key has far
+    // more distinct values than the GROUP BY (per-shard partials = #groups, not #keys). Declare
+    // BEFORE inserting the table's rows so every row broadcasts. The FACT stays sharded.
+    void set_replicated(const std::string& table) { replicated_.insert(table); }
+
     ExecResult exec(const std::string& sql) {
         ParseResult pr = parse_sql(sql);
         if (!pr.ok()) {
@@ -74,11 +83,11 @@ public:
             case StmtKind::Rollback:
                 return broadcast(sql);
             case StmtKind::Insert:
-                return route(sql, pk_value_of(st.insert));
+                return route_or_broadcast(sql, st.insert.table, pk_value_of(st.insert));
             case StmtKind::Update:
-                return route(sql, st.update.where_value);
+                return route_or_broadcast(sql, st.update.table, st.update.where_value);
             case StmtKind::Delete:
-                return route(sql, st.del.where_value);
+                return route_or_broadcast(sql, st.del.table, st.del.where_value);
             case StmtKind::Select:
                 return exec_select(sql, st.select);
             case StmtKind::ShowTables:  // E5: introspection -> any shard (schema is replicated)
@@ -124,6 +133,24 @@ private:
         return shards_[shard_of(key)]->exec(sql);
     }
 
+    // A replicated table's write goes to EVERY shard (full copy on each); a sharded table's write is
+    // routed to the one owning shard by PK hash.
+    ExecResult route_or_broadcast(const std::string& sql, const std::string& table, const Datum& key) {
+        if (replicated_.count(table) != 0) return broadcast(sql);
+        return route(sql, key);
+    }
+
+    // True iff every NON-fact table in the join is replicated and the fact (from[0]) is sharded — the
+    // precondition for the broadcast-dim join (each shard's fact-slice joined with its full dim copies
+    // yields a disjoint partition of the global join; the partial group aggregates then merge).
+    [[nodiscard]] bool broadcast_join_ok(const SelectStmt& sel) const {
+        if (!sel.is_join() || sel.from.empty()) return false;
+        if (replicated_.count(sel.from[0].table) != 0) return false;  // fact must be sharded
+        for (std::size_t i = 1; i < sel.from.size(); ++i)
+            if (replicated_.count(sel.from[i].table) == 0) return false;
+        return true;
+    }
+
     ExecResult exec_select(const std::string& sql, const SelectStmt& sel) {
         // JOIN, or a non-aggregate scan that needs GLOBAL ORDER (ORDER BY): GATHER every involved
         // table's rows from all shards into a fresh local engine and run the ORIGINAL query there —
@@ -132,6 +159,24 @@ private:
         // follow-on.) Aggregates + unordered scans + point reads stay on the efficient
         // scatter-merge path below.
         if (sel.is_join()) {
+            // BROADCAST-DIM JOIN: when every dim is replicated (full copy on each shard), each shard
+            // joins its fact-slice with its local dims and computes PARTIAL group aggregates; the
+            // coordinator merges them (Σ/min/max by group key). The dim was broadcast at write time;
+            // only per-shard #group partials cross the network. Aggregate-only, no HAVING/ORDER BY
+            // (a shard's local HAVING / order can't decide the global result). DISTINCT/AVG are
+            // rejected by merge_aggregate (same as the scatter path). Else: the pre-aggregate
+            // pushdown, else gather-and-run.
+            if (broadcast_join_ok(sel) && sel.has_aggregates && !sel.having.present() &&
+                sel.order_by.empty()) {
+                std::vector<ExecResult> parts;
+                parts.reserve(shards_.size());
+                for (ISqlShard* s : shards_) {
+                    parts.push_back(s->exec(sql));
+                    if (!parts.back().ok) return parts.back();
+                }
+                ++broadcast_joins_;
+                return merge_aggregate(parts, sel);
+            }
             // PUSHDOWN star-schema JOIN+aggregate (co-located shuffle): aggregate the LARGE fact by
             // the join key ON EACH SHARD (no join, no dim there), merge the small per-key partials,
             // then join the (tiny) small dim + roll up by the dim group — so the fact is NEVER
@@ -816,14 +861,21 @@ private:
         return roles;
     }
 
+    // Merge a per-shard partial `v` into the running `acc` for one aggregate. NULL-SAFE: a NULL
+    // partial is "no value from this shard" (e.g. a shard whose join slice is empty for this group),
+    // so it contributes 0 to COUNT/SUM and is skipped for MIN/MAX — exactly single-node NULL-skip
+    // semantics. Without this, a NULL partial's default .i (0) would corrupt a MIN/MAX merge.
     static void combine(Datum& acc, const Datum& v, int kind) {
         const AggKind k = static_cast<AggKind>(kind);
         if (k == AggKind::CountStar || k == AggKind::Count || k == AggKind::Sum) {
-            acc = Datum::make_int(acc.i + v.i);
+            const std::int64_t add = v.is_null ? 0 : v.i;
+            acc = Datum::make_int((acc.is_null ? 0 : acc.i) + add);
         } else if (k == AggKind::Min) {
-            if (v.i < acc.i) acc = v;
+            if (v.is_null) return;
+            if (acc.is_null || v.i < acc.i) acc = v;
         } else if (k == AggKind::Max) {
-            if (v.i > acc.i) acc = v;
+            if (v.is_null) return;
+            if (acc.is_null || v.i > acc.i) acc = v;
         }
     }
 
@@ -917,12 +969,15 @@ private:
     std::vector<ISqlShard*> shards_;
     std::map<std::string, std::string> pk_;          // table -> PK column (for INSERT routing)
     std::map<std::string, std::string> create_sql_;  // table -> CREATE (to rebuild a local copy)
+    std::set<std::string> replicated_;  // tables held in FULL on every shard (writes broadcast)
     std::size_t pushdowns_ = 0;  // star-schema pushdowns taken (vs the gather fallback)
     std::size_t distinct_shuffles_ = 0;  // global-distinct shuffles taken (vs the gather fallback)
+    std::size_t broadcast_joins_ = 0;  // broadcast-dim joins taken (replicated dims, per-shard join)
 
 public:
     [[nodiscard]] std::size_t pushdowns() const { return pushdowns_; }
     [[nodiscard]] std::size_t distinct_shuffles() const { return distinct_shuffles_; }
+    [[nodiscard]] std::size_t broadcast_joins() const { return broadcast_joins_; }
 };
 
 }  // namespace lockstep::query::sql
