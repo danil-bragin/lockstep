@@ -1237,11 +1237,12 @@ private:
                 return ParseResult{*e};
             }
         }
-        if (is_kw("using")) {  // I7: USING HASH | BTREE
+        if (is_kw("using")) {  // I7: USING HASH | BTREE ; J3: USING GIN (array-element)
             advance();
             if (is_kw("hash")) { advance(); st.create_index.hash = true; }
             else if (is_kw("btree")) { advance(); }
-            else return err("USING expects HASH or BTREE");
+            else if (is_kw("gin")) { advance(); st.create_index.gin = true; }
+            else return err("USING expects HASH, BTREE, or GIN");
         }
         if (is_kw("where")) {  // I5: PARTIAL index — capture the predicate's source text (re-parsed).
             advance();

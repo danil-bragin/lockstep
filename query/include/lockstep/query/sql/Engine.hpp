@@ -366,6 +366,7 @@ public:
             for (const std::size_t c : ix.columns) cat_put_u32(o, static_cast<std::uint32_t>(c));
             cat_put_s(o, ix.expr_src);  // J2: expression index source
             o.push_back(ix.expr_type == Type::Int ? 0 : 1);
+            o.push_back(ix.gin ? 1 : 0);  // J3: GIN (array-element) index
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
         for (const std::string& chk : t.checks) {
@@ -435,6 +436,7 @@ public:
             for (std::uint32_t k = 0; k < nic; ++k) ix.columns.push_back(cat_get_u32(s, p));
             ix.expr_src = cat_get_s(s, p);  // J2: expression index source
             ix.expr_type = (s[p++] == 0) ? Type::Int : Type::Text;
+            ix.gin = s[p++] != 0;  // J3: GIN (array-element) index
             t.indexes.push_back(std::move(ix));
         }
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
@@ -1158,6 +1160,20 @@ private:
                 if (!c) return ExecResult::failure("unknown column '" + cn + "' in index");
                 ix.columns.push_back(*c);
             }
+            if (ci.gin) {  // J3: GIN — a single ARRAY column, indexed per element
+                if (ix.columns.size() != 1) {
+                    return ExecResult::failure("USING GIN indexes exactly one ARRAY column");
+                }
+                if (t->columns[ix.columns[0]].logical != 7) {
+                    return ExecResult::failure("USING GIN requires an ARRAY column (got '" +
+                                               ci.column + "')");
+                }
+                if (ci.unique) {
+                    return ExecResult::failure("a GIN (array-element) index cannot be UNIQUE");
+                }
+                ix.gin = true;
+                ix.hash = false;  // GIN entries are ordered per element (range is moot)
+            }
         }
         t->indexes.push_back(ix);
         persist_schema(ci.table);  // C7: the new index is part of the durable schema
@@ -1179,6 +1195,12 @@ private:
             }
             std::set<std::string> uniq_seen;  // E5: UNIQUE backfill dedup (value prefix)
             for (const std::vector<Datum>& row : rows) {
+                if (ix.gin) {  // J3: one entry per distinct array element
+                    if (!row_matches_partial(*t, ix, row)) continue;
+                    for (const Datum& el : gin_elements(ix, row))
+                        commit_writes({{encode_index_entry(table_id, ix, el, row[t->pk_index]), std::string{}}});
+                    continue;
+                }
                 bool skip = true;
                 Key entry;
                 std::string uk;
@@ -1203,6 +1225,12 @@ private:
                 continue;
             }
             const std::vector<Datum> row = decode_row(*t, kv.first, kv.second);
+            if (ix.gin) {  // J3: one entry per distinct array element
+                if (!row_matches_partial(*t, ix, row)) continue;
+                for (const Datum& el : gin_elements(ix, row))
+                    commit_writes({{encode_index_entry(table_id, ix, el, row[t->pk_index]), std::string{}}});
+                continue;
+            }
             bool skip = true;
             Key entry;
             std::string uk;
@@ -1884,10 +1912,32 @@ private:
         return std::nullopt;
     }
 
+    // J3: the DISTINCT, non-NULL elements of a GIN index's array column for `row` (the per-element
+    // index keys). Dedup is by the order-preserving element encoding so `['red','red']` yields one
+    // entry. A NULL array / NULL element contributes nothing (a NULL is never `= ANY`-matched).
+    static std::vector<Datum> gin_elements(const Index& ix, const std::vector<Datum>& row) {
+        std::vector<Datum> out;
+        if (ix.columns.empty()) return out;
+        const Datum& arr = row[ix.columns[0]];
+        if (arr.is_null || arr.logical != 7 || arr.type != Type::Text) return out;
+        std::set<std::string> seen;
+        for (const Datum& el : Datum::decode_array(arr.s)) {
+            if (el.is_null) continue;
+            if (seen.insert(encode_index_col(el)).second) out.push_back(el);
+        }
+        return out;
+    }
+
     void index_writes_for_row(const Table& t, const std::vector<Datum>& row, bool tombstone,
                               std::vector<std::pair<Key, Value>>& out) {
         for (const Index& ix : t.indexes) {
             if (!row_matches_partial(t, ix, row)) continue;  // I5: outside the partial set
+            if (ix.gin) {  // J3: one entry per DISTINCT array element
+                for (const Datum& el : gin_elements(ix, row))
+                    out.emplace_back(encode_index_entry(t.id, ix, el, row[t.pk_index]),
+                                     tombstone ? tombstone_marker() : std::string{});
+                continue;
+            }
             // J2: an EXPRESSION index entry's leading token is the evaluated expression value. A NULL
             // (or, defensively, a type-drifted) result gets no entry — same as a NULL column below.
             // validate_index_exprs already rejected an un-evaluable row at the write entry, so the
@@ -6082,7 +6132,7 @@ private:
         // The inner must have a single/leading-column index on the join column (eq lookup).
         const Index* ix = inner->index_for_column(inner_local);
         if (ix == nullptr || ix->columns.empty() || ix->columns[0] != inner_local ||
-            !ix->partial_src.empty())  // I5: a partial inner index can't serve an arbitrary join key
+            !ix->partial_src.empty() || ix->gin)  // I5: partial / J3: GIN can't serve a whole-value join key
             return std::nullopt;
 
         last_join_index_nl_ = true;  // TEST signal: the index-NL path was taken
@@ -7101,9 +7151,13 @@ private:
         } else if (!pk_fast && sel.filter.present()) {
             if (auto plan = choose_index_access(sel, t)) {
                 const std::size_t n = t.row_count;
+                // J3: a GIN containment lookup is per-ELEMENT; the array column's whole-array n_distinct
+                // stat is meaningless for it, so use the generic eq selectivity (a containment scan is a
+                // selective access — and is always transparent: the residual `= ANY` re-checks each row).
                 std::size_t matches =
-                    plan->is_eq ? est_eq_matches_col(t, plan->index->column, n)
-                                : est_range_rows(t, plan->index->column, plan->lo, plan->hi);
+                    plan->index->gin ? est_eq_matches(n)
+                    : plan->is_eq    ? est_eq_matches_col(t, plan->index->column, n)
+                                     : est_range_rows(t, plan->index->column, plan->lo, plan->hi);
                 // I1: each extra equality in a composite prefix multiplies selectivity (fewer rows).
                 if (plan->is_eq && plan->eq_prefix.size() > 1)
                     matches = std::max<std::size_t>(1, matches >> (plan->eq_prefix.size() - 1));
@@ -7155,7 +7209,7 @@ private:
             if (!col || *col == t.pk_index || n.literal.type != t.columns[*col].type) continue;
             const Index* ix = t.index_for_column(*col);
             // a SINGLE-column index on the leading column (a composite is the I1 prefix path instead).
-            if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col ||
+            if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col || ix->gin ||
                 !query_implies_partial(sel, t, *ix))
                 continue;
             bool dup = false;
@@ -7186,6 +7240,8 @@ private:
             case AccessPath::Kind::PkRange:
                 return est_range_matches(t.row_count);
             case AccessPath::Kind::Index: {
+                if (ap.index.index->gin)  // J3: per-element containment — generic eq selectivity
+                    return est_eq_matches(t.row_count);
                 if (!ap.index.is_eq)
                     return est_range_rows(t, ap.index.index->column, ap.index.lo, ap.index.hi);
                 std::size_t m = est_eq_matches_col(t, ap.index.index->column, t.row_count);  // I6
@@ -7289,6 +7345,20 @@ private:
         return false;
     }
 
+    // J3: is `e` a CONSTANT expression (no column reference)? A constant LHS of `<const> = ANY(arr)`
+    // is a single value the GIN index can look up; a column LHS is row-dependent and cannot.
+    static bool expr_is_constant(const Expr* e) {
+        if (e == nullptr) return true;
+        if (e->kind == ExprKind::Col) return false;
+        if (e->kind == ExprKind::Case) return false;  // its WHEN predicates may touch columns — conservative
+        if (e->left && !expr_is_constant(e->left.get())) return false;
+        if (e->right && !expr_is_constant(e->right.get())) return false;
+        for (const auto& a : e->args) if (!expr_is_constant(a.get())) return false;
+        for (const auto& w : e->case_then) if (!expr_is_constant(w.get())) return false;
+        if (e->case_else && !expr_is_constant(e->case_else.get())) return false;
+        return true;
+    }
+
     // J2: find an EXPRESSION index whose stored expression structurally equals `qe` (the query's LHS
     // expression). The index is usable for `qe = literal` only when the index is not partial-or-the
     // -query-implies-it. Returns the index (or null).
@@ -7327,8 +7397,8 @@ private:
             // query doesn't imply is skipped (a full index on the same column can still serve).
             const Index* ix = nullptr;
             for (const Index& cand : t.indexes)
-                if (!cand.columns.empty() && cand.columns[0] == *col &&
-                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }
+                if (!cand.columns.empty() && cand.columns[0] == *col && !cand.gin &&
+                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }  // J3: GIN excluded (per-element)
             if (ix == nullptr) {
                 continue;
             }
@@ -7379,6 +7449,35 @@ private:
             plan.eq_prefix.push_back(n.literal);
             return plan;
         }
+        // J3: an array CONTAINMENT lookup — `<const> = ANY(arr_col)` over a GIN-indexed array column.
+        // The GIN index has one entry per element, so looking up the constant value yields exactly the
+        // rows whose array holds it. The residual WHERE still re-checks `= ANY` per fetched row, so the
+        // result is byte-identical to a scan.
+        for (const std::int32_t li : leaves) {
+            const PredNode& n = p.nodes[static_cast<std::size_t>(li)];
+            if (n.kind != PredNodeKind::Cmp || n.op != CmpOp::Eq || !n.any_quant || n.all_quant ||
+                n.operand != OperandKind::Expr || !n.rhs_is_column || !expr_is_constant(n.expr.get())) {
+                continue;
+            }
+            const auto acol = t.column_index(n.rhs_column);
+            if (!acol || t.columns[*acol].logical != 7) continue;  // the ANY operand must be an ARRAY column
+            const Index* ix = nullptr;
+            for (const Index& cand : t.indexes)
+                if (cand.gin && !cand.columns.empty() && cand.columns[0] == *acol &&
+                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }
+            if (ix == nullptr) continue;
+            // Evaluate the constant LHS to the element value to look up (no row needed — it is constant).
+            Datum v;
+            const std::vector<Datum> dummy(t.columns.size());
+            if (n.expr == nullptr || eval_expr(*n.expr, t, dummy, v)) continue;  // un-evaluable => scan
+            if (v.is_null || v.type != t.columns[*acol].elem_type) continue;
+            IndexPlan plan;
+            plan.index = ix;
+            plan.is_eq = true;
+            plan.eq = v;
+            plan.eq_prefix.push_back(v);
+            return plan;
+        }
         // Second pass: an indexed BETWEEN (col >= lo AND col <= hi over ONE column).
         for (std::size_t a = 0; a < leaves.size(); ++a) {
             const PredNode& na = p.nodes[static_cast<std::size_t>(leaves[a])];
@@ -7392,7 +7491,7 @@ private:
                 continue;
             }
             const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr || ix->hash || !query_implies_partial(sel, t, *ix)) {  // I7 hash; I5 partial
+            if (ix == nullptr || ix->hash || ix->gin || !query_implies_partial(sel, t, *ix)) {  // I7 hash; J3 GIN; I5 partial
                 continue;
             }
             // Find a matching `col <= hi` conjunct on the SAME column.
@@ -7637,6 +7736,9 @@ private:
     // I3: does `ix` cover every column the query NEEDS (so the row can be served from the index)?
     static bool index_covers_need(const Index& ix, const std::vector<bool>& need,
                                   std::size_t pk_index) {
+        // J2/J3: an expression index covers no stored column; a GIN entry holds a single ARRAY
+        // element, not the array — neither can serve a covering (index-only) read.
+        if (!ix.expr_src.empty() || ix.gin) return false;
         for (std::size_t c = 0; c < need.size(); ++c) {
             if (!need[c] || c == pk_index) continue;
             bool in_ix = false;
@@ -7672,7 +7774,9 @@ private:
                 }
             }
         };
-        if (!ixp->expr_src.empty()) {
+        if (ixp->gin) {
+            skip_token(t.columns[ixp->columns[0]].elem_type);  // J3: one array-element token
+        } else if (!ixp->expr_src.empty()) {
             skip_token(ixp->expr_type);  // J2: one expression-value token
         } else {
             for (const std::size_t cidx : ixp->columns) skip_token(t.columns[cidx].type);  // I1: composite

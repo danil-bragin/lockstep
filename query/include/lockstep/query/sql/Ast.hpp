@@ -75,6 +75,7 @@ struct CreateIndexStmt {
     std::vector<std::string> columns;  // E5: composite index column list (>=1)
     bool unique = false;               // E5: CREATE UNIQUE INDEX
     bool hash = false;                 // I7: USING HASH (equality-only)
+    bool gin = false;                  // J3: USING GIN — array-element index (one entry per element)
     std::string partial_src;           // I5: CREATE INDEX ... WHERE <pred> (partial index)
     std::string expr_src;              // I5/J2: CREATE INDEX ... ON t ((expr)) — the indexed expression
 };

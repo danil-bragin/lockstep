@@ -154,6 +154,10 @@ struct Index {
     // set, `columns` is empty and the entry's leading token is the expression value.
     std::string expr_src;
     Type expr_type = Type::Int;
+    // J3: GIN (array-element) index — `CREATE INDEX ... ON t (arr_col) USING GIN`. The index has ONE
+    // entry per ARRAY element (encoded as the element's physical type), so a containment lookup
+    // (`<const> = ANY(arr_col)`) finds every row whose array holds that value. `columns` == {arr_col}.
+    bool gin = false;
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).
