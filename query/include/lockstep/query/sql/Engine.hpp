@@ -4194,6 +4194,75 @@ private:
                 return r;
             }
         }
+        // ONE-PASS TEXT-KEY HASH-AGGREGATE via the cached dictionary: a single NOT NULL TEXT group
+        // key + all-fusable aggregates, unfiltered (so codes align with the full concat), no HAVING.
+        // The dictionary's codes are DENSE (0..G-1, cached flush-gen-tagged), so each group's
+        // {count, per-column IntFold} accumulates by DIRECT code index — no hash, no idx vectors, no
+        // gather. Emit sorted by the string value (== the byte-identical group order for NOT NULL TEXT).
+        if (!has_filter && !has_having && !gs_mode_ && !would_parallelize && gcols.size() == 1 &&
+            t.columns[gcols[0]].type == Type::Text && t.columns[gcols[0]].logical == 0 &&
+            !t.columns[gcols[0]].nullable) {
+            bool all_ok = true;
+            for (const SelectItem& item : sel.items) {
+                if (item.kind == SelectItemKind::Column) {
+                    if (*t.column_index(item.column) != gcols[0]) { all_ok = false; break; }
+                } else if (item.agg.kind != AggKind::CountStar && !agg_fusable(item.agg, t)) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
+                const TextDictEntry& dict =
+                    col_text_dict_cached(t, static_cast<std::uint32_t>(gcols[0]));
+                const std::size_t G = dict.values.size();
+                const std::size_t nf = fuse_cols.size();
+                std::vector<const std::int64_t*> ap(nf);
+                for (std::size_t k = 0; k < nf; ++k) ap[k] = cols[fuse_cols[k]]->ints.data();
+                std::vector<std::int64_t> cnt(G, 0);
+                std::vector<IntFold> folds(G * nf, IntFold{0, INT64_MAX, INT64_MIN});
+                for (std::uint32_t rw = 0; rw < count; ++rw) {
+                    const std::size_t g = dict.codes[rw];  // dense code == group index (no hash)
+                    ++cnt[g];
+                    if (nf > 0) {
+                        IntFold* f = &folds[g * nf];
+                        for (std::size_t kk = 0; kk < nf; ++kk) {
+                            const std::int64_t x = ap[kk][rw];
+                            f[kk].sum = wrap_add(f[kk].sum, x);
+                            f[kk].mn = f[kk].mn < x ? f[kk].mn : x;
+                            f[kk].mx = f[kk].mx > x ? f[kk].mx : x;
+                        }
+                    }
+                }
+                std::vector<std::size_t> order(G);
+                for (std::size_t i = 0; i < G; ++i) order[i] = i;
+                std::sort(order.begin(), order.end(),
+                          [&](std::size_t a, std::size_t b) { return dict.values[a] < dict.values[b]; });
+                for (const std::size_t oi : order) {
+                    if (cnt[oi] == 0) continue;  // a dict code with no live row (defensive)
+                    ResultRow out;
+                    for (const SelectItem& item : sel.items) {
+                        if (item.kind == SelectItemKind::Column) {
+                            out.cells.emplace_back(item.label, Datum::make_text(dict.values[oi]));
+                        } else if (item.agg.kind == AggKind::CountStar) {
+                            out.cells.emplace_back(item.label, Datum::make_int(cnt[oi]));
+                        } else {
+                            const std::size_t ci = *t.column_index(item.agg.column);
+                            out.cells.emplace_back(
+                                item.label, agg_from_fold(
+                                                item.agg.kind,
+                                                folds[oi * nf + static_cast<std::size_t>(col_to_fuse[ci])],
+                                                static_cast<std::size_t>(cnt[oi])));
+                        }
+                    }
+                    r.rows.push_back(std::move(out));
+                }
+                apply_distinct(sel, r.rows);
+                if (auto e = apply_order_by_labels(sel, r.rows)) return ExecResult::failure(*e);
+                apply_limit(sel, r.rows);
+                r.affected = r.rows.size();
+                return r;
+            }
+        }
         // RAW-INT-KEY fast path: a single NOT NULL INT group column keys the map by the raw
         // int64 — no per-row group_key_field STRING + no vector<string> key. The map is ordered
         // by int, which equals the order-preserving group_key_field order, so output order is

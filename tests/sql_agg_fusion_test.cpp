@@ -37,13 +37,14 @@ int main() {
     col.set_columnar_default(true);
     col.set_vectorize(true);
     for (SqlEngine* e : {&col, &row}) {
-        e->exec("CREATE TABLE t (id INT, g INT NOT NULL, g2 INT NOT NULL, a INT NOT NULL, "
-                "b INT NOT NULL, av INT, PRIMARY KEY (id))");
+        e->exec("CREATE TABLE t (id INT, g INT NOT NULL, g2 INT NOT NULL, gt TEXT NOT NULL, "
+                "a INT NOT NULL, b INT NOT NULL, av INT, PRIMARY KEY (id))");
         for (int i = 0; i < 4000; ++i) {
-            char q[200];
+            char q[220];
             std::snprintf(q, sizeof q,
-                          "INSERT INTO t (id,g,g2,a,b,av) VALUES (%d,%d,%d,%d,%d,%s)", i, i % 7, i % 97,
-                          (i * 31) % 1000 - 500, (i * 17) % 400, (i % 4 == 0) ? "NULL" : std::to_string(i % 90).c_str());
+                          "INSERT INTO t (id,g,g2,gt,a,b,av) VALUES (%d,%d,%d,'cat%d',%d,%d,%s)", i,
+                          i % 7, i % 97, i % 23, (i * 31) % 1000 - 500, (i * 17) % 400,
+                          (i % 4 == 0) ? "NULL" : std::to_string(i % 90).c_str());
             e->exec(q);
         }
     }
@@ -77,6 +78,10 @@ int main() {
         "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a), AVG(a), COUNT(a) FROM t GROUP BY g",
         "SELECT g2, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY g2",
         "SELECT g2, SUM(a), SUM(b) FROM t GROUP BY g2",
+        // one-pass TEXT-key hash-aggregate via the cached dictionary.
+        "SELECT gt, COUNT(*) FROM t GROUP BY gt",
+        "SELECT gt, SUM(a), MIN(a), MAX(a), AVG(a), COUNT(a) FROM t GROUP BY gt",
+        "SELECT gt, SUM(a), SUM(b) FROM t GROUP BY gt",
     };
     for (const char* q : qs) same(col, row, q);
 
