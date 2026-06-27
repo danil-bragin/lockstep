@@ -182,6 +182,7 @@ struct Table {
         bool seen = false;       // any INT value observed
         std::int64_t lo = 0;     // observed min
         std::int64_t hi = 0;     // observed max
+        std::int64_t n_distinct = 0;  // I6: distinct non-NULL value count (0 == unknown; set by ANALYZE)
     };
     std::vector<ColStat> col_stats;  // one per column (sized at CREATE; INT columns only)
 

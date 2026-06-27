@@ -532,6 +532,8 @@ public:
                 return exec_show_tables();
             case StmtKind::Describe:
                 return exec_describe(st.truncate.table);
+            case StmtKind::Analyze:
+                return exec_analyze(st.truncate.table);
         }
         return ExecResult::failure("unknown statement kind");
     }
@@ -1003,6 +1005,35 @@ private:
         commit_writes(writes);
         mt->next_auto_id = auto_id;
         persist_schema(c.table);
+        return ExecResult{};
+    }
+
+    // I6: ANALYZE t — scan the table once and recompute per-column stats: n_distinct (exact distinct
+    // non-NULL value count) + INT min/max + row_count. Used by the cost model for eq selectivity
+    // (matches ~= n / n_distinct). In-memory (re-run after large changes; not persisted).
+    ExecResult exec_analyze(const std::string& table) {
+        Table* t = catalog_.find_mut(table);
+        if (t == nullptr) return ExecResult::failure("unknown table '" + table + "'");
+        std::vector<std::pair<Datum, std::vector<Datum>>> rows;
+        if (auto e = scan_all_rows(*t, rows)) return ExecResult::failure(*e);
+        const std::size_t nc = t->columns.size();
+        std::vector<std::set<std::string>> distinct(nc);
+        std::vector<Table::ColStat> cs(nc);
+        for (const auto& [pk, r] : rows) {
+            for (std::size_t c = 0; c < nc; ++c) {
+                const Datum& d = r[c];
+                if (d.is_null) continue;
+                distinct[c].insert(group_key_field(d));
+                if (d.type == Type::Int) {
+                    if (!cs[c].seen) { cs[c].seen = true; cs[c].lo = cs[c].hi = d.i; }
+                    else { cs[c].lo = std::min(cs[c].lo, d.i); cs[c].hi = std::max(cs[c].hi, d.i); }
+                }
+            }
+        }
+        for (std::size_t c = 0; c < nc; ++c)
+            cs[c].n_distinct = static_cast<std::int64_t>(distinct[c].size());
+        t->col_stats = std::move(cs);
+        t->row_count = rows.size();
         return ExecResult{};
     }
 
@@ -4083,9 +4114,9 @@ private:
         if (sel.distinct) {
             node = wrap(PlanNode::Kind::Distinct, "", std::move(node));
         }
-        // I2: omit the Sort node when the index scan already yields the ORDER BY order.
+        // I2/I7: omit the Sort node when the index scan already yields the ORDER BY order.
         const bool order_via_index = ap.kind == AccessPath::Kind::Index &&
-                                     order_by_matches_index(sel, ap.index, t);
+                                     order_by_matches_index(sel, ap.index, t) != 0;
         if (!sel.order_by.empty() && !order_via_index) {
             node = wrap(PlanNode::Kind::Sort,
                         "ORDER BY " + std::to_string(sel.order_by.size()) +
@@ -4397,8 +4428,9 @@ private:
         const bool vectorizable = sel.filter.present() && !pk_fast && vectorize_ &&
                                   try_extract_conjuncts(sel.filter, sel.filter.root, *t, vterms);
         bool filter_applied = false;
-        // I2: if the index's order already satisfies ORDER BY, scan in index order + skip the sort.
-        const bool order_via_index = used_index && order_by_matches_index(sel, ap.index, *t);
+        // I2/I7: 0 = sort needed; 1 = index order satisfies ORDER BY (forward); 2 = reverse (DESC).
+        const int omode = used_index ? order_by_matches_index(sel, ap.index, *t) : 0;
+        const bool order_via_index = omode != 0;
         // I3: index-only (covering) scan — serve from the index when it covers every needed column.
         const bool covering = used_index && !t->columnar &&
                               index_covers_need(*ap.index.index, need, t->pk_index);
@@ -4406,7 +4438,9 @@ private:
             // Index scan: range-scan the index for the PKs, point-get each row; the full
             // predicate still runs as the residual filter in (2). (read_via_index assembles
             // columnar rows from their column families when t is columnar.)
-            if (auto err = read_via_index(*t, sel, ap.index, need, rows, order_via_index, covering)) {
+            if (auto err = read_via_index(*t, sel, ap.index, need, rows,
+                                          /*preserve_index_order=*/omode == 1, covering,
+                                          /*reverse_index_order=*/omode == 2)) {
                 return ExecResult::failure(*err);
             }
         } else if (t->columnar) {
@@ -6691,6 +6725,13 @@ private:
         return b;
     }
     std::size_t est_eq_matches(std::size_t n) const { return n / 100 + 1; }
+    // I6: eq selectivity from ANALYZE's n_distinct (matches ~= n / n_distinct); fall back to the
+    // fixed 1% guess when stats are absent.
+    std::size_t est_eq_matches_col(const Table& t, std::size_t col, std::size_t n) const {
+        if (col < t.col_stats.size() && t.col_stats[col].n_distinct > 0)
+            return std::max<std::size_t>(1, n / static_cast<std::size_t>(t.col_stats[col].n_distinct));
+        return est_eq_matches(n);
+    }
     std::size_t est_range_matches(std::size_t n) const { return (n * 3) / 10 + 1; }
 
     // Range selectivity from per-column min/max (Phase 2 stats) when available: the fraction
@@ -6733,7 +6774,7 @@ private:
             if (auto plan = choose_index_access(sel, t)) {
                 const std::size_t n = t.row_count;
                 std::size_t matches =
-                    plan->is_eq ? est_eq_matches(n)
+                    plan->is_eq ? est_eq_matches_col(t, plan->index->column, n)
                                 : est_range_rows(t, plan->index->column, plan->lo, plan->hi);
                 // I1: each extra equality in a composite prefix multiplies selectivity (fewer rows).
                 if (plan->is_eq && plan->eq_prefix.size() > 1)
@@ -6759,10 +6800,14 @@ private:
                 return 1;
             case AccessPath::Kind::PkRange:
                 return est_range_matches(t.row_count);
-            case AccessPath::Kind::Index:
-                return ap.index.is_eq
-                           ? est_eq_matches(t.row_count)
-                           : est_range_rows(t, ap.index.index->column, ap.index.lo, ap.index.hi);
+            case AccessPath::Kind::Index: {
+                if (!ap.index.is_eq)
+                    return est_range_rows(t, ap.index.index->column, ap.index.lo, ap.index.hi);
+                std::size_t m = est_eq_matches_col(t, ap.index.index->column, t.row_count);  // I6
+                if (ap.index.eq_prefix.size() > 1)  // I1: composite prefix selectivity
+                    m = std::max<std::size_t>(1, m >> (ap.index.eq_prefix.size() - 1));
+                return m;
+            }
             case AccessPath::Kind::Seq:
                 return t.row_count;
         }
@@ -6891,29 +6936,36 @@ private:
     // ORDER BY keys are exactly the index columns AFTER the eq-prefix, contiguous, ASC, by name. The
     // index entry is (cols asc, pk asc), which matches ORDER BY <cols> with the pipeline's PK
     // tie-break — byte-identical to the sorted full-scan result (the cross-check proves it).
-    [[nodiscard]] static bool order_by_matches_index(const SelectStmt& sel, const IndexPlan& plan,
-                                                     const Table& t) {
+    // Returns 0 (no), 1 (FORWARD — index scan order already satisfies ORDER BY), or 2 (REVERSE — a
+    // descending scan satisfies it; only allowed when the result has NO TIES so the reversed
+    // PK-tie-break is harmless: the index is UNIQUE and the eq-prefix + ORDER BY span the WHOLE index,
+    // making every scanned tuple unique).
+    [[nodiscard]] static int order_by_matches_index(const SelectStmt& sel, const IndexPlan& plan,
+                                                    const Table& t) {
         if (sel.has_aggregates || !sel.group_by.empty() || sel.distinct || sel.order_by.empty())
-            return false;
-        if (!plan.is_eq || plan.index == nullptr) return false;
+            return 0;
+        if (!plan.is_eq || plan.index == nullptr) return 0;
         const Index& ix = *plan.index;
-        for (const std::size_t c : ix.columns) if (t.columns[c].nullable) return false;
+        for (const std::size_t c : ix.columns) if (t.columns[c].nullable) return 0;
         const std::size_t base = plan.eq_prefix.empty() ? 1 : plan.eq_prefix.size();
-        if (base + sel.order_by.size() > ix.columns.size()) return false;
+        if (base + sel.order_by.size() > ix.columns.size()) return 0;
+        bool all_asc = true, all_desc = true;
         for (std::size_t i = 0; i < sel.order_by.size(); ++i) {
             const OrderKey& k = sel.order_by[i];
-            if (k.position != 0 || k.descending || !k.qualifier.empty() ||
-                k.nulls != NullsOrder::Default)
-                return false;
-            if (k.column != t.columns[ix.columns[base + i]].name) return false;
+            if (k.position != 0 || !k.qualifier.empty() || k.nulls != NullsOrder::Default) return 0;
+            if (k.column != t.columns[ix.columns[base + i]].name) return 0;
+            if (k.descending) all_asc = false; else all_desc = false;
         }
-        return true;
+        if (all_asc) return 1;
+        // I7: a uniform DESC needs a UNIQUE index fully covered by eq-prefix + ORDER BY (no ties).
+        if (all_desc && ix.unique && base + sel.order_by.size() == ix.columns.size()) return 2;
+        return 0;
     }
 
     [[nodiscard]] std::optional<std::string> read_via_index(
         const Table& t, const SelectStmt& sel, const IndexPlan& plan,
         const std::vector<bool>& need, std::vector<std::vector<Datum>>& rows_out,
-        bool preserve_index_order = false, bool covering = false) {
+        bool preserve_index_order = false, bool covering = false, bool reverse_index_order = false) {
         // (a) The index range [lo, hi): col-ascending entries for the matching values.
         Key lo = index_prefix(t.id, plan.index->id);
         Key hi;
@@ -6972,7 +7024,9 @@ private:
         // same order. Sort by the order-preserving PK key bytes (total + deterministic).
         // I2: when the caller will SKIP the ORDER BY because the index already yields the
         // requested order, KEEP the index (column-ascending, PK-tie-broken) scan order instead.
-        if (!preserve_index_order)
+        if (reverse_index_order)
+            std::reverse(fetched.begin(), fetched.end());  // I7: DESC over a unique full-cover index
+        else if (!preserve_index_order)
             std::stable_sort(fetched.begin(), fetched.end(),
                              [](const auto& x, const auto& y) {
                                  return encode_pk(x.first) < encode_pk(y.first);

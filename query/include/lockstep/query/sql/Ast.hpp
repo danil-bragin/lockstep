@@ -463,6 +463,7 @@ enum class StmtKind : std::uint8_t {
     SetSearchPath = 15, // E4: SET search_path TO s | DEFAULT
     ShowTables = 16,    // E5: SHOW TABLES
     Describe = 17,      // E5: DESCRIBE t / SHOW COLUMNS FROM t
+    Analyze = 18,       // I6: ANALYZE t — recompute per-column stats (n_distinct, min/max)
 };
 
 struct Statement {

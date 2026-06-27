@@ -84,6 +84,8 @@ public:
             case StmtKind::ShowTables:  // E5: introspection -> any shard (schema is replicated)
             case StmtKind::Describe:
                 return shards_.front()->exec(sql);
+            case StmtKind::Analyze:  // I6: recompute stats on every shard
+                return broadcast(sql);
         }
         return ExecResult::failure("distributed: unsupported statement");
     }

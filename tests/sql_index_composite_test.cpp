@@ -125,6 +125,33 @@ int main() {
         check(explain_has(e, "SELECT v FROM t WHERE a = 5", "Index Scan"), "still an index scan");
     }
 
+    // I7: ORDER BY ... DESC uses the index in REVERSE when it is UNIQUE and fully covered by the
+    // eq-prefix + ORDER BY (no ties -> the reversed PK tie-break is harmless).
+    {
+        SqlEngine d;
+        d.exec("CREATE TABLE w (id INT, a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (id))");
+        for (int i = 0; i < 200; ++i) {
+            char q[128];
+            std::snprintf(q, sizeof q, "INSERT INTO w (id,a,b) VALUES (%d,%d,%d)", i, i % 4, i);  // b unique
+            d.exec(q);
+        }
+        d.exec("CREATE UNIQUE INDEX uab ON w (a, b)");
+        // WHERE a=1 ORDER BY b DESC -> reverse index scan, no Sort node.
+        check(!explain_has(d, "SELECT b FROM w WHERE a = 1 ORDER BY b DESC", "Sort"),
+              "DESC over unique full-cover index -> no Sort");
+        const ExecResult r = d.exec("SELECT b FROM w WHERE a = 1 ORDER BY b DESC");
+        bool desc = true;
+        for (std::size_t i = 1; i < r.rows.size(); ++i)
+            if (r.rows[i].cells[0].second.i > r.rows[i - 1].cells[0].second.i) desc = false;
+        check(r.ok && desc && !r.rows.empty(), "result is b-descending");
+        // teeth: a NON-unique index DESC still sorts (ties would flip the PK tie-break).
+        d.exec("CREATE TABLE n (id INT, a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (id))");
+        for (int i = 0; i < 100; ++i) { char q[128]; std::snprintf(q,sizeof q,"INSERT INTO n (id,a,b) VALUES (%d,%d,%d)",i,i%3,i%5); d.exec(q); }
+        d.exec("CREATE INDEX nab ON n (a, b)");  // not unique
+        check(explain_has(d, "SELECT b FROM n WHERE a = 1 ORDER BY b DESC", "Sort"),
+              "DESC over a non-unique index still sorts");
+    }
+
     if (g_fail) { std::printf("sql_index_composite_test: FAILED\n"); return 1; }
     std::printf("sql_index_composite_test: OK (composite prefix lookup: index chosen, results == "
                 "full-scan truth, 2- and 3-column)\n");

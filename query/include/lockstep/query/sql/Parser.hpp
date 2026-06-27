@@ -445,6 +445,13 @@ public:
                 return err("expected TABLES or COLUMNS after SHOW");
             }
             r = ParseResult{std::move(st)};
+        } else if (kw == "analyze") {  // I6: ANALYZE [TABLE] t
+            advance();
+            if (is_kw("table")) advance();
+            Statement st;
+            st.kind = StmtKind::Analyze;
+            if (auto e = expect_table_name("a table name after ANALYZE", st.truncate.table)) return ParseResult{*e};
+            r = ParseResult{std::move(st)};
         } else if (kw == "describe" || kw == "desc") {  // E5: DESCRIBE t
             advance();
             Statement st;
