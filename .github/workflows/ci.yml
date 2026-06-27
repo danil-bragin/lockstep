@@ -117,10 +117,16 @@ jobs:
           sudo apt-get install -y clang clang-tools clang-tidy cmake ninja-build
       - name: Configure (debug -> emits compile_commands.json)
         run: cmake --preset debug
-      - name: Run clang-tidy over tracked C++ (providers/ exempt)
+      - name: Run clang-tidy over tracked C++ (providers/ + lint fixtures exempt)
         run: |
-          git ls-files '*.cpp' '*.hpp' '*.cc' '*.h' \
-            | grep -v '^providers/' \
+          # Analyze only TRANSLATION UNITS (.cpp/.cc) — they have a compile_commands.json
+          # entry, so the include paths resolve. Headers are NOT analyzed standalone
+          # (they have no compile command -> spurious "file not found"); their diagnostics
+          # surface through the .cpp that includes them, gated by HeaderFilterRegex.
+          # Exempt providers/ (cardinal rule 1) and tools/lint/fixtures/ (deliberately
+          # dirty lint fixtures — same exemption the forbidden-call lint applies).
+          git ls-files '*.cpp' '*.cc' \
+            | grep -vE '^(providers|tools/lint/fixtures)/' \
             | xargs -r clang-tidy -p build/debug
 
   scan-build:
@@ -136,7 +142,11 @@ jobs:
       - name: Configure under scan-build
         run: scan-build --use-cc=clang --use-c++=clang++ cmake --preset debug
       - name: Build under scan-build (--status-bugs fails on any finding)
-        run: scan-build --status-bugs cmake --build --preset debug
+        # --use-cc/--use-c++=clang so the analyzer's underlying COMPILE uses clang (as the configure
+        # step does), not the system g++ default. g++ under -Wpedantic -Werror rejects __int128
+        # ("ISO C++ does not support '__int128'"), which the project uses widely (SeededRandom, the
+        # 128-bit SQL types); clang accepts it. Without this the scan-build build fails to compile.
+        run: scan-build --use-cc=clang --use-c++=clang++ --status-bugs cmake --build --preset debug
 
   # ===========================================================================
   # STAGE 3a -- SANITIZERS on plain clang: ASan / TSan / UBSan.

@@ -32,13 +32,26 @@
 #     digit-parse widening casts and printf arg casts; exhaustive index/enum
 #     switches with no default). All non-bugs, all reviewed — they bury the
 #     real signal (clang-analyzer + the load-bearing bugprone patterns below).
+#   - cppcoreguidelines-pro-type-member-init is DISABLED: it is the clang-tidy
+#     twin of -Wmissing-field-initializers, which the project DELIBERATELY
+#     suppresses (-Wno-missing-field-initializers in cmake/Warnings.cmake) because
+#     designated-init that omits trailing fields — relying on the in-struct
+#     defaults — is idiomatic here. Enforcing it in tidy would contradict that.
+#   - bugprone-unchecked-optional-access is DISABLED: high false-positive on
+#     optionals the surrounding logic guarantees are engaged (and the property /
+#     differential tests prove it) but the analyzer can't see across the guard.
+#   - inc-dec-in-conditions / suspicious-missing-comma / unused-local-non-trivial
+#     are DISABLED: heuristic style smells that here fire on intentional code
+#     (a loop `i++` in a test's bounds check; adjacent string-literal
+#     concatenation in a test's query list; a teeth value used only via push_back).
+#   The static analyzer (clang-analyzer-*, the real bug finder) stays an ERROR and
+#   is clean; performance-* stays a warning (not a merge blocker).
 Checks: >
   -*,
   clang-analyzer-*,
   bugprone-*,
   concurrency-*,
   performance-*,
-  cppcoreguidelines-pro-type-member-init,
   cppcoreguidelines-pro-type-static-cast-downcast,
   cppcoreguidelines-owning-memory,
   cppcoreguidelines-no-malloc,
@@ -51,6 +64,10 @@ Checks: >
   -bugprone-branch-clone,
   -bugprone-misplaced-widening-cast,
   -bugprone-switch-missing-default-case,
+  -bugprone-unchecked-optional-access,
+  -bugprone-suspicious-missing-comma,
+  -bugprone-inc-dec-in-conditions,
+  -bugprone-unused-local-non-trivial-variable,
   -concurrency-mt-unsafe
 
 WarningsAsErrors: 'clang-analyzer-*,bugprone-*,concurrency-*,cppcoreguidelines-*'

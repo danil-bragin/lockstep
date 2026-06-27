@@ -37,8 +37,15 @@ SOURCE_EXTS = (".h", ".hpp", ".hh", ".hxx", ".c", ".cc", ".cpp", ".cxx", ".ixx")
 #   - the lint's own fixtures: dirty fixtures exist to be flagged by the tests,
 #     not by the real gate. Keyed on the relative path so it only applies to
 #     OUR fixtures, not some unrelated directory literally named "fixtures".
+#   - bench/compare: the COMPETITIVE comparison harness (vs Postgres/DuckDB/etc).
+#     It measures real WALL-CLOCK head-to-head latency by design (not the
+#     deterministic sim), is built standalone outside the CMake project, and is
+#     no part of the verified core — so std::chrono there is intended, not a leak.
 EXEMPT_PATH_SEGMENTS = ("providers",)
-EXEMPT_REL_PREFIXES = (os.path.join("tools", "lint", "fixtures"),)
+EXEMPT_REL_PREFIXES = (
+    os.path.join("tools", "lint", "fixtures"),
+    os.path.join("bench", "compare"),
+)
 
 
 # Each forbidden pattern: (label, compiled regex). Labels are the human-facing

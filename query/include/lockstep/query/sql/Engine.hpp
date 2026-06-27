@@ -4482,7 +4482,7 @@ private:
                 }
                 Datum d;
                 if (auto e = coerce(t->columns[*idx], vals[k], d)) {
-                    return *e;
+                    return e;
                 }
                 row[*idx] = d;
                 set[*idx] = true;
@@ -4573,7 +4573,7 @@ private:
                     if (!ci) return "unknown column '" + c + "' in ON CONFLICT DO UPDATE";
                     if (*ci == t->pk_index) return "cannot UPDATE the primary key in ON CONFLICT";
                     Datum d;
-                    if (auto e = coerce(t->columns[*ci], v, d)) return *e;
+                    if (auto e = coerce(t->columns[*ci], v, d)) return e;
                     new_row[*ci] = d;
                 }
                 if (auto e = validate_index_exprs(*t, new_row)) return e;  // J2
@@ -5742,8 +5742,13 @@ private:
                         const std::int64_t mv = lm ? l.i : r.i, k = lm ? r.i : l.i;
                         if (e.op == BinOp::Div && k == 0) return "division by zero";
                         std::int64_t v = 0;
-                        if (e.op == BinOp::Mul ? mul_ovf(mv, k, v) : (v = mv / k, false))
-                            return "integer overflow";
+                        bool ovf = false;
+                        if (e.op == BinOp::Mul) {
+                            ovf = mul_ovf(mv, k, v);
+                        } else {
+                            v = mv / k;
+                        }
+                        if (ovf) return "integer overflow";
                         out = Datum::make_int(v); out.logical = 12; return std::nullopt;
                     }
                     if (lm && rm) {  // month-interval ± month-interval
@@ -5777,8 +5782,13 @@ private:
                             const std::int64_t iv = li ? l.i : r.i, k = li ? r.i : l.i;
                             if (e.op == BinOp::Div && k == 0) return "division by zero";
                             std::int64_t v = 0;
-                            if (e.op == BinOp::Mul ? mul_ovf(iv, k, v) : (v = iv / k, false))
-                                return "integer overflow";
+                            bool ovf = false;
+                            if (e.op == BinOp::Mul) {
+                                ovf = mul_ovf(iv, k, v);
+                            } else {
+                                v = iv / k;
+                            }
+                            if (ovf) return "integer overflow";
                             out = Datum::make_int(v); out.logical = 10; return std::nullopt;
                         }
                         return "unsupported temporal operation";
