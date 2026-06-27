@@ -6642,9 +6642,13 @@ private:
     struct IndexPlan {
         const Index* index = nullptr;
         bool is_eq = false;
-        Datum eq;   // is_eq
+        Datum eq;   // is_eq (single leading-column equality; legacy single-col path)
         Datum lo;   // BETWEEN lower (inclusive)
         Datum hi;   // BETWEEN upper (inclusive)
+        // I1: a COMPOSITE eq prefix — equalities matched on a leading prefix of the index columns
+        // (size >= 1). When non-empty, the scan ranges over this whole prefix (the residual WHERE
+        // still runs over the fetched rows, so an unmatched suffix is filtered there).
+        std::vector<Datum> eq_prefix;
     };
 
     // THE SHARED ACCESS-PATH CHOICE. Both the executor (exec_select) AND the plan builder
@@ -6714,9 +6718,12 @@ private:
         } else if (!pk_fast && sel.filter.present()) {
             if (auto plan = choose_index_access(sel, t)) {
                 const std::size_t n = t.row_count;
-                const std::size_t matches =
+                std::size_t matches =
                     plan->is_eq ? est_eq_matches(n)
                                 : est_range_rows(t, plan->index->column, plan->lo, plan->hi);
+                // I1: each extra equality in a composite prefix multiplies selectivity (fewer rows).
+                if (plan->is_eq && plan->eq_prefix.size() > 1)
+                    matches = std::max<std::size_t>(1, matches >> (plan->eq_prefix.size() - 1));
                 constexpr std::size_t kFetch = 3;  // point-get cost per matched row
                 const std::size_t idx_cost = ilog2(n) + matches * kFetch;
                 const std::size_t seq_cost = n;
@@ -6776,13 +6783,32 @@ private:
                 continue;
             }
             const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr) {
-                continue;
+            if (ix == nullptr || ix->columns.empty() || ix->columns[0] != *col) {
+                continue;  // the eq must be on the index's LEADING column
             }
             IndexPlan plan;
             plan.index = ix;
             plan.is_eq = true;
             plan.eq = n.literal;
+            // I1: extend the equality across a leading PREFIX of a composite index — for each next
+            // index column, look for a matching `col = literal` conjunct; stop at the first miss.
+            plan.eq_prefix.push_back(n.literal);
+            for (std::size_t k = 1; k < ix->columns.size(); ++k) {
+                const std::string& cname = t.columns[ix->columns[k]].name;
+                bool matched = false;
+                for (const std::int32_t lj : leaves) {
+                    const PredNode& m = p.nodes[static_cast<std::size_t>(lj)];
+                    if (m.kind == PredNodeKind::Cmp && m.operand == OperandKind::Column &&
+                        m.qualifier.empty() && !m.rhs_is_column && !m.rhs_is_subquery &&
+                        !m.literal.is_null && m.op == CmpOp::Eq && m.column == cname &&
+                        m.literal.type == t.columns[ix->columns[k]].type) {
+                        plan.eq_prefix.push_back(m.literal);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) break;
+            }
             return plan;
         }
         // Second pass: an indexed BETWEEN (col >= lo AND col <= hi over ONE column).
@@ -6852,8 +6878,11 @@ private:
         Key lo = index_prefix(t.id, plan.index->id);
         Key hi;
         if (plan.is_eq) {
-            put_index_col(lo, plan.eq);
-            hi = key_successor(lo);  // all PK-suffixes under this exact col value
+            // I1: encode the whole matched eq PREFIX (>=1 column) — the range covers every PK suffix
+            // under that exact leading-prefix tuple.
+            if (plan.eq_prefix.empty()) put_index_col(lo, plan.eq);
+            else for (const Datum& d : plan.eq_prefix) put_index_col(lo, d);
+            hi = key_successor(lo);
         } else {
             put_index_col(lo, plan.lo);
             Key hi_pref = index_prefix(t.id, plan.index->id);
@@ -6917,28 +6946,20 @@ private:
                                                      const Key& entry) {
         const std::size_t prefix_len = index_prefix(t.id, index_id).size();
         std::size_t off = prefix_len;
-        // Skip the self-delimiting col token. We need the indexed column's TYPE to skip
-        // it; recover the type from the index id.
-        Type ctype = Type::Int;
-        for (const Index& ix : t.indexes) {
-            if (ix.id == index_id) {
-                ctype = t.columns[ix.column].type;
-                break;
-            }
-        }
-        if (ctype == Type::Int) {
-            off += 9;  // put_pk_int width (sign byte + be64)
-        } else {
-            // Skip the escaped TEXT token up to the 0x00 0x00 terminator.
-            while (off + 1 < entry.size()) {
-                if (entry[off] == '\0') {
-                    if (entry[off + 1] == '\0') {
-                        off += 2;  // terminator
-                        break;
+        // I1: skip EVERY covered column token (a composite index has >1) using each column's TYPE.
+        const Index* ixp = nullptr;
+        for (const Index& ix : t.indexes) if (ix.id == index_id) { ixp = &ix; break; }
+        for (const std::size_t cidx : ixp->columns) {
+            if (t.columns[cidx].type == Type::Int) {
+                off += 9;  // put_pk_int width (sign byte + be64)
+            } else {
+                while (off + 1 < entry.size()) {  // escaped TEXT token up to the 0x00 0x00 terminator
+                    if (entry[off] == '\0') {
+                        if (entry[off + 1] == '\0') { off += 2; break; }
+                        off += 2;  // escaped 0x00 0x01
+                    } else {
+                        off += 1;
                     }
-                    off += 2;  // escaped 0x00 0x01
-                } else {
-                    off += 1;
                 }
             }
         }
