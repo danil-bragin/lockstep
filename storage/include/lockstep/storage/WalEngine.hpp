@@ -79,6 +79,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -223,15 +224,15 @@ public:
         bool tombstone = false;
         bool vlog = false;  // WiscKey: `value` is a VlogPtr, deref on read
     };
-    struct KeyVersions {
-        Key key;
-        std::vector<Version> versions;
-    };
+    using Versions = std::vector<Version>;  // a key's MVCC version list (Seq-ascending)
 
-    // Insert a version (commit order ⇒ already Seq-ascending append).
+    // Insert a version (commit order ⇒ already Seq-ascending append). map_[key] is O(log N) with NO
+    // element shift (the prior sorted-vector did an O(N) insert shift for every NEW key, which made a
+    // columnar flush super-linear — block keys sort before the N persistent delta keys and shifted
+    // them all). An ordered map keeps the SORTED iteration the scan / SSTable flush rely on, so the
+    // observable key order + MVCC version lists are byte-identical (V-DET unaffected).
     void insert(const Key& key, Seq seq, Value value, bool tombstone, bool vlog = false) {
-        KeyVersions& kv = versions_for(key);
-        kv.versions.push_back(Version{seq, std::move(value), tombstone, vlog});
+        map_[key].push_back(Version{seq, std::move(value), tombstone, vlog});
     }
 
     // MVCC read: newest version of key with seq <= at; ∅ if none or it is a
@@ -255,14 +256,12 @@ public:
         Seq seq = kNoSeq;
         bool vlog = false;  // WiscKey: `value` is a VlogPtr — the caller derefs
     };
-    [[nodiscard]] Hit lookup_hit(const Key& key, Seq at) const {
+    // The newest version <= `at` from an already-located version list (the scan path holds the map
+    // iterator, so it folds directly without a second lookup).
+    [[nodiscard]] static Hit hit_from(const Versions& versions, Seq at) {
         Hit hit;
-        const KeyVersions* kv = find(key);
-        if (kv == nullptr) {
-            return hit;
-        }
         const Version* newest = nullptr;
-        for (const Version& v : kv->versions) {
+        for (const Version& v : versions) {
             if (v.seq <= at) {
                 newest = &v;  // ascending ⇒ later hits are strictly newer
             } else {
@@ -279,57 +278,34 @@ public:
         hit.vlog = newest->vlog;
         return hit;
     }
+    [[nodiscard]] Hit lookup_hit(const Key& key, Seq at) const {
+        const auto it = map_.find(key);
+        if (it == map_.end()) {
+            return Hit{};
+        }
+        return hit_from(it->second, at);
+    }
 
-    void clear() { keys_.clear(); }
+    void clear() { map_.clear(); }
 
     // Total version count across all keys (the flush-threshold metric).
     [[nodiscard]] std::size_t version_count() const noexcept {
         std::size_t n = 0;
-        for (const KeyVersions& kv : keys_) {
-            n += kv.versions.size();
+        for (const auto& [k, versions] : map_) {
+            (void)k;
+            n += versions.size();
         }
         return n;
     }
 
-    [[nodiscard]] bool empty() const noexcept { return keys_.empty(); }
+    [[nodiscard]] bool empty() const noexcept { return map_.empty(); }
 
-    // Read-only access to the sorted keys (for flush serialisation + scan merge).
-    [[nodiscard]] const std::vector<KeyVersions>& keys() const noexcept { return keys_; }
+    // Read-only access to the sorted (key -> version list) map (for flush serialisation + scan
+    // merge). std::map iterates in ascending key order — the same order the sorted vector had.
+    [[nodiscard]] const std::map<Key, Versions>& entries() const noexcept { return map_; }
 
 private:
-    // keys_ is kept sorted by key (the on-disk-mirroring invariant), so the
-    // lookup is a BINARY SEARCH over it — O(log N) per get/insert instead of the
-    // old O(N) linear scan (the per-op quadratic the SQL bulk-build surfaced).
-    // This is PURE SPEED: lower_bound finds the SAME slot the linear scan walked
-    // to (first key not < `key`), so the visible key order, the MVCC version
-    // lists, and the mid-insert position are byte-identical to before — only the
-    // number of comparisons to reach the slot changes (V-DET unaffected).
-    [[nodiscard]] static bool key_lt(const KeyVersions& kv, const Key& key) noexcept {
-        return kv.key < key;
-    }
-
-    [[nodiscard]] const KeyVersions* find(const Key& key) const {
-        auto it = std::lower_bound(keys_.begin(), keys_.end(), key, key_lt);
-        if (it != keys_.end() && it->key == key) {
-            return &*it;
-        }
-        return nullptr;  // not present (or past where it would sort)
-    }
-
-    KeyVersions& versions_for(const Key& key) {
-        auto it = std::lower_bound(keys_.begin(), keys_.end(), key, key_lt);
-        if (it != keys_.end() && it->key == key) {
-            return *it;
-        }
-        // Not present: insert a fresh KeyVersions at the lower-bound slot, keeping
-        // keys_ sorted — exactly the position the old linear walk computed.
-        KeyVersions kv;
-        kv.key = key;
-        auto ins = keys_.insert(it, std::move(kv));
-        return *ins;
-    }
-
-    std::vector<KeyVersions> keys_;  // sorted by key; each list Seq-ascending
+    std::map<Key, Versions> map_;  // sorted by key; each version list Seq-ascending
 };
 
 // ---------------------------------------------------------------------------
@@ -680,17 +656,14 @@ public:
         // PK sub-range, an index lookup) touches O(slice) keys, not O(memtable). A full-
         // table scan still starts at begin (lower_bound of the table prefix) and runs to
         // the namespace end — same work as before. Stop at the first key >= range.hi.
-        const std::vector<Memtable::KeyVersions>& mk = mem_.keys();
-        auto it = std::lower_bound(
-            mk.begin(), mk.end(), range.lo,
-            [](const Memtable::KeyVersions& kv, const Key& k) { return kv.key < k; });
-        for (; it != mk.end(); ++it) {
-            if (!range.hi_unbounded && !(it->key < range.hi)) {
+        const std::map<Key, Memtable::Versions>& mk = mem_.entries();
+        for (auto it = mk.lower_bound(range.lo); it != mk.end(); ++it) {
+            if (!range.hi_unbounded && !(it->first < range.hi)) {
                 break;  // past the range upper bound (keys ascending)
             }
-            Memtable::Hit h = mem_.lookup_hit(it->key, at);
+            Memtable::Hit h = Memtable::hit_from(it->second, at);
             if (h.covered) {
-                offer(it->key, h.seq, std::move(h.value), h.tombstone, h.vlog);
+                offer(it->first, h.seq, std::move(h.value), h.tombstone, h.vlog);
             }
         }
         for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
@@ -931,11 +904,11 @@ private:
         }
         // (1) snapshot the memtable → entries (key-asc, seq-asc — its native order).
         std::vector<SstEntry> entries;
-        for (const Memtable::KeyVersions& kv : mem_.keys()) {
-            for (const Memtable::Version& v : kv.versions) {
+        for (const auto& [k, versions] : mem_.entries()) {
+            for (const Memtable::Version& v : versions) {
                 // Carry the WiscKey vlog flag so a separated value's POINTER (not
                 // the value) is what flushes to the SSTable (no value rewrite).
-                entries.push_back(SstEntry{kv.key, v.value, v.seq, v.tombstone, v.vlog});
+                entries.push_back(SstEntry{k, v.value, v.seq, v.tombstone, v.vlog});
             }
         }
         if (entries.empty()) {
