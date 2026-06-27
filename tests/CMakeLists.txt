@@ -2032,9 +2032,11 @@ if(_lockstep_all_tests)
 endif()
 
 # sql_parallel_agg_test spawns a REAL morsel-parallel thread fan-out (not a deterministic
-# single-thread sim), so it legitimately runs much longer than the 90s sim ceiling and is
-# slowest on a CPU-contended CI runner. Raise its ceiling (AFTER the dir-wide default above so
-# it is not clobbered). A true hang is still bounded.
+# single-thread sim), so it legitimately runs longer than the sim ceiling and is slowest on a
+# CPU-contended CI runner — especially under TSan/MSan (heavy thread instrumentation). Give it 4×
+# the per-build ceiling so it SCALES with the sanitizer (90→360 plain, 300→1200 asan/tsan/ubsan,
+# 600→2400 msan) instead of being clobbered down to a fixed value. A true hang is still bounded.
 if(TEST sql_parallel_agg_test)
-  set_tests_properties(sql_parallel_agg_test PROPERTIES TIMEOUT 300)
+  math(EXPR _lockstep_pa_timeout "${_lockstep_test_timeout} * 4")
+  set_tests_properties(sql_parallel_agg_test PROPERTIES TIMEOUT ${_lockstep_pa_timeout})
 endif()

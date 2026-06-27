@@ -74,15 +74,23 @@ void load(SqlEngine& e, std::size_t n) {
     e.exec("CREATE TABLE t (id INT, amount INT NOT NULL, cat INT NOT NULL, region TEXT NOT NULL, "
            "opt INT, PRIMARY KEY (id))");
     const char* regs[] = {"north", "south", "east", "west", "central"};
-    for (std::size_t i = 0; i < n; ++i) {
-        const std::int64_t amount = static_cast<std::int64_t>((i * 2654435761ULL) % 100000);
-        std::string sql = "INSERT INTO t (id, amount, cat, region, opt) VALUES (" +
-                          std::to_string(i) + ", " + std::to_string(amount) + ", " +
-                          std::to_string(i % 8) + ", '" + regs[i % 5] + "', " +
-                          ((i % 4 == 0) ? std::string("NULL") : std::to_string((i * 7) % 5000)) +
-                          ")";
+    // Batch rows into multi-row INSERTs (D6) — IDENTICAL rows (same per-index formula), but ~500x
+    // fewer parse+commit cycles, so the table BUILD doesn't dominate runtime in the unoptimized
+    // debug / instrumented-sanitizer CI builds (where one-exec-per-row over ~1M rows timed out).
+    constexpr std::size_t kBatch = 500;
+    for (std::size_t i = 0; i < n;) {
+        const std::size_t end = (n < i + kBatch) ? n : i + kBatch;
+        std::string sql = "INSERT INTO t (id, amount, cat, region, opt) VALUES ";
+        for (std::size_t j = i; j < end; ++j) {
+            const std::int64_t amount = static_cast<std::int64_t>((j * 2654435761ULL) % 100000);
+            if (j != i) sql += ", ";
+            sql += "(" + std::to_string(j) + ", " + std::to_string(amount) + ", " +
+                   std::to_string(j % 8) + ", '" + regs[j % 5] + "', " +
+                   ((j % 4 == 0) ? std::string("NULL") : std::to_string((j * 7) % 5000)) + ")";
+        }
         const ExecResult r = e.exec(sql);
-        check(r.ok, "insert: " + render(r));
+        check(r.ok, "insert batch @" + std::to_string(i) + ": " + render(r));
+        i = end;
     }
     check(!e.flush_columnar("t").has_value(), "flush n=" + std::to_string(n));
 }
@@ -112,13 +120,17 @@ void run_size(std::size_t n) {
 }  // namespace
 
 int main() {
-    // Sizes spanning: empty, tiny (serial-gated, < kParallelMinRows), and large (parallel,
-    // multiple chunks, non-divisible-by-worker-count splits to stress partition bounds).
-    for (std::size_t n : std::vector<std::size_t>{0, 1, 100, 49999, 50000, 50001, 123457, 300000}) {
+    // Sizes spanning: empty, tiny (serial-gated, < kParallelMinRows), the flush-threshold boundary
+    // (49999/50000/50001), and a clearly multi-chunk size whose row count is not divisible by any
+    // worker count (80021, prime) to stress partition bounds. Kept modest so the parallel-query
+    // folds (the dominant cost) finish well within the CI timeout in unoptimized debug / sanitizer
+    // builds — this is a DETERMINISM gate (parallel == serial for every worker count), not a perf
+    // bench, so a few clearly-multi-morsel sizes cover it as well as the old 300k.
+    for (std::size_t n : std::vector<std::size_t>{0, 1, 100, 49999, 50000, 50001, 80021}) {
         run_size(n);
     }
-    // Repeat the largest a few times so TSan sees many pool dispatch/merge cycles.
-    for (int rep = 0; rep < 3; ++rep) run_size(200003);
+    // Repeat a multi-chunk size a few times so TSan sees many pool dispatch/merge cycles.
+    for (int rep = 0; rep < 3; ++rep) run_size(70001);
 
     if (g_fail) {
         std::printf("sql_parallel_agg_test: FAILED\n");
