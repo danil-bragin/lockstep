@@ -178,7 +178,7 @@ private:
     // single-node (the aggregates roll up exactly); the distributed conformance gate cross-checks.
     std::optional<ExecResult> try_star_join_pushdown(const SelectStmt& sel) {
         if (sel.from.size() != 2 || sel.from[1].kind != JoinKind::Inner) return std::nullopt;
-        if (sel.filter.present() || sel.having.present() || !sel.has_aggregates) return std::nullopt;
+        if (sel.having.present() || !sel.has_aggregates) return std::nullopt;
         if (sel.group_by.empty()) return std::nullopt;
         if (!sel.from[1].on.present() || sel.from[1].on.root < 0) return std::nullopt;
         const PredNode& on = sel.from[1].on.nodes[static_cast<std::size_t>(sel.from[1].on.root)];
@@ -237,8 +237,19 @@ private:
         }
         if (agg_kinds.empty()) return std::nullopt;
 
+        // WHERE PUSHDOWN: split the filter into a fact-side and a dim-side fragment. Fact
+        // predicates filter rows BEFORE the per-shard aggregate (row-local, commutes with the
+        // PK partition); dim predicates filter the gathered dim (inner join drops the unmatched
+        // fact partials). A filter that doesn't split cleanly falls back to gather-and-run.
+        std::string fact_where;
+        std::string dim_where;
+        if (sel.filter.present() && !split_where(sel.filter, fa, da, fact_where, dim_where)) {
+            return std::nullopt;
+        }
+
         // FACT-SIDE per-key aggregate, pushed to every shard; merge the (small) per-key partials.
         const std::string fact_sql = "SELECT " + fk_col + agg_sql + " FROM " + sel.from[0].table +
+                                     (fact_where.empty() ? "" : " WHERE " + fact_where) +
                                      " GROUP BY " + fk_col;
         std::map<std::string, std::vector<Datum>> per_fk;  // fk-render -> [agg datums]
         for (ISqlShard* s : shards_) {
@@ -259,10 +270,13 @@ private:
                 }
             }
         }
-        // Gather the small DIM (key-render -> the dim group-column datums).
+        // Gather the small DIM (key-render -> the dim group-column datums), applying any dim-side
+        // WHERE so only surviving keys join (inner-join semantics, byte-identical to single-node).
+        const std::string dim_sql = "SELECT * FROM " + sel.from[1].table +
+                                    (dim_where.empty() ? "" : " WHERE " + dim_where);
         std::map<std::string, std::vector<Datum>> dim_by_key;
         for (ISqlShard* s : shards_) {
-            ExecResult part = s->exec("SELECT * FROM " + sel.from[1].table);
+            ExecResult part = s->exec(dim_sql);
             if (!part.ok) return std::nullopt;
             for (const ResultRow& row : part.rows) {
                 std::string keyr;
@@ -317,6 +331,70 @@ private:
         }
         r.affected = r.rows.size();
         return r;
+    }
+
+    // The SQL text for a comparison op that re-parses to the same CmpOp, or nullptr for
+    // an op we won't push down (LIKE/Contains — pattern/JSON semantics we don't re-serialize).
+    [[nodiscard]] static const char* cmp_op_sql(CmpOp op) {
+        switch (op) {
+            case CmpOp::Eq: return "=";
+            case CmpOp::Ne: return "!=";
+            case CmpOp::Lt: return "<";
+            case CmpOp::Le: return "<=";
+            case CmpOp::Gt: return ">";
+            case CmpOp::Ge: return ">=";
+            case CmpOp::Like:
+            case CmpOp::Contains:
+                return nullptr;
+        }
+        return nullptr;
+    }
+
+    // Split a star-join WHERE into a fact-side and a dim-side SQL fragment so each can be
+    // pushed to its table independently. Returns false (caller falls back to gather) on ANY
+    // shape that does not split cleanly into single-table simple comparisons ANDed together:
+    //   * a non-AND/non-Cmp node (OR / NOT / IS NULL / IN / EXISTS) — can't safely route,
+    //   * a Cmp whose LHS is not a plain column (Agg / scalar Expr), or whose RHS is a column
+    //     / subquery / ANY|ALL array, or a LIKE/Contains op,
+    //   * a NULL / non-Int-non-Text literal (sql_literal may not round-trip it),
+    //   * a leaf qualified by neither the fact nor the dim alias.
+    // Each leaf goes WHOLE to ONE table's fragment (no leaf spans both tables), so filtering
+    // each side then inner-joining is byte-identical to filtering the joined rows (AND only).
+    [[nodiscard]] static bool split_where(const Predicate& pred, const std::string& fa,
+                                          const std::string& da, std::string& fact_where,
+                                          std::string& dim_where) {
+        std::vector<std::int32_t> stack{pred.root};
+        while (!stack.empty()) {
+            const std::int32_t idx = stack.back();
+            stack.pop_back();
+            if (idx < 0 || static_cast<std::size_t>(idx) >= pred.nodes.size()) return false;
+            const PredNode& n = pred.nodes[static_cast<std::size_t>(idx)];
+            if (n.kind == PredNodeKind::And) {
+                stack.push_back(n.left);
+                stack.push_back(n.right);
+                continue;
+            }
+            if (n.kind != PredNodeKind::Cmp) return false;
+            if (n.operand != OperandKind::Column) return false;
+            if (n.rhs_is_column || n.rhs_is_subquery || n.any_quant || n.all_quant) return false;
+            if (n.literal.is_null ||
+                (n.literal.type != Type::Int && n.literal.type != Type::Text)) {
+                return false;
+            }
+            const char* ops = cmp_op_sql(n.op);
+            if (ops == nullptr) return false;
+            std::string* side = nullptr;
+            if (n.qualifier == fa) {
+                side = &fact_where;
+            } else if (n.qualifier == da) {
+                side = &dim_where;
+            } else {
+                return false;  // unqualified / unknown table — can't route safely
+            }
+            if (!side->empty()) *side += " AND ";
+            *side += n.column + " " + ops + " " + sql_literal(n.literal);
+        }
+        return true;
     }
 
     static void split_qual(const std::string& s, std::string& q, std::string& c) {

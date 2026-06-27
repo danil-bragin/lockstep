@@ -144,6 +144,15 @@ int main() {
         // is aggregated per-key ON THE SHARDS, never gathered. Must equal the single-node oracle.
         "SELECT dim.label, COUNT(*), SUM(t.amount), MIN(t.amount), MAX(t.amount) "
         "FROM t JOIN dim ON t.cat = dim.cat GROUP BY dim.label",
+        // PUSHDOWN + WHERE on the FACT (filters fact rows BEFORE the per-shard aggregate).
+        "SELECT dim.label, COUNT(*), SUM(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
+        "WHERE t.amount > 400 GROUP BY dim.label",
+        // PUSHDOWN + WHERE on the DIM (filters the gathered dim; inner join drops unmatched fact).
+        "SELECT dim.label, COUNT(*), MAX(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
+        "WHERE dim.label < 'd' GROUP BY dim.label",
+        // PUSHDOWN + WHERE spanning BOTH sides (ANDed) — each leaf routed to its own table.
+        "SELECT dim.label, COUNT(*), SUM(t.amount), MIN(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
+        "WHERE t.amount >= 200 AND t.amount <= 800 AND dim.label != 'b' GROUP BY dim.label",
     };
     const std::size_t pd_before = dist.pushdowns();
     for (const std::string& q : b4_queries) {
@@ -152,8 +161,9 @@ int main() {
         check(s == d, "B4 distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" + d +
                           "]");
     }
-    check(dist.pushdowns() > pd_before,
-          "star-schema JOIN actually took the pushdown path (not the gather fallback)");
+    check(dist.pushdowns() - pd_before >= 4,
+          "all 4 star-schema queries (base + 3 WHERE) took the pushdown path, not the gather "
+          "fallback (got " + std::to_string(dist.pushdowns() - pd_before) + ")");
 
     // Distributed AVG is explicitly rejected (can't merge an averaged value across shards).
     const ExecResult avg = dist.exec("SELECT AVG(amount) FROM t");
