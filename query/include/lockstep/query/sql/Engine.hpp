@@ -4049,11 +4049,15 @@ private:
                 node.kind = PlanNode::Kind::PkRangeScan;
                 node.detail = t.name + " (" + t.pk().name + " BETWEEN)";
                 break;
-            case AccessPath::Kind::Index:
+            case AccessPath::Kind::Index: {
                 node.kind = PlanNode::Kind::IndexScan;
-                node.detail = "using " + ap.index.index->name +
+                const bool cov = !t.columnar &&
+                                 index_covers_need(*ap.index.index, needed_columns(t, sel), t.pk_index);
+                node.detail = std::string(cov ? "Index Only Scan: using " : "using ") +
+                              ap.index.index->name +
                               (ap.index.is_eq ? " (= const)" : " (range)") + " on " + t.name;
                 break;
+            }
             case AccessPath::Kind::Seq:
                 node.kind = PlanNode::Kind::SeqScan;
                 node.detail = t.name;
@@ -4395,11 +4399,14 @@ private:
         bool filter_applied = false;
         // I2: if the index's order already satisfies ORDER BY, scan in index order + skip the sort.
         const bool order_via_index = used_index && order_by_matches_index(sel, ap.index, *t);
+        // I3: index-only (covering) scan — serve from the index when it covers every needed column.
+        const bool covering = used_index && !t->columnar &&
+                              index_covers_need(*ap.index.index, need, t->pk_index);
         if (used_index) {
             // Index scan: range-scan the index for the PKs, point-get each row; the full
             // predicate still runs as the residual filter in (2). (read_via_index assembles
             // columnar rows from their column families when t is columnar.)
-            if (auto err = read_via_index(*t, sel, ap.index, need, rows, order_via_index)) {
+            if (auto err = read_via_index(*t, sel, ap.index, need, rows, order_via_index, covering)) {
                 return ExecResult::failure(*err);
             }
         } else if (t->columnar) {
@@ -6906,7 +6913,7 @@ private:
     [[nodiscard]] std::optional<std::string> read_via_index(
         const Table& t, const SelectStmt& sel, const IndexPlan& plan,
         const std::vector<bool>& need, std::vector<std::vector<Datum>>& rows_out,
-        bool preserve_index_order = false) {
+        bool preserve_index_order = false, bool covering = false) {
         // (a) The index range [lo, hi): col-ascending entries for the matching values.
         Key lo = index_prefix(t.id, plan.index->id);
         Key hi;
@@ -6939,6 +6946,10 @@ private:
                 continue;
             }
             const Datum pk = decode_index_entry_pk(t, plan.index->id, ikv.first);
+            if (covering) {  // I3: index-only — reconstruct the row from the entry, no table fetch
+                fetched.emplace_back(pk, decode_index_entry_full(t, *plan.index, ikv.first));
+                continue;
+            }
             if (t.columnar) {
                 // Columnar: assemble the row from its column families (point-gets).
                 auto row = read_columnar_row(t, pk);
@@ -6972,6 +6983,51 @@ private:
             rows_out.push_back(std::move(row));
         }
         return std::nullopt;
+    }
+
+    // I3: reconstruct a ROW from an index ENTRY (covered columns + PK) WITHOUT a table fetch — used
+    // for an index-only (covering) scan. Each covered column is decoded from its order-preserving
+    // token (INT: sign + be64^msb; TEXT-backed: unescape 0x00 0x01 up to the 0x00 0x00 terminator);
+    // the PK is decoded from the suffix. Non-covered columns stay default (the caller guarantees the
+    // query needs only covered columns + the PK).
+    [[nodiscard]] static std::vector<Datum> decode_index_entry_full(const Table& t, const Index& ix,
+                                                                    const Key& entry) {
+        std::vector<Datum> row(t.columns.size());
+        std::size_t off = index_prefix(t.id, ix.id).size();
+        for (const std::size_t cidx : ix.columns) {
+            if (t.columns[cidx].type == Type::Int) {
+                std::uint64_t bits = 0;
+                for (int b = 1; b < 9; ++b) bits = (bits << 8) | static_cast<unsigned char>(entry[off + b]);
+                bits ^= 0x8000000000000000ULL;
+                row[cidx] = Datum::make_int(static_cast<std::int64_t>(bits));
+                off += 9;
+            } else {
+                std::string s;
+                while (off + 1 < entry.size()) {
+                    if (entry[off] == '\0') {
+                        if (entry[off + 1] == '\0') { off += 2; break; }
+                        s.push_back('\0'); off += 2;  // escaped 0x00 0x01
+                    } else {
+                        s.push_back(entry[off]); off += 1;
+                    }
+                }
+                row[cidx] = Datum::make_text(std::move(s));
+            }
+        }
+        row[t.pk_index] = decode_pk(t, table_prefix(t.id) + entry.substr(off));
+        tag_logical_cols(t, row);
+        return row;
+    }
+    // I3: does `ix` cover every column the query NEEDS (so the row can be served from the index)?
+    static bool index_covers_need(const Index& ix, const std::vector<bool>& need,
+                                  std::size_t pk_index) {
+        for (std::size_t c = 0; c < need.size(); ++c) {
+            if (!need[c] || c == pk_index) continue;
+            bool in_ix = false;
+            for (const std::size_t ic : ix.columns) if (ic == c) { in_ix = true; break; }
+            if (!in_ix) return false;
+        }
+        return true;
     }
 
     // Decode the PK datum from an index ENTRY key. The entry is

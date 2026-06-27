@@ -105,6 +105,26 @@ int main() {
               "ORDER BY y DESC still sorts");
     }
 
+    // I3: index-only (covering) scan — when every needed column is in the index (+ PK), serve from
+    // the index without a table fetch. Result must equal the full-scan truth.
+    {
+        // u has index (x,y,z). SELECT y, z WHERE x=2 -> all needed cols (x,y,z) are covered.
+        check(explain_has(e, "SELECT y, z FROM u WHERE x = 2", "Index Only Scan"),
+              "covered projection -> Index Only Scan");
+        const ExecResult r = e.exec("SELECT y, z FROM u WHERE x = 2 AND y = 1");
+        std::int64_t truth = 0;
+        for (int i = 0; i < 300; ++i) if (i % 10 == 2 && i % 5 == 1) ++truth;
+        check(r.ok && (std::int64_t)r.rows.size() == truth, "index-only rows == truth");
+        for (const auto& row : r.rows) check(row.cells[0].second.i == 1, "every covered row has y=1");
+        // SELECT the PK + covered cols is still covering (PK is free from the entry).
+        check(explain_has(e, "SELECT id, z FROM u WHERE x = 2", "Index Only Scan"),
+              "PK + covered col still index-only");
+        // a NON-covered column forces a table fetch (plain Index Scan, not Index Only).
+        check(!explain_has(e, "SELECT v FROM t WHERE a = 5", "Index Only Scan"),
+              "non-covered projection -> not index-only");
+        check(explain_has(e, "SELECT v FROM t WHERE a = 5", "Index Scan"), "still an index scan");
+    }
+
     if (g_fail) { std::printf("sql_index_composite_test: FAILED\n"); return 1; }
     std::printf("sql_index_composite_test: OK (composite prefix lookup: index chosen, results == "
                 "full-scan truth, 2- and 3-column)\n");
