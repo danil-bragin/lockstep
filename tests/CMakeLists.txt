@@ -1478,6 +1478,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_interval_month_test COMMAND lockstep_sql_interval_month_test)
 
+  # sql_uint256_test: UINT256 256-bit unsigned integer (crypto-scale amounts).
+  add_executable(lockstep_sql_uint256_test sql_uint256_test.cpp)
+  target_include_directories(lockstep_sql_uint256_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_uint256_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_uint256_test COMMAND lockstep_sql_uint256_test)
+
   # sql_json_test (F13): JSON type — canonical store + ->/->> access.
   add_executable(lockstep_sql_json_test sql_json_test.cpp)
   target_include_directories(lockstep_sql_json_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

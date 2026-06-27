@@ -700,6 +700,15 @@ private:
             advance();
             return std::nullopt;
         }
+        // UINT256 — a 256-bit UNSIGNED integer (crypto-scale) over TEXT (32-byte order-preserving
+        // big-endian payload). Inherently unsigned (range 0 .. 2^256-1).
+        if (is_kw("uint256") || is_kw("u256")) {
+            out = Type::Text;
+            col.logical = 13;
+            col.is_unsigned = true;
+            advance();
+            return std::nullopt;
+        }
         if (is_kw("decimal") || is_kw("numeric") || is_kw("decimal128") || is_kw("numeric128")) {
             // DECIMAL128 is always 128-bit; DECIMAL/NUMERIC promotes to 128-bit when precision > 18.
             const bool force128 = is_kw("decimal128") || is_kw("numeric128");

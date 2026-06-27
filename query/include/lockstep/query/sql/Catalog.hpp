@@ -56,6 +56,7 @@
 #include <vector>
 
 #include <lockstep/query/Query.hpp>  // Key, Value (== txn opaque bytes)
+#include <lockstep/query/sql/Uint256.hpp>  // u256: the UINT256 (logical 13) backing type
 
 namespace lockstep::query::sql {
 
@@ -315,6 +316,7 @@ struct Datum {
         if (type == Type::Text && logical >= 5) {  // F9e: INT128 / DECIMAL128 (16-byte payload in s)
             if (logical == 5) return render_i128(decode_i128(s));
             if (logical == 6) return render_decimal128(decode_i128(s), scale);
+            if (logical == 13) return u256_to_dec(u256_decode(s));  // UINT256 (32-byte payload)
         }
         return type == Type::Int ? std::to_string(i) : s;
     }

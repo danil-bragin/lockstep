@@ -1754,6 +1754,26 @@ private:
             out.scale = col.scale;
             return check_domain(col, out, for_write);
         }
+        // UINT256 (logical 13) — a 256-bit UNSIGNED column (physical TEXT, 32-byte payload). Accept an
+        // unsigned decimal string or a NON-NEGATIVE INT widened to 256-bit.
+        if (col.type == Type::Text && col.logical == 13) {
+            u256 v{};
+            if (in.type == Type::Text) {
+                if (!u256_from_dec(in.s, v))
+                    return std::string("invalid UINT256 literal '") + in.s + "' for column '" +
+                           col.name + "' (must be an unsigned integer in [0, 2^256-1])";
+            } else if (in.type == Type::Int) {
+                if (in.i < 0)
+                    return std::string("UINT256 column '") + col.name + "' cannot hold a negative value";
+                v = u256_from_u64(static_cast<std::uint64_t>(in.i));
+            } else {
+                return std::string("type mismatch for column '") + col.name + "': expected UINT256, got " +
+                       type_name(in.type);
+            }
+            out = Datum::make_text(u256_encode(v));
+            out.logical = 13;
+            return std::nullopt;
+        }
         if (col.type != in.type) {
             return std::string("type mismatch for column '") + col.name +
                    "': expected " + type_name(col.type) + ", got " +
@@ -3642,13 +3662,26 @@ private:
         // (compute_agg_soa folds the 16-byte payloads in __int128). It must NOT take the unfiltered
         // AggPartial / fused-stats fast path (which accumulates in int64), so flag it to route through
         // the gather path. ARRAY_AGG stays row-AoS only.
+        // UINT256 (logical 13): its 32-byte payload is not the i128 SoA folders' shape, so any UINT256
+        // column anywhere (filter / aggregate / group) takes the row-AoS path (correct via cmp_datum's
+        // order-preserving TEXT compare + the u256 SUM in compute_agg).
+        for (const VecTerm& vt : vterms)
+            if (t.columns[vt.col].logical == 13) return std::nullopt;
+        for (const std::size_t g : gcols)
+            if (t.columns[g].logical == 13) return std::nullopt;
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
+                if (const auto idx = t.column_index(item.agg.column))
+                    if (t.columns[*idx].logical == 13) return std::nullopt;
+            }
+        }
         bool has_i128_agg = false;
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
                 if (item.agg.kind == AggKind::ArrayAgg || item.agg.kind == AggKind::JsonAgg)
                     return std::nullopt;  // F12 / JSON_AGG: row-AoS only
                 if (const auto idx = t.column_index(item.agg.column))
-                    if (t.columns[*idx].logical >= 5) has_i128_agg = true;
+                    if (t.columns[*idx].logical >= 5) has_i128_agg = true;  // 5/6 only reach here (13 bailed)
             }
         }
         // Decode the needed column blocks: filter + group + aggregate-target columns.
@@ -5240,6 +5273,51 @@ private:
     // narrow INT/DECIMAL64 operand widens in). Mirrors the int64 DECIMAL rules (Add/Sub align scales,
     // Mul adds, Div keeps the left scale) but on __int128, with __builtin overflow checks. The result
     // is INT128 (logical 5) when both operands are scale-0, else DECIMAL128 (logical 6).
+    // UINT256 binary arithmetic. Each operand is a UINT256 (32-byte payload) or a non-negative INT
+    // (widened). +/-/*/ / % with overflow / negative-result / division-by-zero reported as errors.
+    [[nodiscard]] std::optional<std::string> eval_bin_u256(BinOp op, const Datum& l, const Datum& r,
+                                                           Datum& out) {
+        auto decode = [](const Datum& d, u256& v) -> std::optional<std::string> {
+            if (d.logical == 13) {
+                if (d.type != Type::Text || d.s.size() != 32) return std::string("malformed UINT256");
+                v = u256_decode(d.s);
+            } else if (d.type == Type::Int) {
+                if (d.i < 0) return std::string("a UINT256 operand cannot be negative");
+                v = u256_from_u64(static_cast<std::uint64_t>(d.i));
+            } else {
+                return std::string("UINT256 arithmetic requires integer operands");
+            }
+            return std::nullopt;
+        };
+        u256 a, b, res;
+        if (auto e = decode(l, a)) return e;
+        if (auto e = decode(r, b)) return e;
+        switch (op) {
+            case BinOp::Add:
+                if (u256_add(a, b, res)) return std::string("UINT256 overflow in addition");
+                break;
+            case BinOp::Sub:
+                if (u256_sub(a, b, res)) return std::string("UINT256 underflow (result is negative)");
+                break;
+            case BinOp::Mul:
+                if (u256_mul(a, b, res)) return std::string("UINT256 overflow in multiplication");
+                break;
+            case BinOp::Div: {
+                u256 rem;
+                if (!u256_divmod(a, b, res, rem)) return std::string("division by zero");
+                break;
+            }
+            case BinOp::Mod: {
+                u256 q;
+                if (!u256_divmod(a, b, q, res)) return std::string("modulo by zero");
+                break;
+            }
+        }
+        out = Datum::make_text(u256_encode(res));
+        out.logical = 13;
+        return std::nullopt;
+    }
+
     [[nodiscard]] std::optional<std::string> eval_bin_i128(BinOp op, const Datum& l, const Datum& r,
                                                            Datum& out) {
         auto decode = [](const Datum& d, __int128& val, std::uint8_t& sc) -> bool {
@@ -5317,10 +5395,11 @@ private:
                 Datum c;
                 if (auto er = eval_expr(*e.left, t, row, c)) return er;
                 if (c.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
-                if (c.logical >= 5) {  // F9e: negate a 128-bit operand (0 - c)
+                if (c.logical == 5 || c.logical == 6) {  // F9e: negate a 128-bit operand (0 - c)
                     Datum zero = Datum::make_int(0);
                     return eval_bin_i128(BinOp::Sub, zero, c, out);
                 }
+                if (c.logical == 13) return "UINT256 is unsigned; it cannot be negated";
                 if (c.type != Type::Int) return "unary '-' requires an INT operand";
                 std::int64_t neg = 0;
                 if (sub_ovf(0, c.i, neg)) return "integer overflow";  // -INT64_MIN overflows
@@ -5334,6 +5413,12 @@ private:
                 if (auto er = eval_expr(*e.left, t, row, l)) return er;
                 if (auto er = eval_expr(*e.right, t, row, r)) return er;
                 if (l.is_null || r.is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+                // UINT256 (logical 13): if either operand is UINT256, compute in u256 (a narrow
+                // non-negative INT widens in). Checked BEFORE the 128-bit path so a UINT256 operand is
+                // never mis-decoded as __int128 (mixing 128-bit with 256-bit is a clean error).
+                if (l.logical == 13 || r.logical == 13) {
+                    return eval_bin_u256(e.op, l, r, out);
+                }
                 // F9e: if either operand is 128-bit (INT128/DECIMAL128), compute in __int128. A plain
                 // INT / DECIMAL64 operand widens in (so 128-bit mixes with the narrow types).
                 if (l.logical == 5 || l.logical == 6 || r.logical == 5 || r.logical == 6) {
@@ -7149,8 +7234,25 @@ private:
             out = best;
             return std::nullopt;
         }
+        // SUM/AVG over a UINT256 column across a join — accumulate in u256 (checked).
+        if (present.front()->logical == 13) {
+            u256 acc{};
+            for (const Datum* d : present) {
+                u256 nx;
+                if (u256_add(acc, u256_decode(d->s), nx)) return "UINT256 overflow in SUM";
+                acc = nx;
+            }
+            if (a.kind == AggKind::Avg) {
+                u256 q, rem;
+                (void)u256_divmod(acc, u256_from_u64(present.size()), q, rem);
+                acc = q;
+            }
+            out = Datum::make_text(u256_encode(acc));
+            out.logical = 13;
+            return std::nullopt;
+        }
         // F9f: SUM/AVG over a 128-bit column (the present Datums carry the INT128/DECIMAL128 tag).
-        if (present.front()->logical >= 5) {
+        if (present.front()->logical == 5 || present.front()->logical == 6) {
             __int128 acc = 0;
             for (const Datum* d : present) {
                 if (__builtin_add_overflow(acc, Datum::decode_i128(d->s), &acc))
@@ -8995,9 +9097,26 @@ private:
             out = best;
             return std::nullopt;
         }
+        // SUM / AVG over a UINT256 column — accumulate in u256 (checked); AVG truncates toward zero.
+        if (t.columns[ci].logical == 13) {
+            u256 acc{};
+            for (const Datum* d : present) {
+                u256 nx;
+                if (u256_add(acc, u256_decode(d->s), nx)) return "UINT256 overflow in SUM";
+                acc = nx;
+            }
+            if (a.kind == AggKind::Avg) {
+                u256 q, rem;
+                (void)u256_divmod(acc, u256_from_u64(present.size()), q, rem);
+                acc = q;
+            }
+            out = Datum::make_text(u256_encode(acc));
+            out.logical = 13;
+            return std::nullopt;
+        }
         // F9f: SUM / AVG over a 128-bit column (INT128/DECIMAL128) — accumulate in __int128 (checked).
         // AVG truncates toward zero. The result keeps the column's logical/scale tag.
-        if (t.columns[ci].logical >= 5) {
+        if (t.columns[ci].logical == 5 || t.columns[ci].logical == 6) {
             __int128 acc = 0;
             for (const Datum* d : present) {
                 if (__builtin_add_overflow(acc, Datum::decode_i128(d->s), &acc))
