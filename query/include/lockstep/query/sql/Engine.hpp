@@ -3187,7 +3187,33 @@ private:
                     }
                 }
             }
-            return any ? best : Datum::make_null(ty);
+            if (!any) return Datum::make_null(ty);
+            if (t.columns[ci].logical >= 5) {  // K1: re-tag a 128-bit MIN/MAX (at() yields an untagged payload)
+                best.logical = t.columns[ci].logical;
+                best.scale = t.columns[ci].scale;
+            }
+            return best;
+        }
+        // K1: SUM / AVG over a 128-bit column (INT128/DECIMAL128) — accumulate in __int128 (checked),
+        // byte-identical to compute_agg's row path. An overflow signals a bail to the row path (which
+        // reports "integer overflow in SUM"); AVG truncates toward zero; the result keeps the tag.
+        if (t.columns[ci].logical >= 5) {
+            __int128 acc = 0;
+            std::int64_t n128 = 0;
+            for (const std::uint32_t r : idxs) {
+                if (cc.nulls[r]) continue;
+                if (__builtin_add_overflow(acc, Datum::decode_i128(cc.texts[r]), &acc)) {
+                    soa_overflow_ = true;
+                    return Datum::make_int(0);  // dummy; columnar_vectorized_agg bails on the flag
+                }
+                ++n128;
+            }
+            if (n128 == 0) return a.kind == AggKind::Sum ? Datum::make_int(0) : Datum::make_null(ty);
+            if (a.kind == AggKind::Avg) acc /= static_cast<__int128>(n128);
+            Datum d = Datum::make_text(Datum::encode_i128(acc));
+            d.logical = t.columns[ci].logical;
+            d.scale = t.columns[ci].scale;
+            return d;
         }
         std::int64_t sum = 0;  // SUM / AVG over INT (validated INT)
         std::int64_t n = 0;
@@ -3211,6 +3237,57 @@ private:
     // BRANCHLESS comparisons (each `a OP lit` yields 0/1; the per-term AND auto-vectorizes), then
     // count the matches. Replaces the per-row branchy `passes()` + index gather for the common
     // filtered scalar aggregate. mask[r]==1 iff row r satisfies EVERY term.
+    // K2: decode a 128-bit (INT128/DECIMAL128) SoA column's 16-byte payloads into a CONTIGUOUS
+    // __int128 array ONCE, so the masked filter + fold run branchlessly over it (no per-row Datum /
+    // string construction — the vectorization the INT path already enjoys). NULL slots decode to 0
+    // (the null mask stays authoritative).
+    static std::vector<__int128> decode_i128_col(const ColumnChunk& cc) {
+        std::vector<__int128> out(cc.count);
+        for (std::uint32_t r = 0; r < cc.count; ++r) {
+            out[r] = cc.nulls[r] ? 0 : Datum::decode_i128(cc.texts[r]);
+        }
+        return out;
+    }
+
+    // K2: branchless 0/1 mask for an all-NOT-NULL conjunctive filter where each term is INT (cols->
+    // ints) or 128-bit (the pre-decoded `i128[col]`). Mirrors build_filter_mask, extended to __int128.
+    [[nodiscard]] static std::int64_t build_filter_mask_i128(
+        const std::vector<const ColumnChunk*>& cols, std::uint32_t count,
+        const std::vector<VecTerm>& vterms, const std::vector<std::vector<__int128>>& i128,
+        const std::vector<bool>& is128, std::vector<std::uint8_t>& mask) {
+        mask.assign(count, 1);
+        for (const VecTerm& vt : vterms) {
+            if (is128[vt.col]) {
+                const __int128* a = i128[vt.col].data();
+                const __int128 b = Datum::decode_i128(vt.lit.s);
+                switch (vt.op) {
+                    case CmpOp::Eq: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] == b); break;
+                    case CmpOp::Ne: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] != b); break;
+                    case CmpOp::Lt: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] < b); break;
+                    case CmpOp::Le: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] <= b); break;
+                    case CmpOp::Gt: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] > b); break;
+                    case CmpOp::Ge: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] >= b); break;
+                    case CmpOp::Like: break;
+                }
+            } else {
+                const std::int64_t* a = cols[vt.col]->ints.data();
+                const std::int64_t b = vt.lit.i;
+                switch (vt.op) {
+                    case CmpOp::Eq: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] == b); break;
+                    case CmpOp::Ne: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] != b); break;
+                    case CmpOp::Lt: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] < b); break;
+                    case CmpOp::Le: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] <= b); break;
+                    case CmpOp::Gt: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] > b); break;
+                    case CmpOp::Ge: for (std::uint32_t r = 0; r < count; ++r) mask[r] &= (a[r] >= b); break;
+                    case CmpOp::Like: break;
+                }
+            }
+        }
+        std::int64_t n = 0;
+        for (std::uint32_t r = 0; r < count; ++r) n += mask[r];
+        return n;
+    }
+
     [[nodiscard]] std::int64_t build_filter_mask(const std::vector<const ColumnChunk*>& cols,
                                                  std::uint32_t count,
                                                  const std::vector<VecTerm>& vterms,
@@ -3274,6 +3351,49 @@ private:
             best = (a.kind == AggKind::Min) ? std::min(best, cand) : std::max(best, cand);
         }
         return Datum::make_int(best);
+    }
+
+    // K2: masked fold of ONE aggregate over a 128-bit (INT128/DECIMAL128) NOT-NULL column, branchless
+    // over the pre-decoded __int128 array. Byte-identical to compute_agg_soa over the matching rows
+    // (same int-0 empty rule, same tag). A SUM overflow sets soa_overflow_ => the caller bails to the
+    // row path (which raises the error).
+    [[nodiscard]] Datum compute_masked_agg_i128(const AggExpr& a, const Table& t,
+                                                const std::vector<__int128>& xs, std::size_t ci,
+                                                std::uint32_t count,
+                                                const std::vector<std::uint8_t>& mask,
+                                                std::int64_t nmatch) {
+        if (a.kind == AggKind::CountStar || a.kind == AggKind::Count) {
+            return Datum::make_int(nmatch);  // NOT NULL => Count == match count
+        }
+        if (nmatch == 0) {
+            return Datum::make_int(0);  // compute_agg_soa empty-index parity (int 0 for all kinds)
+        }
+        const __int128* x = xs.data();
+        Datum d;
+        if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
+            __int128 best = 0;
+            bool any = false;
+            for (std::uint32_t r = 0; r < count; ++r) {
+                if (!mask[r]) continue;
+                if (!any) { best = x[r]; any = true; }
+                else if (a.kind == AggKind::Min ? x[r] < best : x[r] > best) { best = x[r]; }
+            }
+            d = Datum::make_text(Datum::encode_i128(best));
+        } else {  // SUM / AVG — checked __int128 accumulation
+            __int128 acc = 0;
+            for (std::uint32_t r = 0; r < count; ++r) {
+                if (!mask[r]) continue;
+                if (__builtin_add_overflow(acc, x[r], &acc)) {
+                    soa_overflow_ = true;
+                    return Datum::make_int(0);  // dummy; caller bails on the flag
+                }
+            }
+            if (a.kind == AggKind::Avg) acc /= static_cast<__int128>(nmatch);
+            d = Datum::make_text(Datum::encode_i128(acc));
+        }
+        d.logical = t.columns[ci].logical;
+        d.scale = t.columns[ci].scale;
+        return d;
     }
 
     // Is the HAVING predicate SoA-evaluable (only And/Or/Not + Cmp with an Agg or grouped-
@@ -3390,6 +3510,7 @@ private:
             // single-run clean-delta case (restored by compaction).
             return std::nullopt;
         }
+        soa_overflow_ = false;  // K1: set if a 128-bit SoA SUM overflows => bail (the row path errors)
         std::vector<VecTerm> vterms;
         const bool has_filter = sel.filter.present();
         if (has_filter &&
@@ -3433,13 +3554,16 @@ private:
         if (auto e = validate_aggs(sel, t)) {
             return ExecResult::failure(*e);
         }
-        // F9f: a 128-bit (INT128/DECIMAL128) aggregate column isn't handled by the SoA INT folds —
-        // bail to the row-mode AoS path (compute_agg), which decodes the 16-byte payloads.
+        // K1: a 128-bit (INT128/DECIMAL128) aggregate column IS handled by the SoA gather path
+        // (compute_agg_soa folds the 16-byte payloads in __int128). It must NOT take the unfiltered
+        // AggPartial / fused-stats fast path (which accumulates in int64), so flag it to route through
+        // the gather path. ARRAY_AGG stays row-AoS only.
+        bool has_i128_agg = false;
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
                 if (item.agg.kind == AggKind::ArrayAgg) return std::nullopt;  // F12: row-AoS only
                 if (const auto idx = t.column_index(item.agg.column))
-                    if (t.columns[*idx].logical >= 5) return std::nullopt;
+                    if (t.columns[*idx].logical >= 5) has_i128_agg = true;
             }
         }
         // Decode the needed column blocks: filter + group + aggregate-target columns.
@@ -3468,7 +3592,7 @@ private:
         // whole-column concat (decoded only via the cached chunks). The common analytical
         // SELECT SUM/COUNT/MIN/MAX FROM t. Placed BEFORE the column decode so the concat is
         // never built for this path.
-        if (gcols.empty() && !has_filter && !has_having) {
+        if (gcols.empty() && !has_filter && !has_having && !has_i128_agg) {
             // FUSED per-column fold: stream each distinct aggregate column ONCE computing
             // total/sum/min/max together (3x less bandwidth than a fold per aggregate — the
             // scan_agg bandwidth gap). Now a WIN because MIN/MAX are branchless (the prior fusion
@@ -3564,7 +3688,7 @@ private:
         // A row filter shared by both group paths.
         auto passes = [&](std::uint32_t rr) {
             for (const VecTerm& vt : vterms) {
-                if (!apply_cmp(vt.op, cmp_datum(cols[vt.col]->at(rr), vt.lit))) {
+                if (!apply_cmp(vt.op, cmp_cell(*cols[vt.col], rr, vt.lit))) {
                     return false;
                 }
             }
@@ -3576,31 +3700,36 @@ private:
         // per-row branch, no index gather (the generic path collects matching indices then folds
         // by gather). Byte-identical to the generic path; the columnar conformance gate proves it.
         if (gcols.empty() && has_filter && !has_having && !vterms.empty()) {
+            // A column is mask-vectorizable when NOT NULL and either plain INT or 128-bit
+            // (INT128/DECIMAL128). K2 extends the INT-only branchless path to 128-bit columns.
             bool vec_ok = true;
-            for (const VecTerm& vt : vterms) {
-                if (t.columns[vt.col].type != Type::Int || t.columns[vt.col].nullable ||
-                    vt.lit.type != Type::Int || vt.lit.is_null) {
-                    vec_ok = false;
-                    break;
+            bool any_i128 = false;
+            std::vector<bool> is128(t.columns.size(), false);
+            auto classify = [&](std::size_t c, Type lit_ty) {
+                const Column& col = t.columns[c];
+                if (col.nullable) return false;
+                if (col.logical >= 5 && col.type == Type::Text) {  // 128-bit
+                    is128[c] = true;
+                    any_i128 = true;
+                    return lit_ty == Type::Text;  // literal coerced to the 16-byte payload
                 }
+                return col.type == Type::Int && col.logical == 0 && lit_ty == Type::Int;
+            };
+            for (const VecTerm& vt : vterms) {
+                if (vt.lit.is_null || !classify(vt.col, vt.lit.type)) { vec_ok = false; break; }
             }
             if (vec_ok) {
                 for (const SelectItem& item : sel.items) {
-                    if (item.kind != SelectItemKind::Aggregate) {
-                        vec_ok = false;
-                        break;
-                    }
-                    if (item.agg.kind == AggKind::CountStar) {
-                        continue;
-                    }
+                    if (item.kind != SelectItemKind::Aggregate) { vec_ok = false; break; }
+                    if (item.agg.kind == AggKind::CountStar) continue;
                     const auto ci = t.column_index(item.agg.column);
-                    if (!ci || t.columns[*ci].type != Type::Int || t.columns[*ci].nullable) {
-                        vec_ok = false;
-                        break;
-                    }
+                    if (!ci || t.columns[*ci].nullable) { vec_ok = false; break; }
+                    const Column& col = t.columns[*ci];
+                    if (col.logical >= 5 && col.type == Type::Text) { is128[*ci] = true; any_i128 = true; }
+                    else if (col.type != Type::Int || col.logical != 0) { vec_ok = false; break; }
                 }
             }
-            if (vec_ok) {
+            if (vec_ok && !any_i128) {
                 std::vector<std::uint8_t> mask;
                 const std::int64_t nmatch = build_filter_mask(cols, count, vterms, mask);
                 ResultRow out;
@@ -3611,9 +3740,37 @@ private:
                 ExecResult rr;
                 rr.rows.push_back(std::move(out));
                 apply_distinct(sel, rr.rows);
-                if (auto e = apply_order_by_labels(sel, rr.rows)) {
-                    return ExecResult::failure(*e);
+                if (auto e = apply_order_by_labels(sel, rr.rows)) return ExecResult::failure(*e);
+                apply_limit(sel, rr.rows);
+                rr.affected = rr.rows.size();
+                return rr;
+            }
+            if (vec_ok && any_i128) {  // K2: branchless 128-bit (mixed INT/128-bit) masked aggregate
+                std::vector<std::vector<__int128>> dec(t.columns.size());
+                for (std::size_t c = 0; c < t.columns.size(); ++c)
+                    if (is128[c] && cols[c] != nullptr) dec[c] = decode_i128_col(*cols[c]);
+                std::vector<std::uint8_t> mask;
+                const std::int64_t nmatch =
+                    build_filter_mask_i128(cols, count, vterms, dec, is128, mask);
+                ResultRow out;
+                for (const SelectItem& item : sel.items) {
+                    if (item.agg.kind != AggKind::CountStar) {
+                        const std::size_t ci = *t.column_index(item.agg.column);
+                        if (is128[ci]) {
+                            out.cells.emplace_back(item.label, compute_masked_agg_i128(
+                                                                   item.agg, t, dec[ci], ci, count,
+                                                                   mask, nmatch));
+                            continue;
+                        }
+                    }
+                    out.cells.emplace_back(
+                        item.label, compute_masked_agg(item.agg, t, cols, count, mask, nmatch));
                 }
+                if (soa_overflow_) return std::nullopt;  // SUM overflow => row path raises the error
+                ExecResult rr;
+                rr.rows.push_back(std::move(out));
+                apply_distinct(sel, rr.rows);
+                if (auto e = apply_order_by_labels(sel, rr.rows)) return ExecResult::failure(*e);
                 apply_limit(sel, rr.rows);
                 rr.affected = rr.rows.size();
                 return rr;
@@ -3847,6 +4004,9 @@ private:
             if (auto e = emit_all(refs)) {
                 return ExecResult::failure(*e);
             }
+        }
+        if (soa_overflow_) {  // K1: a 128-bit SUM overflowed mid-fold => let the row path raise the error
+            return std::nullopt;
         }
         apply_distinct(sel, r.rows);
         if (auto e = apply_order_by_labels(sel, r.rows)) {
@@ -7972,6 +8132,23 @@ private:
     // present value) ascending; two NULLs are equal. Predicate eval never reaches here
     // with a NULL (it short-circuits NULL comparisons to false), so this only affects
     // the deterministic ORDER BY / tie-break of joined output.
+    // K1: compare a SoA column cell against a literal == cmp_datum(cc.at(r), lit), but WITHOUT
+    // constructing a Datum (no per-row string copy for a TEXT / 128-bit column — the hot filter
+    // path). Filter columns are never arrays (try_extract_conjuncts rejects logical 7), so a TEXT
+    // compare is a plain lexicographic byte compare, exactly like cmp_datum's non-array branch.
+    static int cmp_cell(const ColumnChunk& cc, std::uint32_t r, const Datum& lit) {
+        if (cc.nulls[r] || lit.is_null) {
+            if (cc.nulls[r] && lit.is_null) return 0;
+            return cc.nulls[r] ? -1 : 1;  // NULLs first (matches cmp_datum)
+        }
+        if (cc.type == Type::Int) {
+            const std::int64_t x = cc.ints[r];
+            return x < lit.i ? -1 : (x > lit.i ? 1 : 0);
+        }
+        const std::string& s = cc.texts[r];
+        return s < lit.s ? -1 : (s > lit.s ? 1 : 0);
+    }
+
     static int cmp_datum(const Datum& a, const Datum& b) {
         if (a.is_null || b.is_null) {
             if (a.is_null && b.is_null) return 0;
@@ -8965,6 +9142,7 @@ private:
     bool columnar_default_ = false;    // new tables use the columnar layout when set
     bool group_commit_ = false;        // defer write fsync; caller sync()s the burst once
     bool gs_mode_ = false;             // C2: inside a GROUPING SETS sub-run (NULL-out non-set cols)
+    bool soa_overflow_ = false;        // K1: a 128-bit SoA SUM overflowed => bail to the row path (errors)
     bool in_txn_ = false;              // G1: inside an explicit BEGIN..COMMIT transaction
     std::vector<std::pair<Key, Value>> txn_writes_;  // G1: buffered DML writes (committed at COMMIT)
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)

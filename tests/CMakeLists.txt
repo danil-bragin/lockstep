@@ -1335,6 +1335,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_int128_test COMMAND lockstep_sql_int128_test)
 
+  # sql_columnar_i128_test (K1/K2): columnar SoA 128-bit aggregation == row store (vectorized).
+  add_executable(lockstep_sql_columnar_i128_test sql_columnar_i128_test.cpp)
+  target_include_directories(lockstep_sql_columnar_i128_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_columnar_i128_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_columnar_i128_test COMMAND lockstep_sql_columnar_i128_test)
+
   # sql_domain_test (F10): domain constraints — VARCHAR/CHAR length, DECIMAL precision, UNSIGNED, int width.
   add_executable(lockstep_sql_domain_test sql_domain_test.cpp)
   target_include_directories(lockstep_sql_domain_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
