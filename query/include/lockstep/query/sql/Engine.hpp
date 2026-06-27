@@ -6243,6 +6243,11 @@ private:
         if (n.operand == OperandKind::Agg) {
             return std::string("an aggregate may not appear in WHERE / ON");
         }
+        if (n.operand == OperandKind::Expr) {
+            // J1: scalar-expression predicates are supported on single-table queries; over a
+            // join the per-table eval_expr does not see the joined schema. Fail-closed.
+            return std::string("expression predicates are not supported in a JOIN's WHERE/ON");
+        }
         std::size_t li = 0;
         if (auto e = schema.resolve(n.qualifier, n.column, li)) {
             return e;
@@ -6725,6 +6730,21 @@ private:
                 }
             }
         };
+        // J1: an expression LHS (`a + b = 10`, `doc->>'k' = 'v'`) may touch any column. We do not
+        // walk the Expr tree here — decode every column when one is present (correct, rarely hot).
+        const auto has_expr_operand = [](const Predicate& p) {
+            for (const PredNode& n : p.nodes) {
+                if ((n.kind == PredNodeKind::Cmp || n.kind == PredNodeKind::IsNull ||
+                     n.kind == PredNodeKind::InList) &&
+                    n.operand == OperandKind::Expr) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (has_expr_operand(sel.filter) || has_expr_operand(sel.having)) {
+            return std::vector<bool>(t.columns.size(), true);
+        }
         mark_pred(sel.filter);
         mark_pred(sel.having);
         // The PK is needed by ORDER BY's PK tie-break (apply_order_by) AND is cheap to
@@ -7890,12 +7910,20 @@ private:
                 if (group != nullptr) {
                     return std::string("IS NULL is not supported in HAVING");
                 }
-                const auto idx = t.column_index(n.column);
-                if (!idx) {
-                    return std::string("unknown column '" + n.column + "' in table '" +
-                                       t.name + "'");
+                bool null = false;
+                if (n.operand == OperandKind::Expr) {  // J1: <expr> IS [NOT] NULL
+                    if (!n.expr) return std::string("empty expression operand in IS NULL");
+                    Datum v;
+                    if (auto e = eval_expr(*n.expr, t, row, v)) return e;
+                    null = v.is_null;
+                } else {
+                    const auto idx = t.column_index(n.column);
+                    if (!idx) {
+                        return std::string("unknown column '" + n.column + "' in table '" +
+                                           t.name + "'");
+                    }
+                    null = row[*idx].is_null;
                 }
-                const bool null = row[*idx].is_null;
                 truth = n.is_not ? !null : null;
                 return std::nullopt;
             }
@@ -7936,6 +7964,14 @@ private:
                                    "SELECT list, not in WHERE");
             }
             if (auto e = compute_agg(n.agg, t, *group, lhs)) {
+                return e;
+            }
+        } else if (n.operand == OperandKind::Expr) {
+            // J1: a scalar-expression LHS (a+b, doc->>'k', UPPER(x)) evaluated per row.
+            if (!n.expr) {
+                return std::string("empty expression operand in predicate");
+            }
+            if (auto e = eval_expr(*n.expr, t, row, lhs)) {
                 return e;
             }
         } else {
@@ -7991,6 +8027,18 @@ private:
                 if (auto e = coerce(t.columns[*cidx], rhs, cv, /*for_write=*/false)) return e;
                 rhs = cv;
             }
+        }
+        // J1: an expression LHS carrying a logical tag (e.g. ts + INTERVAL, a DECIMAL sum) needs
+        // its literal RHS coerced to the same logical representation, mirroring the column path.
+        if (n.operand == OperandKind::Expr && !n.rhs_is_subquery && !n.rhs_is_column &&
+            !rhs.is_null && lhs.logical != 0) {
+            Column tmp;
+            tmp.type = lhs.type;
+            tmp.logical = lhs.logical;
+            tmp.scale = lhs.scale;
+            Datum cv;
+            if (auto e = coerce(tmp, rhs, cv, /*for_write=*/false)) return e;
+            rhs = cv;
         }
         // NULL operand => UNKNOWN => false (three-valued logic collapsed at filter).
         if (lhs.is_null || rhs.is_null) {

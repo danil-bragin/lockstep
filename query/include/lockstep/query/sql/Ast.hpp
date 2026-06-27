@@ -152,6 +152,7 @@ enum class CmpOp : std::uint8_t {
 enum class OperandKind : std::uint8_t {
     Column = 0,  // a column name (resolved at plan time vs the schema)
     Agg = 1,     // an aggregate expression (HAVING only): e.g. COUNT(*) > 2
+    Expr = 2,    // J1: a scalar expression LHS (e.g. a+b, doc->>'k', UPPER(x)) — evaluated per row
 };
 
 enum class AggKind : std::uint8_t {
@@ -192,6 +193,8 @@ enum class PredNodeKind : std::uint8_t {
     Exists = 6,   // [NOT] EXISTS ( SELECT ... )
 };
 
+struct Expr;  // J1: PredNode may carry a scalar-expression LHS (defined below)
+
 struct PredNode {
     PredNodeKind kind = PredNodeKind::Cmp;
 
@@ -200,6 +203,7 @@ struct PredNode {
     std::string qualifier;  // v3: optional table/alias qualifier ("" == unqualified)
     std::string column;     // operand == Column
     AggExpr agg;            // operand == Agg (HAVING)
+    std::shared_ptr<Expr> expr;  // J1: operand == Expr — a scalar expression LHS, evaluated per row
     CmpOp op = CmpOp::Eq;
     Datum literal;
 

@@ -2412,7 +2412,8 @@ private:
         if (is_agg) {
             leaf.operand = OperandKind::Agg;
             leaf.agg = agg;
-        } else {
+        } else if (allow_agg) {
+            // HAVING: a non-aggregate operand is a GROUP BY column (no expression LHS here).
             std::string qual;
             std::string col;
             if (auto e = expect_qualified_column("a column name in the predicate", qual,
@@ -2422,6 +2423,23 @@ private:
             leaf.operand = OperandKind::Column;
             leaf.qualifier = qual;
             leaf.column = col;
+        } else {
+            // J1: parse the LHS as a scalar expression. A bare column stays
+            // OperandKind::Column (back-compat: the index / conjunct / PK-fastpath paths all
+            // key off a column operand); any richer expression (a+b, doc->>'k', UPPER(x))
+            // becomes an Expr operand evaluated per row.
+            std::shared_ptr<Expr> lhs;
+            if (auto e = parse_scalar_expr(lhs)) {
+                return e;
+            }
+            if (lhs && lhs->kind == ExprKind::Col) {
+                leaf.operand = OperandKind::Column;
+                leaf.qualifier = lhs->qualifier;
+                leaf.column = lhs->column;
+            } else {
+                leaf.operand = OperandKind::Expr;
+                leaf.expr = lhs;
+            }
         }
 
         // v4: <column> IS [NOT] NULL — a three-valued NULL test (the ONLY predicate that
@@ -2438,7 +2456,8 @@ private:
             }
             PredNode n;
             n.kind = PredNodeKind::IsNull;
-            n.operand = OperandKind::Column;
+            n.operand = leaf.operand;  // J1: an expression LHS keeps its Expr operand
+            n.expr = leaf.expr;
             n.qualifier = leaf.qualifier;
             n.column = leaf.column;
             n.is_not = is_not;
@@ -2473,7 +2492,8 @@ private:
                 }
                 PredNode n;
                 n.kind = PredNodeKind::InList;
-                n.operand = OperandKind::Column;
+                n.operand = leaf.operand;  // J1: an expression LHS keeps its Expr operand
+                n.expr = leaf.expr;
                 n.qualifier = leaf.qualifier;
                 n.column = leaf.column;
                 n.is_not = neg;
