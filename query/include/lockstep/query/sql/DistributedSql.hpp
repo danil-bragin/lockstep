@@ -150,6 +150,12 @@ private:
         if (sel.where == SelectWhereKind::Eq) {
             return route(sql, sel.eq_value);  // point read -> the owning shard
         }
+        // Single-table GROUP BY + HAVING: a shard applying HAVING to its LOCAL partial groups is
+        // wrong for a group split across shards (the global aggregate decides, not the partial).
+        // Gather the table and run single-node — byte-identical, incl any HAVING error.
+        if (sel.has_aggregates && sel.having.present()) {
+            return gather_and_run(sql, {sel.table});
+        }
         std::vector<ExecResult> parts;
         parts.reserve(shards_.size());
         for (ISqlShard* s : shards_) {
@@ -178,7 +184,7 @@ private:
     // single-node (the aggregates roll up exactly); the distributed conformance gate cross-checks.
     std::optional<ExecResult> try_star_join_pushdown(const SelectStmt& sel) {
         if (sel.from.size() != 2 || sel.from[1].kind != JoinKind::Inner) return std::nullopt;
-        if (sel.having.present() || !sel.has_aggregates) return std::nullopt;
+        if (!sel.has_aggregates) return std::nullopt;
         if (sel.group_by.empty()) return std::nullopt;
         if (!sel.from[1].on.present() || sel.from[1].on.root < 0) return std::nullopt;
         const PredNode& on = sel.from[1].on.nodes[static_cast<std::size_t>(sel.from[1].on.root)];
@@ -260,6 +266,15 @@ private:
         }
         if (agg_kinds.empty()) return std::nullopt;
 
+        // HAVING: plan its aggregates onto the fact side and resolve each leaf; applied as a
+        // coordinator post-filter on the rolled-up groups (below). Bails to gather on an unsafe shape.
+        std::map<std::int32_t, std::size_t> hv_agg_at;
+        std::map<std::int32_t, std::size_t> hv_key_at;
+        if (sel.having.present() &&
+            !plan_having(sel.having, fa, da, dim_gcols, agg_kinds, agg_sql, hv_agg_at, hv_key_at)) {
+            return std::nullopt;
+        }
+
         // WHERE PUSHDOWN: split the filter into a fact-side and a dim-side fragment. Fact
         // predicates filter rows BEFORE the per-shard aggregate (row-local, commutes with the
         // PK partition); dim predicates filter the gathered dim (inner join drops the unmatched
@@ -337,6 +352,14 @@ private:
                   [](const G* a, const G* b) { return key_less(a->gkey, b->gkey); });
         ExecResult r;
         for (const G* g : ordered) {
+            if (sel.having.present()) {
+                bool keep = false;
+                if (!eval_having(sel.having, sel.having.root, g->aggs, g->gkey, hv_agg_at, hv_key_at,
+                                 keep)) {
+                    return std::nullopt;  // unresolved/type-mismatch HAVING — gather reproduces it
+                }
+                if (!keep) continue;  // group filtered out by HAVING
+            }
             ResultRow out;
             for (std::size_t i = 0; i < plans.size(); ++i) {
                 const Plan& p = plans[i];
@@ -424,6 +447,138 @@ private:
             if (!side->empty()) *side += " AND ";
             *side += n.column + " " + ops + " " + sql_literal(n.literal);
         }
+        return true;
+    }
+
+    // Compare two scalar datums under a CmpOp (the 6 ordered ops; INT numeric, TEXT lexical) —
+    // the coordinator equivalent of the engine's leaf_truth for HAVING evaluation.
+    [[nodiscard]] static bool datum_cmp(CmpOp op, const Datum& a, const Datum& b) {
+        int c = 0;
+        if (a.type == Type::Int) {
+            c = (a.i < b.i) ? -1 : (a.i > b.i) ? 1 : 0;
+        } else {
+            const int sc = a.s.compare(b.s);
+            c = (sc < 0) ? -1 : (sc > 0) ? 1 : 0;
+        }
+        switch (op) {
+            case CmpOp::Eq: return c == 0;
+            case CmpOp::Ne: return c != 0;
+            case CmpOp::Lt: return c < 0;
+            case CmpOp::Le: return c <= 0;
+            case CmpOp::Gt: return c > 0;
+            case CmpOp::Ge: return c >= 0;
+            default: return false;
+        }
+    }
+
+    // Plan a star-join HAVING for coordinator post-filtering. Every aggregate the HAVING references
+    // is pushed onto the FACT side too (so each rolled-up group carries its value), and each Cmp leaf
+    // is resolved to an aggregate position (agg_at) or a dim group-key index (key_at). Returns false
+    // (caller falls back to gather, which runs HAVING single-node — byte-identical incl any error) on
+    // any shape that isn't pushdown-safe: a non-And/Or/Not/Cmp node, a fact aggregate that is AVG /
+    // DISTINCT / a collection agg / not over the fact, a column that is not a dim group column, a
+    // column/subquery/quantifier RHS, a LIKE/Contains op, or a NULL / non-Int-non-Text literal.
+    [[nodiscard]] static bool plan_having(const Predicate& pred, const std::string& fa,
+                                          const std::string& da,
+                                          const std::vector<std::string>& dim_gcols,
+                                          std::vector<int>& agg_kinds, std::string& agg_sql,
+                                          std::map<std::int32_t, std::size_t>& agg_at,
+                                          std::map<std::int32_t, std::size_t>& key_at) {
+        std::vector<std::int32_t> stack{pred.root};
+        while (!stack.empty()) {
+            const std::int32_t idx = stack.back();
+            stack.pop_back();
+            if (idx < 0 || static_cast<std::size_t>(idx) >= pred.nodes.size()) return false;
+            const PredNode& n = pred.nodes[static_cast<std::size_t>(idx)];
+            if (n.kind == PredNodeKind::And || n.kind == PredNodeKind::Or) {
+                stack.push_back(n.left);
+                stack.push_back(n.right);
+                continue;
+            }
+            if (n.kind == PredNodeKind::Not) {
+                stack.push_back(n.left);
+                continue;
+            }
+            if (n.kind != PredNodeKind::Cmp) return false;
+            if (n.rhs_is_column || n.rhs_is_subquery || n.any_quant || n.all_quant) return false;
+            if (cmp_op_sql(n.op) == nullptr) return false;
+            if (n.literal.is_null ||
+                (n.literal.type != Type::Int && n.literal.type != Type::Text)) {
+                return false;
+            }
+            if (n.operand == OperandKind::Agg) {
+                const AggExpr& a = n.agg;
+                if (a.distinct || a.kind == AggKind::Avg || a.kind == AggKind::ArrayAgg ||
+                    a.kind == AggKind::JsonAgg) {
+                    return false;
+                }
+                std::string colpart = "*";
+                if (a.kind != AggKind::CountStar) {
+                    if (a.qualifier != fa || a.column.empty()) return false;  // agg over the fact only
+                    colpart = a.column;
+                }
+                agg_sql += ", " + agg_name(a.kind) + "(" + colpart + ")";
+                agg_at[idx] = agg_kinds.size();
+                agg_kinds.push_back(static_cast<int>(a.kind));
+            } else if (n.operand == OperandKind::Column) {
+                if (!n.qualifier.empty() && n.qualifier != da) return false;
+                std::size_t gi = 0;
+                bool found = false;
+                for (std::size_t k = 0; k < dim_gcols.size(); ++k) {
+                    if (dim_gcols[k] == n.column) { gi = k; found = true; break; }
+                }
+                if (!found) return false;  // HAVING column must be a dim GROUP BY column
+                key_at[idx] = gi;
+            } else {
+                return false;  // scalar Expr LHS
+            }
+        }
+        return true;
+    }
+
+    // Evaluate a planned HAVING for one rolled-up group. `ok` is the truth; the bool return is
+    // whether evaluation SUCCEEDED (false => an unresolved leaf / type mismatch => caller bails to
+    // gather). Mirrors single-node HAVING: NULL operand => false; AND/OR short-circuit; NOT negates.
+    [[nodiscard]] static bool eval_having(const Predicate& pred, std::int32_t node,
+                                          const std::vector<Datum>& aggs,
+                                          const std::vector<Datum>& gkey,
+                                          const std::map<std::int32_t, std::size_t>& agg_at,
+                                          const std::map<std::int32_t, std::size_t>& key_at,
+                                          bool& ok) {
+        if (node < 0) { ok = true; return true; }
+        const PredNode& n = pred.nodes[static_cast<std::size_t>(node)];
+        if (n.kind == PredNodeKind::And) {
+            bool l = false;
+            if (!eval_having(pred, n.left, aggs, gkey, agg_at, key_at, l)) return false;
+            if (!l) { ok = false; return true; }
+            return eval_having(pred, n.right, aggs, gkey, agg_at, key_at, ok);
+        }
+        if (n.kind == PredNodeKind::Or) {
+            bool l = false;
+            if (!eval_having(pred, n.left, aggs, gkey, agg_at, key_at, l)) return false;
+            if (l) { ok = true; return true; }
+            return eval_having(pred, n.right, aggs, gkey, agg_at, key_at, ok);
+        }
+        if (n.kind == PredNodeKind::Not) {
+            bool c = false;
+            if (!eval_having(pred, n.left, aggs, gkey, agg_at, key_at, c)) return false;
+            ok = !c;
+            return true;
+        }
+        Datum lhs;
+        if (const auto ai = agg_at.find(node); ai != agg_at.end()) {
+            if (ai->second >= aggs.size()) return false;
+            lhs = aggs[ai->second];
+        } else if (const auto ki = key_at.find(node); ki != key_at.end()) {
+            if (ki->second >= gkey.size()) return false;
+            lhs = gkey[ki->second];
+        } else {
+            return false;
+        }
+        const Datum& rhs = n.literal;
+        if (lhs.is_null || rhs.is_null) { ok = false; return true; }
+        if (lhs.type != rhs.type) return false;  // single-node errors here; gather reproduces it
+        ok = datum_cmp(n.op, lhs, rhs);
         return true;
     }
 

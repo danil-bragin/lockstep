@@ -115,6 +115,10 @@ int main() {
         "SELECT COUNT(*), SUM(amount) FROM t WHERE amount > 500",
         "SELECT amount FROM t WHERE id = 1234",     // point read -> one shard
         "SELECT COUNT(*) FROM t WHERE amount > 999999",  // zero-match aggregate
+        // Single-table GROUP BY + HAVING: a group spans shards, so HAVING must apply to the GLOBAL
+        // aggregate (the coordinator gathers + runs single-node, not per-shard local HAVING).
+        "SELECT cat, SUM(amount) FROM t GROUP BY cat HAVING SUM(amount) > 120000",
+        "SELECT region, COUNT(*) FROM t GROUP BY region HAVING COUNT(*) > 380",
     };
     for (const std::string& q : queries) {
         const std::string s = render(solo.exec(q));
@@ -158,6 +162,15 @@ int main() {
         // PUSHDOWN + AVG mixed with other aggregates AND a WHERE.
         "SELECT dim.label, AVG(t.amount), COUNT(*), MAX(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
         "WHERE t.amount > 300 GROUP BY dim.label",
+        // PUSHDOWN + HAVING on a SELECTed aggregate (coordinator post-filter on rolled-up groups).
+        "SELECT dim.label, SUM(t.amount) FROM t JOIN dim ON t.cat = dim.cat GROUP BY dim.label "
+        "HAVING SUM(t.amount) > 100000",
+        // PUSHDOWN + HAVING on an aggregate NOT in the SELECT list (pushed for HAVING only).
+        "SELECT dim.label, MAX(t.amount) FROM t JOIN dim ON t.cat = dim.cat GROUP BY dim.label "
+        "HAVING COUNT(*) > 240",
+        // PUSHDOWN + WHERE + HAVING together.
+        "SELECT dim.label, COUNT(*), SUM(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
+        "WHERE t.amount >= 100 GROUP BY dim.label HAVING SUM(t.amount) > 80000 AND COUNT(*) >= 100",
     };
     const std::size_t pd_before = dist.pushdowns();
     for (const std::string& q : b4_queries) {
@@ -166,9 +179,9 @@ int main() {
         check(s == d, "B4 distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" + d +
                           "]");
     }
-    check(dist.pushdowns() - pd_before >= 6,
-          "all 6 star-schema queries (base + 3 WHERE + 2 AVG) took the pushdown path, not the "
-          "gather fallback (got " + std::to_string(dist.pushdowns() - pd_before) + ")");
+    check(dist.pushdowns() - pd_before >= 9,
+          "all 9 star-schema queries (base + 3 WHERE + 2 AVG + 3 HAVING) took the pushdown path, "
+          "not the gather fallback (got " + std::to_string(dist.pushdowns() - pd_before) + ")");
 
     // Distributed AVG is explicitly rejected (can't merge an averaged value across shards).
     const ExecResult avg = dist.exec("SELECT AVG(amount) FROM t");
