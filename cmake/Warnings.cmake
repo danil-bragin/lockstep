@@ -14,6 +14,11 @@ set(_lockstep_warning_flags
   -Wextra
   -Werror
   -Wpedantic
+  # Designated-init that intentionally omits trailing fields is idiomatic here (e.g.
+  # Column{.name=.., .type=..}). Apple clang ignores this under -Wextra; upstream clang
+  # (the CI toolchain) flags it -> a host/CI divergence. The omitted fields fall back to
+  # their in-struct defaults by design, so silence this one check while keeping -Wextra.
+  -Wno-missing-field-initializers
 )
 
 target_compile_options(lockstep_warnings INTERFACE ${_lockstep_warning_flags})

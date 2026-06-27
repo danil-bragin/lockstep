@@ -18,7 +18,18 @@ struct JVal {
     bool b = false;
     std::string text;  // Num: canonical digits; Str: the raw (unescaped) string
     std::vector<JVal> arr;
-    std::vector<std::pair<std::string, JVal>> obj;
+    // An object entry. A forward-declared NESTED struct (completed just below) — NOT
+    // std::pair<std::string, JVal>: libstdc++ requires a std::pair's members be COMPLETE types when
+    // the vector member is declared, but JVal is still incomplete here (recursive type). std::vector
+    // of an incomplete element is allowed (C++17), so vector<Member> with Member forward-declared
+    // compiles on both libstdc++ and libc++.
+    struct Member;
+    std::vector<Member> obj;
+};
+
+struct JVal::Member {
+    std::string key;
+    JVal val;
 };
 
 inline void skip_ws(const std::string& s, std::size_t& p) {
@@ -122,7 +133,7 @@ inline void skip_ws(const std::string& s, std::size_t& p) {
             ++p;
             JVal child;
             if (!parse_value(s, p, child)) return false;
-            v.obj.emplace_back(std::move(key), std::move(child));
+            v.obj.push_back(JVal::Member{std::move(key), std::move(child)});
             skip_ws(s, p);
             if (p < s.size() && s[p] == ',') { ++p; continue; }
             if (p < s.size() && s[p] == '}') { ++p; return true; }
@@ -185,17 +196,17 @@ inline void serialize(const JVal& v, std::string& out) {
             return;
         }
         case JVal::Obj: {
-            std::vector<const std::pair<std::string, JVal>*> ents;
+            std::vector<const JVal::Member*> ents;
             ents.reserve(v.obj.size());
             for (const auto& e : v.obj) ents.push_back(&e);
             std::sort(ents.begin(), ents.end(),
-                      [](const auto* a, const auto* b) { return a->first < b->first; });
+                      [](const auto* a, const auto* b) { return a->key < b->key; });
             out.push_back('{');
             for (std::size_t k = 0; k < ents.size(); ++k) {
                 if (k) out.push_back(',');
-                escape_into(ents[k]->first, out);
+                escape_into(ents[k]->key, out);
                 out.push_back(':');
-                serialize(ents[k]->second, out);
+                serialize(ents[k]->val, out);
             }
             out.push_back('}');
             return;

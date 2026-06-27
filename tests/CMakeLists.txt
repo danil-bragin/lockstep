@@ -2030,3 +2030,11 @@ if(_lockstep_all_tests)
   set_tests_properties(${_lockstep_all_tests}
     PROPERTIES TIMEOUT ${_lockstep_test_timeout})
 endif()
+
+# sql_parallel_agg_test spawns a REAL morsel-parallel thread fan-out (not a deterministic
+# single-thread sim), so it legitimately runs much longer than the 90s sim ceiling and is
+# slowest on a CPU-contended CI runner. Raise its ceiling (AFTER the dir-wide default above so
+# it is not clobbered). A true hang is still bounded.
+if(TEST sql_parallel_agg_test)
+  set_tests_properties(sql_parallel_agg_test PROPERTIES TIMEOUT 300)
+endif()

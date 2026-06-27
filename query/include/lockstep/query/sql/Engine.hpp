@@ -5551,6 +5551,20 @@ private:
     static bool mul_ovf(std::int64_t a, std::int64_t b, std::int64_t& r) {
         return __builtin_mul_overflow(a, b, &r);
     }
+    // Checked 128-bit signed multiply WITHOUT __builtin_mul_overflow. On __int128 that builtin
+    // lowers to __muloti4, which lives in compiler-rt but NOT libgcc — so it is an undefined symbol
+    // under the CI clang's default rtlib (Apple clang links compiler-rt and hides this). Plain
+    // 128-bit * and / use __multi3 / __divti3 (in libgcc, always linked). Returns true on overflow
+    // (out then holds the wrapped product). Pure; no UB (wrapping product via unsigned; the only
+    // trapping division — INT128_MIN / -1 — is special-cased before the verify divide).
+    static bool mul_ovf_i128(__int128 a, __int128 b, __int128& out) {
+        out = static_cast<__int128>(static_cast<unsigned __int128>(a) *
+                                    static_cast<unsigned __int128>(b));  // wrapping, UB-free
+        if (a == 0) return false;
+        const __int128 kMin = static_cast<__int128>(static_cast<unsigned __int128>(1) << 127);
+        if (a == -1 && b == kMin) return true;  // verify divide would trap; this IS an overflow
+        return out / a != b;                    // exact: out == a*b iff no overflow
+    }
     static std::int64_t wrap_add(std::int64_t a, std::int64_t b) {
         return static_cast<std::int64_t>(static_cast<std::uint64_t>(a) +
                                          static_cast<std::uint64_t>(b));
@@ -5631,8 +5645,8 @@ private:
             case BinOp::Sub: {
                 const std::uint8_t cs = ls > rs ? ls : rs;
                 __int128 li = 0, ri = 0;
-                if (__builtin_mul_overflow(lv, p10(cs - ls), &li) ||
-                    __builtin_mul_overflow(rv, p10(cs - rs), &ri))
+                if (mul_ovf_i128(lv, p10(cs - ls), li) ||
+                    mul_ovf_i128(rv, p10(cs - rs), ri))
                     return "integer overflow";
                 if (op == BinOp::Add ? __builtin_add_overflow(li, ri, &v)
                                      : __builtin_sub_overflow(li, ri, &v))
@@ -5641,13 +5655,13 @@ private:
                 break;
             }
             case BinOp::Mul:
-                if (__builtin_mul_overflow(lv, rv, &v)) return "integer overflow";
+                if (mul_ovf_i128(lv, rv, v)) return "integer overflow";
                 out_sc = static_cast<std::uint8_t>(ls + rs);
                 break;
             case BinOp::Div: {
                 if (rv == 0) return "division by zero";
                 __int128 num = 0;
-                if (__builtin_mul_overflow(lv, p10(rs), &num)) return "integer overflow";
+                if (mul_ovf_i128(lv, p10(rs), num)) return "integer overflow";
                 v = num / rv;  // result scale = ls
                 out_sc = ls;
                 break;
@@ -6162,7 +6176,7 @@ private:
             if (a[1].type == Type::Text) {
                 if (root.kind == json::JVal::Obj)
                     for (const auto& en : root.obj)
-                        if (en.first == a[1].s) { found = &en.second; break; }
+                        if (en.key == a[1].s) { found = &en.val; break; }
             } else if (root.kind == json::JVal::Arr && a[1].i >= 0 &&
                        a[1].i < static_cast<std::int64_t>(root.arr.size())) {
                 found = &root.arr[static_cast<std::size_t>(a[1].i)];
@@ -6197,7 +6211,7 @@ private:
                     const std::string key = step.type == Type::Text ? step.s : std::to_string(step.i);
                     const json::JVal* nx = nullptr;
                     for (const auto& en : cur->obj)
-                        if (en.first == key) { nx = &en.second; break; }
+                        if (en.key == key) { nx = &en.val; break; }
                     cur = nx;
                 } else if (cur->kind == json::JVal::Arr) {
                     const std::int64_t idx =
@@ -8785,7 +8799,7 @@ private:
             for (const auto& [k, sv] : sub.obj) {
                 const json::JVal* dv = nullptr;
                 for (const auto& en : doc.obj)
-                    if (en.first == k) { dv = &en.second; break; }
+                    if (en.key == k) { dv = &en.val; break; }
                 if (dv == nullptr || !json_contained(*dv, sv)) return false;
             }
             return true;
