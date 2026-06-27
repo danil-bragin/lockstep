@@ -153,6 +153,11 @@ int main() {
         // PUSHDOWN + WHERE spanning BOTH sides (ANDed) — each leaf routed to its own table.
         "SELECT dim.label, COUNT(*), SUM(t.amount), MIN(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
         "WHERE t.amount >= 200 AND t.amount <= 800 AND dim.label != 'b' GROUP BY dim.label",
+        // PUSHDOWN + AVG (fact col) — expands to pushed SUM+COUNT, divided at the coordinator.
+        "SELECT dim.label, AVG(t.amount) FROM t JOIN dim ON t.cat = dim.cat GROUP BY dim.label",
+        // PUSHDOWN + AVG mixed with other aggregates AND a WHERE.
+        "SELECT dim.label, AVG(t.amount), COUNT(*), MAX(t.amount) FROM t JOIN dim ON t.cat = dim.cat "
+        "WHERE t.amount > 300 GROUP BY dim.label",
     };
     const std::size_t pd_before = dist.pushdowns();
     for (const std::string& q : b4_queries) {
@@ -161,9 +166,9 @@ int main() {
         check(s == d, "B4 distributed != solo for [" + q + "]\n  solo=[" + s + "]\n  dist=[" + d +
                           "]");
     }
-    check(dist.pushdowns() - pd_before >= 4,
-          "all 4 star-schema queries (base + 3 WHERE) took the pushdown path, not the gather "
-          "fallback (got " + std::to_string(dist.pushdowns() - pd_before) + ")");
+    check(dist.pushdowns() - pd_before >= 6,
+          "all 6 star-schema queries (base + 3 WHERE + 2 AVG) took the pushdown path, not the "
+          "gather fallback (got " + std::to_string(dist.pushdowns() - pd_before) + ")");
 
     // Distributed AVG is explicitly rejected (can't merge an averaged value across shards).
     const ExecResult avg = dist.exec("SELECT AVG(amount) FROM t");

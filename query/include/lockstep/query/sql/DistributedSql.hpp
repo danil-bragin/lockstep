@@ -207,8 +207,17 @@ private:
             if (q != da) return std::nullopt;
             dim_gcols.push_back(c);
         }
-        // Plan each SELECT item; build the fact-side aggregate list (in SELECT order).
-        struct Plan { bool is_col = false; std::string dim_col; std::size_t agg_pos = 0; };
+        // Plan each SELECT item; build the fact-side aggregate list (in SELECT order). An AVG output
+        // expands to TWO fact-side aggregates (SUM + COUNT of the column) merged independently and
+        // divided at the end — SUM/COUNT both skip NULL, so SUM/COUNT == single-node AVG exactly.
+        struct Plan {
+            bool is_col = false;
+            bool is_avg = false;
+            std::string dim_col;
+            std::size_t agg_pos = 0;       // non-AVG: index of the single fact aggregate
+            std::size_t avg_sum_pos = 0;   // AVG: index of the pushed SUM(col)
+            std::size_t avg_cnt_pos = 0;   // AVG: index of the pushed COUNT(col)
+        };
         std::vector<Plan> plans;
         std::vector<int> agg_kinds;  // fact-side aggregate kinds (== order in fact_sql after fk)
         std::string agg_sql;
@@ -223,15 +232,29 @@ private:
                 p.dim_col = item.column;
             } else {
                 const AggExpr& a = item.agg;
-                if (a.kind == AggKind::Avg) return std::nullopt;  // needs sum+count split
-                std::string colpart = "*";
-                if (a.kind != AggKind::CountStar) {
-                    if (a.qualifier != fa) return std::nullopt;  // aggregate must be over the fact
-                    colpart = a.column;
+                // Only additive/min/max/avg kinds merge from partials; DISTINCT and the collection
+                // aggregates (ARRAY_AGG/JSON_AGG) cannot — fall back to gather for those.
+                if (a.distinct || a.kind == AggKind::ArrayAgg || a.kind == AggKind::JsonAgg) {
+                    return std::nullopt;
                 }
-                agg_sql += ", " + agg_name(a.kind) + "(" + colpart + ")";
-                p.agg_pos = agg_kinds.size();
-                agg_kinds.push_back(static_cast<int>(a.kind));
+                if (a.kind == AggKind::Avg) {
+                    if (a.qualifier != fa || a.column.empty()) return std::nullopt;  // AVG over a fact col
+                    agg_sql += ", SUM(" + a.column + "), COUNT(" + a.column + ")";
+                    p.is_avg = true;
+                    p.avg_sum_pos = agg_kinds.size();
+                    agg_kinds.push_back(static_cast<int>(AggKind::Sum));
+                    p.avg_cnt_pos = agg_kinds.size();
+                    agg_kinds.push_back(static_cast<int>(AggKind::Count));
+                } else {
+                    std::string colpart = "*";
+                    if (a.kind != AggKind::CountStar) {
+                        if (a.qualifier != fa) return std::nullopt;  // aggregate must be over the fact
+                        colpart = a.column;
+                    }
+                    agg_sql += ", " + agg_name(a.kind) + "(" + colpart + ")";
+                    p.agg_pos = agg_kinds.size();
+                    agg_kinds.push_back(static_cast<int>(a.kind));
+                }
             }
             plans.push_back(p);
         }
@@ -323,6 +346,13 @@ private:
                     for (std::size_t k = 0; k < dim_gcols.size(); ++k)
                         if (dim_gcols[k] == p.dim_col) { gi = k; break; }
                     out.cells.emplace_back(label, g->gkey[gi]);
+                } else if (p.is_avg) {
+                    // AVG = Σsum / Σcount (non-null), INT trunc toward zero (== single-node). A
+                    // count==0 (all-NULL) group renders a TYPED NULL single-node; rather than
+                    // reconstruct that exact null, fall back to gather (rare, still correct).
+                    const std::int64_t cnt = g->aggs[p.avg_cnt_pos].i;
+                    if (cnt == 0) return std::nullopt;
+                    out.cells.emplace_back(label, Datum::make_int(g->aggs[p.avg_sum_pos].i / cnt));
                 } else {
                     out.cells.emplace_back(label, g->aggs[p.agg_pos]);
                 }
