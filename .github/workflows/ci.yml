@@ -210,16 +210,15 @@ jobs:
               # seed-sweep / fault-storm tests to a few seeds — MSan detects use-of-uninitialized
               # on the code PATHS, not via statistical seed coverage, so a handful of seeds is
               # enough here; the full sweeps run under plain + ASan/TSan/UBSan.
-              # Skip two tests under MSan only:
+              # Skip two tests under MSan only (NOTE: no apostrophes in this block — it lives
+              # inside a single-quoted bash -lc script):
               #   - sql_parallel_agg_test: a threading determinism gate that TSan owns; under MSan
               #     it is pathologically slow on 2 cores and adds no uninit coverage.
               #   - prod_cluster_smoke: spins up real lockstepd processes and asserts cluster
-              #     behavior against ABSOLUTE wall-clock deadlines; MSan's 5x slowdown blows the
+              #     behavior against ABSOLUTE wall-clock deadlines; the MSan 5x slowdown blows the
               #     restart/catch-up deadline (not a memory issue). ASan/TSan/UBSan cover it.
-              export CONSENSUS_A_SEEDS=8 CONSENSUS_XCHECK_SEEDS=8 LOCKSTEP_E2E_SEEDS=8 \
-                     LOCKSTEP_XSHARD_SEEDS=4 LOCKSTEP_WISCKEY_SEEDS=16
-              ctest --preset msan --output-on-failure \
-                -E "sql_parallel_agg_test|prod_cluster_smoke"'
+              export CONSENSUS_A_SEEDS=8 CONSENSUS_XCHECK_SEEDS=8 LOCKSTEP_E2E_SEEDS=8 LOCKSTEP_XSHARD_SEEDS=4 LOCKSTEP_WISCKEY_SEEDS=16
+              ctest --preset msan --output-on-failure -E "sql_parallel_agg_test|prod_cluster_smoke"'
 
   # ===========================================================================
   # STAGE 4 -- DETERMINISTIC SIMULATION BATTERY.
