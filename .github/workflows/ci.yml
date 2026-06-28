@@ -255,6 +255,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y default-jre-headless
+      - name: Fetch TLA+ tools (tla2tools.jar — a git-ignored ~10 MB binary)
+        run: |
+          mkdir -p tools/tla
+          curl -fsSL -o tools/tla/tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
       - name: Model-check every spec (invariants must hold)
         run: |
           set -e
