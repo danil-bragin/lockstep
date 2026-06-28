@@ -37,6 +37,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -299,7 +300,16 @@ Task run_diff_large(Scheduler& /*sched*/, Engine& sut, Engine& ref, SeededRandom
 }
 
 void test_differential_large_values() {
-    const std::uint64_t n_seeds = 128;
+    // Seed-sweep count; reducible via LOCKSTEP_WISCKEY_SEEDS so the heavy instrumented builds
+    // (notably MSan, ~5x slower on 2 CI cores) can run a smaller sweep — the differential checks
+    // every code path on each seed, so a handful still covers what a sanitizer can find.
+    std::uint64_t n_seeds = 128;
+    if (const char* env = std::getenv("LOCKSTEP_WISCKEY_SEEDS")) {
+        const long v = std::strtol(env, nullptr, 10);
+        if (v > 0) {
+            n_seeds = static_cast<std::uint64_t>(v);
+        }
+    }
     std::uint64_t mismatches = 0;
     DiffOut first_bad;
     std::uint64_t first_seed = 0;

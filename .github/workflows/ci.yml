@@ -212,8 +212,8 @@ jobs:
               # enough here; the full sweeps run under plain + ASan/TSan/UBSan. Skip the
               # morsel-parallel determinism gate (a threading gate that TSan owns; under MSan it
               # is pathologically slow on 2 cores and adds no uninit coverage).
-              export CONSENSUS_A_SEEDS=8 CONSENSUS_XCHECK_SEEDS=8 \
-                     LOCKSTEP_E2E_SEEDS=8 LOCKSTEP_XSHARD_SEEDS=8
+              export CONSENSUS_A_SEEDS=8 CONSENSUS_XCHECK_SEEDS=8 LOCKSTEP_E2E_SEEDS=8 \
+                     LOCKSTEP_XSHARD_SEEDS=4 LOCKSTEP_WISCKEY_SEEDS=16
               ctest --preset msan --output-on-failure -E "sql_parallel_agg_test"'
 
   # ===========================================================================

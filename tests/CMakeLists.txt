@@ -2027,7 +2027,7 @@ endif()
 # plain build). Scale the ceiling by the sanitizer so the timeout still catches
 # a TRUE hang fast without false-failing slow-but-terminating instrumented runs.
 if(LOCKSTEP_SANITIZER STREQUAL "msan")
-  set(_lockstep_test_timeout 600)   # MSan+origins: the slowest instrumentation
+  set(_lockstep_test_timeout 1800)  # MSan+origins: the slowest instrumentation (~5x), 2 CI cores
 elseif(NOT LOCKSTEP_SANITIZER STREQUAL "")
   set(_lockstep_test_timeout 300)   # ASan / TSan / UBSan
 else()
