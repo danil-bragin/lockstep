@@ -158,7 +158,13 @@ inline FramePool& frame_pool() noexcept {
 }
 inline void frame_free(void* p, std::size_t n) noexcept {
 #if defined(LOCKSTEP_FRAMEPOOL_ASAN) || defined(LOCKSTEP_NO_FRAMEPOOL)
-    ::operator delete(p, n);
+    // Pair the UNSIZED delete with the unsized `::operator new(n)` above. The sized
+    // `::operator delete(p, n)` is the C++14 sized-deallocation overload, which clang
+    // only makes callable under -fsized-deallocation (off by default) — so it failed
+    // to resolve in the ASan build (the only config that compiles this branch). The
+    // unsized delete is always declared and is the correct counterpart to plain new.
+    (void)n;
+    ::operator delete(p);
 #else
     frame_pool().release(n, p);
 #endif

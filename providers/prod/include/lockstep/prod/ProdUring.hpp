@@ -259,11 +259,15 @@ private:
     // io_uring shared-index memory ordering: the kernel publishes the CQ tail and reads
     // the SQ tail with release/acquire semantics; we mirror that on the user side so a
     // CQE we read was fully written, and an SQE we publish is visible before we enter().
+    // Use the clang/gcc atomic BUILTINS rather than std::atomic_ref: same acquire/release
+    // semantics on the shared ring index, but no <atomic> dependency — the MSan job's
+    // separately-built instrumented libc++ ships no std::atomic_ref (a C++20 addition). The
+    // builtins are universally available and the sanitizers (incl. TSan) model them correctly.
     static unsigned load_acquire(const unsigned* p) noexcept {
-        return std::atomic_ref<const unsigned>(*p).load(std::memory_order_acquire);
+        return __atomic_load_n(p, __ATOMIC_ACQUIRE);
     }
     static void store_release(unsigned* p, unsigned v) noexcept {
-        std::atomic_ref<unsigned>(*p).store(v, std::memory_order_release);
+        __atomic_store_n(p, v, __ATOMIC_RELEASE);
     }
 
     int ring_fd_ = -1;
