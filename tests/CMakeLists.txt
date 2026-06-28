@@ -1899,7 +1899,12 @@ endif()
 # lockstepd self-deadlines (--run-seconds). Built ONLY on Linux + only when TLS is enabled
 # (the lockstepd/lockstep_admin Linux targets carry LOCKSTEP_TLS via OpenSSL); the macOS
 # host stays green (test absent). NOTE: needs openssl on PATH (the dev image's libssl-dev).
-if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin AND OpenSSL_FOUND)
+# Excluded under MSan: lockstepd links the SYSTEM OpenSSL, which is NOT MSan-instrumented, so
+# MSan reports false use-of-uninitialized-value on every value that flows out of libssl/libcrypto
+# (the library DID initialize it; MSan just can't see across an uninstrumented boundary). ASan /
+# TSan / UBSan cover these tests; a real MSan run would need an instrumented OpenSSL.
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin AND OpenSSL_FOUND
+   AND NOT LOCKSTEP_SANITIZER STREQUAL "msan")
   add_test(
     NAME prod_tls_test
     COMMAND ${CMAKE_COMMAND} -E env
@@ -1917,7 +1922,10 @@ endif()
 # cert-CN extraction is OpenSSL-gated); the macOS host stays green (test absent). Needs
 # openssl on PATH (the dev image's libssl-dev). PROCESS-CLEANUP: traps EXIT/INT/TERM to
 # SIGKILL every tracked child; the daemon self-deadlines (--run-seconds).
-if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin AND OpenSSL_FOUND)
+# Excluded under MSan for the same reason as prod_tls_test: the system OpenSSL is uninstrumented,
+# so MSan false-positives on values returned from it. ASan/TSan/UBSan cover this test.
+if(UNIX AND NOT APPLE AND TARGET lockstepd AND TARGET lockstep_admin AND OpenSSL_FOUND
+   AND NOT LOCKSTEP_SANITIZER STREQUAL "msan")
   add_test(
     NAME prod_auth_test
     COMMAND ${CMAKE_COMMAND} -E env
