@@ -1,5 +1,9 @@
 # Lockstep
 
+[![CI](https://github.com/danil-bragin/lockstep/actions/workflows/ci.yml/badge.svg)](https://github.com/danil-bragin/lockstep/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C.svg)
+
 A C++23 **deterministic distributed database**. The entire system is a pure
 function of `(seed, initial tasks)`: every source of nondeterminism — clock,
 network, disk, randomness, thread scheduling — flows through an abstraction
