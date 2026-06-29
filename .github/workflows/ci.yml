@@ -71,16 +71,30 @@ jobs:
   compile:
     name: compile (${{ matrix.preset }})
     runs-on: ubuntu-latest
+    # ccache wraps every compile (CMAKE_*_COMPILER_LAUNCHER) and its cache dir is restored
+    # across runs, so an unchanged or small-diff push reuses object files instead of recompiling
+    # this header-heavy tree from scratch — the big win for re-runs (e.g. doc / CI-config commits).
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     strategy:
       fail-fast: false
       matrix:
         preset: [debug, release]
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain (llvm/clang, cmake, ninja)
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-compile-${{ matrix.preset }}-${{ github.sha }}
+          restore-keys: |
+            ccache-compile-${{ matrix.preset }}-
+      - name: Install toolchain (llvm/clang, cmake, ninja, ccache)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang clang-tools clang-tidy cmake ninja-build
+          sudo apt-get install -y clang clang-tools clang-tidy cmake ninja-build ccache
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
       - name: Build
