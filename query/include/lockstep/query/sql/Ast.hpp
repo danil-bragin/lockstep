@@ -368,6 +368,16 @@ struct SelectStmt {
     // pipeline runs (qualified-column resolution over the joined schema).
     std::vector<JoinEntry> from;
 
+    // D4: WITH common table expressions — `WITH name AS (SELECT ...)[, ...] <this SELECT>`.
+    // Each is a NAMED subquery the engine materializes into an ephemeral table before running
+    // this query; a FROM entry whose table matches a CTE name reads that materialized table.
+    // (Non-recursive; shared_ptr keeps SelectStmt copyable with this self-referential member.)
+    std::vector<std::pair<std::string, std::shared_ptr<SelectStmt>>> ctes;
+
+    // D3: a derived table — `FROM (SELECT ...) AS alias`. When set on a JoinEntry (below, via
+    // `subquery`), the engine materializes it into an ephemeral table named by the alias. Held
+    // here as a forward note; the actual member lives on JoinEntry.
+
     // v3: true iff this is a genuine JOIN (>1 FROM entry) — the planner takes the
     // joined pipeline (build per-table scans + combine) instead of the single scan.
     [[nodiscard]] bool is_join() const { return from.size() > 1; }

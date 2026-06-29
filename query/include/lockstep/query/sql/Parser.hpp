@@ -76,6 +76,7 @@ public:
 
     [[nodiscard]] bool ok() const { return std::holds_alternative<Statement>(value_); }
     [[nodiscard]] const Statement& stmt() const { return std::get<Statement>(value_); }
+    [[nodiscard]] Statement& stmt_mut() { return std::get<Statement>(value_); }  // D4: attach WITH ctes
     [[nodiscard]] const ParseError& error() const { return std::get<ParseError>(value_); }
 
 private:
@@ -402,6 +403,8 @@ public:
             r = parse_delete();
         } else if (kw == "select") {
             r = parse_select();
+        } else if (kw == "with") {
+            r = parse_with();
         } else if (kw == "explain") {
             // EXPLAIN [ANALYZE] <select> — transparency. Consume the prefix, parse the inner
             // SELECT, and tag it so the engine returns the plan (+ ANALYZE counters) instead
@@ -2049,6 +2052,36 @@ private:
 
     // SELECT [DISTINCT] (* | item, ...) FROM t [WHERE p] [GROUP BY ..] [HAVING ..]
     //                                          [ORDER BY ..] [LIMIT n [OFFSET m]] [AT ..]
+    // D4: WITH name AS ( <select> )[, name2 AS ( <select> )] <main select>. Parse the CTE list,
+    // then the main query (reusing parse_select for set-op chaining), and attach the CTEs so the
+    // engine materializes them before running the main query. Non-recursive (no RECURSIVE keyword).
+    ParseResult parse_with() {
+        advance();  // WITH
+        std::vector<std::pair<std::string, std::shared_ptr<SelectStmt>>> ctes;
+        for (;;) {
+            if (cur_.kind != Tok::Ident) return make_err("expected a CTE name after WITH");
+            std::string name = cur_.text;
+            advance();
+            if (!is_kw("as")) return make_err("expected AS after the CTE name");
+            advance();  // AS
+            if (cur_.kind != Tok::LParen) return make_err("expected ( before the CTE body");
+            advance();  // (
+            if (!is_kw("select")) return make_err("a CTE body must be a SELECT");
+            auto sub = std::make_shared<SelectStmt>();
+            if (auto e = parse_select_stmt(*sub)) return ParseResult{*e};
+            if (cur_.kind != Tok::RParen) return make_err("expected ) to close the CTE body");
+            advance();  // )
+            ctes.emplace_back(std::move(name), std::move(sub));
+            if (cur_.kind == Tok::Comma) { advance(); continue; }
+            break;
+        }
+        if (!is_kw("select")) return make_err("expected SELECT after the WITH clause");
+        ParseResult r = parse_select();
+        if (!r.ok()) return r;
+        r.stmt_mut().select.ctes = std::move(ctes);
+        return r;
+    }
+
     ParseResult parse_select() {
         Statement st;
         st.kind = StmtKind::Select;

@@ -1019,14 +1019,24 @@ private:
     // the table (with a HIDDEN auto-increment PK so the model's PK requirement is met without polluting
     // SELECT *), and INSERT every result row.
     ExecResult exec_create_as_select(const CreateStmt& c) {
-        const ExecResult q = exec_select(*c.as_select);
-        if (!q.ok) return q;
+        if (auto e = materialize_select(c.table, *c.as_select)) return ExecResult::failure(*e);
+        return ExecResult{};
+    }
+
+    // Run a SELECT and materialize its result into a NEW table `name` — the schema is inferred from
+    // the result (column names from the output labels; each type from the first non-NULL value,
+    // default INT; plus a hidden synthetic `_ctid` identity PK). Reused by CREATE TABLE AS SELECT
+    // (E3) and by the WITH-CTE / FROM-subquery materialization (D3/D4). Returns an error string on
+    // failure, std::nullopt on success.
+    std::optional<std::string> materialize_select(const std::string& name, const SelectStmt& sel) {
+        const ExecResult q = exec_select(sel);
+        if (!q.ok) return q.error;
         // Determine the output column names + types. Names from the result labels; a type from the
         // first non-NULL value in each column (default INT if a column is entirely NULL/empty).
         std::size_t ncol = q.rows.empty() ? 0 : q.rows[0].cells.size();
-        if (ncol == 0) return ExecResult::failure("CREATE TABLE AS SELECT needs a non-empty result shape");
+        if (ncol == 0) return std::string("subquery / CREATE TABLE AS SELECT needs a non-empty result shape");
         Table t;
-        t.name = c.table;
+        t.name = name;
         Column pk;  // a hidden synthetic identity
         pk.name = "_ctid";
         pk.type = Type::Int;
@@ -1052,9 +1062,9 @@ private:
         }
         t.col_stats.assign(t.columns.size(), Table::ColStat{});
         (void)catalog_.create(std::move(t));
-        persist_schema(c.table);
+        persist_schema(name);
         // Insert the rows over the verified write path.
-        Table* mt = catalog_.find_mut(c.table);
+        Table* mt = catalog_.find_mut(name);
         std::int64_t auto_id = 1;
         std::vector<std::pair<Key, Value>> writes;
         for (const ResultRow& r : q.rows) {
@@ -1062,16 +1072,15 @@ private:
             row[0] = Datum::make_int(auto_id++);
             for (std::size_t k = 0; k < ncol; ++k) {
                 Datum d;
-                if (auto e = coerce(mt->columns[k + 1], r.cells[k].second, d))
-                    return ExecResult::failure(*e);
+                if (auto e = coerce(mt->columns[k + 1], r.cells[k].second, d)) return e;
                 row[k + 1] = d;
             }
             emit_row_writes(*mt, row, writes);
         }
         commit_writes(writes);
         mt->next_auto_id = auto_id;
-        persist_schema(c.table);
-        return ExecResult{};
+        persist_schema(name);
+        return std::nullopt;
     }
 
     // I6: ANALYZE t — scan the table once and recompute per-column stats: n_distinct (exact distinct
@@ -5217,7 +5226,41 @@ private:
         return out;
     }
 
+    // D4: drop the ephemeral tables a WITH clause materialized (best-effort, if_exists).
+    void drop_materialized(const std::vector<std::string>& names) {
+        for (const std::string& n : names) {
+            DropTableStmt dt;
+            dt.table = n;
+            dt.if_exists = true;
+            (void)exec_drop_table(dt);
+        }
+    }
+
     ExecResult exec_select(const SelectStmt& sel) {
+        // D4: WITH common table expressions. Materialize each CTE (in order — a later CTE may read
+        // an earlier one) into an ephemeral table named by the CTE, run the main query (a copy with
+        // the ctes stripped so this does not recurse), then drop the ephemeral tables. A CTE whose
+        // name clashes with a real table is rejected (no shadowing in this version), and an empty
+        // CTE result is an error (schema is inferred from the rows, like CREATE TABLE AS SELECT).
+        if (!sel.ctes.empty()) {
+            std::vector<std::string> created;
+            for (const auto& [name, sub] : sel.ctes) {
+                if (catalog_.find(name) != nullptr) {
+                    drop_materialized(created);
+                    return ExecResult::failure("WITH name '" + name + "' clashes with an existing table");
+                }
+                if (auto e = materialize_select(name, *sub)) {
+                    drop_materialized(created);
+                    return ExecResult::failure(*e);
+                }
+                created.push_back(name);
+            }
+            SelectStmt body = sel;
+            body.ctes.clear();
+            const ExecResult r = exec_select(body);
+            drop_materialized(created);
+            return r;
+        }
         if (sel.set_op != SetOp::None) {
             return exec_set_operation(sel);
         }

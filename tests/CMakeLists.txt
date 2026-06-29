@@ -1197,6 +1197,13 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
     PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_setops_test COMMAND lockstep_sql_setops_test)
+  # sql_cte_test (D4): WITH common table expressions (materialized, chained, joined).
+  add_executable(lockstep_sql_cte_test sql_cte_test.cpp)
+  target_include_directories(lockstep_sql_cte_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_cte_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_cte_test COMMAND lockstep_sql_cte_test)
   # sql_default_test (F4): column DEFAULT — fill on omit, override, durable.
   add_executable(lockstep_sql_default_test sql_default_test.cpp)
   target_include_directories(lockstep_sql_default_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
