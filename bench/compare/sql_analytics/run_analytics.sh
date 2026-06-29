@@ -19,7 +19,7 @@ echo "== SQL analytics: Lockstep columnar vs Postgres | N=$N iters=$ITERS cpu=$P
 # ---- Lockstep: build (if needed) + run pinned ----------------------------------------------
 echo "-- building lockstep analytics bench --"
 docker run --rm -v "$ROOT":/work -w /work lockstep-dev:latest bash -c \
-  "clang++ -std=c++23 -O2 \$(for d in core storage txn consensus query harness providers/sim providers/prod; do echo -I \$d/include; done) \
+  "clang++ -std=c++23 -O2 -rtlib=compiler-rt \$(for d in core storage txn consensus query harness providers/sim providers/prod; do echo -I \$d/include; done) \
    bench/compare/sql_analytics/lockstep_analytics.cpp -o /work/build/lrel/sql_analytics 2>&1 | tail -5"
 echo "-- running lockstep (pinned cpu $PIN) --"
 docker run --rm --cpuset-cpus="$PIN" -v "$ROOT":/work -w /work lockstep-dev:latest \

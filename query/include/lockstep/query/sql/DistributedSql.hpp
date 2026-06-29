@@ -62,6 +62,11 @@ public:
     // BEFORE inserting the table's rows so every row broadcasts. The FACT stays sharded.
     void set_replicated(const std::string& table) { replicated_.insert(table); }
 
+    // BENCH A/B knob: when false, the co-located-shuffle pushdown (and broadcast-dim) paths are
+    // skipped, so every distributed JOIN falls to gather-and-run (the whole fact is gathered to the
+    // coordinator). Lets a benchmark measure the SAME query both ways and quantify the shuffle win.
+    void set_pushdown_enabled(bool on) { pushdown_enabled_ = on; }
+
     ExecResult exec(const std::string& sql) {
         ParseResult pr = parse_sql(sql);
         if (!pr.ok()) {
@@ -161,14 +166,15 @@ private:
         // node. (Baseline broadcast-style distributed JOIN; a shuffle/co-located join is a perf
         // follow-on.) Aggregates + unordered scans + point reads stay on the efficient
         // scatter-merge path below.
-        if (sel.is_join()) {
+        if (sel.is_join() && pushdown_enabled_) {
             // BROADCAST-DIM JOIN: when every dim is replicated (full copy on each shard), each shard
             // joins its fact-slice with its local dims and computes PARTIAL group aggregates; the
             // coordinator merges them (Σ/min/max by group key). The dim was broadcast at write time;
             // only per-shard #group partials cross the network. Aggregate-only, no HAVING/ORDER BY
             // (a shard's local HAVING / order can't decide the global result). DISTINCT/AVG are
             // rejected by merge_aggregate (same as the scatter path). Else: the pre-aggregate
-            // pushdown, else gather-and-run.
+            // pushdown, else gather-and-run. (pushdown_enabled_ is a bench A/B knob — when off,
+            // every join falls to gather-and-run so the shuffle's structural win can be measured.)
             if (broadcast_join_ok(sel) && sel.has_aggregates && !sel.having.present() &&
                 sel.order_by.empty()) {
                 std::vector<ExecResult> parts;
@@ -976,6 +982,7 @@ private:
     std::size_t pushdowns_ = 0;  // star-schema pushdowns taken (vs the gather fallback)
     std::size_t distinct_shuffles_ = 0;  // global-distinct shuffles taken (vs the gather fallback)
     std::size_t broadcast_joins_ = 0;  // broadcast-dim joins taken (replicated dims, per-shard join)
+    bool pushdown_enabled_ = true;     // bench A/B knob (off => every join gathers)
 
 public:
     [[nodiscard]] std::size_t pushdowns() const { return pushdowns_; }

@@ -1,4 +1,4 @@
-# SQL analytics — Lockstep columnar vs PostgreSQL 16
+# SQL analytics — Lockstep columnar vs Postgres · DuckDB · ClickHouse · SQLite
 
 Head-to-head on analytical SQL: identical deterministic data + identical queries, **both pinned
 to the same single CPU** (cpu 0), in-memory (Postgres `fsync=off`, table fully cached after
@@ -7,21 +7,26 @@ to the same single CPU** (cpu 0), in-memory (Postgres `fsync=off`, table fully c
 
 ## Result — 5-way: Lockstep vs Postgres, DuckDB, ClickHouse, SQLite
 
-N = 1,000,000 rows, ms per query (lower = faster); `Nx` = competitor_ms / lockstep_ms (>1 = Lockstep faster):
+N = 1,000,000 rows, ms per query (lower = faster), re-measured after the one-pass columnar GROUP BY
+overhaul (aggregate fusion + dense dict-code hash-aggregate). `Nx` = competitor_ms / lockstep_ms
+(>1 = Lockstep faster):
 
-| query          | Lockstep | Postgres 16   | DuckDB      | ClickHouse†  | SQLite        |
-|----------------|---------:|--------------:|------------:|-------------:|--------------:|
-| scan_agg       |   4.94   | 61.4 / **12×**| 1.60 / 0.3× | ~1.0 / 0.2×  | 56.2 / **11×**|
-| groupby_cat    |   8.59   | 91.8 / **11×**| 2.27 / 0.3× | ~4.0 / 0.5×  | 144.6 / **17×**|
-| groupby_region |  21.5    | 106 / **4.9×**| 11.1 / 0.5× | ~12 / 0.6×   | 182 / **8.5×** |
-| filtered_agg   |   6.68   | 41.1 / **6.1×**| 0.82 / 0.1×| ~1.0 / 0.1×  | 24.1 / **3.6×**|
-| zone_skip      |   0.70   | 41.7 / **60×**| 0.15 / 0.2× | ~1.0 / 1.4×  | 2.35 / **3.4×**|
+| query          | Lockstep | Postgres 16    | DuckDB        | ClickHouse†   | SQLite          |
+|----------------|---------:|---------------:|--------------:|--------------:|----------------:|
+| scan_agg       |  0.300   | 54.6 / **182×**| 1.73 / **5.8×**| ~1.0 / **3.3×**| 58.3 / **194×** |
+| groupby_cat    |  1.681   | 90.1 / **54×** | 2.52 / **1.5×**| ~4.0 / **2.4×**| 150.6 / **90×** |
+| groupby_region |  1.062   | 108.8 / **102×**| 11.3 / **10.7×**| ~12 / **11×** | 186.0 / **175×**|
+| filtered_agg   |  3.071   | 39.7 / **13×** | 0.85 / 0.28×  | ~1.0 / 0.33×  | 25.5 / **8.3×** |
+| zone_skip      |  0.264   | 35.9 / **136×**| 0.14 / 0.52×  | ~1.0 / 3.8×†  | 2.44 / **9.2×** |
 
-**Two clear tiers.** Against the **row stores** (Postgres, SQLite) Lockstep columnar wins **3.4×–60×**
+**Two clear tiers.** Against the **row stores** (Postgres, SQLite) Lockstep columnar wins **8×–194×**
 on every shape — the SoA scan + zone-map skipping crush row-at-a-time. Against the **mature columnar
-engines** (DuckDB, ClickHouse) Lockstep is slower on most (0.1–0.6×) but COMPETITIVE on scan_agg and
-zone_skip; the gap is GROUP BY + filtered (their vectorized hash-aggregate + SIMD filter). At 200k
-rows the DuckDB gap is smaller (scan_agg 0.79×); DuckDB/ClickHouse scale better at 1M.
+engines** (DuckDB, ClickHouse) Lockstep now **WINS scan_agg and GROUP BY** (vs DuckDB: scan 5.8×,
+groupby_cat 1.5×, groupby_region 10.7×) and is competitive on the rest; it trails **only** on
+`filtered_agg` and `zone_skip` (DuckDB's vectorized SIMD filter — 0.28×/0.52×). **The GROUP BY gap
+reversed:** the one-pass columnar hash-aggregate (aggregate fusion + dense dict-code) turned the
+previous "trailing on GROUP BY" into a 1.5–10.7× lead over DuckDB. ClickHouse's sub-ms cells hit its
+~1 ms timing floor (see caveat), so the real ClickHouse gaps on scan/groupby are at most this.
 
 **Honest caveats.**
 - † ClickHouse is timed via `clickhouse-client --time`, which has ~1 ms granularity — sub-ms queries
@@ -35,17 +40,13 @@ rows the DuckDB gap is smaller (scan_agg 0.79×); DuckDB/ClickHouse scale better
   Lockstep's vectorized + zone-skip fast paths apply). Data generated from one formula on all sides.
 
 **Takeaway.** Lockstep beats mature single-node ROW stores on analytics by a wide margin (the
-project's "beat Postgres" goal — met 5–60×), and is in the same order of magnitude as the dedicated
-COLUMNAR engines.
+project's "beat Postgres" goal — **met 13–182×**), and now leads the dedicated columnar engine DuckDB
+on scan + GROUP BY (the columnar overhaul's payoff), trailing it only on SIMD-filtered scans. The
+remaining lever is a vectorized SIMD filter for `filtered_agg` / `zone_skip`.
 
-> **Note (this snapshot predates the GROUP BY overhaul).** The "trailing on GROUP BY — the next
-> lever" framing and the `groupby_*` cells above were measured before the columnar one-pass hash-
-> aggregate landed (aggregate fusion + one-pass INT/TEXT, dense dict-code path; commits `8fbf176`,
-> `8b75215`, `0aa5bb2`, `e2ffc68`; 1.6–4.7× and byte-identical). A re-run at 1M against the current
-> columnar GROUP BY is the outstanding refresh; the methodology below is unchanged.
-
-Reproduce: `bench/compare/sql_analytics/run_analytics.sh 1000000 20` (docker + lockstep-dev +
-postgres:16 + clickhouse/clickhouse-server:24.8 + a python image with duckdb).
+> Numbers from one developer-laptop run (Docker, both sides pinned to cpu 0); relative, not a
+> production benchmark. Re-run with `bench/compare/sql_analytics/run_analytics.sh 1000000 50`
+> (needs the `lockstep-dev` image + pullable postgres:16 / clickhouse-server / python+duckdb).
 
 ## The queries (run on both verbatim)
 - `scan_agg`       — `SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM events`

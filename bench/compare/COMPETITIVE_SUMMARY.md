@@ -85,18 +85,22 @@ write, so confirm its fsync semantics before quoting as durable.)
 - **Horizontal:** real — 635k/s on one node across 6 shards; the architecture scales, now shown live.
 - **SQL is no longer in-process-only:** runs over the wire (verified exactly-once) at ~105k/s.
 
-## Since delivered (were open levers here)
-- **Distributed SQL across shards — DONE.** Scatter-gather + a co-located-shuffle star-JOIN pushdown
-  (the large fact is aggregated by the join key on each shard and never gathered) with
-  WHERE/AVG/HAVING/COUNT(DISTINCT)-shuffle/multi-dim/broadcast-dim variants, each byte-identical to
-  single-node (DistributedSql.hpp; tests/sql_distributed_test.cpp). Not yet re-benchmarked here.
-- **Vectorized hash-aggregate (the GROUP BY gap) — DONE.** Columnar one-pass INT/TEXT hash-aggregate
-  + aggregate fusion (1.6–4.7×, byte-identical). The SQL-analytics numbers below predate it.
+## Since delivered + benchmarked (were open levers here)
+- **Distributed star-JOIN co-located shuffle — DONE + BENCHMARKED.** The large fact is aggregated by
+  the join key on each shard and never gathered. A/B vs the gather-the-fact baseline (same shards /
+  data / query, byte-identical result): **424× at 200k rows, 2,402× at 1M** (the pushdown cost tracks
+  join-key cardinality; the gather cost tracks fact size). See `distributed_join/REPORT.md`. Variants:
+  WHERE/AVG/HAVING/COUNT(DISTINCT)-shuffle/multi-dim/broadcast-dim (DistributedSql.hpp).
+- **Vectorized hash-aggregate (the GROUP BY gap) — DONE + BENCHMARKED.** The one-pass columnar
+  hash-aggregate (aggregate fusion + dense dict-code) **reversed the DuckDB GROUP BY gap**: at 1M,
+  Lockstep now leads DuckDB on scan (5.8×) and GROUP BY (1.5–10.7×), beats Postgres 13–182×. See the
+  refreshed `sql_analytics/REPORT.md`.
 
 ## Open levers (documented, fresh-session)
 wire write-path GROUP COMMIT (turn the 3.3k durable keyed write into a win — the ⭐1 follow-up) ·
-dictionary-RLE TEXT storage / vectorized JOIN · distributed-JOIN competitive benchmark (the feature
-exists but has no head-to-head number yet).
+vectorized SIMD filter (the only shape DuckDB still wins — filtered_agg/zone_skip) ·
+dictionary-RLE TEXT storage · distributed-JOIN vs a SHARDED competitor (Citus) for a same-topology
+head-to-head (the current A/B is internal pushdown-vs-gather).
 
 Reproduce: `bench/compare/run.sh` (KV) · `bench/compare/multi_shard_ceiling.sh` (horizontal) ·
 `bench/compare/sql_analytics/run_analytics.sh 1000000 20` (SQL analytics) · `lockstep_sqlbench` /
