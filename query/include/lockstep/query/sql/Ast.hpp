@@ -338,9 +338,13 @@ enum class JoinKind : std::uint8_t { Cross = 0, Inner = 1, Left = 2, Right = 3, 
 // `table` when no AS clause is given). Self-joins use distinct aliases.
 struct JoinEntry {
     JoinKind kind = JoinKind::Inner;
-    std::string table;  // the base table name (catalog lookup)
+    std::string table;  // the base table name (catalog lookup); for a derived table, == alias
     std::string alias;  // the binding name (== table when no AS); MUST be unique
     Predicate on;       // ON predicate (root -1 == none, i.e. a CROSS join)
+    // D3: a DERIVED TABLE — `FROM (SELECT ...) AS alias`. When set, the engine materializes this
+    // subquery into an ephemeral table named by `alias` before running the query (then drops it),
+    // and `table` is set to `alias`. shared_ptr keeps JoinEntry copyable with this nested SELECT.
+    std::shared_ptr<SelectStmt> subquery;
 };
 
 // D1/D2: set operation linking two SELECTs. None for a plain query; UNION/INTERSECT/EXCEPT chain

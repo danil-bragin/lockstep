@@ -2804,6 +2804,21 @@ private:
     // NOT be used as a bare alias (it would swallow JOIN/WHERE/...); an explicit AS
     // <alias> still requires an identifier.
     [[nodiscard]] std::optional<ParseError> parse_table_ref(JoinEntry& e) {
+        // D3: a DERIVED TABLE — `( SELECT ... ) [AS] alias`. Parse the subquery and require an
+        // alias (the binding name; the engine materializes it into an ephemeral table so named).
+        if (cur_.kind == Tok::LParen) {
+            advance();  // (
+            if (!is_kw("select")) return make_err("a FROM subquery must be a SELECT");
+            auto sub = std::make_shared<SelectStmt>();
+            if (auto er = parse_select_stmt(*sub)) return er;
+            if (cur_.kind != Tok::RParen) return make_err("expected ) to close the FROM subquery");
+            advance();  // )
+            if (is_kw("as")) advance();
+            if (auto er = expect_ident("an alias for the FROM subquery", e.alias)) return er;
+            e.subquery = std::move(sub);
+            e.table = e.alias;  // the materialized table is named by the alias
+            return std::nullopt;
+        }
         if (auto er = expect_table_name("a table name", e.table)) {  // E4: schema.table
             return er;
         }

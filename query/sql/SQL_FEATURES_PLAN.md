@@ -78,7 +78,7 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] A1/A2/A3/A4 WHERE-side — J1 expression operands in WHERE/CHECK (scalar Expr as a Cmp LHS: `a+b=10`, `doc->>'k'='v'`, `UPPER(name)='BOB'`; row+columnar) — sql_expr_pred_test
 - [x] D1 UNION/ALL + D2 INTERSECT/EXCEPT (set-op chain; dedup; combined ORDER/LIMIT; arity teeth) — sql_setops_test
 - [x] E2 CROSS — ALREADY PRESENT (see below)
-- [ ] D3 FROM-subquery · D4 CTE/WITH — the only two still open (E3 N-way, E4 non-equi, A4 CAST are all DONE below)
+- [x] D3 FROM-subquery (derived tables) · D4 CTE/WITH — materialized into ephemeral tables (chained/joined/aggregated), sql_cte_test
 - [x] E4 non-equi join — ALREADY PRESENT (theta via nested_loop; verified)
 - [x] F1 composite PRIMARY KEY (all-INT, row-mode): order-preserving concatenated key codec; single-col path byte-identical (conformance/columnar gates green); durable; teeth=TEXT/columnar/dup; UPDATE/DELETE-by-composite + multi-col INDEX = follow-on — sql_composite_pk_test
 - [x] E2 CROSS JOIN — ALREADY PRESENT (catalog miss; verified)
@@ -116,7 +116,7 @@ Quick wins → foundation A1 → riders → mid → big → F1 last.
 - [x] INTERVAL months/years (logical month-interval, 12-month logical year; calendar add) — sql_interval_month_test
 - [x] UINT256 (logical 13; 32-byte big-endian payload; crypto-scale beyond 128-bit) — sql_uint256_test
 - [x] secondary / composite / partial / merge indexes + ANALYZE stats + cost-based planning — sql_index_test, sql_analyze_test
-- [ ] D3 FROM-subquery (derived tables) · D4 CTE / `WITH` — the remaining single-node gaps
+- [x] D3 FROM-subquery (derived tables) · D4 CTE / `WITH` — DONE (sql_cte_test). Single-node SQL surface now complete.
 
 ## Distributed SQL (DistributedSql.hpp — scatter/gather over M shards)
 A coordinator fans a statement across shards and merges results byte-identically to a

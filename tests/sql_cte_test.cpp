@@ -75,7 +75,30 @@ int main() {
     check(col0(e, "SELECT id FROM emp WHERE dept = 'sales' ORDER BY id") == "3,4,",
           "non-WITH query still works");
 
+    // ---- D3: FROM-subqueries (derived tables) — `FROM (SELECT ...) AS alias` ----
+
+    // (8) Basic derived table.
+    check(col0(e, "SELECT id FROM (SELECT id, sal FROM emp WHERE sal > 250) AS hi "
+                  "ORDER BY id") == "1,3,5,",
+          "derived table: sal>250 => 1,3,5");
+
+    // (9) Aggregating derived table, then filter its rolled-up result in the outer query.
+    check(col2(e, "SELECT dept, total FROM "
+                  "(SELECT dept, SUM(sal) AS total FROM emp GROUP BY dept) AS d "
+                  "WHERE total > 500 ORDER BY dept") == "eng:1100,",
+          "derived aggregate + outer filter: only eng(1100) > 500");
+
+    // (10) Derived table JOINed with a real table.
+    check(col0(e, "SELECT d.id FROM (SELECT id FROM emp WHERE sal > 300) AS d "
+                  "JOIN emp ON d.id = emp.id ORDER BY d.id") == "1,5,",
+          "derived table joined to a real table => 1,5");
+
+    // (11) A derived table whose subquery reads a CTE (CTEs materialize first).
+    check(col0(e, "WITH eng AS (SELECT id FROM emp WHERE dept = 'eng') "
+                  "SELECT x.id FROM (SELECT id FROM eng) AS x ORDER BY x.id") == "1,2,5,",
+          "derived table over a CTE => eng ids 1,2,5");
+
     if (g_fail) { std::printf("sql_cte_test: FAILED\n"); return 1; }
-    std::printf("sql_cte_test: OK (WITH common table expressions)\n");
+    std::printf("sql_cte_test: OK (WITH CTEs + FROM-subqueries)\n");
     return 0;
 }

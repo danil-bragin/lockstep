@@ -5237,26 +5237,39 @@ private:
     }
 
     ExecResult exec_select(const SelectStmt& sel) {
-        // D4: WITH common table expressions. Materialize each CTE (in order — a later CTE may read
-        // an earlier one) into an ephemeral table named by the CTE, run the main query (a copy with
-        // the ctes stripped so this does not recurse), then drop the ephemeral tables. A CTE whose
-        // name clashes with a real table is rejected (no shadowing in this version), and an empty
-        // CTE result is an error (schema is inferred from the rows, like CREATE TABLE AS SELECT).
-        if (!sel.ctes.empty()) {
+        // D4 WITH common table expressions + D3 FROM-subqueries (derived tables). Materialize each
+        // CTE (in order — a later CTE may read an earlier one) and each derived-table subquery into
+        // an ephemeral table named by the CTE / the derived alias, run the main query (a copy with
+        // the ctes + subqueries stripped so this does not recurse), then drop them. A name that
+        // clashes with an existing table is rejected (no shadowing here); an empty subquery result
+        // is an error (schema is inferred from the rows, like CREATE TABLE AS SELECT).
+        bool has_derived = false;
+        for (const JoinEntry& je : sel.from) if (je.subquery) { has_derived = true; break; }
+        if (!sel.ctes.empty() || has_derived) {
             std::vector<std::string> created;
-            for (const auto& [name, sub] : sel.ctes) {
-                if (catalog_.find(name) != nullptr) {
+            auto materialize = [&](const std::string& nm, const SelectStmt& sub) -> ExecResult {
+                if (catalog_.find(nm) != nullptr) {
                     drop_materialized(created);
-                    return ExecResult::failure("WITH name '" + name + "' clashes with an existing table");
+                    return ExecResult::failure("subquery/CTE name '" + nm + "' clashes with a table");
                 }
-                if (auto e = materialize_select(name, *sub)) {
+                if (auto e = materialize_select(nm, sub)) {
                     drop_materialized(created);
                     return ExecResult::failure(*e);
                 }
-                created.push_back(name);
+                created.push_back(nm);
+                return ExecResult{};
+            };
+            for (const auto& [name, sub] : sel.ctes) {       // CTEs first (derived may read them)
+                if (const ExecResult m = materialize(name, *sub); !m.ok) return m;
+            }
+            for (const JoinEntry& je : sel.from) {           // then the derived tables
+                if (je.subquery) {
+                    if (const ExecResult m = materialize(je.alias, *je.subquery); !m.ok) return m;
+                }
             }
             SelectStmt body = sel;
             body.ctes.clear();
+            for (JoinEntry& je : body.from) je.subquery.reset();  // now plain table refs (== alias)
             const ExecResult r = exec_select(body);
             drop_materialized(created);
             return r;
