@@ -73,35 +73,53 @@ inline core::Task build_backup_image(Engine& src, Snapshot snap, std::vector<std
     co_return;
 }
 
-// CRC-VERIFY a complete in-memory backup image and replay it into `dst`. Identical integrity
-// contract to restore_task (bad magic / version / CRC / truncation → rejected, no partial restore).
-inline core::Task apply_backup_image(std::span<const std::byte> image, Engine& dst, core::Error& result) {
+// FULLY validate a complete in-memory backup image WITHOUT applying it: magic, version, the payload
+// CRC, AND the record framing (so a CRC-valid but structurally malformed payload is also rejected).
+// Pure (no scheduler / no Engine) — lets a caller verify EVERY section before applying ANY, so a
+// multi-section restore stays all-or-nothing (no partial state from a later corrupt section).
+inline core::Error validate_image(std::span<const std::byte> image) {
     if (image.size() < kBackupHeaderBytes || !backup_magic_ok(image.data())) {
-        result = core::Error{core::ErrorCode::Corruption, "backup: bad magic"};
-        co_return;
+        return core::Error{core::ErrorCode::Corruption, "backup: bad magic"};
     }
     if (get_u32(image.data() + 4) != kBackupVersion) {
-        result = core::Error{core::ErrorCode::InvalidArgument, "backup: unsupported version"};
-        co_return;
+        return core::Error{core::ErrorCode::InvalidArgument, "backup: unsupported version"};
     }
     const std::uint64_t payload_len = get_u64(image.data() + 16);
     const std::uint32_t want_crc = get_u32(image.data() + 24);
-    if (kBackupHeaderBytes + payload_len > image.size()) {
-        result = core::Error{core::ErrorCode::Corruption, "backup: truncated image"};
-        co_return;
+    if (static_cast<std::uint64_t>(kBackupHeaderBytes) + payload_len > image.size()) {
+        return core::Error{core::ErrorCode::Corruption, "backup: truncated image"};
     }
     std::span<const std::byte> payload = image.subspan(kBackupHeaderBytes, static_cast<std::size_t>(payload_len));
     if (Crc32::compute(payload) != want_crc) {
-        result = core::Error{core::ErrorCode::Corruption, "backup: CRC mismatch (torn/corrupt backup)"};
-        co_return;
+        return core::Error{core::ErrorCode::Corruption, "backup: CRC mismatch (torn/corrupt backup)"};
     }
     std::size_t pos = 0;
     while (pos < payload.size()) {
-        if (pos + 8 > payload.size()) { result = core::Error{core::ErrorCode::Corruption, "backup: truncated record header"}; co_return; }
+        if (pos + 8 > payload.size()) return core::Error{core::ErrorCode::Corruption, "backup: truncated record header"};
         const std::uint32_t klen = get_u32(payload.data() + pos);
         const std::uint32_t vlen = get_u32(payload.data() + pos + 4);
         pos += 8;
-        if (pos + klen + vlen > payload.size()) { result = core::Error{core::ErrorCode::Corruption, "backup: truncated record"}; co_return; }
+        if (pos + static_cast<std::size_t>(klen) + vlen > payload.size())
+            return core::Error{core::ErrorCode::Corruption, "backup: truncated record"};
+        pos += static_cast<std::size_t>(klen) + vlen;
+    }
+    return core::Error{};
+}
+
+// CRC-VERIFY a complete in-memory backup image and replay it into `dst`. Identical integrity
+// contract to restore_task (bad magic / version / CRC / truncation → rejected, no partial restore).
+inline core::Task apply_backup_image(std::span<const std::byte> image, Engine& dst, core::Error& result) {
+    if (const core::Error e = validate_image(image); !e.ok()) {
+        result = e;
+        co_return;
+    }
+    const std::uint64_t payload_len = get_u64(image.data() + 16);
+    std::span<const std::byte> payload = image.subspan(kBackupHeaderBytes, static_cast<std::size_t>(payload_len));
+    std::size_t pos = 0;
+    while (pos < payload.size()) {
+        const std::uint32_t klen = get_u32(payload.data() + pos);
+        const std::uint32_t vlen = get_u32(payload.data() + pos + 4);
+        pos += 8;
         std::string key(reinterpret_cast<const char*>(payload.data() + pos), klen);
         pos += klen;
         std::string val(reinterpret_cast<const char*>(payload.data() + pos), vlen);
@@ -202,6 +220,13 @@ inline core::Task restore_task(core::IDisk& in, Engine& dst, core::Error& result
     sched.spawn(detail::backup_bytes_task(src, snap, out));
     sched.run();
     return core::Error{};
+}
+
+// FULLY validate an in-memory backup image (magic + version + CRC + record framing) WITHOUT
+// applying it — used to verify every section of a multi-section stream before any is applied, so a
+// restore stays all-or-nothing. Pure (no scheduler).
+[[nodiscard]] inline core::Error validate_backup_image(std::span<const std::byte> image) {
+    return detail::validate_image(image);
 }
 
 // CRC-verify a complete in-memory image and replay it into `dst` (same integrity contract as

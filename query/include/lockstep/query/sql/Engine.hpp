@@ -276,14 +276,24 @@ inline core::Task read_stream(core::IDisk& in, std::uint32_t& scope_out,
         }
         off += 8;
         const std::uint64_t len = storage::get_u64(lb.data());
-        std::vector<std::byte> sec(static_cast<std::size_t>(len));
-        if (len > 0) {
-            if (const core::Error e = co_await in.read(off, std::span<std::byte>(sec.data(), sec.size())); !e.ok()) {
+        // Read in bounded chunks rather than pre-allocating `len` bytes: a CORRUPT length field
+        // (e.g. a flipped bit inflating it to gigabytes) then fails on the first read past the
+        // device end instead of attempting one enormous allocation. The buffer only ever grows to
+        // the bytes actually read.
+        constexpr std::size_t kChunk = std::size_t{1} << 16;
+        std::vector<std::byte> sec;
+        std::uint64_t remaining = len;
+        while (remaining > 0) {
+            const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kChunk));
+            const std::size_t base = sec.size();
+            sec.resize(base + want);
+            if (const core::Error e = co_await in.read(off, std::span<std::byte>(sec.data() + base, want)); !e.ok()) {
                 result = e;
                 co_return;
             }
+            off += static_cast<core::Offset>(want);
+            remaining -= want;
         }
-        off += static_cast<core::Offset>(len);
         sections_out.push_back(std::move(sec));
     }
     result = core::Error{};
@@ -430,6 +440,13 @@ public:
     // backup restores schemas only (the data store stays empty); a Full backup restores both. The
     // in-memory catalog is rebuilt from the restored catalog store (reprime_catalog_from_store).
     [[nodiscard]] core::Error restore(core::Scheduler& in_sched, core::IDisk& in) {
+        // FRESH-ENGINE contract: restoring onto a populated engine would overlay records and leave
+        // stale tables/rows the backup never had (the catalog reprime sees BOTH). Require an empty
+        // target so the restored state is EXACTLY the backup, with nothing left over.
+        if (!catalog_.all().empty() || db_.tip() != 0) {
+            return core::Error{core::ErrorCode::InvalidArgument,
+                               "sql restore: target engine must be fresh (empty)"};
+        }
         std::uint32_t scope_raw = 0;
         std::vector<std::vector<std::byte>> sections;
         core::Error r = core::Error{core::ErrorCode::Unknown, "sql restore: did not run"};
@@ -441,13 +458,24 @@ public:
         if (sections.empty()) {
             return core::Error{core::ErrorCode::Corruption, "sql backup: missing catalog section"};
         }
+        const bool full = scope_raw == static_cast<std::uint32_t>(SqlBackupScope::Full);
+        if (full && sections.size() < 2) {
+            return core::Error{core::ErrorCode::Corruption, "sql backup: missing data section"};
+        }
+        // ATOMIC: CRC-verify EVERY section BEFORE applying ANY, so a corrupt DATA section cannot
+        // leave the catalog half-restored (all-or-nothing across both stores, V-NOTORN).
+        if (const core::Error e = storage::validate_backup_image(sections[0]); !e.ok()) {
+            return e;
+        }
+        if (full) {
+            if (const core::Error e = storage::validate_backup_image(sections[1]); !e.ok()) {
+                return e;
+            }
+        }
         if (const core::Error e = catalog_db_.restore_image(sections[0]); !e.ok()) {
             return e;
         }
-        if (scope_raw == static_cast<std::uint32_t>(SqlBackupScope::Full)) {
-            if (sections.size() < 2) {
-                return core::Error{core::ErrorCode::Corruption, "sql backup: missing data section"};
-            }
+        if (full) {
             if (const core::Error e = db_.restore_image(sections[1]); !e.ok()) {
                 return e;
             }
