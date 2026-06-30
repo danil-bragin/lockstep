@@ -46,7 +46,10 @@ namespace detail {
            std::to_integer<char>(p[2]) == 'B' && std::to_integer<char>(p[3]) == '1';
 }
 
-inline core::Task backup_task(Engine& src, Snapshot snap, core::IDisk& out, core::Error& result) {
+// Scan the full live keyspace as-of `snap` and build the self-contained CRC-protected image
+// (header + payload) in `image` — the SAME bytes whether the image is written to a disk or kept
+// in memory (so a disk backup and an in-memory backup of one state are byte-identical, V-DET).
+inline core::Task build_backup_image(Engine& src, Snapshot snap, std::vector<std::byte>& image) {
     Range full;
     full.hi_unbounded = true;
     const std::vector<KeyValue> kvs = co_await src.scan(full, snap);
@@ -60,18 +63,67 @@ inline core::Task backup_task(Engine& src, Snapshot snap, core::IDisk& out, core
     }
     const std::uint32_t crc = Crc32::compute(payload);
 
-    std::vector<std::byte> image;
+    image.clear();
     for (char c : std::string_view("LSB1")) image.push_back(static_cast<std::byte>(c));
     put_u32(image, kBackupVersion);
     put_u64(image, snap.at);
     put_u64(image, static_cast<std::uint64_t>(payload.size()));
     put_u32(image, crc);
     image.insert(image.end(), payload.begin(), payload.end());
+    co_return;
+}
 
+// CRC-VERIFY a complete in-memory backup image and replay it into `dst`. Identical integrity
+// contract to restore_task (bad magic / version / CRC / truncation → rejected, no partial restore).
+inline core::Task apply_backup_image(std::span<const std::byte> image, Engine& dst, core::Error& result) {
+    if (image.size() < kBackupHeaderBytes || !backup_magic_ok(image.data())) {
+        result = core::Error{core::ErrorCode::Corruption, "backup: bad magic"};
+        co_return;
+    }
+    if (get_u32(image.data() + 4) != kBackupVersion) {
+        result = core::Error{core::ErrorCode::InvalidArgument, "backup: unsupported version"};
+        co_return;
+    }
+    const std::uint64_t payload_len = get_u64(image.data() + 16);
+    const std::uint32_t want_crc = get_u32(image.data() + 24);
+    if (kBackupHeaderBytes + payload_len > image.size()) {
+        result = core::Error{core::ErrorCode::Corruption, "backup: truncated image"};
+        co_return;
+    }
+    std::span<const std::byte> payload = image.subspan(kBackupHeaderBytes, static_cast<std::size_t>(payload_len));
+    if (Crc32::compute(payload) != want_crc) {
+        result = core::Error{core::ErrorCode::Corruption, "backup: CRC mismatch (torn/corrupt backup)"};
+        co_return;
+    }
+    std::size_t pos = 0;
+    while (pos < payload.size()) {
+        if (pos + 8 > payload.size()) { result = core::Error{core::ErrorCode::Corruption, "backup: truncated record header"}; co_return; }
+        const std::uint32_t klen = get_u32(payload.data() + pos);
+        const std::uint32_t vlen = get_u32(payload.data() + pos + 4);
+        pos += 8;
+        if (pos + klen + vlen > payload.size()) { result = core::Error{core::ErrorCode::Corruption, "backup: truncated record"}; co_return; }
+        std::string key(reinterpret_cast<const char*>(payload.data() + pos), klen);
+        pos += klen;
+        std::string val(reinterpret_cast<const char*>(payload.data() + pos), vlen);
+        pos += vlen;
+        (void)co_await dst.put(std::move(key), std::move(val));
+    }
+    result = co_await dst.sync();
+    co_return;
+}
+
+inline core::Task backup_task(Engine& src, Snapshot snap, core::IDisk& out, core::Error& result) {
+    std::vector<std::byte> image;
+    co_await build_backup_image(src, snap, image);
     core::Offset off = 0;
     const core::Error ae = co_await out.append(std::span<const std::byte>(image.data(), image.size()), off);
     if (!ae.ok()) { result = ae; co_return; }
     result = co_await out.sync();
+    co_return;
+}
+
+inline core::Task backup_bytes_task(Engine& src, Snapshot snap, std::vector<std::byte>& out) {
+    co_await build_backup_image(src, snap, out);
     co_return;
 }
 
@@ -138,6 +190,26 @@ inline core::Task restore_task(core::IDisk& in, Engine& dst, core::Error& result
 [[nodiscard]] inline core::Error restore_engine(core::Scheduler& sched, core::IDisk& in, Engine& dst) {
     core::Error result = core::Error{core::ErrorCode::Unknown, "restore: did not run"};
     sched.spawn(detail::restore_task(in, dst, result));
+    sched.run();
+    return result;
+}
+
+// In-memory variants: produce / consume the SAME self-contained image as the disk path, without an
+// intermediary IDisk. Used to back up two stores that live on DIFFERENT schedulers into one stream
+// (each store backs up to bytes on its OWN scheduler; an outer layer concatenates + writes once).
+[[nodiscard]] inline core::Error backup_engine_bytes(core::Scheduler& sched, Engine& src, Snapshot snap,
+                                                     std::vector<std::byte>& out) {
+    sched.spawn(detail::backup_bytes_task(src, snap, out));
+    sched.run();
+    return core::Error{};
+}
+
+// CRC-verify a complete in-memory image and replay it into `dst` (same integrity contract as
+// restore_engine — corrupt image leaves `dst` untouched, V-NOTORN).
+[[nodiscard]] inline core::Error restore_engine_bytes(core::Scheduler& sched, std::span<const std::byte> image,
+                                                      Engine& dst) {
+    core::Error result = core::Error{core::ErrorCode::Unknown, "restore: did not run"};
+    sched.spawn(detail::apply_backup_image(image, dst, result));
     sched.run();
     return result;
 }

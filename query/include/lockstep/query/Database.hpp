@@ -54,6 +54,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -66,6 +67,7 @@
 #include <lockstep/core/Task.hpp>
 #include <lockstep/sim/SeededRandom.hpp>
 #include <lockstep/sim/SimDisk.hpp>
+#include <lockstep/storage/Backup.hpp>
 #include <lockstep/storage/Engine.hpp>
 #include <lockstep/storage/WalEngine.hpp>
 
@@ -321,6 +323,23 @@ public:
         }
     }
 
+    // The engine Snapshot Seq at the LIVE committed tip — the point a logical backup captures.
+    [[nodiscard]] storage::Seq live_snap_seq() const { return snap_for(tip()); }
+
+    // RESTORE from a logical backup image: CRC-verify + replay the (key,value) records into the live
+    // engine (V-NOTORN — a corrupt image is rejected, NO partial state), then reset the prefix
+    // bookkeeping to a single [empty, tip] step (same shape recover() leaves). Intended for a FRESH
+    // store (empty engine); the restored tip is the backed-up snapshot's live state.
+    [[nodiscard]] core::Error restore_image(std::span<const std::byte> image) {
+        const core::Error e = storage::restore_engine_bytes(*sched_, image, *engine_);
+        const storage::Seq last = engine_->last_seq();
+        snap_.assign(1, storage::kNoSeq);
+        if (last != storage::kNoSeq) {
+            snap_.push_back(last);
+        }
+        return e;
+    }
+
 private:
     static sim::DiskFaultConfig fault_free_cfg() {
         sim::DiskFaultConfig dc;
@@ -570,6 +589,17 @@ public:
 
     // Recover the committed query state from the durable IDisk after a restart.
     void recover(std::size_t durable_len) { store_->recover(durable_len); }
+
+    // ---- Logical backup / restore seam (see storage/Backup.hpp + SqlEngine::backup) ----
+    // Live engine + its scheduler (a backup scans the engine on its own scheduler).
+    [[nodiscard]] storage::Engine& engine() noexcept { return store_->engine(); }
+    [[nodiscard]] core::Scheduler& scheduler() noexcept { return store_->scheduler(); }
+    // The engine Snapshot Seq a backup captures (the live committed tip).
+    [[nodiscard]] storage::Seq live_snap_seq() const { return store_->live_snap_seq(); }
+    // Replay a logical backup image into this (fresh) store, resetting prefix bookkeeping.
+    [[nodiscard]] core::Error restore_image(std::span<const std::byte> image) {
+        return store_->restore_image(image);
+    }
 
 private:
     // A fixed seed for the standalone storage sim. The OBSERVABLE result must NOT

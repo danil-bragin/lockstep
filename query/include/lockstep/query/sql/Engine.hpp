@@ -150,12 +150,19 @@
 // query surface would for the same KV writes (the conformance gate proves it).
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include <lockstep/storage/Backup.hpp>
+#include <lockstep/storage/Codec.hpp>
 
 #include <lockstep/query/Database.hpp>
 #include <lockstep/query/ParallelExecutor.hpp>
@@ -200,6 +207,89 @@ struct ExecResult {
         return r;
     }
 };
+
+// ---- Logical SQL backup (whole DB = catalog + data) ------------------------------------------
+// A SqlEngine has TWO independent stores on TWO schedulers: the catalog store (schemas) and the
+// data store (rows/blocks). A single IDisk cannot be driven by both schedulers, so each store backs
+// up to a self-contained storage image (storage::backup_engine_bytes) on its OWN scheduler and an
+// outer SQL wrapper concatenates the section(s) into one stream written to the caller's `out`.
+//
+// SCOPE: SchemaOnly backs up the catalog only (table/index/type definitions, no rows); Full backs up
+// catalog + data. restore() reads the scope from the stream header, so a SchemaOnly image can never
+// silently restore stale data, and a Full image always restores both.
+//
+// STREAM: header(16B) = magic "LSQB"(4) · version u32 · scope u32 · nsec u32 ; then `nsec` sections,
+// each = len u64 · storage-backup-image[len]. Section 0 = catalog; section 1 (Full only) = data.
+enum class SqlBackupScope : std::uint32_t { SchemaOnly = 0, Full = 1 };
+
+inline constexpr std::uint32_t kSqlBackupVersion = 1;
+inline constexpr std::size_t kSqlBackupHeaderBytes = 16;
+
+namespace backup_detail {
+[[nodiscard]] inline bool sql_magic_ok(const std::byte* p) noexcept {
+    return std::to_integer<char>(p[0]) == 'L' && std::to_integer<char>(p[1]) == 'S' &&
+           std::to_integer<char>(p[2]) == 'Q' && std::to_integer<char>(p[3]) == 'B';
+}
+
+// Append the assembled stream to `out` + sync (runs on the caller's out scheduler). `image` is moved
+// into the coroutine frame (stable for the suspend), so this is NOT a dangling-capture lambda.
+inline core::Task write_stream(core::IDisk& out, std::vector<std::byte> image, core::Error& result) {
+    core::Offset off = 0;
+    if (const core::Error e = co_await out.append(std::span<const std::byte>(image.data(), image.size()), off);
+        !e.ok()) {
+        result = e;
+        co_return;
+    }
+    result = co_await out.sync();
+    co_return;
+}
+
+// Read + parse the SQL backup stream from `in` into per-section byte blobs (runs on the caller's in
+// scheduler). Bounds + magic + version checked; a short/garbage stream → Corruption (no partial).
+inline core::Task read_stream(core::IDisk& in, std::uint32_t& scope_out,
+                              std::vector<std::vector<std::byte>>& sections_out, core::Error& result) {
+    std::array<std::byte, kSqlBackupHeaderBytes> hdr{};
+    if (const core::Error e = co_await in.read(0, std::span<std::byte>(hdr.data(), hdr.size())); !e.ok()) {
+        result = e;
+        co_return;
+    }
+    if (!sql_magic_ok(hdr.data())) {
+        result = core::Error{core::ErrorCode::Corruption, "sql backup: bad magic"};
+        co_return;
+    }
+    if (storage::get_u32(hdr.data() + 4) != kSqlBackupVersion) {
+        result = core::Error{core::ErrorCode::InvalidArgument, "sql backup: unsupported version"};
+        co_return;
+    }
+    scope_out = storage::get_u32(hdr.data() + 8);
+    const std::uint32_t nsec = storage::get_u32(hdr.data() + 12);
+    if (nsec == 0 || nsec > 2) {
+        result = core::Error{core::ErrorCode::Corruption, "sql backup: bad section count"};
+        co_return;
+    }
+    core::Offset off = static_cast<core::Offset>(kSqlBackupHeaderBytes);
+    for (std::uint32_t i = 0; i < nsec; ++i) {
+        std::array<std::byte, 8> lb{};
+        if (const core::Error e = co_await in.read(off, std::span<std::byte>(lb.data(), lb.size())); !e.ok()) {
+            result = e;
+            co_return;
+        }
+        off += 8;
+        const std::uint64_t len = storage::get_u64(lb.data());
+        std::vector<std::byte> sec(static_cast<std::size_t>(len));
+        if (len > 0) {
+            if (const core::Error e = co_await in.read(off, std::span<std::byte>(sec.data(), sec.size())); !e.ok()) {
+                result = e;
+                co_return;
+            }
+        }
+        off += static_cast<core::Offset>(len);
+        sections_out.push_back(std::move(sec));
+    }
+    result = core::Error{};
+    co_return;
+}
+}  // namespace backup_detail
 
 // ----------------------------------------------------------------------------
 // THE SQL ENGINE. Owns a Catalog + a query::Database (the verified surface) + the
@@ -250,10 +340,15 @@ public:
         if (catalog_durable_) {
             catalog_db_.recover(catalog_len);
         }
-        // C7: rebuild the CATALOG from its durable schema records (reserved 0x01 namespace) in the
-        // SEPARATE catalog store. Without this the recovered ROW/BLOCK data is uninterpretable after
-        // a restart (the schema lived only in memory). Each record is a serialized Table re-registered
-        // with its PERSISTED id (the data keys are namespaced by it).
+        reprime_catalog_from_store();
+    }
+
+    // Rebuild the in-memory Catalog from the catalog store's durable schema records (reserved 0x01
+    // namespace + 0x02 empty-schema markers). Without this the recovered ROW/BLOCK data is
+    // uninterpretable (the schema lived only in memory). Shared by recover() and restore() — each
+    // serialized Table is re-registered with its PERSISTED id (the data keys are namespaced by it).
+    void reprime_catalog_from_store() {
+        catalog_ = Catalog{};  // restore() may run on a fresh engine; recover() starts empty too
         std::vector<storage::KeyValue> kvs;
         {
             Query<Strict> q;
@@ -287,6 +382,84 @@ public:
     // True iff the catalog store is disk-backed (4-arg ctor) — the caller then persists the
     // catalog disk's length alongside the data disk's and passes both to recover().
     [[nodiscard]] bool catalog_durable() const noexcept { return catalog_durable_; }
+
+    // ---- Logical backup / restore of the WHOLE SQL database (schemas + optionally data) ----
+    // Write a self-contained, CRC-protected logical backup of this engine to `out` (driven on
+    // `out_sched`, the scheduler that runs `out`). SchemaOnly captures the catalog (every table /
+    // index / type definition); Full also captures all row + columnar data as-of the live tip. The
+    // image is portable + point-in-time (see storage::backup_engine — same record stream, here for
+    // BOTH the catalog and the data store). Determinism: identical state ⇒ byte-identical stream.
+    [[nodiscard]] core::Error backup(core::Scheduler& out_sched, core::IDisk& out,
+                                     SqlBackupScope scope = SqlBackupScope::Full) {
+        std::vector<std::byte> cat_img;
+        if (const core::Error e = storage::backup_engine_bytes(
+                catalog_db_.scheduler(), catalog_db_.engine(),
+                storage::Snapshot{catalog_db_.live_snap_seq()}, cat_img);
+            !e.ok()) {
+            return e;
+        }
+        std::vector<std::byte> data_img;
+        if (scope == SqlBackupScope::Full) {
+            if (const core::Error e = storage::backup_engine_bytes(
+                    db_.scheduler(), db_.engine(), storage::Snapshot{db_.live_snap_seq()}, data_img);
+                !e.ok()) {
+                return e;
+            }
+        }
+        const std::uint32_t nsec = (scope == SqlBackupScope::Full) ? 2U : 1U;
+        std::vector<std::byte> image;
+        for (char c : std::string_view("LSQB")) image.push_back(static_cast<std::byte>(c));
+        storage::put_u32(image, kSqlBackupVersion);
+        storage::put_u32(image, static_cast<std::uint32_t>(scope));
+        storage::put_u32(image, nsec);
+        storage::put_u64(image, static_cast<std::uint64_t>(cat_img.size()));
+        image.insert(image.end(), cat_img.begin(), cat_img.end());
+        if (scope == SqlBackupScope::Full) {
+            storage::put_u64(image, static_cast<std::uint64_t>(data_img.size()));
+            image.insert(image.end(), data_img.begin(), data_img.end());
+        }
+        core::Error result = core::Error{core::ErrorCode::Unknown, "sql backup: did not run"};
+        out_sched.spawn(backup_detail::write_stream(out, std::move(image), result));
+        out_sched.run();
+        return result;
+    }
+
+    // Restore a logical backup from `in` (driven on `in_sched`) into THIS (fresh) engine. The whole
+    // stream is CRC-verified before anything is applied — a torn/corrupt/short backup is REJECTED
+    // and the engine is left untouched (V-NOTORN). The scope is read from the stream: a SchemaOnly
+    // backup restores schemas only (the data store stays empty); a Full backup restores both. The
+    // in-memory catalog is rebuilt from the restored catalog store (reprime_catalog_from_store).
+    [[nodiscard]] core::Error restore(core::Scheduler& in_sched, core::IDisk& in) {
+        std::uint32_t scope_raw = 0;
+        std::vector<std::vector<std::byte>> sections;
+        core::Error r = core::Error{core::ErrorCode::Unknown, "sql restore: did not run"};
+        in_sched.spawn(backup_detail::read_stream(in, scope_raw, sections, r));
+        in_sched.run();
+        if (!r.ok()) {
+            return r;
+        }
+        if (sections.empty()) {
+            return core::Error{core::ErrorCode::Corruption, "sql backup: missing catalog section"};
+        }
+        if (const core::Error e = catalog_db_.restore_image(sections[0]); !e.ok()) {
+            return e;
+        }
+        if (scope_raw == static_cast<std::uint32_t>(SqlBackupScope::Full)) {
+            if (sections.size() < 2) {
+                return core::Error{core::ErrorCode::Corruption, "sql backup: missing data section"};
+            }
+            if (const core::Error e = db_.restore_image(sections[1]); !e.ok()) {
+                return e;
+            }
+        }
+        tip_ = db_.tip();
+        chunk_cache_.clear();
+        concat_cache_.clear();
+        text_dict_cache_.clear();
+        zone_cache_.clear();
+        reprime_catalog_from_store();
+        return core::Error{};
+    }
 
     // ---- Catalog persistence (C7) — schema records under the reserved 0x01 key namespace ----
     static void cat_put_u32(std::string& o, std::uint32_t v) {
