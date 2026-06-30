@@ -299,6 +299,44 @@ inline core::Task read_stream(core::IDisk& in, std::uint32_t& scope_out,
     result = core::Error{};
     co_return;
 }
+
+// Read a framed SQL-TEXT dump (magic "LSQL" + version u32 + len u64 + utf8 text) from `in` into
+// `out`. Magic/version checked; the text is read in bounded chunks (a corrupt length fails on a read
+// past the device end rather than a giant allocation). A non-dump / short stream → Corruption.
+inline core::Task read_text_stream(core::IDisk& in, std::string& out, core::Error& result) {
+    std::array<std::byte, 16> hdr{};
+    if (const core::Error e = co_await in.read(0, std::span<std::byte>(hdr.data(), hdr.size())); !e.ok()) {
+        result = e;
+        co_return;
+    }
+    if (!(std::to_integer<char>(hdr[0]) == 'L' && std::to_integer<char>(hdr[1]) == 'S' &&
+          std::to_integer<char>(hdr[2]) == 'Q' && std::to_integer<char>(hdr[3]) == 'L')) {
+        result = core::Error{core::ErrorCode::Corruption, "sql dump: bad magic"};
+        co_return;
+    }
+    if (storage::get_u32(hdr.data() + 4) != kSqlBackupVersion) {
+        result = core::Error{core::ErrorCode::InvalidArgument, "sql dump: unsupported version"};
+        co_return;
+    }
+    const std::uint64_t len = storage::get_u64(hdr.data() + 8);
+    constexpr std::size_t kChunk = std::size_t{1} << 16;
+    core::Offset off = 16;
+    std::uint64_t remaining = len;
+    out.clear();
+    while (remaining > 0) {
+        const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kChunk));
+        std::vector<std::byte> buf(want);
+        if (const core::Error e = co_await in.read(off, std::span<std::byte>(buf.data(), buf.size())); !e.ok()) {
+            result = e;
+            co_return;
+        }
+        for (std::byte b : buf) out.push_back(static_cast<char>(std::to_integer<unsigned char>(b)));
+        off += static_cast<core::Offset>(want);
+        remaining -= want;
+    }
+    result = core::Error{};
+    co_return;
+}
 }  // namespace backup_detail
 
 // ----------------------------------------------------------------------------
@@ -489,6 +527,315 @@ public:
         return core::Error{};
     }
 
+    // ============================================================================================
+    // SQL-TEXT backup (pg_dump style): emit a portable .sql script of CREATE SCHEMA / CREATE TABLE /
+    // CREATE INDEX (+ INSERTs for Full) that, replayed through the verified exec() path, rebuilds the
+    // database. Human-readable + portable to any SQL-ish tool; the engine-specific columnar attribute
+    // rides as a `-- lockstep:columnar` directive (a comment our restore_sql honours, ignored by other
+    // tools). The binary backup() above stays the FULL-fidelity path; this text path covers the core
+    // relational surface and REFUSES (clear error) a column whose type it cannot yet round-trip.
+    // ============================================================================================
+
+    // Build the .sql script in `out`. scope: SchemaOnly = DDL only; Full = DDL + one INSERT per row.
+    [[nodiscard]] core::Error dump_sql_string(SqlBackupScope scope, std::string& out) {
+        out.clear();
+        for (const std::string& s : catalog_.schemas()) {
+            out += "CREATE SCHEMA IF NOT EXISTS " + s + ";\n";
+        }
+        const std::vector<const Table*> order = sql_table_order();
+        for (const Table* tp : order) {
+            if (tp->columnar) out += "-- lockstep:columnar\n";
+            std::string ddl;
+            if (const core::Error e = sql_render_create_table(*tp, ddl); !e.ok()) return e;
+            out += ddl + "\n";
+            for (const Index& ix : tp->indexes) out += sql_render_create_index(*tp, ix) + "\n";
+        }
+        if (scope == SqlBackupScope::Full) {
+            for (const Table* tp : order) {
+                if (const core::Error e = sql_render_inserts(*tp, out); !e.ok()) return e;
+            }
+        }
+        return core::Error{};
+    }
+
+    // Write the .sql script to `out` (framed: magic "LSQL" + version u32 + len u64 + utf8 text), so a
+    // restore can read it back without a separate length channel and reject a non-dump stream.
+    [[nodiscard]] core::Error dump_sql(core::Scheduler& out_sched, core::IDisk& out,
+                                       SqlBackupScope scope = SqlBackupScope::Full) {
+        std::string text;
+        if (const core::Error e = dump_sql_string(scope, text); !e.ok()) return e;
+        std::vector<std::byte> image;
+        for (char c : std::string_view("LSQL")) image.push_back(static_cast<std::byte>(c));
+        storage::put_u32(image, kSqlBackupVersion);
+        storage::put_u64(image, static_cast<std::uint64_t>(text.size()));
+        for (char c : text) image.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
+        core::Error result = core::Error{core::ErrorCode::Unknown, "sql dump: did not run"};
+        out_sched.spawn(backup_detail::write_stream(out, std::move(image), result));
+        out_sched.run();
+        return result;
+    }
+
+    // Recover the WHOLE database by replaying a .sql script into THIS (fresh) engine: split into
+    // single statements (the parser takes one at a time), honour the `-- lockstep:columnar` directive,
+    // and exec() each. Aborts on the first failing statement (returns its error). Fresh-engine guarded.
+    [[nodiscard]] core::Error restore_sql_string(const std::string& script) {
+        if (!catalog_.all().empty() || db_.tip() != 0) {
+            return core::Error{core::ErrorCode::InvalidArgument,
+                               "sql restore: target engine must be fresh (empty)"};
+        }
+        bool columnar_pending = false;
+        auto run_stmt = [&](const std::string& raw) -> core::Error {
+            std::size_t b = raw.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) return core::Error{};  // blank
+            const std::size_t e = raw.find_last_not_of(" \t\r\n");
+            const std::string stmt = raw.substr(b, e - b + 1);
+            const bool col = columnar_pending;
+            columnar_pending = false;
+            if (col) set_columnar_default(true);
+            const ExecResult r = exec(stmt);
+            if (col) set_columnar_default(false);
+            if (!r.ok) {
+                return core::Error{core::ErrorCode::InvalidArgument,
+                                   "sql restore: a statement in the script failed to execute"};
+            }
+            return core::Error{};
+        };
+        std::string cur;
+        bool in_str = false;
+        bool at_start = true;  // at the start of a statement (between ';' and the next real token)
+        const std::size_t n = script.size();
+        for (std::size_t i = 0; i < n;) {
+            const char ch = script[i];
+            if (!in_str && at_start && ch == '-' && i + 1 < n && script[i + 1] == '-') {
+                std::size_t j = i + 2;  // a directive / comment line — consumed, never parsed
+                std::string line;
+                while (j < n && script[j] != '\n') line.push_back(script[j++]);
+                if (line.find("lockstep:columnar") != std::string::npos) columnar_pending = true;
+                i = (j < n) ? j + 1 : j;
+                continue;
+            }
+            if (ch == '\'') {
+                if (in_str && i + 1 < n && script[i + 1] == '\'') {  // '' escaped quote inside a string
+                    cur += "''";
+                    i += 2;
+                    continue;
+                }
+                in_str = !in_str;
+                cur.push_back(ch);
+                ++i;
+                continue;
+            }
+            if (!in_str && ch == ';') {
+                if (const core::Error e = run_stmt(cur); !e.ok()) return e;
+                cur.clear();
+                at_start = true;
+                ++i;
+                continue;
+            }
+            if (!in_str && (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')) {
+                if (!cur.empty()) cur.push_back(ch);  // keep interior whitespace; ignore leading
+                ++i;
+                continue;
+            }
+            cur.push_back(ch);
+            at_start = false;
+            ++i;
+        }
+        return run_stmt(cur);  // a trailing statement with no terminating ';'
+    }
+
+    // Read a framed .sql dump from `in` and replay it (see restore_sql_string).
+    [[nodiscard]] core::Error restore_sql(core::Scheduler& in_sched, core::IDisk& in) {
+        std::string text;
+        core::Error r = core::Error{core::ErrorCode::Unknown, "sql restore: did not run"};
+        in_sched.spawn(backup_detail::read_text_stream(in, text, r));
+        in_sched.run();
+        if (!r.ok()) return r;
+        return restore_sql_string(text);
+    }
+
+private:
+    // ---- SQL-text renderers (pure, from the catalog) -------------------------------------------
+    // Quote + escape a TEXT value as a SQL string literal ('' for an embedded single quote).
+    static std::string sql_quote(const std::string& s) {
+        std::string o = "'";
+        for (char c : s) {
+            if (c == '\'') o += "''";
+            else o.push_back(c);
+        }
+        o.push_back('\'');
+        return o;
+    }
+
+    // Render a column's TYPE token. Returns false for a type the text dump cannot yet round-trip
+    // (every logical/exotic type — DECIMAL/DATE/TIMESTAMP/UUID/ENUM/ARRAY/JSON/INT128/…); the caller
+    // turns that into a clear error pointing at the binary backup.
+    static bool sql_column_type(const Column& c, std::string& out) {
+        if (c.type == Type::Int && c.logical == 0) {
+            switch (c.int_bits) {
+                case 8: out = "TINYINT"; break;
+                case 16: out = "SMALLINT"; break;
+                case 32: out = "INT32"; break;
+                default: out = "BIGINT"; break;
+            }
+            if (c.is_unsigned) out += " UNSIGNED";
+            return true;
+        }
+        if (c.type == Type::Text && c.logical == 0) {
+            if (c.max_len > 0) {
+                out = (c.fixed_char ? "CHAR(" : "VARCHAR(") + std::to_string(c.max_len) + ")";
+            } else {
+                out = "TEXT";
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // A SQL literal for one stored cell (only reached for supported, logical-0 columns).
+    static std::string sql_literal(const Datum& d) {
+        if (d.is_null) return "NULL";
+        if (d.type == Type::Int) return std::to_string(d.i);
+        return sql_quote(d.s);
+    }
+
+    [[nodiscard]] core::Error sql_render_create_table(const Table& t, std::string& out) {
+        out = "CREATE TABLE " + t.name + " (";
+        bool first = true;
+        for (const Column& c : t.columns) {
+            if (c.dropped) continue;  // a logically-dropped column is gone after a fresh rebuild
+            std::string ty;
+            if (!sql_column_type(c, ty)) {
+                return core::Error{core::ErrorCode::InvalidArgument,
+                                   "sql dump: a column type cannot be round-tripped by the SQL-text "
+                                   "dump yet; use the binary backup() for this database"};
+            }
+            if (!first) out += ", ";
+            first = false;
+            out += c.name + " " + ty;
+            if (!c.nullable) out += " NOT NULL";
+            if (c.auto_increment) out += " AUTO_INCREMENT";
+            if (c.unique) out += " UNIQUE";
+            if (c.has_default) {
+                out += " DEFAULT " + (c.type == Type::Int ? std::to_string(c.default_i)
+                                                          : sql_quote(c.default_s));
+            }
+            if (!c.fk_table.empty()) {
+                out += " REFERENCES " + c.fk_table;
+                if (!c.fk_column.empty()) out += "(" + c.fk_column + ")";
+            }
+        }
+        for (const std::string& chk : t.checks) out += ", CHECK (" + chk + ")";
+        out += ", PRIMARY KEY (";
+        if (t.pk_columns.empty()) {
+            out += t.columns[t.pk_index].name;  // back-compat (recovered single-col PK)
+        } else {
+            for (std::size_t k = 0; k < t.pk_columns.size(); ++k) {
+                if (k != 0) out += ", ";
+                out += t.columns[t.pk_columns[k]].name;
+            }
+        }
+        out += "));";
+        return core::Error{};
+    }
+
+    [[nodiscard]] std::string sql_render_create_index(const Table& t, const Index& ix) {
+        std::string o = "CREATE ";
+        if (ix.unique) o += "UNIQUE ";
+        o += "INDEX " + ix.name + " ON " + t.name + " (";
+        if (!ix.expr_src.empty()) {
+            o += "(" + ix.expr_src + ")";  // expression index: ON t ((expr))
+        } else if (!ix.columns.empty()) {
+            for (std::size_t k = 0; k < ix.columns.size(); ++k) {
+                if (k != 0) o += ", ";
+                o += t.columns[ix.columns[k]].name;
+            }
+        } else {
+            o += t.columns[ix.column].name;
+        }
+        o += ")";
+        if (ix.gin) o += " USING GIN";
+        else if (ix.hash) o += " USING HASH";
+        if (!ix.partial_src.empty()) o += " WHERE " + ix.partial_src;
+        o += ";";
+        return o;
+    }
+
+    [[nodiscard]] core::Error sql_render_inserts(const Table& t, std::string& out) {
+        std::string collist;
+        std::string sel = "SELECT ";
+        bool first = true;
+        for (const Column& c : t.columns) {
+            if (c.dropped) continue;
+            std::string ty;
+            if (!sql_column_type(c, ty)) {
+                return core::Error{core::ErrorCode::InvalidArgument,
+                                   "sql dump: a column type cannot be round-tripped by the SQL-text "
+                                   "dump yet; use the binary backup() for this database"};
+            }
+            if (!first) {
+                collist += ", ";
+                sel += ", ";
+            }
+            first = false;
+            collist += c.name;
+            sel += c.name;
+        }
+        sel += " FROM " + t.name;
+        const ExecResult r = exec(sel);
+        if (!r.ok) {
+            return core::Error{core::ErrorCode::Unknown, "sql dump: reading a table's rows failed"};
+        }
+        for (const ResultRow& row : r.rows) {
+            out += "INSERT INTO " + t.name + " (" + collist + ") VALUES (";
+            for (std::size_t k = 0; k < row.cells.size(); ++k) {
+                if (k != 0) out += ", ";
+                out += sql_literal(row.cells[k].second);
+            }
+            out += ");\n";
+        }
+        return core::Error{};
+    }
+
+    // Tables in FOREIGN-KEY dependency order (a referenced parent before its children), so the
+    // replayed CREATE/INSERT never references a table/row that does not exist yet. A self-reference or
+    // a cycle (rare) falls back to catalog order for the unresolved remainder.
+    [[nodiscard]] std::vector<const Table*> sql_table_order() {
+        const std::map<std::string, Table>& tabs = catalog_.all();
+        std::map<std::string, int> indeg;
+        for (const auto& [nm, t] : tabs) indeg[nm] = 0;
+        for (const auto& [nm, t] : tabs) {
+            for (const Column& c : t.columns) {
+                if (!c.fk_table.empty() && c.fk_table != nm && tabs.count(c.fk_table) != 0) {
+                    indeg[nm] += 1;  // nm depends on its parent c.fk_table
+                }
+            }
+        }
+        std::vector<const Table*> order;
+        std::set<std::string> done;
+        bool progress = true;
+        while (order.size() < tabs.size() && progress) {
+            progress = false;
+            for (const auto& [nm, t] : tabs) {
+                if (done.count(nm) != 0 || indeg[nm] != 0) continue;
+                order.push_back(&t);
+                done.insert(nm);
+                progress = true;
+                for (const auto& [cnm, ct] : tabs) {  // relax children of nm
+                    if (done.count(cnm) != 0) continue;
+                    for (const Column& c : ct.columns) {
+                        if (c.fk_table == nm && cnm != nm) indeg[cnm] -= 1;
+                    }
+                }
+            }
+        }
+        for (const auto& [nm, t] : tabs) {  // any cyclic remainder, catalog order
+            if (done.count(nm) == 0) order.push_back(&t);
+        }
+        return order;
+    }
+
+public:
     // ---- Catalog persistence (C7) — schema records under the reserved 0x01 key namespace ----
     static void cat_put_u32(std::string& o, std::uint32_t v) {
         o.push_back(static_cast<char>(v >> 24));
