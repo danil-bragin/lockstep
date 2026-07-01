@@ -58,11 +58,40 @@ const char* op_name(std::uint8_t type) {
     }
 }
 
+// Read an existing file's bytes through ProdDisk (create=false — never create). Returns
+// false (and leaves `image` empty) if the file is absent or unreadable.
+bool read_file(const std::string& path, std::vector<std::byte>& image) {
+    Scheduler sched;
+    ProdDisk disk(sched, path, /*dir_fd=*/-1, /*create=*/false);
+    if (!disk.valid()) return false;
+    Error rd{lockstep::core::ErrorCode::Unknown, "norun"};
+    sched.spawn(read_all(disk, disk.logical_len(), image, rd));
+    sched.run();
+    return rd.ok();
+}
+
+// Verify one known file if present; print its verdict; bump the counters. Absent = skip.
+void scrub_one(const std::string& path, int& present, int& corrupt) {
+    std::vector<std::byte> image;
+    if (!read_file(path, image)) return;  // not present in this data dir — skip.
+    ++present;
+    const st::VerifyResult vr = st::verify_image(image);
+    if (vr.error.ok()) {
+        std::printf("  OK       %-40s (%s, %llu bytes)\n", path.c_str(), st::format_name(vr.format),
+                    static_cast<unsigned long long>(vr.total_len));
+    } else {
+        ++corrupt;
+        std::printf("  CORRUPT  %-40s (%s) — %s\n", path.c_str(), st::format_name(vr.format),
+                    vr.error.detail.empty() ? "integrity check failed" : std::string(vr.error.detail).c_str());
+    }
+}
+
 int usage() {
-    std::printf("usage: lockstep_recover <verify|dump|force-truncate> <file> [--force]\n"
-                "  verify          integrity verdict (exit 0 clean / 1 corrupt / 2 error)\n"
+    std::printf("usage: lockstep_recover <verify|dump|force-truncate|scrub> <file|data-dir> [--force]\n"
+                "  verify          integrity verdict for one file (exit 0 clean / 1 corrupt / 2 error)\n"
                 "  dump            print each WAL record up to the consistent-prefix boundary\n"
-                "  force-truncate  cut a torn WAL back to its consistent prefix (needs --force)\n");
+                "  force-truncate  cut a torn WAL back to its consistent prefix (needs --force)\n"
+                "  scrub           verify every known durable file under a data dir (exit 0 all-clean / 1 any-corrupt)\n");
     return 2;
 }
 }  // namespace
@@ -85,7 +114,29 @@ int main(int argc, char** argv) {
         }
     }
     if (cmd.empty() || path.empty()) return usage();
-    if (cmd != "verify" && cmd != "dump" && cmd != "force-truncate") return usage();
+    if (cmd != "verify" && cmd != "dump" && cmd != "force-truncate" && cmd != "scrub") return usage();
+
+    // scrub <data-dir>: verify every KNOWN durable file (fixed names — no directory
+    // listing, so no raw dir IO) under the data dir and its shard_<i> subdirs. Absent
+    // files are skipped. Read-only: reports corruption but never truncates (run
+    // force-truncate on the named file to recover it).
+    if (cmd == "scrub") {
+        static const char* kNames[] = {"lockstepd.wal", "lockstepd-sql.wal",
+                                       "lockstepd-sql-catalog.wal", "consensus.wal"};
+        int present = 0, corrupt = 0;
+        std::printf("scrub: %s\n", path.c_str());
+        for (const char* n : kNames) scrub_one(path + "/" + n, present, corrupt);
+        for (int s = 0; s < 64; ++s) {  // probe shard_<i> subdirs (multi-shard daemon layout)
+            const std::string sd = path + "/shard_" + std::to_string(s);
+            for (const char* n : kNames) scrub_one(sd + "/" + n, present, corrupt);
+        }
+        if (present == 0) {
+            std::printf("scrub: no known Lockstep files found under '%s'\n", path.c_str());
+            return 2;
+        }
+        std::printf("scrub: %d file(s) checked, %d corrupt\n", present, corrupt);
+        return corrupt > 0 ? 1 : 0;
+    }
 
     Scheduler sched;
     ProdDisk disk(sched, path, /*dir_fd=*/-1, /*create=*/false);  // inspect existing file; never create.

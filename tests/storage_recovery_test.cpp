@@ -6,7 +6,9 @@
 // across WAL / backup / PITR / unknown; and the integrity verdict for a good vs corrupt
 // backup and PITR archive. Pure over byte images — runs everywhere.
 #include <cstdio>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <lockstep/core/Scheduler.hpp>
@@ -52,6 +54,32 @@ DiskFaultConfig nofault() {
     return dc;
 }
 std::span<const std::byte> sp(const std::vector<std::byte>& v) { return {v.data(), v.size()}; }
+
+using lockstep::storage::IDiskFactory;
+// A SimDisk-backed factory that mints one disk per id and lets the test grab the
+// FIRST SSTable-range disk (id < kDefaultVlogBaseId) to inspect the flushed image.
+class SimFactory final : public IDiskFactory {
+public:
+    SimFactory(Scheduler& s, SimClock& c, SeededRandom& r, DiskFaultConfig cfg)
+        : sched_(&s), clock_(&c), rng_(&r), cfg_(cfg) {}
+    [[nodiscard]] lockstep::core::IDisk& disk_for(std::uint64_t id) override {
+        for (auto& e : disks_)
+            if (e.first == id) return *e.second;
+        disks_.emplace_back(id, std::make_unique<SimDisk>(*sched_, *clock_, *rng_, cfg_));
+        return *disks_.back().second;
+    }
+    [[nodiscard]] SimDisk* sstable_disk() {
+        for (auto& e : disks_)
+            if (e.first < WalEngine::kDefaultVlogBaseId) return e.second.get();
+        return nullptr;
+    }
+private:
+    Scheduler* sched_;
+    SimClock* clock_;
+    SeededRandom* rng_;
+    DiskFaultConfig cfg_;
+    std::vector<std::pair<std::uint64_t, std::unique_ptr<SimDisk>>> disks_;
+};
 
 Task load(Engine& e) {
     for (int i = 0; i < 8; ++i) (void)co_await e.put("k" + std::to_string(i), "v" + std::to_string(i));
@@ -187,8 +215,49 @@ int main() {
         check(e2.last_seq() == committed, "recovered tip Seq == committed (no committed op lost)");
     }
 
+    // (6) SSTable + manifest: recognise + verify REAL flushed files, and catch a
+    //     corrupt one. Run an LSM engine with a tiny flush threshold so it flushes.
+    {
+        SimDisk wal(sched, clock, rng, dc), man(sched, clock, rng, dc);
+        SimFactory fac(sched, clock, rng, dc);
+        WalEngine lsm(sched, wal, man, fac, /*flush_threshold=*/4);
+        sched.spawn([](Engine& en) -> Task {
+            for (int i = 0; i < 40; ++i)
+                (void)co_await en.put("s" + std::to_string(i), "d" + std::to_string(i));
+            (void)co_await en.sync();
+            co_return;
+        }(lsm));
+        sched.run();
+        check(lsm.sstable_count() > 0, "flush produced at least one SSTable");
+
+        // manifest
+        const std::vector<std::byte> mimg = man.durable_snapshot();
+        check(detect_format(sp(mimg)) == FileFormat::Manifest, "manifest recognised by magic");
+        check(verify_image(mimg).error.ok(), "verify: good manifest ok");
+        {
+            std::vector<std::byte> bad = mimg;
+            check(bad.size() > 8, "manifest has content");
+            bad[8] ^= std::byte{0x40};  // flip inside the first record -> CRC/contiguity boundary at 0
+            const auto vr = verify_image(bad);
+            check(!vr.error.ok() && vr.valid_prefix_len < mimg.size(),
+                  "verify: corrupt manifest flagged with a shorter recoverable prefix");
+        }
+
+        // SSTable
+        SimDisk* sst = fac.sstable_disk();
+        check(sst != nullptr, "an SSTable backing disk exists");
+        const std::vector<std::byte> simg = sst->durable_snapshot();
+        check(detect_format(sp(simg)) == FileFormat::SSTable, "SSTable recognised by footer magic");
+        check(verify_image(simg).error.ok(), "verify: good SSTable ok");
+        {
+            std::vector<std::byte> bad = simg;
+            bad[simg.size() / 3] ^= std::byte{0x11};  // corrupt a data/index block
+            check(!verify_image(bad).error.ok(), "verify: corrupt SSTable rejected (block/footer CRC)");
+        }
+    }
+
     if (g_fail) { std::printf("storage_recovery_test: FAILED\n"); return 1; }
     std::printf("storage_recovery_test: OK (detect + WAL prefix walk + torn/flip boundary + "
-                "backup/PITR verdict + force-truncate safety proof)\n");
+                "backup/PITR/manifest/SSTable verdict + force-truncate safety proof)\n");
     return 0;
 }

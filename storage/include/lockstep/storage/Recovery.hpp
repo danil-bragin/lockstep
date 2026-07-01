@@ -26,28 +26,61 @@
 
 namespace lockstep::storage {
 
-// The recognised on-disk formats (by magic). Unknown = not a Lockstep file (or a
-// format this tool does not yet decode, e.g. an SSTable / manifest — increment 2).
-enum class FileFormat : std::uint8_t { Unknown, Wal, Backup, PitrArchive };
+// The recognised on-disk formats (by magic). Unknown = not a Lockstep file.
+enum class FileFormat : std::uint8_t { Unknown, Wal, Backup, PitrArchive, Manifest, SSTable };
 
 [[nodiscard]] inline const char* format_name(FileFormat f) noexcept {
     switch (f) {
         case FileFormat::Wal: return "WAL";
         case FileFormat::Backup: return "backup";
         case FileFormat::PitrArchive: return "PITR-archive";
+        case FileFormat::Manifest: return "manifest";
+        case FileFormat::SSTable: return "SSTable";
         case FileFormat::Unknown: return "unknown";
     }
     return "unknown";
 }
 
-// Recognise a file by its leading magic. WAL frames its magic as a u32 (get_u32),
-// while the backup / PITR headers write their magic as literal ASCII — match each the
-// way it is written so there is no endianness ambiguity.
+// Recognise a file by its magic. WAL / manifest frame their magic as a u32 (get_u32)
+// at the FRONT; an SSTable's magic lives in its 48-byte FOOTER (u32 at len-8); the
+// backup / PITR headers write their magic as literal ASCII — match each the way it is
+// written so there is no endianness ambiguity.
 [[nodiscard]] inline FileFormat detect_format(std::span<const std::byte> image) {
     if (image.size() >= 4 && get_u32(image.data()) == kWalMagic) return FileFormat::Wal;
+    if (image.size() >= 4 && get_u32(image.data()) == kManMagic) return FileFormat::Manifest;
     if (image.size() >= kBackupHeaderBytes && detail::backup_magic_ok(image.data())) return FileFormat::Backup;
     if (image.size() >= kPitrHeaderBytes && detail::pitr_magic_ok(image.data())) return FileFormat::PitrArchive;
+    if (image.size() >= 48 && get_u32(image.data() + image.size() - 8) == kSstMagic) return FileFormat::SSTable;
     return FileFormat::Unknown;
+}
+
+// The result of walking a manifest image to its install-prefix boundary (mirrors a
+// WAL: per-record CRC + entry_no Seq-contiguity, stop-at-first-corrupt — a torn tail
+// is recoverable to the prefix, exactly as recover_lsm folds it).
+struct ManifestInspection {
+    std::size_t records = 0;
+    std::size_t valid_prefix_len = 0;
+    std::size_t total_len = 0;
+    bool clean = false;
+    std::uint64_t max_entry_no = 0;
+};
+
+[[nodiscard]] inline ManifestInspection inspect_manifest(const std::vector<std::byte>& image) {
+    ManifestInspection ins;
+    ins.total_len = image.size();
+    std::size_t pos = 0;
+    std::uint64_t expect = 1;  // entry_no is 1,2,3,… contiguous across every record kind.
+    while (pos < image.size()) {
+        const ManifestDecode d = decode_manifest(image, pos);
+        if (!d.ok || d.record.entry_no != expect) break;  // corrupt/torn OR a gap — boundary.
+        ++ins.records;
+        ins.max_entry_no = d.record.entry_no;
+        pos += d.consumed;
+        ++expect;
+    }
+    ins.valid_prefix_len = pos;
+    ins.clean = (pos == image.size());
+    return ins;
 }
 
 // One decoded WAL record's summary (no value bytes — a diagnostic, not a dump of data).
@@ -138,6 +171,25 @@ struct VerifyResult {
             r.error = validate_pitr_archive(std::span<const std::byte>(image.data(), image.size()));
             r.valid_prefix_len = r.error.ok() ? image.size() : 0;
             break;
+        case FileFormat::Manifest: {
+            const ManifestInspection mi = inspect_manifest(image);
+            r.valid_prefix_len = mi.valid_prefix_len;
+            r.error = mi.clean
+                          ? core::Error{}
+                          : core::Error{core::ErrorCode::Corruption,
+                                        "manifest: torn/garbage tail after the install prefix "
+                                        "(recoverable — folds to valid_prefix_len)"};
+            break;
+        }
+        case FileFormat::SSTable: {
+            SSTableReader rdr;
+            const bool good = SSTableLoader::parse(image, /*sstable_id=*/0, rdr);
+            r.error = good ? core::Error{}
+                           : core::Error{core::ErrorCode::Corruption,
+                                         "sstable: footer / index / block CRC failed (corrupt SSTable)"};
+            r.valid_prefix_len = good ? image.size() : 0;
+            break;
+        }
         case FileFormat::Unknown:
             r.error = core::Error{core::ErrorCode::InvalidArgument,
                                   "unrecognised file (not a Lockstep WAL / backup / PITR archive)"};
