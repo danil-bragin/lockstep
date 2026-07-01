@@ -390,6 +390,18 @@ if(TARGET lockstep_storage AND TARGET lockstep_runtime
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME storage_state_hash_test COMMAND lockstep_storage_state_hash_test)
+  # storage_bulk_corruption_test: P6 — catastrophic bulk-region + whole-segment loss across
+  # every durable format; the recovery stack rejects-or-recovers-a-prefix, never fabricates.
+  add_executable(lockstep_storage_bulk_corruption_test storage_bulk_corruption_test.cpp)
+  target_include_directories(lockstep_storage_bulk_corruption_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_bulk_corruption_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_bulk_corruption_test COMMAND lockstep_storage_bulk_corruption_test)
 else()
   message(WARNING
     "lockstep_storage / runtime / providers_sim not all found; "

@@ -267,6 +267,24 @@ public:
               " rotted=" + std::to_string(rotted_count()));
     }
 
+    // BULK-REGION CORRUPTION (plan P6): flip every durable byte in [off, off+len) —
+    // a CONTIGUOUS media fault (a bad sector / partial platter loss), where the
+    // per-op bit-rot models a single flipped byte. A test-injection seam only (like
+    // crash()); never on the IO path. Clamped to the durable image.
+    void corrupt_region(std::size_t off, std::size_t len) {
+        for (std::size_t i = off; i < off + len && i < durable_.size(); ++i) {
+            durable_[i] = static_cast<std::byte>(std::to_integer<unsigned>(durable_[i]) ^ 0xFFu);
+        }
+    }
+    // WHOLE-SEGMENT / TAIL LOSS (plan P6): drop the durable bytes at/after `keep`
+    // (a truncated file / lost trailing region). Recovery must yield a consistent
+    // prefix, never a fabricated value.
+    void truncate_durable(std::size_t keep) {
+        if (keep < durable_.size()) {
+            durable_.resize(keep);
+        }
+    }
+
     // ---- introspection (tests / checkers; never used for ordering) --------
 
     [[nodiscard]] std::size_t durable_len() const noexcept { return durable_.size(); }
