@@ -527,6 +527,25 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME consensus_harness_test COMMAND lockstep_consensus_harness_test)
 
+  # --- P3: apply-seam + cross-replica keyspace hash over a REAL Raft cluster ----
+  # A fault-storm run commits KEYED ops; each replica applies its committed prefix
+  # into a WalEngine state machine; keyspace_hash is cross-checked at a common index
+  # (clean agree; a bit-rotted applied store is detected though the log still agrees).
+  # Links storage (WalEngine / KeyedOp / StateHash) in addition to consensus.
+  if(TARGET lockstep_storage AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_state_hash_test.cpp")
+    add_executable(lockstep_consensus_state_hash_test consensus_state_hash_test.cpp)
+    target_include_directories(lockstep_consensus_state_hash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_state_hash_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_state_hash_test COMMAND lockstep_consensus_state_hash_test)
+  endif()
+
   # --- Phase 4 Stage I: DUAL independent Raft implementations (pre-wired) ------
   # impl A and impl B are authored by TWO different agents against the same seam
   # + verified spec; targets pre-registered here so neither agent edits this file.

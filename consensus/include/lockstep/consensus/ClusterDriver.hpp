@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -102,6 +103,14 @@ struct ClusterConfig {
     // are driven mid-run by the leader (commit-before-next-paced) when > 0.
     std::uint64_t init_config_size = 0;   // 0 ⇒ = n_nodes (fixed membership)
     std::uint64_t membership_changes = 0;  // single-server changes to drive (0 = none)
+
+    // OPTIONAL submit-value generator. When UNSET (the default), the client driver
+    // builds its usual unique string "c<cid>_v<i>_op<opid>" — every existing run is
+    // BYTE-IDENTICAL. A test may set this to submit STRUCTURED payloads (e.g.
+    // encoded keyed ops) so the committed log applies to a real state machine; the
+    // value is still opaque to consensus (the linearizability tracking compares
+    // whatever bytes were submitted). Must be a pure function of its args (no clock).
+    std::function<std::string(std::uint64_t client_id, std::uint64_t i, std::uint64_t op_id)> value_fn;
 };
 
 namespace detail {
@@ -228,8 +237,10 @@ inline Task client_driver(ClusterRunState* st, const ClusterConfig* cfg,
         SubmitObservation obs;
         obs.op_id = st->next_op_id++;
         obs.client_id = client_id;
-        obs.value = "c" + std::to_string(client_id) + "_v" + std::to_string(i) +
-                    "_op" + std::to_string(obs.op_id);
+        obs.value = cfg->value_fn
+                        ? cfg->value_fn(client_id, i, obs.op_id)
+                        : ("c" + std::to_string(client_id) + "_v" + std::to_string(i) +
+                           "_op" + std::to_string(obs.op_id));
         obs.invoke_vt = st->clock.now();
 
         if (li != UINT64_MAX) {
