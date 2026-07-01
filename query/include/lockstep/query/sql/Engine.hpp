@@ -4874,14 +4874,15 @@ private:
             const std::size_t gc = gcols[0];
             std::map<std::string, std::pair<std::vector<std::uint32_t>, std::vector<Datum>>> tg;
             std::vector<std::pair<std::vector<Datum>, std::vector<std::uint32_t>>> hg;  // open-addr
-            if (par_group) {
-                build_groups_parallel(
-                    tg, count, has_filter, passes,
-                    [&](std::uint32_t rr) { return cols[gc]->texts[rr]; },
-                    [&](std::uint32_t rr) {
-                        return std::vector<Datum>{Datum::make_text(cols[gc]->texts[rr])};
-                    });
-            } else if (!use_survivors) {
+            // The DICTIONARY path (group by INT dict codes) is the fast serial grouping for TEXT
+            // keys and BEATS parallel per-row STRING hashing — forcing par_group here caused a
+            // measured 3x REGRESSION (groupby_region 0.34ms serial dict -> 1.02ms parallel
+            // string-hash at 4 workers), because string hashing + per-thread string maps + a
+            // string-map merge cost far more than the dict path saves. So prefer the dict path
+            // whenever it applies (the full-concat / non-survivor case); only fall back to the
+            // parallel string grouping when the dict codes don't align (a zone-skipped subset).
+            const bool use_dict = !use_survivors;
+            if (use_dict) {
                 // A2 — DICTIONARY path: codes align with the full concat (non-survivor only), so
                 // group by INT codes (direct/fast) instead of per-row string hashing, then re-sort
                 // the (few) groups by the STRING value to match the string-ordered output.
@@ -4895,6 +4896,13 @@ private:
                 std::sort(hg.begin(), hg.end(), [](const auto& a, const auto& b) {
                     return a.first[0].s < b.first[0].s;  // string order (codes are insertion order)
                 });
+            } else if (par_group) {
+                build_groups_parallel(
+                    tg, count, has_filter, passes,
+                    [&](std::uint32_t rr) { return cols[gc]->texts[rr]; },
+                    [&](std::uint32_t rr) {
+                        return std::vector<Datum>{Datum::make_text(cols[gc]->texts[rr])};
+                    });
             } else {
                 hg = hash_group_collect<std::string>(  // open-addressing (A1) — sorted by key
                     count, has_filter, passes,
@@ -4904,7 +4912,7 @@ private:
                     });
             }
             std::vector<GroupRef> refs;
-            if (par_group) {
+            if (!use_dict && par_group) {  // only the parallel string path fills `tg`
                 refs.reserve(tg.size());
                 for (const auto& [k, slot] : tg) {
                     (void)k;

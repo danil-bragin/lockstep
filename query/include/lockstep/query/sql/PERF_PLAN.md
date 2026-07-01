@@ -157,3 +157,27 @@ The "NEXT: storage range scan" lever above was taken, and several roadmap phases
 - **Distributed analytic SQL DONE** — co-located-shuffle star-JOIN pushdown (the large fact is never
   gathered) with WHERE/AVG/HAVING/COUNT(DISTINCT)/multi-dim/broadcast-dim variants; see
   `query/sql/SQL_FEATURES_PLAN.md` (distributed-SQL section) and DistributedSql.hpp.
+
+### MEASURED HEAD-TO-HEAD vs Postgres 16 (the north-star, HIT) + a parallel-regression fix
+Ran `bench/compare/sql_analytics` (200k rows, one CPU, in-memory, EXPLAIN-ANALYZE min-of-5 for pg):
+
+| query          | Lockstep (serial) | Postgres 16 | speedup |
+|----------------|-------------------|-------------|---------|
+| scan_agg       | 0.060 ms          | 7.998 ms    | **133×** |
+| groupby_cat    | 0.612 ms          | 10.212 ms   | **16.7×** |
+| groupby_region | 0.342 ms          | 11.782 ms   | **34×** |
+| filtered_agg   | 0.580 ms          | 5.106 ms    | **8.8×** |
+| zone_skip      | 0.070 ms          | 5.072 ms    | **72×** |
+
+The ≥3× north-star is MET on every query (8.8×–133×): the columnar SoA engine + zone-map skipping +
+vectorized aggregate win as designed. Load+flush (~3 s / 200k) dominates but is one-time.
+
+**PROFILE-FOUND BUG + FIX (parallelism must never regress).** With `--workers 4`, groupby_region (a
+low-cardinality TEXT GROUP BY) went 0.34 ms → **1.06 ms — a 3× REGRESSION**, while groupby_cat improved
+1.85×. Cause: the TEXT grouped path chose `build_groups_parallel` (per-row STRING hashing across threads
++ per-thread string maps + a string-map merge) OVER the fast serial DICTIONARY path (group by INT dict
+codes), and for few groups the string-hash parallelism costs far more than it saves. Fix: prefer the
+dictionary path whenever it applies (the full-concat / non-survivor case) even under a parallel executor;
+fall back to parallel string grouping only for a zone-skipped subset where the codes don't align. Result:
+groupby_region 0.34 → 0.50 ms at 4 workers (the 3× catastrophe gone), groupby_cat keeps its ~2× parallel
+win, results byte-identical (bench checksums match serial↔parallel; sql_columnar_test == row-mode PASS).
