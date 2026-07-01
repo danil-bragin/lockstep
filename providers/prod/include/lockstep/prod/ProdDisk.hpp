@@ -101,9 +101,13 @@ public:
     // `dir_fd` (optional, >=0) is an OPEN descriptor on the containing directory;
     // when provided AND this open created the file, the first sync() fsyncs it so
     // the new dirent is durable. Pass -1 to skip the dir-fsync (e.g. reopen).
-    ProdDisk(core::Scheduler& sched, const std::string& path, int dir_fd = -1) noexcept
+    // `create` (default true) opens O_RDWR|O_CREAT — the normal device behaviour. Pass
+    // false for OFFLINE INSPECTION of an existing file (O_RDWR, no O_CREAT): a missing
+    // path then fails open (valid()==false) instead of silently creating an empty file —
+    // exactly what a read-only diagnostic tool wants.
+    ProdDisk(core::Scheduler& sched, const std::string& path, int dir_fd = -1, bool create = true) noexcept
         : sink_(&sched), dir_fd_(dir_fd) {
-        open_file(path);
+        open_file(path, create);
     }
 
 #ifdef __linux__
@@ -116,7 +120,7 @@ public:
     // transparently falls back to a synchronous fdatasync: correctness is identical.
     ProdDisk(ProdReactor& reactor, const std::string& path, int dir_fd = -1) noexcept
         : sink_(&reactor), reactor_(&reactor), dir_fd_(dir_fd) {
-        open_file(path);
+        open_file(path, /*create=*/true);
     }
 #endif
 
@@ -141,6 +145,27 @@ public:
     // The logical end-of-device (durable + buffered bytes). Append-structured, so
     // the next append lands exactly here. Introspection only.
     [[nodiscard]] std::uint64_t logical_len() const noexcept { return len_; }
+
+    // OFFLINE RECOVERY ONLY (operator toolkit — lockstep_recover force-truncate).
+    // Truncate the file to `new_len` bytes, discarding everything above it, and fsync so
+    // the cut is durable. Used to trim a torn WAL back to its consistent-prefix boundary
+    // so the engine opens. DESTRUCTIVE, but the dropped suffix is by definition a torn /
+    // uncommitted tail (never a committed prefix — recovery would discard it anyway). Off
+    // the durability hot path: a plain synchronous ftruncate + fsync. Refuses to GROW the
+    // file (new_len > len_) or run on a bad fd. Returns false on any error.
+    [[nodiscard]] bool truncate_to(std::uint64_t new_len) noexcept {
+        if (fd_ < 0 || new_len > len_) {
+            return false;
+        }
+        if (::ftruncate(fd_, static_cast<off_t>(new_len)) != 0) {
+            return false;
+        }
+        if (::fsync(fd_) != 0) {
+            return false;
+        }
+        len_ = new_len;
+        return true;
+    }
 
     // ---- S8.5 PROFILING counters (introspection only; off the durability path) --
     // Single-threaded reactor owns this disk, so plain (non-atomic) counters are
@@ -332,9 +357,10 @@ private:
 
     // Shared open path for both ctors. O_CREAT|O_RDWR: append-structured but we pwrite
     // at an explicit offset (no O_APPEND). Adopts the current size as the logical end.
-    void open_file(const std::string& path) noexcept {
+    void open_file(const std::string& path, bool create) noexcept {
         const bool existed = (::access(path.c_str(), F_OK) == 0);
-        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+        const int flags = create ? (O_RDWR | O_CREAT) : O_RDWR;
+        fd_ = ::open(path.c_str(), flags, 0644);
         if (fd_ < 0) {
             open_errno_ = errno;
             return;

@@ -59,21 +59,38 @@ const char* op_name(std::uint8_t type) {
 }
 
 int usage() {
-    std::printf("usage: lockstep_recover <verify|dump> <file>\n");
+    std::printf("usage: lockstep_recover <verify|dump|force-truncate> <file> [--force]\n"
+                "  verify          integrity verdict (exit 0 clean / 1 corrupt / 2 error)\n"
+                "  dump            print each WAL record up to the consistent-prefix boundary\n"
+                "  force-truncate  cut a torn WAL back to its consistent prefix (needs --force)\n");
     return 2;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) return usage();
-    const std::string cmd = argv[1];
-    const std::string path = argv[2];
-    if (cmd != "verify" && cmd != "dump") return usage();
+    // Parse: <cmd> <file> plus an optional --force flag in any position.
+    std::string cmd;
+    std::string path;
+    bool force = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--force") {
+            force = true;
+        } else if (cmd.empty()) {
+            cmd = a;
+        } else if (path.empty()) {
+            path = a;
+        } else {
+            return usage();
+        }
+    }
+    if (cmd.empty() || path.empty()) return usage();
+    if (cmd != "verify" && cmd != "dump" && cmd != "force-truncate") return usage();
 
     Scheduler sched;
-    ProdDisk disk(sched, path);
+    ProdDisk disk(sched, path, /*dir_fd=*/-1, /*create=*/false);  // inspect existing file; never create.
     if (!disk.valid()) {
-        std::printf("error: cannot open '%s' (errno=%d)\n", path.c_str(), disk.open_errno());
+        std::printf("error: cannot open '%s' (errno=%d — file not found?)\n", path.c_str(), disk.open_errno());
         return 2;
     }
     const std::uint64_t len = disk.logical_len();
@@ -110,6 +127,42 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(ins.total_len),
                     ins.clean ? " (clean)" : "  <-- TORN/GARBAGE TAIL");
         return ins.clean ? 0 : 1;
+    }
+
+    if (cmd == "force-truncate") {
+        if (fmt != st::FileFormat::Wal) {
+            std::printf("force-truncate: only applies to WAL files (this is a %s file)\n",
+                        st::format_name(fmt));
+            return 2;
+        }
+        const st::WalInspection ins = st::inspect_wal(image);
+        if (ins.clean) {
+            std::printf("force-truncate: '%s' is already clean (%llu bytes, %llu records) — nothing to do\n",
+                        path.c_str(), static_cast<unsigned long long>(ins.total_len),
+                        static_cast<unsigned long long>(ins.records.size()));
+            return 0;
+        }
+        const std::uint64_t drop = ins.total_len - ins.valid_prefix_len;
+        if (!force) {
+            std::printf("force-truncate: '%s' has a torn/garbage tail.\n"
+                        "  WOULD keep the %llu-byte consistent prefix (%llu record(s), up to seq %llu)\n"
+                        "  WOULD drop %llu tail byte(s) (a torn/uncommitted suffix).\n"
+                        "Re-run with --force to apply (DESTRUCTIVE — the dropped bytes are gone).\n",
+                        path.c_str(), static_cast<unsigned long long>(ins.valid_prefix_len),
+                        static_cast<unsigned long long>(ins.records.size()),
+                        static_cast<unsigned long long>(ins.max_seq),
+                        static_cast<unsigned long long>(drop));
+            return 3;  // refused — needs --force.
+        }
+        if (!disk.truncate_to(ins.valid_prefix_len)) {
+            std::printf("force-truncate: FAILED to truncate '%s'\n", path.c_str());
+            return 2;
+        }
+        std::printf("force-truncate: '%s' truncated to %llu bytes (dropped %llu tail byte(s)); "
+                    "the WAL now opens to its consistent prefix (up to seq %llu).\n",
+                    path.c_str(), static_cast<unsigned long long>(ins.valid_prefix_len),
+                    static_cast<unsigned long long>(drop), static_cast<unsigned long long>(ins.max_seq));
+        return 0;
     }
 
     // verify

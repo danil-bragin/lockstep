@@ -18,6 +18,8 @@
 #include <lockstep/storage/WalEngine.hpp>
 
 using lockstep::core::Error;
+using lockstep::core::IDisk;
+using lockstep::core::Offset;
 using lockstep::core::Scheduler;
 using lockstep::core::SimClock;
 using lockstep::core::Task;
@@ -29,6 +31,9 @@ using lockstep::storage::detect_format;
 using lockstep::storage::Engine;
 using lockstep::storage::FileFormat;
 using lockstep::storage::inspect_wal;
+using lockstep::storage::KeyValue;
+using lockstep::storage::Range;
+using lockstep::storage::Seq;
 using lockstep::storage::Snapshot;
 using lockstep::storage::verify_image;
 using lockstep::storage::WalInspection;
@@ -53,6 +58,26 @@ Task load(Engine& e) {
     (void)co_await e.del("k3");           // a tombstone (type 1)
     (void)co_await e.put("k0", "v0-new");  // an update
     (void)co_await e.sync();
+    co_return;
+}
+Task scan_committed(Engine& e, Seq at, std::vector<KeyValue>& out) {
+    Range full;
+    full.hi_unbounded = true;
+    out = co_await e.scan(full, Snapshot{at});
+    co_return;
+}
+Task seed(IDisk& d, std::vector<std::byte> bytes, Error& res) {
+    Offset off = 0;
+    res = co_await d.append(std::span<const std::byte>(bytes.data(), bytes.size()), off);
+    if (res.ok()) res = co_await d.sync();
+    co_return;
+}
+Task recover_scan(WalEngine& en, std::size_t len, std::vector<KeyValue>& out, bool& ok) {
+    const Error e = co_await en.recover(len);
+    ok = e.ok();
+    Range full;
+    full.hi_unbounded = true;
+    out = co_await en.scan(full, Snapshot{en.last_seq()});
     co_return;
 }
 }  // namespace
@@ -131,7 +156,39 @@ int main() {
         check(detect_format(sp(empty)) == FileFormat::Unknown, "empty file -> unknown");
     }
 
+    // (5) FORCE-TRUNCATE SAFETY PROOF: a torn WAL truncated to its consistent-prefix
+    //     boundary recovers to EXACTLY the committed state — never loses a committed op,
+    //     never fabricates a value. This is the guarantee behind the destructive
+    //     `force-truncate` tool (which cuts the file to wal_valid_prefix_len).
+    {
+        std::vector<KeyValue> want;
+        sched.spawn(scan_committed(e, committed, want));
+        sched.run();
+
+        std::vector<std::byte> torn = wal;
+        for (int i = 0; i < 17; ++i) torn.push_back(std::byte{0xCC});  // torn/garbage tail
+        const std::size_t plen = wal_valid_prefix_len(torn);
+        check(plen == wal.size(), "truncate target == the clean prefix boundary");
+        const std::vector<std::byte> cut(torn.begin(), torn.begin() + static_cast<std::ptrdiff_t>(plen));
+
+        SimDisk d2(sched, clock, rng, dc);
+        Error se{lockstep::core::ErrorCode::Unknown, "norun"};
+        sched.spawn(seed(d2, cut, se));
+        sched.run();
+        check(se.ok(), "seeded the truncated WAL onto a fresh disk");
+
+        WalEngine e2(sched, d2);
+        std::vector<KeyValue> got;
+        bool rec_ok = false;
+        sched.spawn(recover_scan(e2, cut.size(), got, rec_ok));
+        sched.run();
+        check(rec_ok, "recover from the truncated WAL ok");
+        check(got == want, "force-truncate is SAFE: recovered state == committed source state");
+        check(e2.last_seq() == committed, "recovered tip Seq == committed (no committed op lost)");
+    }
+
     if (g_fail) { std::printf("storage_recovery_test: FAILED\n"); return 1; }
-    std::printf("storage_recovery_test: OK (detect + WAL prefix walk + torn/flip boundary + backup/PITR verdict)\n");
+    std::printf("storage_recovery_test: OK (detect + WAL prefix walk + torn/flip boundary + "
+                "backup/PITR verdict + force-truncate safety proof)\n");
     return 0;
 }
