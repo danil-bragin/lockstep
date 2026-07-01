@@ -558,6 +558,26 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
     add_test(NAME consensus_state_hash_test COMMAND lockstep_consensus_state_hash_test)
   endif()
 
+  # --- SQL-over-Raft: deterministic SQL DML replicated over a real Raft cluster ---------
+  # Each replica applies the committed SQL-statement log into its own SqlEngine and every
+  # replica's database is identical (the HA PostgreSQL invariant). Links query (SqlEngine).
+  if(TARGET lockstep_storage AND TARGET lockstep_query AND TARGET lockstep_txn AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sql_over_raft_test.cpp")
+    add_executable(lockstep_sql_over_raft_test sql_over_raft_test.cpp)
+    target_include_directories(lockstep_sql_over_raft_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_sql_over_raft_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_query
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME sql_over_raft_test COMMAND lockstep_sql_over_raft_test)
+  endif()
+
   # --- P4: CTRL dual-copy metadata durability -----------------------------------
   # A torn trailing metadata copy still recovers the latest term/vote from the leading
   # copy (a single copy would silently revert it). Consensus-only.
