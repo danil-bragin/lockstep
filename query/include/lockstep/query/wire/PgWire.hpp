@@ -149,17 +149,22 @@ inline void pg_command_complete(std::vector<std::byte>& out, const std::string& 
     pg_put_str(p, tag);
     pg_detail::emit(out, 'C', p);
 }
-// ErrorResponse: minimal field set — Severity, SQLSTATE code, Message — then a NUL.
-inline void pg_error_response(std::vector<std::byte>& out, const std::string& msg) {
+// ErrorResponse with an explicit SQLSTATE code: Severity, Code, Message, then a NUL.
+inline void pg_error_response_code(std::vector<std::byte>& out, const std::string& code,
+                                   const std::string& msg) {
     std::vector<std::byte> p;
     p.push_back(static_cast<std::byte>('S'));
     pg_put_str(p, "ERROR");
     p.push_back(static_cast<std::byte>('C'));
-    pg_put_str(p, "XX000");  // internal_error SQLSTATE (generic)
+    pg_put_str(p, code);
     p.push_back(static_cast<std::byte>('M'));
     pg_put_str(p, msg.empty() ? "query failed" : msg);
     p.push_back(std::byte{0});  // field terminator
     pg_detail::emit(out, 'E', p);
+}
+// ErrorResponse with the generic internal_error SQLSTATE (XX000).
+inline void pg_error_response(std::vector<std::byte>& out, const std::string& msg) {
+    pg_error_response_code(out, "XX000", msg);
 }
 
 // The command tag PG expects in CommandComplete, derived from the statement + counts.
@@ -290,7 +295,12 @@ inline void pg_reply_for_statement(std::vector<std::byte>& out, const std::strin
 class PgSession {
 public:
     using ExecFn = std::function<sql::ExecResult(const std::string&)>;
-    explicit PgSession(ExecFn exec) : exec_(std::move(exec)) {}
+    // Optional authenticator: (user, password) -> allowed. UNSET (default) = trust (no
+    // password requested), preserving the open path. When set, the shim requests a
+    // cleartext password on startup and validates it (map user -> RBAC role here).
+    using AuthFn = std::function<bool(const std::string& user, const std::string& password)>;
+    explicit PgSession(ExecFn exec, AuthFn auth = {})
+        : exec_(std::move(exec)), auth_(std::move(auth)) {}
 
     [[nodiscard]] bool closed() const noexcept { return closed_; }
 
@@ -299,7 +309,7 @@ public:
         buf_.insert(buf_.end(), input.begin(), input.end());
         std::vector<std::byte> out;
         for (;;) {
-            if (!started_) {
+            if (!started_ && !awaiting_password_) {
                 // The startup phase has NO type byte: [int32 len][int32 code][params...].
                 if (buf_.size() < 8) break;
                 const std::int32_t len = pg_get_i32(buf_.data());
@@ -310,13 +320,36 @@ public:
                     buf_.erase(buf_.begin(), buf_.begin() + len);
                     continue;  // the client resends a real StartupMessage.
                 }
-                // A real StartupMessage (protocol 3.0 = 196608): accept, no auth (trust).
+                // A real StartupMessage (protocol 3.0 = 196608).
+                user_ = startup_user(buf_.data(), static_cast<std::size_t>(len));
                 buf_.erase(buf_.begin(), buf_.begin() + len);
-                started_ = true;
-                pg_auth_ok(out);
-                pg_parameter_status(out, "server_version", "14.0 (Lockstep)");
-                pg_parameter_status(out, "client_encoding", "UTF8");
-                pg_ready_for_query(out);
+                if (auth_) {
+                    // Request a cleartext password ('R' + int32 3); validate on PasswordMessage.
+                    std::vector<std::byte> p;
+                    pg_put_i32(p, 3);
+                    pg_detail::emit(out, 'R', p);
+                    awaiting_password_ = true;
+                } else {
+                    accept(out);  // trust: no auth configured.
+                }
+                continue;
+            }
+            if (awaiting_password_) {
+                // PasswordMessage 'p': [type][int32 len][password\0].
+                if (buf_.size() < 5) break;
+                const std::int32_t plen = pg_get_i32(buf_.data() + 1);
+                if (plen < 4 || buf_.size() < static_cast<std::size_t>(plen) + 1) break;
+                std::string pw(reinterpret_cast<const char*>(buf_.data() + 5),
+                               plen > 4 ? static_cast<std::size_t>(plen) - 4 - 1 : 0);
+                buf_.erase(buf_.begin(), buf_.begin() + plen + 1);
+                awaiting_password_ = false;
+                if (auth_(user_, pw)) {
+                    accept(out);
+                } else {
+                    pg_error_response_code(out, "28P01", "password authentication failed for user \"" + user_ + "\"");
+                    closed_ = true;
+                    break;
+                }
                 continue;
             }
             // Regular phase: [type byte][int32 len][payload].
@@ -354,6 +387,26 @@ public:
     }
 
 private:
+    // Complete the handshake: AuthenticationOk + a couple of ParameterStatus + ReadyForQuery.
+    void accept(std::vector<std::byte>& out) {
+        started_ = true;
+        pg_auth_ok(out);
+        pg_parameter_status(out, "server_version", "14.0 (Lockstep)");
+        pg_parameter_status(out, "client_encoding", "UTF8");
+        pg_ready_for_query(out);
+    }
+    // Extract the "user" parameter from a StartupMessage ([int32 len][int32 code][k\0 v\0 ...]).
+    [[nodiscard]] static std::string startup_user(const std::byte* data, std::size_t len) {
+        std::size_t pos = 8;  // skip the length + protocol code
+        while (pos < len) {
+            const std::string key = read_cstring(data, len, pos);
+            if (key.empty()) break;  // the trailing NUL ends the parameter list
+            const std::string val = read_cstring(data, len, pos);
+            if (key == "user") return val;
+        }
+        return "";
+    }
+
     // A simple-Query string may hold several ';'-separated statements; run each, then emit
     // exactly ONE ReadyForQuery. On the first error, stop (PG aborts the rest of the batch).
     void handle_query(std::vector<std::byte>& out, const std::string& sql) {
@@ -522,8 +575,11 @@ private:
     }
 
     ExecFn exec_;
+    AuthFn auth_;                  // optional (user,password)->allowed; unset = trust
     std::vector<std::byte> buf_;  // unconsumed input bytes
     bool started_ = false;        // startup handshake completed
+    bool awaiting_password_ = false;  // sent AuthenticationCleartextPassword, awaiting 'p'
+    std::string user_;            // the startup "user" parameter (for auth)
     bool closed_ = false;
     std::map<std::string, std::string> stmts_;  // prepared statements: name -> query
     std::map<std::string, Portal> portals_;     // bound portals: name -> {sql, cached}

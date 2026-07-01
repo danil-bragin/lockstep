@@ -36,6 +36,9 @@ int main(int argc, char** argv) {
     std::uint16_t port = 0;
     std::string data_dir = ".";
     std::uint64_t run_seconds = 30;
+    std::string req_user;
+    std::string req_password;
+    bool require_auth = false;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (std::strcmp(argv[i], "--port") == 0) {
             port = static_cast<std::uint16_t>(parse_u64(argv[i + 1], port));
@@ -43,6 +46,12 @@ int main(int argc, char** argv) {
             data_dir = argv[i + 1];
         } else if (std::strcmp(argv[i], "--run-seconds") == 0) {
             run_seconds = parse_u64(argv[i + 1], run_seconds);
+        } else if (std::strcmp(argv[i], "--user") == 0) {
+            req_user = argv[i + 1];
+            require_auth = true;
+        } else if (std::strcmp(argv[i], "--password") == 0) {
+            req_password = argv[i + 1];
+            require_auth = true;
         }
     }
     if (port == 0) {
@@ -60,15 +69,21 @@ int main(int argc, char** argv) {
     engine.recover(d_disk.logical_len(), c_disk.logical_len());  // replay durable state (fresh dir -> no-op)
 
     prod::ProdReactor reactor;
+    prod::ProdPgServer::AuthFn auth;
+    if (require_auth) {
+        auth = [req_user, req_password](const std::string& u, const std::string& p) {
+            return u == req_user && p == req_password;
+        };
+    }
     prod::ProdPgServer pg(reactor, port,
-                          [&engine](const std::string& s) { return engine.exec(s); });
+                          [&engine](const std::string& s) { return engine.exec(s); }, auth);
     if (!pg.valid()) {
         std::fprintf(stderr, "lockstep_pgd: could not bind port %u\n", static_cast<unsigned>(port));
         return 1;
     }
-    std::printf("lockstep_pgd: PostgreSQL-wire on 127.0.0.1:%u (data-dir=%s, run-seconds=%llu)\n",
+    std::printf("lockstep_pgd: PostgreSQL-wire on 127.0.0.1:%u (data-dir=%s, run-seconds=%llu, auth=%s)\n",
                 static_cast<unsigned>(port), data_dir.c_str(),
-                static_cast<unsigned long long>(run_seconds));
+                static_cast<unsigned long long>(run_seconds), require_auth ? "password" : "trust");
     std::fflush(stdout);
 
     const core::Tick deadline =

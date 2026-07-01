@@ -86,6 +86,14 @@ std::vector<std::byte> ssl_request() {
     pw::pg_put_i32(msg, 80877103);
     return msg;
 }
+std::vector<std::byte> password_msg(const std::string& pwd) {
+    std::vector<std::byte> m;
+    m.push_back(static_cast<std::byte>('p'));
+    pw::pg_put_i32(m, static_cast<std::int32_t>(pwd.size() + 1 + 4));
+    for (char c : pwd) m.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
+    m.push_back(std::byte{0});
+    return m;
+}
 std::vector<std::byte> query(const std::string& sql) {
     std::vector<std::byte> msg;
     msg.push_back(static_cast<std::byte>('Q'));
@@ -259,6 +267,31 @@ int main() {
         check(has_type(ms, 'Z'), "extended: Sync -> ReadyForQuery");
     }
 
+    // (4c) AUTH: with an authenticator set, startup requests a cleartext password.
+    {
+        pw::PgSession as([&engine](const std::string& s) -> ExecResult { return engine.exec(s); },
+                         [](const std::string& u, const std::string& p) { return u == "lockstep" && p == "secret"; });
+        const auto r1 = parse_backend(as.feed(sp(startup())));
+        bool req = false;
+        for (const Msg& m : r1)
+            if (m.type == 'R' && m.body.size() >= 4 && pw::pg_get_i32(m.body.data()) == 3) req = true;
+        check(req, "auth: startup -> AuthenticationCleartextPassword (code 3)");
+        const auto r2 = parse_backend(as.feed(sp(password_msg("secret"))));
+        bool ok = false;
+        for (const Msg& m : r2)
+            if (m.type == 'R' && m.body.size() >= 4 && pw::pg_get_i32(m.body.data()) == 0) ok = true;
+        check(ok && has_type(r2, 'Z'), "auth: correct password -> AuthenticationOk + ReadyForQuery");
+        check(!as.closed(), "auth: session open after successful auth");
+    }
+    {
+        pw::PgSession bad([&engine](const std::string& s) -> ExecResult { return engine.exec(s); },
+                          [](const std::string&, const std::string&) { return false; });
+        (void)bad.feed(sp(startup()));
+        const auto r = parse_backend(bad.feed(sp(password_msg("wrong"))));
+        check(has_type(r, 'E'), "auth: wrong password -> ErrorResponse");
+        check(bad.closed(), "auth: wrong password closes the session");
+    }
+
     // (5) Terminate -> session closed.
     {
         std::vector<std::byte> term;
@@ -269,7 +302,7 @@ int main() {
     }
 
     if (g_fail) { std::printf("pg_wire_test: FAILED\n"); return 1; }
-    std::printf("pg_wire_test: OK (PG v3 handshake + simple query + EXTENDED protocol "
-                "Parse/Bind/Describe/Execute with a bound $1 param)\n");
+    std::printf("pg_wire_test: OK (handshake + simple query + EXTENDED protocol (bound $1) + "
+                "per-type OIDs + cleartext-password auth)\n");
     return 0;
 }

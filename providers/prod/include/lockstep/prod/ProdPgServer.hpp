@@ -32,11 +32,13 @@ namespace lockstep::prod {
 class ProdPgServer {
 public:
     using ExecFn = query::wire::PgSession::ExecFn;
+    using AuthFn = query::wire::PgSession::AuthFn;
 
     // Bind + listen on 127.0.0.1:`port` and register the accept handler on `reactor`.
-    // `exec` runs one SQL statement (typically SqlEngine::exec). valid() reports bind ok.
-    ProdPgServer(ProdReactor& reactor, std::uint16_t port, ExecFn exec)
-        : reactor_(&reactor), exec_(std::move(exec)) {
+    // `exec` runs one SQL statement (typically SqlEngine::exec). `auth` (optional) gates
+    // each connection with a cleartext password; unset = trust. valid() reports bind ok.
+    ProdPgServer(ProdReactor& reactor, std::uint16_t port, ExecFn exec, AuthFn auth = {})
+        : reactor_(&reactor), exec_(std::move(exec)), auth_(std::move(auth)) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             return;
@@ -88,7 +90,7 @@ private:
                 break;  // EAGAIN / no more pending connections.
             }
             set_nonblock(c);
-            conns_.emplace(c, std::make_unique<query::wire::PgSession>(exec_));
+            conns_.emplace(c, std::make_unique<query::wire::PgSession>(exec_, auth_));
             reactor_->add_fd(c, EPOLLIN, [this, c](std::uint32_t) { conn_ready(c); });
         }
     }
@@ -140,6 +142,7 @@ private:
 
     ProdReactor* reactor_;
     ExecFn exec_;
+    AuthFn auth_;
     int listen_fd_ = -1;
     std::map<int, std::unique_ptr<query::wire::PgSession>> conns_;
 };
