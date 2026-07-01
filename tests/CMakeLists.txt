@@ -378,6 +378,18 @@ if(TARGET lockstep_storage AND TARGET lockstep_runtime
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME storage_recovery_test COMMAND lockstep_storage_recovery_test)
+  # storage_state_hash_test: cross-replica keyspace-hash corruption check (P3) — clean
+  # replicas agree, a bit-rotted / dropped-op replica's applied-state divergence detected.
+  add_executable(lockstep_storage_state_hash_test storage_state_hash_test.cpp)
+  target_include_directories(lockstep_storage_state_hash_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_state_hash_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_state_hash_test COMMAND lockstep_storage_state_hash_test)
 else()
   message(WARNING
     "lockstep_storage / runtime / providers_sim not all found; "
