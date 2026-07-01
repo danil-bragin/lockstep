@@ -507,7 +507,13 @@ public:
     // entry's value as the LOCAL commit index advances — the node applies the replicated
     // log into its state machine (e.g. exec a committed SQL statement into a local
     // SqlEngine). Set BEFORE start(). Unset = no apply pump (unchanged behavior).
-    void set_apply_fn(std::function<void(const std::string&)> fn) { apply_fn_ = std::move(fn); }
+    void set_apply_fn(std::function<void(consensus::Index, const std::string&)> fn) {
+        apply_fn_ = std::move(fn);
+    }
+    // Highest committed index applied into the state machine so far (0 = none). A PG-over-
+    // Raft write waits on this reaching its submit index before replying (the value is durable
+    // + applied on this node once applied_index() >= index).
+    [[nodiscard]] consensus::Index applied_index() const noexcept { return applied_; }
 
     // SQL-OVER-RAFT read seam: a callback that runs a read-only SQL query against the local
     // applied state machine and returns a rendered result — the SqlQuery admin verb. Set
@@ -684,7 +690,8 @@ private:
             const consensus::Index ci = self->node_->commit_index();
             const std::span<const consensus::LogEntry> lg = self->node_->log();
             while (self->applied_ < ci && self->applied_ < static_cast<consensus::Index>(lg.size())) {
-                self->apply_fn_(lg[static_cast<std::size_t>(self->applied_)].value);
+                // 1-based log index of this entry = applied_ + 1 (matches SubmitResult.index).
+                self->apply_fn_(self->applied_ + 1, lg[static_cast<std::size_t>(self->applied_)].value);
                 ++self->applied_;
             }
         }
@@ -840,7 +847,7 @@ private:
     ProdRandom rng_;             // election jitter / backoff (seeded)
     ProdDisk disk_;              // the DURABLE consensus log over data_dir (S9.2: reactor-bound)
     std::unique_ptr<consensus::ConsensusNode> node_;  // impl A, UNCHANGED
-    std::function<void(const std::string&)> apply_fn_;  // SQL-over-Raft state-machine apply
+    std::function<void(consensus::Index, const std::string&)> apply_fn_;  // SQL-over-Raft apply
     std::function<std::string(const std::string&)> query_fn_;  // SQL-over-Raft local read
     consensus::Index applied_ = 0;                       // highest applied index (0 = none)
 

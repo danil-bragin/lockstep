@@ -39,6 +39,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <new>
 #include <optional>
 #include <string>
@@ -96,6 +98,7 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 #include <lockstep/prod/ProdReactor.hpp>
 #include <lockstep/prod/ProdServerNode.hpp>  // keyed-KV wire::Server daemon (--wire-server)
 #include <lockstep/prod/ProdPgServer.hpp>    // PostgreSQL-wire daemon (--pg-port)
+#include <lockstep/prod/ProdPgRaftServer.hpp>  // PostgreSQL-wire over the REPLICATED cluster (--sql --pg-port)
 #include <lockstep/prod/ProdShardRunner.hpp>  // Phase 9 S9.1 multi-shard orchestrator
 
 #include <lockstep/consensus/ConsensusNode.hpp>
@@ -562,8 +565,8 @@ int main(int argc, char** argv) {
     // (with --shard-base-port + --shards M): this process hosts M shard-replicas, each
     // shard an N-node Raft group across the N processes. Takes precedence over the S9.1
     // single-node multi-shard path below.
-    if (args.pg_port != 0) {
-        return run_pg_server(args);
+    if (args.pg_port != 0 && !args.sql) {
+        return run_pg_server(args);  // standalone single-node PG; --sql routes to the replicated path
     }
     if (args.wire_server) {
         return run_wire_server(args);
@@ -724,15 +727,51 @@ int main(int argc, char** argv) {
     std::optional<prod::ProdDisk> sql_d_disk;
     std::optional<prod::ProdDisk> sql_c_disk;
     std::optional<lockstep::query::sql::SqlEngine> sql_engine;
+    // Applied-result stash: committed index -> the ExecResult the apply pump produced, so a
+    // PG-over-Raft write can read back its own result (affected count) once it commits.
+    auto sql_results =
+        std::make_shared<std::map<consensus::Index, lockstep::query::sql::ExecResult>>();
+    std::optional<prod::ProdPgRaftServer> pg_raft;
     if (args.sql) {
         sql_d_disk.emplace(sql_d_sched, args.data_dir + "/lockstepd-sqlraft-data.wal");
         sql_c_disk.emplace(sql_c_sched, args.data_dir + "/lockstepd-sqlraft-catalog.wal");
         sql_engine.emplace(sql_d_sched, *sql_d_disk, sql_c_sched, *sql_c_disk);
         sql_engine->recover(sql_d_disk->logical_len(), sql_c_disk->logical_len());
-        node.set_apply_fn([&sql_engine](const std::string& v) { (void)sql_engine->exec(v); });
+        node.set_apply_fn([&sql_engine, sql_results](consensus::Index idx, const std::string& v) {
+            (*sql_results)[idx] = sql_engine->exec(v);
+            if (sql_results->size() > 4096) {  // bound memory — a PG write reads its result in ~ms
+                sql_results->erase(sql_results->begin());
+            }
+        });
         node.set_query_fn([&sql_engine](const std::string& q) { return render_sql(sql_engine->exec(q)); });
         std::printf("lockstepd: SQL-over-Raft ENABLED (committed values applied as SQL)\n");
         std::fflush(stdout);
+
+        // PG-over-Raft: a real PG client (psql) talks to the REPLICATED SQL database. Reads
+        // served from local applied state; writes submitted through Raft, reply deferred to
+        // the commit. Only when --pg-port is given alongside --sql.
+        if (args.pg_port != 0) {
+            pg_raft.emplace(
+                reactor, args.pg_port,
+                [&node](const std::string& s) { return node.submit(s); },
+                [&sql_engine](const std::string& s) { return sql_engine->exec(s); },
+                [&node] { return node.applied_index(); },
+                [sql_results](consensus::Index i)
+                    -> std::optional<lockstep::query::sql::ExecResult> {
+                    const auto it = sql_results->find(i);
+                    if (it == sql_results->end()) return std::nullopt;
+                    return it->second;
+                },
+                [&node] { return node.role() == consensus::Role::Leader; });
+            if (!pg_raft->valid()) {
+                std::fprintf(stderr, "lockstepd: PG-over-Raft bind failed on port %u\n",
+                             static_cast<unsigned>(args.pg_port));
+                return 1;
+            }
+            std::printf("lockstepd: PostgreSQL-wire (SQL-over-Raft) on 127.0.0.1:%u\n",
+                        static_cast<unsigned>(args.pg_port));
+            std::fflush(stdout);
+        }
     }
 
     // --- start the node + admin serve-loop, run the BOUNDED reactor loop ------
