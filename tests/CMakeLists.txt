@@ -562,6 +562,22 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
     add_test(NAME consensus_meta_dualcopy_test COMMAND lockstep_consensus_meta_dualcopy_test)
   endif()
 
+  # --- P4 part 2: CTRL protocol-aware corrupt-committed-entry recovery ----------
+  # A mid-log body-corrupt entry is detected; recovery keeps the clean prefix + arms a
+  # repair watermark; the node refuses to lead until repaired. Consensus-only.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_ctrl_repair_test.cpp")
+    add_executable(lockstep_consensus_ctrl_repair_test consensus_ctrl_repair_test.cpp)
+    target_include_directories(lockstep_consensus_ctrl_repair_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_ctrl_repair_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_ctrl_repair_test COMMAND lockstep_consensus_ctrl_repair_test)
+  endif()
+
   # --- P5: quorum-loss recovery via force_new_cluster ---------------------------
   # A lone survivor of a lost-quorum cluster recovers the ability to commit by
   # unilaterally reconfiguring to a single-node cluster {self}. Consensus-only.

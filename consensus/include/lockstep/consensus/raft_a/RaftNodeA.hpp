@@ -677,6 +677,11 @@ public:
         return commit_index_;
     }
 
+    // CTRL (P4 part 2): the repair watermark (0 = healthy). Non-zero after recovery
+    // detected a corrupt committed entry with a valid physical suffix — the node is in
+    // repair mode (won't run/vote-short) until replication refills its log to this length.
+    [[nodiscard]] Index repair_watermark() const noexcept { return repair_watermark_; }
+
     // ---- lifecycle the harness drives ------------------------------------
 
     void start() override {
@@ -714,6 +719,7 @@ public:
         applied_index_ = 0;
         log_view_.clear();
         commit_index_ = 0;
+        repair_watermark_ = 0;  // CTRL (P4): re-derived fresh on the next recovery
         votes_granted_.clear();
         leader_hint_ = kNoLeader;
         for (auto& v : next_index_) {
@@ -1026,6 +1032,13 @@ private:
             arm_election_deadline();
             return;
         }
+        // CTRL (P4 part 2): while a corrupt committed entry is unrepaired, do NOT stand
+        // for election — our log is truncated below the length we HAD, so leading now
+        // could drop a committed entry. Wait (as a Follower) to be repaired by a leader.
+        if (repair_watermark_ > 0 && llen() < repair_watermark_) {
+            arm_election_deadline();
+            return;
+        }
         // state[s] ∈ {Follower, Candidate} (a Leader does not time out into a new
         // election here — it heartbeats). Bump term, become Candidate, self-vote.
         ++current_term_;
@@ -1090,7 +1103,16 @@ private:
         const bool cand_cfg_up_to_date = (m.cfg_index >= cfg_idx_);
         const bool can_vote =
             (voted_for_ == kNil || voted_for_ == m.source);
-        const bool grant = can_vote && cand_up_to_date && cand_cfg_up_to_date;
+        // CTRL (P4 part 2): if we recovered past a corrupt committed entry, we KNOW we had
+        // a log at least `repair_watermark_` long. Refuse a candidate shorter than that —
+        // it is missing an entry WE had (possibly committed), so voting it in could lose
+        // that entry (the corrupt-node-forms-a-short-majority disaster). This is stricter
+        // than the standard up-to-date check, which compares only against our (truncated)
+        // last entry.
+        const bool not_behind_repair =
+            (repair_watermark_ == 0 || m.last_log_index >= repair_watermark_);
+        const bool grant =
+            can_vote && cand_up_to_date && cand_cfg_up_to_date && not_behind_repair;
 
         if (grant && voted_for_ != m.source) {
             voted_for_ = m.source;
@@ -1346,6 +1368,12 @@ private:
         }
         (void)mutated;
 
+        // CTRL (P4 part 2): once replication has refilled our log up to the length we HAD
+        // before a corrupt-entry recovery, the hole is repaired — resume full participation.
+        if (repair_watermark_ > 0 && llen() >= repair_watermark_) {
+            repair_watermark_ = 0;
+        }
+
         // Adopt leaderCommit: commitIndex = Max(commitIndex, Min(leaderCommit,
         // lastNew)) where lastNew = prevLogIndex + len(entries).
         const Index last_new = m.prev_log_index + m.entries.size();
@@ -1405,6 +1433,10 @@ private:
             // whole state with the leader's, so prior accumulated deltas no longer apply.
             // Subsequent local compactions persist incrementally from this base.
             persist_snapshot_full();
+        }
+        // CTRL (P4 part 2): a snapshot covering our known-had length repairs the hole.
+        if (repair_watermark_ > 0 && llen() >= repair_watermark_) {
+            repair_watermark_ = 0;
         }
 
         RaftMsg resp;
@@ -1855,6 +1887,7 @@ private:
         std::uint64_t rec_cfg_idx = 0;
         bool rec_have_cfg = false;
         bool any = false;
+        Index rec_repair_to = 0;  // CTRL (P4): highest ENTRY index found PAST a corrupt record
 
         for (;;) {
             if (self->gen_ != my_gen) {
@@ -1880,7 +1913,35 @@ private:
             }
             const auto* bp = reinterpret_cast<const std::uint8_t*>(body.data());
             if (wire::crc32(bp, len) != crc) {
-                break;  // corrupt record → durable prefix ends here
+                // CTRL (P4 part 2): a record whose FRAMING is intact (we read exactly `len`
+                // bytes) but whose CRC fails — a corrupt record, not merely a torn tail.
+                // Scan FORWARD past it (using each following record's own intact framing)
+                // to learn whether the physical log EXTENDED beyond our clean prefix: any
+                // CRC-valid ENTRY after the hole proves we HAD that entry. The highest such
+                // index becomes the repair watermark. We still recover only the clean
+                // PREFIX (break below) — the leader refills the hole via AppendEntries —
+                // but the watermark stops us running/voting-short until it is repaired.
+                std::uint64_t soff = off + 8 + static_cast<std::uint64_t>(len);
+                for (;;) {
+                    std::vector<std::byte> sh(8);
+                    if (!(co_await disk->read(soff, {sh.data(), sh.size()})).ok()) break;
+                    const auto* shp = reinterpret_cast<const std::uint8_t*>(sh.data());
+                    wire::Reader shr{shp, 8, 0, true};
+                    const std::uint32_t scrc = shr.u32();
+                    const std::uint32_t slen = shr.u32();
+                    if (!shr.ok() || slen == 0 || slen > (1u << 20)) break;
+                    std::vector<std::byte> sb(slen);
+                    if (!(co_await disk->read(soff + 8, {sb.data(), sb.size()})).ok()) break;
+                    const auto* sbp = reinterpret_cast<const std::uint8_t*>(sb.data());
+                    if (wire::crc32(sbp, slen) != scrc) break;
+                    wire::Reader sr{sbp, slen, 0, true};
+                    if (static_cast<RecKind>(sr.u8()) == RecKind::Entry) {
+                        const Index sindex = sr.u64();
+                        if (sr.ok() && sindex > rec_repair_to) rec_repair_to = sindex;
+                    }
+                    soff += 8u + slen;
+                }
+                break;  // recover only the clean prefix; the watermark drives the repair.
             }
             // Decode the record and apply it.
             wire::Reader r{bp, len, 0, true};
@@ -2058,6 +2119,14 @@ private:
             self->applied_index_ = rec_base;
             self->log_view_.clear();
         }
+        // CTRL (P4 part 2): if a corrupt entry was detected AND the physical log proved it
+        // extended beyond our recovered clean prefix, arm the repair watermark. Otherwise
+        // (a clean recovery or a plain torn tail with nothing valid after) it stays 0 and
+        // every existing path is byte-identical.
+        self->repair_watermark_ =
+            (rec_repair_to > self->snap_base_ + static_cast<Index>(self->log_.size()))
+                ? rec_repair_to
+                : 0;
         // C4.2: restore the adopted config chain + cfgIdx (forward-only). If no
         // CONFIG record survived, the node sits at the init config (index 0). The
         // committed index is conservatively re-learned (a leader re-confirms; a
@@ -2257,6 +2326,14 @@ private:
     // (Snapshot.tla ReconstructUpTo: snapshot.state then the retained suffix).
     mutable std::vector<LogEntry> log_view_;
     Index commit_index_ = 0;           // commitIndex[s]
+    // CTRL (P4 part 2) repair watermark: 0 = healthy. Set by recovery when a corrupt
+    // committed entry is detected AND the physical log proved it extended past our clean
+    // prefix (valid ENTRY records after the hole) — the length we HAD. While
+    // repair_watermark_ > llen() the node neither runs for election nor grants a vote to a
+    // candidate whose log is shorter than it, so a corrupt node + lagging peers cannot
+    // elect a leader that DROPPED a committed entry (CTRL's silent-loss disaster). It is
+    // cleared once replication refills the log up to this length (the hole is repaired).
+    Index repair_watermark_ = 0;
     std::vector<std::uint64_t> votes_granted_;  // votesGranted[s] (a set)
 
     // C4.3 compaction trigger: snapshot once the retained suffix exceeds this many
