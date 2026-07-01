@@ -562,6 +562,22 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
     add_test(NAME consensus_meta_dualcopy_test COMMAND lockstep_consensus_meta_dualcopy_test)
   endif()
 
+  # --- P5: quorum-loss recovery via force_new_cluster ---------------------------
+  # A lone survivor of a lost-quorum cluster recovers the ability to commit by
+  # unilaterally reconfiguring to a single-node cluster {self}. Consensus-only.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_force_new_cluster_test.cpp")
+    add_executable(lockstep_consensus_force_new_cluster_test consensus_force_new_cluster_test.cpp)
+    target_include_directories(lockstep_consensus_force_new_cluster_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_force_new_cluster_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_force_new_cluster_test COMMAND lockstep_consensus_force_new_cluster_test)
+  endif()
+
   # --- P2: cluster-identity split-brain guard (restore-new-cluster) ------------
   # A foreign-token node is excluded (never leader, never commits) while the
   # same-token majority still elects + commits. Consensus-only (no storage link).

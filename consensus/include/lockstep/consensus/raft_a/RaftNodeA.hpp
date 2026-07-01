@@ -833,6 +833,36 @@ public:
         return true;
     }
 
+    // FORCE-NEW-CLUSTER (plan P5 — quorum-loss recovery). After PERMANENT majority loss
+    // the cluster cannot commit (no quorum survives). This UNILATERALLY reconfigures the
+    // survivor into a single-node cluster {self} under a FRESH cluster identity, KEEPING
+    // its committed log, so it self-elects (its own config is quorum 1) and resumes
+    // committing. DANGEROUS + operator-only: it bypasses the quorum-gated config protocol,
+    // so it is sound ONLY when the old majority is truly gone (pick the most up-to-date
+    // survivor — a behind survivor loses the entries it lacks). The fresh token makes any
+    // surviving old member a FOREIGN cluster (dropped by the identity guard, P2) so it
+    // cannot rejoin and fork. Members are re-added afterward via the normal add path (they
+    // catch up from this survivor's log). NOT durable across restart by itself: relaunch
+    // the survivor with --cluster-token = new_token to keep the new identity.
+    void force_new_cluster(std::uint64_t new_token) {
+        if (!running_) {
+            return;
+        }
+        cfg_chain_.assign(1, std::vector<std::uint64_t>{self_});
+        cfg_idx_ = 0;
+        cfg_committed_idx_ = 0;
+        for (auto& v : cfg_adopted_) {
+            v = 0;
+        }
+        cluster_token_ = new_token;
+        persist_config(0, cfg_chain_[0]);  // durable single-node config (recovers on restart)
+        // Step down to Follower + re-arm; on the next timeout the node self-elects (its
+        // {self} config is its own quorum) and commits its preserved log forward.
+        role_ = Role::Follower;
+        leader_hint_ = kNoLeader;
+        arm_election_deadline();
+    }
+
     [[nodiscard]] std::vector<std::uint64_t> current_config() const override {
         return cfg_chain_.empty() ? std::vector<std::uint64_t>{}
                                   : cfg_chain_[cfg_idx_];
