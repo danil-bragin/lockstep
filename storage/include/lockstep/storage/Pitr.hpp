@@ -202,6 +202,7 @@ inline core::Task archive_bytes_task(WalEngine& src, Seq from_seq, std::vector<s
     const core::Error ee = co_await src.export_ops(from_seq, ops);
     if (!ee.ok()) { result = ee; co_return; }
     build_archive_image(ops, out);
+    result = core::Error{};  // success — the in-memory image is complete.
     co_return;
 }
 

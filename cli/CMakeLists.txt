@@ -81,6 +81,20 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_providers_prod
         Threads::Threads)
 
+    # --- lockstep_recover — OFFLINE RECOVERY / DIAGNOSTICS CLI [LINUX ONLY] --------
+    # Read-only inspection of an on-disk WAL / backup / PITR archive (verify + dump).
+    # Reads the file through ProdDisk (no raw syscall — forbidden-lint scans cli/); the
+    # decode/verify logic is the pure storage/Recovery.hpp core (tested on every host by
+    # storage_recovery_test). Built on Linux only, like the other prod-provider tools.
+    add_executable(lockstep_recover lockstep_recover.cpp)
+    target_link_libraries(lockstep_recover
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_prod)
+
     # --- Phase 7 S5b-2: lockstep_admin — the CLUSTER ADMIN CLIENT [LINUX ONLY] -
     # The leader-find client for the multi-PROCESS cluster: dials a node's admin port
     # over REAL TCP, SUBMITs (retrying the next host on NotLeader until the leader

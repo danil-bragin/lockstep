@@ -366,6 +366,18 @@ if(TARGET lockstep_storage AND TARGET lockstep_runtime
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME storage_pitr_test COMMAND lockstep_storage_pitr_test)
+  # storage_recovery_test: offline diagnostics — format detect, WAL consistent-prefix
+  # walk, torn/flipped-tail boundary reporting, backup/PITR integrity verdict (P2 core).
+  add_executable(lockstep_storage_recovery_test storage_recovery_test.cpp)
+  target_include_directories(lockstep_storage_recovery_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_recovery_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_recovery_test COMMAND lockstep_storage_recovery_test)
 else()
   message(WARNING
     "lockstep_storage / runtime / providers_sim not all found; "
