@@ -57,15 +57,20 @@ public:
     using AppliedFn = std::function<consensus::Index()>;                          // node applied idx
     using ResultFn = std::function<std::optional<psql::ExecResult>(consensus::Index)>;  // stash pop
     using LeaderFn = std::function<bool()>;                                       // is this node leader
+    // AUTH + RBAC: validate (user, password) and return the access level:
+    //   -1 = reject (bad credentials), 0 = read-only (SELECT), 1 = read-write.
+    // Unset = trust (no password prompt, read-write) — the demo/loopback default.
+    using AuthFn = std::function<int(const std::string& user, const std::string& password)>;
 
     ProdPgRaftServer(ProdReactor& reactor, std::uint16_t port, SubmitFn submit, ExecFn exec,
-                     AppliedFn applied, ResultFn result, LeaderFn is_leader)
+                     AppliedFn applied, ResultFn result, LeaderFn is_leader, AuthFn auth = {})
         : reactor_(&reactor),
           submit_(std::move(submit)),
           exec_(std::move(exec)),
           applied_(std::move(applied)),
           result_(std::move(result)),
-          is_leader_(std::move(is_leader)) {
+          is_leader_(std::move(is_leader)),
+          auth_(std::move(auth)) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             return;
@@ -113,6 +118,9 @@ private:
     struct Conn {
         std::vector<std::byte> buf;
         bool started = false;
+        bool awaiting_password = false;  // sent AuthenticationCleartextPassword, awaiting 'p'
+        std::string user;
+        int role = 1;  // 0 = read-only, 1 = read-write (default when no auth is configured)
         // A write awaiting its Raft commit+apply (at most one — PG is request/response).
         bool pending = false;
         consensus::Index pending_index = 0;
@@ -173,6 +181,37 @@ private:
             if (c.pending) {
                 break;  // blocked until the completion pump replies to the in-flight write
             }
+            if (c.awaiting_password) {
+                // PasswordMessage 'p': [type][int32 len][password\0]. Validate + set role.
+                if (c.buf.size() < 5) break;
+                const char ptype = static_cast<char>(c.buf[0]);
+                const std::int32_t plen = pgw::pg_get_i32(c.buf.data() + 1);
+                if (plen < 4 || c.buf.size() < 1 + static_cast<std::size_t>(plen)) break;
+                if (ptype != 'p') {  // protocol error — expected a password
+                    write_all(fd, out);
+                    close_conn(fd);
+                    return;
+                }
+                std::string pw;
+                if (plen > 5) {
+                    pw.assign(reinterpret_cast<const char*>(c.buf.data() + 5),
+                              static_cast<std::size_t>(plen) - 5);
+                }
+                erase_front(c, 1 + static_cast<std::size_t>(plen));
+                const int lvl = auth_(c.user, pw);
+                if (lvl < 0) {
+                    pgw::pg_error_response_code(
+                        out, "28P01", "password authentication failed for user \"" + c.user + "\"");
+                    write_all(fd, out);
+                    close_conn(fd);
+                    return;
+                }
+                c.role = lvl;
+                accept(out);
+                c.started = true;
+                c.awaiting_password = false;
+                continue;
+            }
             if (!c.started) {
                 if (c.buf.size() < 4) break;
                 const std::int32_t len = pgw::pg_get_i32(c.buf.data());
@@ -183,12 +222,17 @@ private:
                     erase_front(c, static_cast<std::size_t>(len));
                     continue;
                 }
-                // StartupMessage -> trust + announce ready (auth is a separate follow-on here).
-                pgw::pg_auth_ok(out);
-                pgw::pg_parameter_status(out, "server_version", "14.0 (lockstep-raft)");
-                pgw::pg_ready_for_query(out);
-                c.started = true;
+                c.user = extract_user(c.buf.data(), static_cast<std::size_t>(len));
                 erase_front(c, static_cast<std::size_t>(len));
+                if (auth_) {  // require a cleartext password (use TLS to protect it on the wire)
+                    std::vector<std::byte> ch;
+                    pgw::pg_put_i32(ch, 3);  // AuthenticationCleartextPassword
+                    pgw::pg_detail::emit(out, 'R', ch);
+                    c.awaiting_password = true;
+                    continue;
+                }
+                accept(out);  // trust (no auth configured)
+                c.started = true;
                 continue;
             }
             if (c.buf.size() < 5) break;
@@ -288,6 +332,12 @@ private:
     // until the commit lands. `add_ready` = whether the completion pump should append
     // ReadyForQuery (true for simple query; false for extended, where Sync does it).
     void defer_write(Conn& c, const std::string& sql, bool add_ready, std::vector<std::byte>& out) {
+        if (c.role < 1) {  // RBAC: a read-only user may not write
+            pgw::pg_error_response_code(out, "42501",
+                                        "permission denied: user \"" + c.user + "\" is read-only");
+            if (add_ready) pgw::pg_ready_for_query(out);
+            return;
+        }
         if (!is_leader_()) {
             pgw::pg_error_response_code(out, "25006",
                                         "cannot execute a write on a follower — reconnect to the leader");
@@ -304,6 +354,25 @@ private:
         c.pending_index = sr.index;
         c.pending_sql = sql;
         c.pending_ready = add_ready;
+    }
+
+    // Send the post-authentication handshake: AuthenticationOk + a ParameterStatus + Ready.
+    void accept(std::vector<std::byte>& out) {
+        pgw::pg_auth_ok(out);
+        pgw::pg_parameter_status(out, "server_version", "14.0 (lockstep-raft)");
+        pgw::pg_ready_for_query(out);
+    }
+
+    // Extract the "user" parameter from a StartupMessage: [int32 len][int32 version][k\0v\0...\0].
+    static std::string extract_user(const std::byte* data, std::size_t len) {
+        std::size_t pos = 8;  // skip the length + protocol-version words
+        while (pos < len) {
+            const std::string key = rd_cstr(data, len, pos);
+            if (key.empty()) break;
+            const std::string val = rd_cstr(data, len, pos);
+            if (key == "user") return val;
+        }
+        return "";
     }
 
     // ---- EXTENDED protocol (prepared statements) over the Raft path ------------------------
@@ -517,6 +586,7 @@ private:
     AppliedFn applied_;
     ResultFn result_;
     LeaderFn is_leader_;
+    AuthFn auth_;
     int listen_fd_ = -1;
     std::map<int, std::unique_ptr<Conn>> conns_;
 };

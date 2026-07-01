@@ -170,6 +170,9 @@ struct Args {
     std::string pg_user;
     std::string pg_password;
     bool pg_auth = false;
+    // Optional read-only PG user (RBAC): can SELECT but not write on the replicated endpoint.
+    std::string pg_ro_user;
+    std::string pg_ro_password;
 
     // SQL-OVER-RAFT (--sql 1): in the replicated cluster-member path, apply committed
     // values as SQL statements into a local SqlEngine + answer read-only SqlQuery admin
@@ -314,6 +317,10 @@ Args parse_args(int argc, char** argv) {
         } else if (std::strcmp(k, "--pg-password") == 0) {
             a.pg_password = v;
             a.pg_auth = true;
+        } else if (std::strcmp(k, "--pg-ro-user") == 0) {
+            a.pg_ro_user = v;
+        } else if (std::strcmp(k, "--pg-ro-password") == 0) {
+            a.pg_ro_password = v;
         } else if (std::strcmp(k, "--sql") == 0) {
             a.sql = (parse_u64(v, 0) != 0);  // value-taking flag (loop is strict pairs): --sql 1
         } else if (std::strcmp(k, "--proc-host") == 0) {
@@ -751,6 +758,18 @@ int main(int argc, char** argv) {
         // served from local applied state; writes submitted through Raft, reply deferred to
         // the commit. Only when --pg-port is given alongside --sql.
         if (args.pg_port != 0) {
+            // AUTH + RBAC: with --pg-user/--pg-password, require a cleartext password (use TLS to
+            // protect it). --pg-ro-user/--pg-ro-password adds a READ-ONLY principal (SELECT only).
+            prod::ProdPgRaftServer::AuthFn pg_auth_fn;
+            if (args.pg_auth) {
+                pg_auth_fn = [rw_u = args.pg_user, rw_p = args.pg_password, ro_u = args.pg_ro_user,
+                              ro_p = args.pg_ro_password](const std::string& u,
+                                                          const std::string& p) -> int {
+                    if (u == rw_u && p == rw_p) return 1;                        // read-write
+                    if (!ro_u.empty() && u == ro_u && p == ro_p) return 0;       // read-only
+                    return -1;                                                   // reject
+                };
+            }
             pg_raft.emplace(
                 reactor, args.pg_port,
                 [&node](const std::string& s) { return node.submit(s); },
@@ -762,7 +781,7 @@ int main(int argc, char** argv) {
                     if (it == sql_results->end()) return std::nullopt;
                     return it->second;
                 },
-                [&node] { return node.role() == consensus::Role::Leader; });
+                [&node] { return node.role() == consensus::Role::Leader; }, pg_auth_fn);
             if (!pg_raft->valid()) {
                 std::fprintf(stderr, "lockstepd: PG-over-Raft bind failed on port %u\n",
                              static_cast<unsigned>(args.pg_port));
