@@ -30,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -41,6 +42,7 @@
 #include <lockstep/consensus/ConsensusNode.hpp>  // SubmitResult, Index
 #include <lockstep/core/Task.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
+#include <lockstep/prod/ProdScram.hpp>  // SCRAM-SHA-256 (LOCKSTEP_TLS-gated)
 #include <lockstep/query/sql/Engine.hpp>
 #include <lockstep/query/wire/PgWire.hpp>
 
@@ -61,16 +63,21 @@ public:
     //   -1 = reject (bad credentials), 0 = read-only (SELECT), 1 = read-write.
     // Unset = trust (no password prompt, read-write) — the demo/loopback default.
     using AuthFn = std::function<int(const std::string& user, const std::string& password)>;
+    // SCRAM lookup: a user -> {cleartext password, access level} the server uses to derive
+    // the SCRAM keys (the password is never sent over the wire). Set = prefer SCRAM-SHA-256.
+    using ScramFn = std::function<std::optional<std::pair<std::string, int>>(const std::string& user)>;
 
     ProdPgRaftServer(ProdReactor& reactor, std::uint16_t port, SubmitFn submit, ExecFn exec,
-                     AppliedFn applied, ResultFn result, LeaderFn is_leader, AuthFn auth = {})
+                     AppliedFn applied, ResultFn result, LeaderFn is_leader, AuthFn auth = {},
+                     ScramFn scram = {})
         : reactor_(&reactor),
           submit_(std::move(submit)),
           exec_(std::move(exec)),
           applied_(std::move(applied)),
           result_(std::move(result)),
           is_leader_(std::move(is_leader)),
-          auth_(std::move(auth)) {
+          auth_(std::move(auth)),
+          scram_(std::move(scram)) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             return;
@@ -121,6 +128,11 @@ private:
         bool awaiting_password = false;  // sent AuthenticationCleartextPassword, awaiting 'p'
         std::string user;
         int role = 1;  // 0 = read-only, 1 = read-write (default when no auth is configured)
+        int sasl_state = 0;  // 0 none, 1 awaiting SASLInitialResponse, 2 awaiting SASLResponse
+        int sasl_role = 1;   // access level to grant if the SCRAM proof verifies
+#ifdef LOCKSTEP_TLS
+        std::unique_ptr<ScramServer> scram;
+#endif
         // A write awaiting its Raft commit+apply (at most one — PG is request/response).
         bool pending = false;
         consensus::Index pending_index = 0;
@@ -181,24 +193,36 @@ private:
             if (c.pending) {
                 break;  // blocked until the completion pump replies to the in-flight write
             }
-            if (c.awaiting_password) {
-                // PasswordMessage 'p': [type][int32 len][password\0]. Validate + set role.
+            if (c.awaiting_password || c.sasl_state != 0) {
+                // A 'p' message: cleartext PasswordMessage OR a SASL (SCRAM) response.
                 if (c.buf.size() < 5) break;
                 const char ptype = static_cast<char>(c.buf[0]);
                 const std::int32_t plen = pgw::pg_get_i32(c.buf.data() + 1);
                 if (plen < 4 || c.buf.size() < 1 + static_cast<std::size_t>(plen)) break;
-                if (ptype != 'p') {  // protocol error — expected a password
+                if (ptype != 'p') {  // protocol error — expected a password / SASL frame
                     write_all(fd, out);
                     close_conn(fd);
                     return;
                 }
-                std::string pw;
-                if (plen > 5) {
-                    pw.assign(reinterpret_cast<const char*>(c.buf.data() + 5),
-                              static_cast<std::size_t>(plen) - 5);
+                const std::byte* pp = c.buf.data() + 5;
+                const std::size_t pl = static_cast<std::size_t>(plen) - 4;
+#ifdef LOCKSTEP_TLS
+                if (c.sasl_state == 1) {  // SASLInitialResponse
+                    sasl_initial(c, pp, pl, out);
+                    erase_front(c, 1 + static_cast<std::size_t>(plen));
+                    continue;
                 }
+                if (c.sasl_state == 2) {  // SASLResponse (client-final)
+                    const bool alive = sasl_final(fd, c, pp, pl, out);
+                    if (!alive) return;  // rejected + connection closed
+                    erase_front(c, 1 + static_cast<std::size_t>(plen));
+                    continue;
+                }
+#endif
+                std::string pw;  // cleartext PasswordMessage
+                if (pl > 0) pw.assign(reinterpret_cast<const char*>(pp), pl - 1);
                 erase_front(c, 1 + static_cast<std::size_t>(plen));
-                const int lvl = auth_(c.user, pw);
+                const int lvl = auth_ ? auth_(c.user, pw) : 1;
                 if (lvl < 0) {
                     pgw::pg_error_response_code(
                         out, "28P01", "password authentication failed for user \"" + c.user + "\"");
@@ -224,9 +248,23 @@ private:
                 }
                 c.user = extract_user(c.buf.data(), static_cast<std::size_t>(len));
                 erase_front(c, static_cast<std::size_t>(len));
-                if (auth_) {  // require a cleartext password (use TLS to protect it on the wire)
+#ifdef LOCKSTEP_TLS
+                if (scram_) {  // AuthenticationSASL — offer SCRAM-SHA-256 (password never sent)
+                    std::vector<std::byte> p;
+                    pgw::pg_put_i32(p, 10);
+                    for (const char* m = "SCRAM-SHA-256"; *m != 0; ++m) {
+                        p.push_back(std::byte{static_cast<unsigned char>(*m)});
+                    }
+                    p.push_back(std::byte{0});  // terminate the mechanism name
+                    p.push_back(std::byte{0});  // terminate the mechanism list
+                    pgw::pg_detail::emit(out, 'R', p);
+                    c.sasl_state = 1;
+                    continue;
+                }
+#endif
+                if (auth_) {  // AuthenticationCleartextPassword (protect with TLS on the wire)
                     std::vector<std::byte> ch;
-                    pgw::pg_put_i32(ch, 3);  // AuthenticationCleartextPassword
+                    pgw::pg_put_i32(ch, 3);
                     pgw::pg_detail::emit(out, 'R', ch);
                     c.awaiting_password = true;
                     continue;
@@ -374,6 +412,78 @@ private:
         }
         return "";
     }
+
+#ifdef LOCKSTEP_TLS
+    // SASLInitialResponse: [mechanism\0][int32 ir-len][client-first-message]. Start the SCRAM
+    // exchange with the server-known password and reply AuthenticationSASLContinue.
+    void sasl_initial(Conn& c, const std::byte* p, std::size_t plen, std::vector<std::byte>& out) {
+        std::size_t pos = 0;
+        const std::string mech = rd_cstr(p, plen, pos);
+        std::string client_first;
+        if (pos + 4 <= plen) {
+            const std::int32_t irlen = pgw::pg_get_i32(p + pos);
+            pos += 4;
+            if (irlen > 0 && pos + static_cast<std::size_t>(irlen) <= plen) {
+                client_first.assign(reinterpret_cast<const char*>(p + pos),
+                                    static_cast<std::size_t>(irlen));
+            }
+        }
+        if (mech != "SCRAM-SHA-256") {
+            pgw::pg_error_response_code(out, "28P01", "unsupported SASL mechanism");
+            c.sasl_state = 0;
+            return;
+        }
+        // Strip the GS2 header ("n,," etc.) -> client-first-message-bare (after the 2nd comma).
+        const std::size_t c1 = client_first.find(',');
+        const std::size_t c2 = c1 == std::string::npos ? std::string::npos : client_first.find(',', c1 + 1);
+        const std::string bare =
+            c2 == std::string::npos ? client_first : client_first.substr(c2 + 1);
+        std::string password;
+        const auto looked = scram_(c.user);
+        if (looked) {
+            password = looked->first;
+            c.sasl_role = looked->second;
+        } else {
+            c.sasl_role = -1;  // unknown user — run the exchange but reject at the end
+        }
+        c.scram = std::make_unique<ScramServer>();
+        if (!c.scram->begin(bare, password)) {
+            pgw::pg_error_response_code(out, "28P01", "SCRAM initialization failed");
+            c.sasl_state = 0;
+            return;
+        }
+        std::vector<std::byte> pl;
+        pgw::pg_put_i32(pl, 11);  // AuthenticationSASLContinue
+        const std::string& sf = c.scram->server_first();
+        for (const char ch : sf) pl.push_back(std::byte{static_cast<unsigned char>(ch)});
+        pgw::pg_detail::emit(out, 'R', pl);
+        c.sasl_state = 2;
+    }
+
+    // SASLResponse: the client-final-message. Verify the proof + reply AuthenticationSASLFinal
+    // then AuthenticationOk. Returns false (connection closed) on a failed proof / unknown user.
+    bool sasl_final(int fd, Conn& c, const std::byte* p, std::size_t plen, std::vector<std::byte>& out) {
+        const std::string client_final(reinterpret_cast<const char*>(p), plen);
+        if (!c.scram || c.sasl_role < 0 || !c.scram->finish(client_final)) {
+            pgw::pg_error_response_code(out, "28P01",
+                                        "SCRAM authentication failed for user \"" + c.user + "\"");
+            write_all(fd, out);
+            close_conn(fd);
+            return false;
+        }
+        std::vector<std::byte> pl;
+        pgw::pg_put_i32(pl, 12);  // AuthenticationSASLFinal
+        const std::string& sfin = c.scram->server_final();
+        for (const char ch : sfin) pl.push_back(std::byte{static_cast<unsigned char>(ch)});
+        pgw::pg_detail::emit(out, 'R', pl);
+        c.role = c.sasl_role;
+        accept(out);  // AuthenticationOk + ParameterStatus + ReadyForQuery
+        c.started = true;
+        c.sasl_state = 0;
+        c.scram.reset();
+        return true;
+    }
+#endif  // LOCKSTEP_TLS
 
     // ---- EXTENDED protocol (prepared statements) over the Raft path ------------------------
     static std::string rd_cstr(const std::byte* p, std::size_t plen, std::size_t& pos) {
@@ -587,6 +697,7 @@ private:
     ResultFn result_;
     LeaderFn is_leader_;
     AuthFn auth_;
+    ScramFn scram_;
     int listen_fd_ = -1;
     std::map<int, std::unique_ptr<Conn>> conns_;
 };

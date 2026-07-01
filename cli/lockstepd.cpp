@@ -44,6 +44,7 @@
 #include <new>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 // PERF PROFILER (S8.6) — a global operator new counter to measure HEAP ALLOCATIONS PER
@@ -173,6 +174,9 @@ struct Args {
     // Optional read-only PG user (RBAC): can SELECT but not write on the replicated endpoint.
     std::string pg_ro_user;
     std::string pg_ro_password;
+    // --pg-scram 1: authenticate with SCRAM-SHA-256 (password never crosses the wire) instead
+    // of cleartext. Needs OpenSSL (LOCKSTEP_TLS); falls back to cleartext otherwise.
+    bool pg_scram = false;
 
     // SQL-OVER-RAFT (--sql 1): in the replicated cluster-member path, apply committed
     // values as SQL statements into a local SqlEngine + answer read-only SqlQuery admin
@@ -321,6 +325,8 @@ Args parse_args(int argc, char** argv) {
             a.pg_ro_user = v;
         } else if (std::strcmp(k, "--pg-ro-password") == 0) {
             a.pg_ro_password = v;
+        } else if (std::strcmp(k, "--pg-scram") == 0) {
+            a.pg_scram = (parse_u64(v, 0) != 0);
         } else if (std::strcmp(k, "--sql") == 0) {
             a.sql = (parse_u64(v, 0) != 0);  // value-taking flag (loop is strict pairs): --sql 1
         } else if (std::strcmp(k, "--proc-host") == 0) {
@@ -770,6 +776,18 @@ int main(int argc, char** argv) {
                     return -1;                                                   // reject
                 };
             }
+            // SCRAM-SHA-256 (--pg-scram): the server looks up the user's password to derive the
+            // keys — the password itself is never sent over the wire.
+            prod::ProdPgRaftServer::ScramFn pg_scram_fn;
+            if (args.pg_scram && args.pg_auth) {
+                pg_scram_fn = [rw_u = args.pg_user, rw_p = args.pg_password, ro_u = args.pg_ro_user,
+                               ro_p = args.pg_ro_password](const std::string& u)
+                    -> std::optional<std::pair<std::string, int>> {
+                    if (u == rw_u) return std::make_pair(rw_p, 1);
+                    if (!ro_u.empty() && u == ro_u) return std::make_pair(ro_p, 0);
+                    return std::nullopt;
+                };
+            }
             pg_raft.emplace(
                 reactor, args.pg_port,
                 [&node](const std::string& s) { return node.submit(s); },
@@ -781,7 +799,7 @@ int main(int argc, char** argv) {
                     if (it == sql_results->end()) return std::nullopt;
                     return it->second;
                 },
-                [&node] { return node.role() == consensus::Role::Leader; }, pg_auth_fn);
+                [&node] { return node.role() == consensus::Role::Leader; }, pg_auth_fn, pg_scram_fn);
             if (!pg_raft->valid()) {
                 std::fprintf(stderr, "lockstepd: PG-over-Raft bind failed on port %u\n",
                              static_cast<unsigned>(args.pg_port));
