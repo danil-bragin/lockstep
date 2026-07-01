@@ -3839,6 +3839,27 @@ private:
         }
         return IntFold{s, mn, mx};
     }
+    // Row-RANGE variant of fold_masked_col (for morsel parallelism): fold ONLY rows [lo,hi).
+    // Partial folds combine associatively (sum via 2's-complement add, min/max) so a fixed-order
+    // merge is BYTE-IDENTICAL to the serial fold_masked_col over [0,count).
+    static IntFold fold_masked_col_range(const ColumnChunk& cc, std::uint32_t lo, std::uint32_t hi,
+                                         const std::vector<std::uint8_t>& mask) {
+        const std::int64_t* v = cc.ints.data();
+        std::int64_t s = 0, mn = INT64_MAX, mx = INT64_MIN;
+        for (std::uint32_t r = lo; r < hi; ++r) {
+            const std::int64_t x = v[r];
+            const std::int64_t m = mask[r];
+            s += x * m;
+            const std::int64_t lov = m ? x : INT64_MAX;
+            const std::int64_t hiv = m ? x : INT64_MIN;
+            mn = mn < lov ? mn : lov;
+            mx = mx > hiv ? mx : hiv;
+        }
+        return IntFold{s, mn, mx};
+    }
+    static IntFold combine_fold(const IntFold& a, const IntFold& b) {
+        return IntFold{a.sum + b.sum, a.mn < b.mn ? a.mn : b.mn, a.mx > b.mx ? a.mx : b.mx};
+    }
     // Satisfy one fusable aggregate (idxs NON-empty, INT NOT NULL column) from a precomputed fold.
     static Datum agg_from_fold(AggKind k, const IntFold& f, std::size_t cnt) {
         switch (k) {
@@ -4043,6 +4064,32 @@ private:
         }
         std::int64_t n = 0;
         for (std::uint32_t r = 0; r < count; ++r) n += mask[r];
+        return n;
+    }
+    // Row-RANGE variant of build_filter_mask (morsel parallelism): write mask[lo,hi) + return the
+    // slice's match count. Workers own DISJOINT ranges of the shared mask (no contention); the
+    // slice counts sum to the same total, so the result is byte-identical to the serial build.
+    static std::int64_t build_filter_mask_range(const std::vector<const ColumnChunk*>& cols,
+                                                std::uint32_t lo, std::uint32_t hi,
+                                                const std::vector<VecTerm>& vterms,
+                                                std::vector<std::uint8_t>& mask) {
+        for (std::uint32_t r = lo; r < hi; ++r) mask[r] = 1;
+        for (const VecTerm& vt : vterms) {
+            const std::int64_t* a = cols[vt.col]->ints.data();
+            const std::int64_t b = vt.lit.i;
+            switch (vt.op) {
+                case CmpOp::Eq: for (std::uint32_t r = lo; r < hi; ++r) mask[r] &= (a[r] == b); break;
+                case CmpOp::Ne: for (std::uint32_t r = lo; r < hi; ++r) mask[r] &= (a[r] != b); break;
+                case CmpOp::Lt: for (std::uint32_t r = lo; r < hi; ++r) mask[r] &= (a[r] < b); break;
+                case CmpOp::Le: for (std::uint32_t r = lo; r < hi; ++r) mask[r] &= (a[r] <= b); break;
+                case CmpOp::Gt: for (std::uint32_t r = lo; r < hi; ++r) mask[r] &= (a[r] > b); break;
+                case CmpOp::Ge: for (std::uint32_t r = lo; r < hi; ++r) mask[r] &= (a[r] >= b); break;
+                case CmpOp::Like:
+                case CmpOp::Contains: break;
+            }
+        }
+        std::int64_t n = 0;
+        for (std::uint32_t r = lo; r < hi; ++r) n += mask[r];
         return n;
     }
 
@@ -4471,19 +4518,59 @@ private:
                 // vectorization — same lesson as the reverted running-accumulator). AGGREGATE FUSION:
                 // fold each DISTINCT aggregated INT column ONCE over the mask (so SUM(a),MIN(a),MAX(a)
                 // read column a a single time). The empty-match case keeps the int-0 rule.
-                std::vector<std::uint8_t> mask;
-                const std::int64_t nmatch = build_filter_mask(cols, count, vterms, mask);
+                // Collect the DISTINCT aggregated INT columns (fused: each folded ONCE).
                 std::vector<int> col_to_fuse(t.columns.size(), -1);
-                std::vector<IntFold> folds;
-                if (nmatch > 0) {
-                    for (const SelectItem& item : sel.items) {
-                        if (item.kind != SelectItemKind::Aggregate ||
-                            item.agg.kind == AggKind::CountStar)
-                            continue;
-                        const std::size_t ci = *t.column_index(item.agg.column);
-                        if (col_to_fuse[ci] < 0) {
-                            col_to_fuse[ci] = static_cast<int>(folds.size());
-                            folds.push_back(fold_masked_col(*cols[ci], count, mask));
+                std::vector<std::size_t> agg_cols;
+                for (const SelectItem& item : sel.items) {
+                    if (item.kind != SelectItemKind::Aggregate ||
+                        item.agg.kind == AggKind::CountStar)
+                        continue;
+                    const std::size_t ci = *t.column_index(item.agg.column);
+                    if (col_to_fuse[ci] < 0) {
+                        col_to_fuse[ci] = static_cast<int>(agg_cols.size());
+                        agg_cols.push_back(ci);
+                    }
+                }
+                std::vector<std::uint8_t> mask(count);
+                std::vector<IntFold> folds(agg_cols.size());
+                std::int64_t nmatch = 0;
+                const bool par = parallel_executor_ != nullptr &&
+                                 parallel_executor_->workers() > 1 &&
+                                 static_cast<std::int64_t>(count) >= kParallelMinRows;
+                if (!par) {
+                    nmatch = build_filter_mask(cols, count, vterms, mask);
+                    if (nmatch > 0) {
+                        for (std::size_t k = 0; k < agg_cols.size(); ++k) {
+                            folds[k] = fold_masked_col(*cols[agg_cols[k]], count, mask);
+                        }
+                    }
+                } else {
+                    // MORSEL PARALLELISM for the scalar FILTERED aggregate (the profile showed this
+                    // shape did NOT parallelize). Each worker builds its DISJOINT slice of the shared
+                    // mask AND folds that slice; slice counts + partial folds merge in a FIXED order,
+                    // so the result is byte-identical to the serial build+fold.
+                    const std::size_t nparts =
+                        std::min<std::size_t>(parallel_executor_->workers(), count);
+                    const std::uint32_t per =
+                        static_cast<std::uint32_t>((count + nparts - 1) / nparts);
+                    std::vector<std::int64_t> pn(nparts, 0);
+                    std::vector<std::vector<IntFold>> pf(nparts,
+                                                         std::vector<IntFold>(agg_cols.size()));
+                    parallel_executor_->parallel_for(nparts, [&](std::size_t w) {
+                        const std::uint32_t lo = static_cast<std::uint32_t>(w) * per;
+                        if (lo >= count) return;
+                        const std::uint32_t hi = std::min(count, lo + per);
+                        pn[w] = build_filter_mask_range(cols, lo, hi, vterms, mask);
+                        for (std::size_t k = 0; k < agg_cols.size(); ++k) {
+                            pf[w][k] = fold_masked_col_range(*cols[agg_cols[k]], lo, hi, mask);
+                        }
+                    });
+                    for (std::size_t w = 0; w < nparts; ++w) nmatch += pn[w];
+                    if (nmatch > 0) {
+                        for (std::size_t k = 0; k < agg_cols.size(); ++k) {
+                            IntFold m{0, INT64_MAX, INT64_MIN};
+                            for (std::size_t w = 0; w < nparts; ++w) m = combine_fold(m, pf[w][k]);
+                            folds[k] = m;
                         }
                     }
                 }

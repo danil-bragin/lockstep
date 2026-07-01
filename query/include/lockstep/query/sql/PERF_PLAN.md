@@ -181,3 +181,12 @@ dictionary path whenever it applies (the full-concat / non-survivor case) even u
 fall back to parallel string grouping only for a zone-skipped subset where the codes don't align. Result:
 groupby_region 0.34 → 0.50 ms at 4 workers (the 3× catastrophe gone), groupby_cat keeps its ~2× parallel
 win, results byte-identical (bench checksums match serial↔parallel; sql_columnar_test == row-mode PASS).
+
+**Morsel-parallelised the scalar FILTERED aggregate (the profile's other gap).** filtered_agg
+(`... WHERE amount>800`) previously did NOT parallelise (0.58 → 0.60 ms with 4 workers) — the
+build_filter_mask + fold_masked_col passes were serial. Added row-RANGE variants
+(build_filter_mask_range / fold_masked_col_range) so each worker builds its DISJOINT slice of the shared
+mask AND folds that slice; the slice match-counts + partial folds (sum/min/max) merge in a fixed order.
+SUM/MIN/MAX/COUNT are associative, so the merge is byte-identical to the serial build+fold. Result:
+filtered_agg 0.61 → 0.48 ms at 4 workers (**~1.27×**, was a wash), checksums match serial↔parallel,
+sql_columnar_test passes. NEXT (optional): dictionary/RLE TEXT storage encoding; Phase 6 breadth.
