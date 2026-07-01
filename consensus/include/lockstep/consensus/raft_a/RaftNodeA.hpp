@@ -1667,6 +1667,15 @@ private:
     // ===================================================================
 
     void persist_meta() {
+        // CTRL DUAL-COPY METADATA (plan P4). (currentTerm, votedFor) cannot be
+        // reconstructed from peers, so a single torn/flipped metadata write that is
+        // lost on recovery would silently REVERT the vote/term — risking a double vote
+        // in a term (two leaders → split-brain). Persist TWO consecutive CRC'd copies:
+        // if the trailing copy is torn/un-synced on a crash, recovery still finds the
+        // leading copy with the SAME latest values, so the vote/term survive. The two
+        // copies carry identical values, so replaying both is idempotent and the
+        // recovered (term,vote) is unchanged in the no-fault case (V-META-DURABLE).
+        enqueue_durable(rec_meta(current_term_, voted_for_));
         enqueue_durable(rec_meta(current_term_, voted_for_));
     }
     void persist_entry(Index index, const LogEntry& e) {

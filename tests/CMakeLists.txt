@@ -546,6 +546,22 @@ if(TARGET lockstep_consensus AND TARGET lockstep_runtime
     add_test(NAME consensus_state_hash_test COMMAND lockstep_consensus_state_hash_test)
   endif()
 
+  # --- P4: CTRL dual-copy metadata durability -----------------------------------
+  # A torn trailing metadata copy still recovers the latest term/vote from the leading
+  # copy (a single copy would silently revert it). Consensus-only.
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/consensus_meta_dualcopy_test.cpp")
+    add_executable(lockstep_consensus_meta_dualcopy_test consensus_meta_dualcopy_test.cpp)
+    target_include_directories(lockstep_consensus_meta_dualcopy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(lockstep_consensus_meta_dualcopy_test
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_consensus
+        lockstep_runtime
+        lockstep_providers_sim)
+    add_test(NAME consensus_meta_dualcopy_test COMMAND lockstep_consensus_meta_dualcopy_test)
+  endif()
+
   # --- P2: cluster-identity split-brain guard (restore-new-cluster) ------------
   # A foreign-token node is excluded (never leader, never commits) while the
   # same-token majority still elects + commits. Consensus-only (no storage link).
