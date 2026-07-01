@@ -1249,6 +1249,20 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME sql_sqldump_test COMMAND lockstep_sql_sqldump_test)
+  # pg_wire_test: the PostgreSQL v3 wire shim (query/wire/PgWire.hpp) driven end to end
+  # against a real SqlEngine — handshake + simple query protocol (CREATE/INSERT/SELECT/error).
+  add_executable(lockstep_pg_wire_test pg_wire_test.cpp)
+  target_include_directories(lockstep_pg_wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_pg_wire_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_query
+      lockstep_txn
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME pg_wire_test COMMAND lockstep_pg_wire_test)
 
   # sql_wire_catalog_recover_test: the wire/prod analogue — a wire::Server with SEPARATE durable
   # disks for keyed/SQL-data/SQL-catalog runs DDL+INSERT via dispatch(), is dropped (a crash), then
