@@ -481,7 +481,16 @@ public:
         reactor_->arm_uring();
         node_->start();
         reactor_->spawn(admin_serve(this, admin_budget));
+        if (apply_fn_) {
+            reactor_->spawn(apply_pump(this));  // SQL-over-Raft: apply committed entries in order
+        }
     }
+
+    // SQL-OVER-RAFT: install a callback invoked, in commit order, with each committed
+    // entry's value as the LOCAL commit index advances — the node applies the replicated
+    // log into its state machine (e.g. exec a committed SQL statement into a local
+    // SqlEngine). Set BEFORE start(). Unset = no apply pump (unchanged behavior).
+    void set_apply_fn(std::function<void(const std::string&)> fn) { apply_fn_ = std::move(fn); }
 
     // ---- direct (in-process) node surface — the admin protocol wraps these ----
     [[nodiscard]] consensus::SubmitResult submit(const std::string& value) {
@@ -643,6 +652,22 @@ private:
     // the node, and sends a reply frame back to the requester. BOUNDED by `budget`
     // (NEVER unbounded). Each iteration co_awaits recv() then send(): a single
     // round-trip. On a malformed frame it simply ignores it (no reply) and continues.
+    // SQL-OVER-RAFT apply pump: a periodic reactor coroutine that, as the committed index
+    // advances, invokes apply_fn_ with each newly-committed entry's value IN ORDER (once
+    // each). Deterministic state machines (the SqlEngine) reach identical state on every
+    // replica. Bounded by the reactor's run deadline (left suspended at teardown).
+    static core::Task apply_pump(ProdConsensusNode* self) {
+        for (;;) {
+            co_await self->reactor_->clock().delay(2'000'000);  // 2ms apply cadence
+            const consensus::Index ci = self->node_->commit_index();
+            const std::span<const consensus::LogEntry> lg = self->node_->log();
+            while (self->applied_ < ci && self->applied_ < static_cast<consensus::Index>(lg.size())) {
+                self->apply_fn_(lg[static_cast<std::size_t>(self->applied_)].value);
+                ++self->applied_;
+            }
+        }
+    }
+
     static core::Task admin_serve(ProdConsensusNode* self, int budget) {
         ProdNetwork* net = self->admin_net_;
         for (int i = 0; i < budget; ++i) {
@@ -784,6 +809,8 @@ private:
     ProdRandom rng_;             // election jitter / backoff (seeded)
     ProdDisk disk_;              // the DURABLE consensus log over data_dir (S9.2: reactor-bound)
     std::unique_ptr<consensus::ConsensusNode> node_;  // impl A, UNCHANGED
+    std::function<void(const std::string&)> apply_fn_;  // SQL-over-Raft state-machine apply
+    consensus::Index applied_ = 0;                       // highest applied index (0 = none)
 
     AuthPolicy auth_{};  // AUTH/RBAC principal->role->permission policy (empty == OPEN/legacy)
 
