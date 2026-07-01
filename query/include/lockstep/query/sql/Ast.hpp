@@ -491,6 +491,9 @@ enum class StmtKind : std::uint8_t {
     ShowTables = 16,    // E5: SHOW TABLES
     Describe = 17,      // E5: DESCRIBE t / SHOW COLUMNS FROM t
     Analyze = 18,       // I6: ANALYZE t — recompute per-column stats (n_distinct, min/max)
+    Savepoint = 19,          // G6: SAVEPOINT name
+    RollbackToSavepoint = 20,  // G6: ROLLBACK TO [SAVEPOINT] name
+    ReleaseSavepoint = 21,     // G6: RELEASE [SAVEPOINT] name
 };
 
 struct Statement {
@@ -508,6 +511,7 @@ struct Statement {
     bool schema_if_not_exists = false;  // E4
     bool schema_if_exists = false;      // E4
     AlterStmt alter;
+    std::string savepoint_name;  // G6: SAVEPOINT / ROLLBACK TO / RELEASE target
 };
 
 }  // namespace lockstep::query::sql

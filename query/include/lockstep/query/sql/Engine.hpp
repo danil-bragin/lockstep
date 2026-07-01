@@ -1075,10 +1075,12 @@ public:
                 if (in_txn_) return ExecResult::failure("already in a transaction");
                 in_txn_ = true;
                 txn_writes_.clear();
+                savepoints_.clear();
                 return ExecResult{};
             case StmtKind::Commit: {
                 if (!in_txn_) return ExecResult::failure("COMMIT with no active transaction");
                 in_txn_ = false;
+                savepoints_.clear();
                 std::vector<std::pair<Key, Value>> flush;
                 flush.swap(txn_writes_);
                 if (!flush.empty()) commit_writes(flush);  // now in_txn_ is false -> actually commits
@@ -1088,7 +1090,39 @@ public:
                 if (!in_txn_) return ExecResult::failure("ROLLBACK with no active transaction");
                 in_txn_ = false;
                 txn_writes_.clear();  // discard the buffered writes (nothing was committed)
+                savepoints_.clear();
                 return ExecResult{};
+            case StmtKind::Savepoint:
+                if (!in_txn_) return ExecResult::failure("SAVEPOINT can only be used in a transaction");
+                savepoints_.emplace_back(st.savepoint_name, txn_writes_.size());
+                return ExecResult{};
+            case StmtKind::RollbackToSavepoint: {
+                if (!in_txn_)
+                    return ExecResult::failure("ROLLBACK TO SAVEPOINT with no active transaction");
+                std::size_t at = savepoints_.size();
+                for (std::size_t i = savepoints_.size(); i-- > 0;) {
+                    if (savepoints_[i].first == st.savepoint_name) { at = i; break; }
+                }
+                if (at == savepoints_.size())
+                    return ExecResult::failure("no such savepoint: " + st.savepoint_name);
+                if (savepoints_[at].second < txn_writes_.size()) {
+                    txn_writes_.resize(savepoints_[at].second);  // undo writes since the savepoint
+                }
+                savepoints_.resize(at + 1);  // drop later savepoints; keep the target (re-rollback ok)
+                return ExecResult{};
+            }
+            case StmtKind::ReleaseSavepoint: {
+                if (!in_txn_)
+                    return ExecResult::failure("RELEASE SAVEPOINT with no active transaction");
+                std::size_t at = savepoints_.size();
+                for (std::size_t i = savepoints_.size(); i-- > 0;) {
+                    if (savepoints_[i].first == st.savepoint_name) { at = i; break; }
+                }
+                if (at == savepoints_.size())
+                    return ExecResult::failure("no such savepoint: " + st.savepoint_name);
+                savepoints_.resize(at);  // forget the savepoint (+ later ones); writes are kept
+                return ExecResult{};
+            }
             case StmtKind::CreateSchema:
                 if (!catalog_.create_schema(st.schema_arg, st.schema_if_not_exists))
                     return ExecResult::failure("schema '" + st.schema_arg + "' already exists");
@@ -10534,6 +10568,10 @@ private:
     bool soa_overflow_ = false;        // K1: a 128-bit SoA SUM overflowed => bail to the row path (errors)
     bool in_txn_ = false;              // G1: inside an explicit BEGIN..COMMIT transaction
     std::vector<std::pair<Key, Value>> txn_writes_;  // G1: buffered DML writes (committed at COMMIT)
+    // G6: SAVEPOINT stack — (name, txn_writes_ length when the savepoint was set). ROLLBACK TO
+    // truncates txn_writes_ back to that length (undoing writes since the savepoint) and drops
+    // savepoints established after it; RELEASE just forgets the savepoint (keeps the writes).
+    std::vector<std::pair<std::string, std::size_t>> savepoints_;
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change

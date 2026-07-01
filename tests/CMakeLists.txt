@@ -1489,6 +1489,13 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
     PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_txn_test COMMAND lockstep_sql_txn_test)
+  # sql_savepoint_test (G6): SAVEPOINT / ROLLBACK TO / RELEASE nested partial rollback.
+  add_executable(lockstep_sql_savepoint_test sql_savepoint_test.cpp)
+  target_include_directories(lockstep_sql_savepoint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_savepoint_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_savepoint_test COMMAND lockstep_sql_savepoint_test)
   # sql_correlated_test (B2): correlated subqueries (EXISTS / NOT EXISTS / scalar).
   add_executable(lockstep_sql_correlated_test sql_correlated_test.cpp)
   target_include_directories(lockstep_sql_correlated_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

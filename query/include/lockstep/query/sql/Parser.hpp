@@ -439,8 +439,32 @@ public:
             r = ParseResult{std::move(st)};
         } else if (kw == "rollback") {
             advance();
+            if (is_kw("transaction") || is_kw("work")) advance();  // optional
             Statement st;
-            st.kind = StmtKind::Rollback;
+            if (is_kw("to")) {  // ROLLBACK TO [SAVEPOINT] name
+                advance();
+                if (is_kw("savepoint")) advance();  // optional keyword
+                st.kind = StmtKind::RollbackToSavepoint;
+                if (auto e = expect_ident("a savepoint name after ROLLBACK TO", st.savepoint_name))
+                    return ParseResult{*e};
+            } else {
+                st.kind = StmtKind::Rollback;
+            }
+            r = ParseResult{std::move(st)};
+        } else if (kw == "savepoint") {
+            advance();
+            Statement st;
+            st.kind = StmtKind::Savepoint;
+            if (auto e = expect_ident("a savepoint name after SAVEPOINT", st.savepoint_name))
+                return ParseResult{*e};
+            r = ParseResult{std::move(st)};
+        } else if (kw == "release") {
+            advance();
+            if (is_kw("savepoint")) advance();  // optional keyword
+            Statement st;
+            st.kind = StmtKind::ReleaseSavepoint;
+            if (auto e = expect_ident("a savepoint name after RELEASE", st.savepoint_name))
+                return ParseResult{*e};
             r = ParseResult{std::move(st)};
         } else if (kw == "alter") {
             r = parse_alter();
