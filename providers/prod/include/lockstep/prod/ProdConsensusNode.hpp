@@ -146,6 +146,8 @@ enum class AdminKind : std::uint8_t {
     // new token; the reply just acks it was applied.
     ForceNewCluster = 11,     // req: [ForceNewCluster][u64 new_token]
     ForceNewClusterRep = 12,  // rep: [ForceNewClusterRep][u64 new_token]
+    SqlQuery = 13,     // req: [SqlQuery][str sql]  (SQL-over-Raft local read)
+    SqlQueryRep = 14,  // rep: [SqlQueryRep][str rendered_result]
 };
 
 // A decoded STATUS reply (the client-observable cluster state across the socket).
@@ -282,6 +284,21 @@ struct Reader {
         return false;
     }
     out_token = r.u64();
+    return r.ok();
+}
+// SQL-over-Raft: encode a read-only SQL query request; decode its rendered-result reply.
+[[nodiscard]] inline std::vector<std::byte> encode_sql_query(const std::string& sql) {
+    std::vector<std::byte> b;
+    admin_detail::put_u8(b, static_cast<std::uint8_t>(AdminKind::SqlQuery));
+    admin_detail::put_str(b, sql);
+    return b;
+}
+[[nodiscard]] inline bool decode_sql_query(std::span<const std::byte> payload, std::string& out) {
+    admin_detail::Reader r{payload.data(), payload.size(), 0, true};
+    if (static_cast<AdminKind>(r.u8()) != AdminKind::SqlQueryRep) {
+        return false;
+    }
+    out = r.str();
     return r.ok();
 }
 
@@ -492,6 +509,11 @@ public:
     // SqlEngine). Set BEFORE start(). Unset = no apply pump (unchanged behavior).
     void set_apply_fn(std::function<void(const std::string&)> fn) { apply_fn_ = std::move(fn); }
 
+    // SQL-OVER-RAFT read seam: a callback that runs a read-only SQL query against the local
+    // applied state machine and returns a rendered result — the SqlQuery admin verb. Set
+    // before start(). Unset = the verb returns an error.
+    void set_query_fn(std::function<std::string(const std::string&)> fn) { query_fn_ = std::move(fn); }
+
     // ---- direct (in-process) node surface — the admin protocol wraps these ----
     [[nodiscard]] consensus::SubmitResult submit(const std::string& value) {
         return node_->submit(value);
@@ -696,6 +718,7 @@ private:
             case AdminKind::Status:
             case AdminKind::StatCommit:
             case AdminKind::Metrics:
+            case AdminKind::SqlQuery:
                 return OpClass::Read;
             default:
                 return OpClass::None;  // unknown/reply kinds -> DENIED (never executed).
@@ -761,6 +784,14 @@ private:
             node_->force_new_cluster(new_token);  // quorum-loss recovery (P5)
             admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::ForceNewClusterRep));
             admin_detail::put_u64(rep, new_token);
+        } else if (kind == AdminKind::SqlQuery) {
+            const std::string q = r.str();
+            if (!r.ok()) {
+                return rep;
+            }
+            const std::string result = query_fn_ ? query_fn_(q) : std::string("ERR:no SQL engine");
+            admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::SqlQueryRep));
+            admin_detail::put_str(rep, result);
         } else if (kind == AdminKind::Status) {
             admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::StatusRep));
             admin_detail::put_u8(rep, static_cast<std::uint8_t>(node_->role()));
@@ -810,6 +841,7 @@ private:
     ProdDisk disk_;              // the DURABLE consensus log over data_dir (S9.2: reactor-bound)
     std::unique_ptr<consensus::ConsensusNode> node_;  // impl A, UNCHANGED
     std::function<void(const std::string&)> apply_fn_;  // SQL-over-Raft state-machine apply
+    std::function<std::string(const std::string&)> query_fn_;  // SQL-over-Raft local read
     consensus::Index applied_ = 0;                       // highest applied index (0 = none)
 
     AuthPolicy auth_{};  // AUTH/RBAC principal->role->permission policy (empty == OPEN/legacy)

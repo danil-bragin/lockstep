@@ -228,6 +228,17 @@ core::Task metrics_rpc(core::INetwork* cli, core::Endpoint admin, std::string* o
     co_return;
 }
 
+// SQL-over-Raft: send a read-only SqlQuery; *ok iff a result came back into *out.
+core::Task sql_query_rpc(core::INetwork* cli, core::Endpoint admin, std::string sql,
+                         std::string* out, bool* ok, bool* done) {
+    const std::vector<std::byte> req = prod::encode_sql_query(sql);
+    co_await cli->send(admin, {req.data(), req.size()});
+    core::Message rep = co_await cli->recv();
+    *ok = prod::decode_sql_query(rep.payload, *out);
+    *done = true;
+    co_return;
+}
+
 // P5: send a ForceNewCluster request; *ok iff the node acked (echoed the token).
 core::Task force_new_cluster_rpc(core::INetwork* cli, core::Endpoint admin, std::uint64_t token,
                                  bool* ok, bool* done) {
@@ -356,6 +367,19 @@ bool do_metrics(std::uint16_t port, std::string& out) {
     bool ok = false;
     bool done = false;
     c.reactor.spawn(metrics_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// SQL-over-Raft: run a read-only SQL query on one node; fill `out` with its rendered result.
+bool do_sql(std::uint16_t port, const std::string& sql, std::string& out) {
+    Client c(port);
+    if (!c.ok) {
+        return false;
+    }
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(sql_query_rpc(c.net(), c.admin_ep(), sql, &out, &ok, &done));
     c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
     return done && ok;
 }
@@ -1177,6 +1201,19 @@ int cmd_force_new_cluster(const std::vector<std::uint16_t>& hosts, std::uint64_t
     return ok ? 0 : 1;
 }
 
+// SQL-over-Raft: run a read-only SQL query on each host + print its rendered result. When
+// several hosts are given, this shows every replica's applied SQL state (they must match).
+int cmd_sql(const std::string& sql, const std::vector<std::uint16_t>& hosts) {
+    for (std::uint16_t port : hosts) {
+        std::string out;
+        const bool ok = do_sql(port, sql, out);
+        std::printf("SQL port=%u ok=%d result=%s\n", static_cast<unsigned>(port), ok ? 1 : 0,
+                    ok ? out.c_str() : "(no reply)");
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
 // CROSS-REPLICA HASHCHECK (plan P3) — query each host's committed log, materialise the
 // applied keyspace at a COMMON commit index, and compare hashes across replicas. Agreement
 // confirms the replicas hold identical applied state; a mismatch is a CORRUPT alarm (silent
@@ -1470,6 +1507,8 @@ int main(int argc, char** argv) {
             "(cross-replica applied-keyspace agreement; exit 1 on divergence)\n"
             "       lockstep_admin force-new-cluster --token T --host PORT "
             "(DANGER: recover a lone survivor after permanent quorum loss)\n"
+            "       lockstep_admin sql \"<query>\" --host PORT [--host PORT ...] "
+            "(SQL-over-Raft: read each replica's applied SQL state)\n"
             "       lockstep_admin commit --host PORT [--host PORT ...]\n"
             "       lockstep_admin metrics --host PORT [--host PORT ...] "
             "(scrape Prometheus metrics)\n"
@@ -1501,9 +1540,10 @@ int main(int argc, char** argv) {
     bool have_token = false;
     int i = 2;
 
-    if (verb == "submit") {
+    if (verb == "submit" || verb == "sql") {
         if (argc < 3) {
-            std::fprintf(stderr, "lockstep_admin submit: missing VALUE\n");
+            std::fprintf(stderr, "lockstep_admin %s: missing %s\n", verb.c_str(),
+                         verb == "sql" ? "SQL" : "VALUE");
             return 2;
         }
         value = argv[2];
@@ -1610,6 +1650,9 @@ int main(int argc, char** argv) {
     }
     if (verb == "force-new-cluster") {
         return cmd_force_new_cluster(hosts, token, have_token);
+    }
+    if (verb == "sql") {
+        return cmd_sql(value, hosts);
     }
     if (verb == "submit") {
         return cmd_submit(value, hosts, await_durable);

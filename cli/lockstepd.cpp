@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -166,6 +167,11 @@ struct Args {
     std::string pg_user;
     std::string pg_password;
     bool pg_auth = false;
+
+    // SQL-OVER-RAFT (--sql 1): in the replicated cluster-member path, apply committed
+    // values as SQL statements into a local SqlEngine + answer read-only SqlQuery admin
+    // requests, so a write submitted to the cluster materialises the same SQL DB on every node.
+    bool sql = false;
     // CROSS-MACHINE replicated shards: dial host per process id (proc_hosts[q-1] = proc q's
     // IP). Empty => 127.0.0.1 (single-host, the default). Set via --proc-host ID:HOST.
     std::vector<std::string> proc_hosts;
@@ -205,6 +211,18 @@ std::uint64_t parse_u64(const char* s, std::uint64_t fallback) {
     char* end = nullptr;
     const unsigned long long v = std::strtoull(s, &end, 10);
     return (end != nullptr && *end == '\0') ? static_cast<std::uint64_t>(v) : fallback;
+}
+
+// SQL-OVER-RAFT: a stable rendering of an ExecResult for the SqlQuery admin reply — so a
+// client can compare replicas byte-for-byte (an error, an affected count, or the rows).
+std::string render_sql(const lockstep::query::sql::ExecResult& r) {
+    if (!r.ok) return "ERR:" + r.error;
+    std::string s = "ok aff=" + std::to_string(r.affected);
+    for (const auto& row : r.rows) {
+        s += " |";
+        for (const auto& [name, d] : row.cells) s += " " + name + "=" + d.render();
+    }
+    return s;
 }
 
 // Parse a peer token into a Peer. Accepts BOTH:
@@ -293,6 +311,8 @@ Args parse_args(int argc, char** argv) {
         } else if (std::strcmp(k, "--pg-password") == 0) {
             a.pg_password = v;
             a.pg_auth = true;
+        } else if (std::strcmp(k, "--sql") == 0) {
+            a.sql = (parse_u64(v, 0) != 0);  // value-taking flag (loop is strict pairs): --sql 1
         } else if (std::strcmp(k, "--proc-host") == 0) {
             // --proc-host ID:HOST — record process ID's dial IP for cross-machine repl shards.
             const char* colon = (v != nullptr) ? std::strchr(v, ':') : nullptr;
@@ -694,6 +714,26 @@ int main(int argc, char** argv) {
                 {"cluster_size", static_cast<std::uint64_t>(cluster.size())},
                 {"seed", args.seed},
                 {"disk", node.disk_valid() ? "ok" : "unavailable"}});
+
+    // --- SQL-OVER-RAFT (--sql 1): a local SqlEngine driven by the committed Raft log ----
+    // The engine's TWO stores live on their OWN schedulers (exec drives them inline). The
+    // apply pump exec's each committed value as a SQL statement; SqlQuery reads locally.
+    // Declared here so they outlive the run loop; only wired when --sql is given.
+    core::Scheduler sql_d_sched;
+    core::Scheduler sql_c_sched;
+    std::optional<prod::ProdDisk> sql_d_disk;
+    std::optional<prod::ProdDisk> sql_c_disk;
+    std::optional<lockstep::query::sql::SqlEngine> sql_engine;
+    if (args.sql) {
+        sql_d_disk.emplace(sql_d_sched, args.data_dir + "/lockstepd-sqlraft-data.wal");
+        sql_c_disk.emplace(sql_c_sched, args.data_dir + "/lockstepd-sqlraft-catalog.wal");
+        sql_engine.emplace(sql_d_sched, *sql_d_disk, sql_c_sched, *sql_c_disk);
+        sql_engine->recover(sql_d_disk->logical_len(), sql_c_disk->logical_len());
+        node.set_apply_fn([&sql_engine](const std::string& v) { (void)sql_engine->exec(v); });
+        node.set_query_fn([&sql_engine](const std::string& q) { return render_sql(sql_engine->exec(q)); });
+        std::printf("lockstepd: SQL-over-Raft ENABLED (committed values applied as SQL)\n");
+        std::fflush(stdout);
+    }
 
     // --- start the node + admin serve-loop, run the BOUNDED reactor loop ------
     // A generous bounded admin recv budget (NEVER an unbounded loop). The reactor run
