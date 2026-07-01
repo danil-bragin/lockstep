@@ -240,6 +240,13 @@ public:
         return false;
     }
 
+    // FORCE-NEW-CLUSTER (P5 quorum-loss recovery): reconfigure this survivor into a
+    // single-node cluster {self} under a fresh cluster identity `new_token`, keeping its
+    // log, so it self-elects and resumes committing after a permanent majority loss.
+    // DANGEROUS + operator-only (see the impl). Default: no-op (an impl without it, e.g.
+    // a fixed-membership node, ignores the request).
+    virtual void force_new_cluster(std::uint64_t new_token) { (void)new_token; }
+
     // The config this server currently believes it is in (Membership.tla Cfg(s) =
     // configs[cfgIdx[s]]) — sorted node ids. Default: empty (fixed-membership node).
     [[nodiscard]] virtual std::vector<std::uint64_t> current_config() const {

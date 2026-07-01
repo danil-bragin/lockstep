@@ -850,7 +850,7 @@ public:
     // cannot rejoin and fork. Members are re-added afterward via the normal add path (they
     // catch up from this survivor's log). NOT durable across restart by itself: relaunch
     // the survivor with --cluster-token = new_token to keep the new identity.
-    void force_new_cluster(std::uint64_t new_token) {
+    void force_new_cluster(std::uint64_t new_token) override {
         if (!running_) {
             return;
         }

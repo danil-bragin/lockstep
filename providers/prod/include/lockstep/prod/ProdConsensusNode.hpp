@@ -140,6 +140,12 @@ enum class AdminKind : std::uint8_t {
     // carries a short reason string so the client/test can confirm it was an auth denial
     // (not a dead node / not-leader). This is the AUTHZ gate AFTER the mTLS AUTHN gate.
     AuthDenied = 10,    // rep: [AuthDenied][str reason]
+    // P5 QUORUM-LOSS RECOVERY: force this survivor into a single-node cluster {self}
+    // under a fresh identity token, so it self-elects + commits after a permanent
+    // majority loss. DANGEROUS + mutating (Write op class, auth-gated). req carries the
+    // new token; the reply just acks it was applied.
+    ForceNewCluster = 11,     // req: [ForceNewCluster][u64 new_token]
+    ForceNewClusterRep = 12,  // rep: [ForceNewClusterRep][u64 new_token]
 };
 
 // A decoded STATUS reply (the client-observable cluster state across the socket).
@@ -259,6 +265,24 @@ struct Reader {
     std::vector<std::byte> b;
     admin_detail::put_u8(b, static_cast<std::uint8_t>(AdminKind::Metrics));
     return b;
+}
+// P5 QUORUM-LOSS RECOVERY: force this node into a single-node cluster {self} under a
+// fresh identity `new_token`. DANGEROUS (mutating); the reply echoes the token on apply.
+[[nodiscard]] inline std::vector<std::byte> encode_force_new_cluster(std::uint64_t new_token) {
+    std::vector<std::byte> b;
+    admin_detail::put_u8(b, static_cast<std::uint8_t>(AdminKind::ForceNewCluster));
+    admin_detail::put_u64(b, new_token);
+    return b;
+}
+// Decode a ForceNewCluster reply (client side): true + the echoed token on success.
+[[nodiscard]] inline bool decode_force_new_cluster(std::span<const std::byte> payload,
+                                                   std::uint64_t& out_token) {
+    admin_detail::Reader r{payload.data(), payload.size(), 0, true};
+    if (static_cast<AdminKind>(r.u8()) != AdminKind::ForceNewClusterRep) {
+        return false;
+    }
+    out_token = r.u64();
+    return r.ok();
 }
 
 // Decode a STATUS reply payload (client side). Returns false on a malformed frame.
@@ -642,7 +666,8 @@ private:
     [[nodiscard]] static OpClass op_class_of(AdminKind kind) noexcept {
         switch (kind) {
             case AdminKind::Submit:
-                return OpClass::Write;
+            case AdminKind::ForceNewCluster:
+                return OpClass::Write;  // mutating (recovery) — auth-gated like Submit.
             case AdminKind::Status:
             case AdminKind::StatCommit:
             case AdminKind::Metrics:
@@ -703,6 +728,14 @@ private:
                 admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::NotLeader));
                 admin_detail::put_u64(rep, sr.leader_hint);
             }
+        } else if (kind == AdminKind::ForceNewCluster) {
+            const std::uint64_t new_token = r.u64();
+            if (!r.ok()) {
+                return rep;  // malformed: ignore
+            }
+            node_->force_new_cluster(new_token);  // quorum-loss recovery (P5)
+            admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::ForceNewClusterRep));
+            admin_detail::put_u64(rep, new_token);
         } else if (kind == AdminKind::Status) {
             admin_detail::put_u8(rep, static_cast<std::uint8_t>(AdminKind::StatusRep));
             admin_detail::put_u8(rep, static_cast<std::uint8_t>(node_->role()));

@@ -228,6 +228,18 @@ core::Task metrics_rpc(core::INetwork* cli, core::Endpoint admin, std::string* o
     co_return;
 }
 
+// P5: send a ForceNewCluster request; *ok iff the node acked (echoed the token).
+core::Task force_new_cluster_rpc(core::INetwork* cli, core::Endpoint admin, std::uint64_t token,
+                                 bool* ok, bool* done) {
+    const std::vector<std::byte> req = prod::encode_force_new_cluster(token);
+    co_await cli->send(admin, {req.data(), req.size()});
+    core::Message rep = co_await cli->recv();
+    std::uint64_t echoed = 0;
+    *ok = prod::decode_force_new_cluster(rep.payload, echoed) && echoed == token;
+    *done = true;
+    co_return;
+}
+
 // ---- one SUBMIT round-trip (free function over stable pointers) ------------
 struct SubmitOutcome {
     bool replied = false;
@@ -344,6 +356,19 @@ bool do_metrics(std::uint16_t port, std::string& out) {
     bool ok = false;
     bool done = false;
     c.reactor.spawn(metrics_rpc(c.net(), c.admin_ep(), &out, &ok, &done));
+    c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
+    return done && ok;
+}
+
+// P5: send ForceNewCluster to one admin port. Returns true iff the node acked.
+bool do_force_new_cluster(std::uint16_t port, std::uint64_t token) {
+    Client c(port);
+    if (!c.ok) {
+        return false;
+    }
+    bool ok = false;
+    bool done = false;
+    c.reactor.spawn(force_new_cluster_rpc(c.net(), c.admin_ep(), token, &ok, &done));
     c.reactor.run_until([&done] { return done; }, c.reactor.now() + kReqWallNs);
     return done && ok;
 }
@@ -1131,6 +1156,27 @@ int cmd_metrics(const std::vector<std::uint16_t>& hosts) {
     return 0;
 }
 
+// P5 QUORUM-LOSS RECOVERY — force a survivor into a single-node cluster {self} under a
+// fresh identity token so it self-elects + commits after a permanent majority loss.
+// DANGEROUS: run ONLY on the most up-to-date survivor with the old majority truly gone;
+// the fresh token makes any stale old-cluster node a foreign cluster (dropped by the
+// guard). --token is REQUIRED (no default — you must consciously pick a new identity).
+int cmd_force_new_cluster(const std::vector<std::uint16_t>& hosts, std::uint64_t token,
+                          bool have_token) {
+    if (!have_token) {
+        std::fprintf(stderr, "force-new-cluster: --token <u64> is REQUIRED (a fresh cluster identity)\n");
+        return 2;
+    }
+    if (hosts.size() != 1) {
+        std::fprintf(stderr, "force-new-cluster: give EXACTLY one --host (the survivor to recover)\n");
+        return 2;
+    }
+    const bool ok = do_force_new_cluster(hosts[0], token);
+    std::printf("FORCE-NEW-CLUSTER port=%u token=%llu ok=%d\n", static_cast<unsigned>(hosts[0]),
+                static_cast<unsigned long long>(token), ok ? 1 : 0);
+    return ok ? 0 : 1;
+}
+
 // CROSS-REPLICA HASHCHECK (plan P3) — query each host's committed log, materialise the
 // applied keyspace at a COMMON commit index, and compare hashes across replicas. Agreement
 // confirms the replicas hold identical applied state; a mismatch is a CORRUPT alarm (silent
@@ -1422,6 +1468,8 @@ int main(int argc, char** argv) {
             "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
             "       lockstep_admin hashcheck --host PORT [--host PORT ...] "
             "(cross-replica applied-keyspace agreement; exit 1 on divergence)\n"
+            "       lockstep_admin force-new-cluster --token T --host PORT "
+            "(DANGER: recover a lone survivor after permanent quorum loss)\n"
             "       lockstep_admin commit --host PORT [--host PORT ...]\n"
             "       lockstep_admin metrics --host PORT [--host PORT ...] "
             "(scrape Prometheus metrics)\n"
@@ -1449,6 +1497,8 @@ int main(int argc, char** argv) {
     BenchArgs ba;
     PipeArgs pa;
     bool await_durable = true;  // S8.4: submit is DURABLE (await commit) by default.
+    std::uint64_t token = 0;    // P5 force-new-cluster identity token (--token)
+    bool have_token = false;
     int i = 2;
 
     if (verb == "submit") {
@@ -1489,6 +1539,10 @@ int main(int argc, char** argv) {
             ++i;
         } else if (std::strcmp(argv[i], "--conns") == 0 && i + 1 < argc) {
             pa.conns = parse_u64_opt(argv[i + 1], pa.conns);
+            ++i;
+        } else if (std::strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            token = parse_u64_opt(argv[i + 1], token);
+            have_token = true;
             ++i;
         } else if (std::strcmp(argv[i], "--no-await") == 0) {
             // Accept-only submit (load-harness accept measurement); DEFAULT is durable.
@@ -1553,6 +1607,9 @@ int main(int argc, char** argv) {
     }
     if (verb == "hashcheck") {
         return cmd_hashcheck(hosts);
+    }
+    if (verb == "force-new-cluster") {
+        return cmd_force_new_cluster(hosts, token, have_token);
     }
     if (verb == "submit") {
         return cmd_submit(value, hosts, await_durable);
