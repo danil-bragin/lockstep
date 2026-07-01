@@ -115,6 +115,7 @@ struct Args {
     std::uint16_t listen_port = 0;  // this node's consensus listen port (REQUIRED >0)
     std::uint16_t admin_port = 0;   // this node's admin listen port (REQUIRED >0)
     std::uint64_t seed = 0;
+    std::uint64_t cluster_token = 0;  // P2 restore-new-cluster identity (0 = unset)
     std::string data_dir = ".";
     std::vector<Peer> peers;  // EVERY cluster member incl self (id -> consensus port)
 
@@ -248,6 +249,8 @@ Args parse_args(int argc, char** argv) {
             a.admin_port = static_cast<std::uint16_t>(parse_u64(v, a.admin_port));
         } else if (std::strcmp(k, "--seed") == 0) {
             a.seed = parse_u64(v, a.seed);
+        } else if (std::strcmp(k, "--cluster-token") == 0) {
+            a.cluster_token = parse_u64(v, a.cluster_token);
         } else if (std::strcmp(k, "--data-dir") == 0) {
             a.data_dir = v;
         } else if (std::strcmp(k, "--run-seconds") == 0) {
@@ -344,6 +347,7 @@ int run_multishard(const Args& args) {
     cfg.base_port = args.shard_base_port;
     cfg.data_dir = args.data_dir;
     cfg.seed = args.seed;
+    cfg.cluster_token = args.cluster_token;  // P2 cluster-identity guard
     cfg.run_seconds = args.run_seconds;
     cfg.election_min_ms = args.election_min_ms;
     cfg.election_max_ms = args.election_max_ms;
@@ -387,6 +391,7 @@ int run_repl_multishard(const Args& args) {
     cfg.base_port = args.shard_base_port;
     cfg.data_dir = args.data_dir;
     cfg.seed = args.seed;
+    cfg.cluster_token = args.cluster_token;  // P2 cluster-identity guard
     cfg.run_seconds = args.run_seconds;
     cfg.election_min_ms = args.election_min_ms;
     cfg.election_max_ms = args.election_max_ms;

@@ -85,6 +85,9 @@ struct ShardRunConfig {
     std::uint64_t election_min_ms = 8;
     std::uint64_t election_max_ms = 20;
     std::uint64_t heartbeat_ms = 4;
+    // P2 restore-new-cluster: cluster-identity token (0 = unset). A restored cluster is
+    // launched with a fresh token so a stale old-cluster node (same ids/ports) is dropped.
+    std::uint64_t cluster_token = 0;
 
 #if defined(__linux__) && defined(LOCKSTEP_TLS)
     // TLS TRANSPORT (opt-in): when enabled, EACH shard's reactor owns its OWN TLS contexts
@@ -180,6 +183,7 @@ inline void run_one_shard(const ShardRunConfig& cfg, const ShardPlan& plan,
         timing.election_max = static_cast<core::Tick>(cfg.election_max_ms) * kMsToNs;
         timing.heartbeat = static_cast<core::Tick>(cfg.heartbeat_ms) * kMsToNs;
         timing.request_deadline = 2'000 * kMsToNs;
+        timing.cluster_token = cfg.cluster_token;  // P2 cluster-identity guard
         node = std::make_unique<ProdConsensusNode>(reactor, *bus, plan.node_id, admin_id,
                                                    plan.data_dir, cfg.seed + plan.index,
                                                    std::move(cluster), timing);
@@ -325,6 +329,9 @@ struct ReplShardRunConfig {
     std::uint64_t election_min_ms = 150;
     std::uint64_t election_max_ms = 300;
     std::uint64_t heartbeat_ms = 30;
+    // P2 restore-new-cluster: cluster-identity token (0 = unset). A restored replicated
+    // cluster is launched with a fresh token so a stale old-cluster process is excluded.
+    std::uint64_t cluster_token = 0;
 
     // CROSS-MACHINE: dial host per process id (1-based: proc_hosts[q-1] is process q's IP).
     // Empty / short / blank entry => 127.0.0.1 (single-host cluster — the historical default,
@@ -438,6 +445,7 @@ inline void run_one_repl_shard(const ReplShardRunConfig& cfg, std::uint64_t shar
         timing.election_max = static_cast<core::Tick>(cfg.election_max_ms) * kMsToNs;
         timing.heartbeat = static_cast<core::Tick>(cfg.heartbeat_ms) * kMsToNs;
         timing.request_deadline = 2'000 * kMsToNs;
+        timing.cluster_token = cfg.cluster_token;  // P2 cluster-identity guard
         node = std::make_unique<ProdConsensusNode>(reactor, *bus, node_id, admin_id, sdir,
                                                    cfg.seed + shard, std::move(cluster),
                                                    timing);

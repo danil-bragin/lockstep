@@ -346,6 +346,10 @@ public:
         core::Tick election_max = kElectionMaxNs;
         core::Tick heartbeat = kHeartbeatNs;
         core::Tick request_deadline = kRequestDeadlineNs;
+        // P2 restore-new-cluster: the cluster-identity token. 0 = unset (a normal single
+        // cluster). A restored cluster is booted with a FRESH token so a stale node from
+        // the old cluster (same ids/ports) is dropped by the guard and cannot rejoin.
+        std::uint64_t cluster_token = 0;
     };
 
     // 1-node convenience ctor (S5b-1 call sites): default timing.
@@ -388,6 +392,7 @@ public:
         nc.election_timeout_max = timing.election_max;
         nc.heartbeat_interval = timing.heartbeat;
         nc.request_deadline = timing.request_deadline;
+        nc.cluster_token = timing.cluster_token;  // P2 cluster-identity guard
         // PROD compaction cadence: snapshot every ~4096 entries instead of every 8. Each
         // snapshot RE-SERIALIZES the whole accumulated state (O(n)); at the gate's default
         // of 8 a long single-daemon run pays O(n^2) of redundant snapshot I/O. 4096 keeps
