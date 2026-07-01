@@ -177,6 +177,84 @@ int main() {
         check(has_type(ms, 'Z'), "bad query -> ReadyForQuery (session recovers)");
     }
 
+    // (4b) EXTENDED protocol: Parse / Bind($1=1) / Describe / Execute / Sync for a prepared
+    //      "SELECT id, name FROM t WHERE id = $1" -> ParseComplete, BindComplete,
+    //      RowDescription, one DataRow [1, alice], CommandComplete "SELECT 1", ReadyForQuery.
+    {
+        std::vector<std::byte> ext;
+        // Parse 'P': unnamed stmt, query, 0 param types.
+        {
+            std::vector<std::byte> p;
+            pw::pg_put_str(p, "");  // statement name (unnamed)
+            pw::pg_put_str(p, "SELECT id, name FROM t WHERE id = $1");
+            pw::pg_put_i16(p, 0);  // number of parameter type OIDs
+            ext.push_back(static_cast<std::byte>('P'));
+            pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+            ext.insert(ext.end(), p.begin(), p.end());
+        }
+        // Bind 'B': unnamed portal, unnamed stmt, 0 fmt codes, 1 param = "1", 0 result fmts.
+        {
+            std::vector<std::byte> p;
+            pw::pg_put_str(p, "");  // portal
+            pw::pg_put_str(p, "");  // statement
+            pw::pg_put_i16(p, 0);   // format codes
+            pw::pg_put_i16(p, 1);   // one parameter
+            pw::pg_put_i32(p, 1);   // param length
+            p.push_back(static_cast<std::byte>('1'));
+            pw::pg_put_i16(p, 0);   // result format codes
+            ext.push_back(static_cast<std::byte>('B'));
+            pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+            ext.insert(ext.end(), p.begin(), p.end());
+        }
+        // Describe 'D': portal ''.
+        {
+            std::vector<std::byte> p;
+            p.push_back(static_cast<std::byte>('P'));
+            pw::pg_put_str(p, "");
+            ext.push_back(static_cast<std::byte>('D'));
+            pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+            ext.insert(ext.end(), p.begin(), p.end());
+        }
+        // Execute 'E': portal '', 0 max rows.
+        {
+            std::vector<std::byte> p;
+            pw::pg_put_str(p, "");
+            pw::pg_put_i32(p, 0);
+            ext.push_back(static_cast<std::byte>('E'));
+            pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+            ext.insert(ext.end(), p.begin(), p.end());
+        }
+        // Sync 'S'.
+        ext.push_back(static_cast<std::byte>('S'));
+        pw::pg_put_i32(ext, 4);
+
+        const auto ms = parse_backend(session.feed(sp(ext)));
+        check(has_type(ms, '1'), "extended: ParseComplete '1'");
+        check(has_type(ms, '2'), "extended: BindComplete '2'");
+        check(has_type(ms, 'T'), "extended: RowDescription 'T' (from Describe)");
+        int drows = 0;
+        std::vector<std::string> vals;
+        for (const Msg& m : ms)
+            if (m.type == 'D') {
+                ++drows;
+                std::size_t p = 2;
+                for (int c = 0; c < 2; ++c) {
+                    const std::int32_t vl = pw::pg_get_i32(m.body.data() + p);
+                    p += 4;
+                    vals.emplace_back(reinterpret_cast<const char*>(m.body.data() + p),
+                                      vl < 0 ? 0 : static_cast<std::size_t>(vl));
+                    if (vl > 0) p += static_cast<std::size_t>(vl);
+                }
+            }
+        check(drows == 1 && vals.size() == 2 && vals[0] == "1" && vals[1] == "alice",
+              "extended: bound $1=1 -> one DataRow [1, alice]");
+        bool tag = false;
+        for (const Msg& m : ms)
+            if (m.type == 'C') { std::size_t p = 0; tag = (cstring(m.body, p) == "SELECT 1"); }
+        check(tag, "extended: CommandComplete 'SELECT 1'");
+        check(has_type(ms, 'Z'), "extended: Sync -> ReadyForQuery");
+    }
+
     // (5) Terminate -> session closed.
     {
         std::vector<std::byte> term;
@@ -187,6 +265,7 @@ int main() {
     }
 
     if (g_fail) { std::printf("pg_wire_test: FAILED\n"); return 1; }
-    std::printf("pg_wire_test: OK (PG v3 handshake + simple query: CREATE/INSERT/SELECT/error over the shim)\n");
+    std::printf("pg_wire_test: OK (PG v3 handshake + simple query + EXTENDED protocol "
+                "Parse/Bind/Describe/Execute with a bound $1 param)\n");
     return 0;
 }

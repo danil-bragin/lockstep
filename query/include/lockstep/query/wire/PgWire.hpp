@@ -20,6 +20,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,10 @@ inline void pg_put_i32(std::vector<std::byte>& b, std::int32_t v) {
     b.push_back(static_cast<std::byte>((u >> 16) & 0xFFu));
     b.push_back(static_cast<std::byte>((u >> 8) & 0xFFu));
     b.push_back(static_cast<std::byte>(u & 0xFFu));
+}
+[[nodiscard]] inline std::int16_t pg_get_i16(const std::byte* p) {
+    return static_cast<std::int16_t>((std::to_integer<unsigned>(p[0]) << 8) |
+                                     std::to_integer<unsigned>(p[1]));
 }
 [[nodiscard]] inline std::int32_t pg_get_i32(const std::byte* p) {
     return static_cast<std::int32_t>((static_cast<std::uint32_t>(std::to_integer<unsigned>(p[0])) << 24) |
@@ -181,6 +187,60 @@ inline void pg_error_response(std::vector<std::byte>& out, const std::string& ms
            up(i, "SHOW");
 }
 
+// ---- EXTENDED protocol (prepared statements) helpers ----------------------------------
+// A bound parameter value -> a SQL literal to splice into the query text (our SqlEngine
+// takes a SQL string, so extended-protocol params are substituted, not truly bound). A
+// NULL is the keyword NULL; a numeric-looking text is spliced verbatim; anything else is a
+// single-quoted string literal with '' escaping. Handles TEXT-format params (format 0);
+// binary-format params are rendered as-is (drivers overwhelmingly use text params).
+[[nodiscard]] inline std::string pg_param_literal(const std::string& v, bool is_null) {
+    if (is_null) return "NULL";
+    if (v.empty()) return "''";
+    bool numeric = true;
+    std::size_t i = (v[0] == '-' || v[0] == '+') ? 1 : 0;
+    bool digit = false, dot = false;
+    for (; i < v.size(); ++i) {
+        if (v[i] >= '0' && v[i] <= '9') { digit = true; }
+        else if (v[i] == '.' && !dot) { dot = true; }
+        else { numeric = false; break; }
+    }
+    if (numeric && digit) return v;  // splice numbers unquoted
+    std::string out = "'";
+    for (char c : v) { if (c == '\'') out += "''"; else out += c; }
+    out += "'";
+    return out;
+}
+// Replace $1,$2,... in `sql` with `lits` (1-based), skipping $N inside a '...' string.
+[[nodiscard]] inline std::string pg_substitute_params(const std::string& sql,
+                                                      const std::vector<std::string>& lits) {
+    std::string out;
+    bool in_str = false;
+    for (std::size_t i = 0; i < sql.size(); ++i) {
+        const char c = sql[i];
+        if (c == '\'') { in_str = !in_str; out += c; continue; }
+        if (!in_str && c == '$' && i + 1 < sql.size() && sql[i + 1] >= '1' && sql[i + 1] <= '9') {
+            std::size_t j = i + 1;
+            std::uint32_t n = 0;
+            while (j < sql.size() && sql[j] >= '0' && sql[j] <= '9') { n = n * 10 + static_cast<std::uint32_t>(sql[j] - '0'); ++j; }
+            out += (n >= 1 && n <= lits.size()) ? lits[n - 1] : "NULL";
+            i = j - 1;
+            continue;
+        }
+        out += c;
+    }
+    return out;
+}
+inline void pg_parse_complete(std::vector<std::byte>& out) { pg_detail::emit(out, '1', {}); }
+inline void pg_bind_complete(std::vector<std::byte>& out) { pg_detail::emit(out, '2', {}); }
+inline void pg_close_complete(std::vector<std::byte>& out) { pg_detail::emit(out, '3', {}); }
+inline void pg_no_data(std::vector<std::byte>& out) { pg_detail::emit(out, 'n', {}); }
+inline void pg_parameter_description(std::vector<std::byte>& out, std::int16_t nparams) {
+    std::vector<std::byte> p;
+    pg_put_i16(p, nparams);
+    for (std::int16_t k = 0; k < nparams; ++k) pg_put_i32(p, 0);  // type OID unknown
+    pg_detail::emit(out, 't', p);
+}
+
 // Build the backend reply for ONE executed statement (no ReadyForQuery — the caller emits
 // exactly one per Query message, after all statements in it).
 inline void pg_reply_for_statement(std::vector<std::byte>& out, const std::string& sql,
@@ -252,8 +312,20 @@ public:
                 closed_ = true;
                 buf_.erase(buf_.begin(), buf_.begin() + len + 1);
                 break;
+            } else if (type == 'P') {  // Parse (prepare a statement)
+                handle_parse(out, payload, plen);
+            } else if (type == 'B') {  // Bind (parameters -> a portal)
+                handle_bind(out, payload, plen);
+            } else if (type == 'D') {  // Describe (statement or portal)
+                handle_describe(out, payload, plen);
+            } else if (type == 'E') {  // Execute (run a portal)
+                handle_execute(out, payload, plen);
+            } else if (type == 'C') {  // Close (a statement or portal)
+                handle_close(out, payload, plen);
+            } else if (type == 'S') {  // Sync (end of the extended-query cycle)
+                pg_ready_for_query(out);
             }
-            // (Extended-protocol messages P/B/E/D/S are ignored in this increment.)
+            // 'H' Flush and any unknown message: nothing to do (we return `out` already).
             buf_.erase(buf_.begin(), buf_.begin() + len + 1);
         }
         return out;
@@ -277,6 +349,132 @@ private:
             pg_detail::emit(out, 'I', empty);
         }
         pg_ready_for_query(out);
+    }
+
+    // ---- EXTENDED protocol (prepared statements) -------------------------------------
+    struct Portal {
+        std::string sql;                          // the query with $N substituted
+        std::optional<sql::ExecResult> cached;    // filled by Describe, consumed by Execute
+    };
+
+    [[nodiscard]] static std::string read_cstring(const std::byte* p, std::size_t plen, std::size_t& pos) {
+        std::string s;
+        while (pos < plen && std::to_integer<char>(p[pos]) != 0) s += std::to_integer<char>(p[pos++]);
+        if (pos < plen) ++pos;  // skip the NUL
+        return s;
+    }
+
+    // Parse 'P': name\0 query\0 int16 nparamtypes int32[]... — store the prepared statement.
+    void handle_parse(std::vector<std::byte>& out, const std::byte* p, std::size_t plen) {
+        std::size_t pos = 0;
+        const std::string name = read_cstring(p, plen, pos);
+        const std::string query = read_cstring(p, plen, pos);
+        stmts_[name] = query;  // param types ignored: we substitute textually
+        pg_parse_complete(out);
+    }
+
+    // Bind 'B': portal\0 stmt\0 [fmt codes] [params] [result fmts] — substitute -> a portal.
+    void handle_bind(std::vector<std::byte>& out, const std::byte* p, std::size_t plen) {
+        std::size_t pos = 0;
+        const std::string portal = read_cstring(p, plen, pos);
+        const std::string stmt = read_cstring(p, plen, pos);
+        if (pos + 2 > plen) return;
+        const std::int16_t nfmt = pg_get_i16(p + pos);
+        pos += 2 + static_cast<std::size_t>(nfmt < 0 ? 0 : nfmt) * 2;  // skip format codes
+        if (pos + 2 > plen) return;
+        const std::int16_t nparams = pg_get_i16(p + pos);
+        pos += 2;
+        std::vector<std::string> lits;
+        for (std::int16_t k = 0; k < nparams && pos + 4 <= plen; ++k) {
+            const std::int32_t vlen = pg_get_i32(p + pos);
+            pos += 4;
+            if (vlen < 0) {
+                lits.push_back(pg_param_literal("", true));
+            } else {
+                std::string v(reinterpret_cast<const char*>(p + pos), static_cast<std::size_t>(vlen));
+                pos += static_cast<std::size_t>(vlen);
+                lits.push_back(pg_param_literal(v, false));
+            }
+        }
+        const auto it = stmts_.find(stmt);
+        const std::string sql = (it != stmts_.end()) ? pg_substitute_params(it->second, lits) : std::string();
+        portals_[portal] = Portal{sql, std::nullopt};
+        pg_bind_complete(out);
+    }
+
+    // Describe 'D': 'S'+stmt or 'P'+portal. For a portal we execute+cache so the
+    // RowDescription is correct AND the following Execute does not re-run the statement.
+    void handle_describe(std::vector<std::byte>& out, const std::byte* p, std::size_t plen) {
+        if (plen < 1) return;
+        const char what = std::to_integer<char>(p[0]);
+        std::size_t pos = 1;
+        const std::string name = read_cstring(p, plen, pos);
+        if (what == 'S') {
+            const auto it = stmts_.find(name);
+            pg_parameter_description(out, it != stmts_.end() ? count_params(it->second) : 0);
+            pg_no_data(out);  // columns are unknown before execution
+            return;
+        }
+        // 'P' portal
+        const auto it = portals_.find(name);
+        if (it == portals_.end()) { pg_no_data(out); return; }
+        it->second.cached = exec_(it->second.sql);
+        const sql::ExecResult& r = *it->second.cached;
+        if (r.ok && (pg_is_select(it->second.sql) || !r.rows.empty())) {
+            std::vector<std::string> cols;
+            if (!r.rows.empty())
+                for (const auto& c : r.rows.front().cells) cols.push_back(c.first);
+            pg_row_description(out, cols);
+        } else {
+            pg_no_data(out);
+        }
+    }
+
+    // Execute 'E': portal\0 int32 maxrows — run (or reuse the Describe cache) + reply.
+    void handle_execute(std::vector<std::byte>& out, const std::byte* p, std::size_t plen) {
+        std::size_t pos = 0;
+        const std::string portal = read_cstring(p, plen, pos);
+        const auto it = portals_.find(portal);
+        if (it == portals_.end()) { pg_error_response(out, "unknown portal"); return; }
+        const bool had_describe = it->second.cached.has_value();
+        const sql::ExecResult r = had_describe ? *it->second.cached : exec_(it->second.sql);
+        it->second.cached.reset();
+        if (!r.ok) { pg_error_response(out, r.error); return; }
+        const bool is_sel = pg_is_select(it->second.sql) || !r.rows.empty();
+        if (!had_describe && is_sel) {  // no prior Describe -> include RowDescription
+            std::vector<std::string> cols;
+            if (!r.rows.empty())
+                for (const auto& c : r.rows.front().cells) cols.push_back(c.first);
+            pg_row_description(out, cols);
+        }
+        for (const sql::ResultRow& row : r.rows) pg_data_row(out, row);
+        pg_command_complete(out, pg_command_tag(it->second.sql, r, is_sel));
+    }
+
+    // Close 'C': 'S'+stmt or 'P'+portal.
+    void handle_close(std::vector<std::byte>& out, const std::byte* p, std::size_t plen) {
+        if (plen >= 1) {
+            const char what = std::to_integer<char>(p[0]);
+            std::size_t pos = 1;
+            const std::string name = read_cstring(p, plen, pos);
+            if (what == 'S') stmts_.erase(name); else portals_.erase(name);
+        }
+        pg_close_complete(out);
+    }
+
+    [[nodiscard]] static std::int16_t count_params(const std::string& sql) {
+        std::int16_t maxn = 0;
+        bool in_str = false;
+        for (std::size_t i = 0; i < sql.size(); ++i) {
+            if (sql[i] == '\'') in_str = !in_str;
+            else if (!in_str && sql[i] == '$' && i + 1 < sql.size() && sql[i + 1] >= '1' && sql[i + 1] <= '9') {
+                std::int16_t n = 0;
+                std::size_t j = i + 1;
+                while (j < sql.size() && sql[j] >= '0' && sql[j] <= '9') { n = static_cast<std::int16_t>(n * 10 + (sql[j] - '0')); ++j; }
+                if (n > maxn) maxn = n;
+            }
+        }
+        return maxn;
     }
 
     // Split on ';' at the top level (quote-aware — a ';' inside '...' is data).
@@ -311,6 +509,8 @@ private:
     std::vector<std::byte> buf_;  // unconsumed input bytes
     bool started_ = false;        // startup handshake completed
     bool closed_ = false;
+    std::map<std::string, std::string> stmts_;  // prepared statements: name -> query
+    std::map<std::string, Portal> portals_;     // bound portals: name -> {sql, cached}
 };
 
 }  // namespace lockstep::query::wire
