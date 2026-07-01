@@ -4700,7 +4700,8 @@ private:
             std::pair<const std::vector<Datum>*, const std::vector<std::uint32_t>*>;
         auto emit_all = [&](const std::vector<GroupRef>& refs) -> std::optional<std::string> {
             const bool par_fold = parallel_executor_ != nullptr &&
-                                  parallel_executor_->workers() > 1 && refs.size() > 1 &&
+                                  parallel_executor_->workers() > 1 &&
+                                  refs.size() >= kParallelMinGroups &&
                                   static_cast<std::int64_t>(count) >= kParallelMinRows;
             if (!par_fold) {
                 for (const GroupRef& ref : refs) {
@@ -10565,6 +10566,12 @@ private:
     IParallelExecutor* parallel_executor_ = nullptr;
     // Below this row count a parallel split costs more (thread dispatch) than it saves.
     static constexpr std::int64_t kParallelMinRows = 50000;
+    // emit_all parallelises the per-group FOLD ACROSS GROUPS. With only a handful of groups (a
+    // low-cardinality GROUP BY served by the fast serial dict path) there is nothing to balance
+    // and the concurrent folds only add dispatch overhead (groupby_region residual ~40%). Fold
+    // groups in parallel only when there are enough of them; the group-BUILD pass still
+    // parallelises independently (par_group), so few-group GROUP BY keeps that win.
+    static constexpr std::size_t kParallelMinGroups = 64;
 };
 
 }  // namespace lockstep::query::sql
