@@ -354,6 +354,18 @@ if(TARGET lockstep_storage AND TARGET lockstep_runtime
       lockstep_runtime
       lockstep_providers_sim)
   add_test(NAME storage_backup_test COMMAND lockstep_storage_backup_test)
+  # storage_pitr_test: point-in-time recovery — op-log archive/restore, undo-bad-delete,
+  # target sweep, determinism, bounds, integrity teeth, flush-refusal, WiscKey vlog deref.
+  add_executable(lockstep_storage_pitr_test storage_pitr_test.cpp)
+  target_include_directories(lockstep_storage_pitr_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_pitr_test
+    PRIVATE
+      lockstep_warnings
+      lockstep_sanitizers
+      lockstep_storage
+      lockstep_runtime
+      lockstep_providers_sim)
+  add_test(NAME storage_pitr_test COMMAND lockstep_storage_pitr_test)
 else()
   message(WARNING
     "lockstep_storage / runtime / providers_sim not all found; "

@@ -126,6 +126,18 @@ struct WalRecord {
     bool vlog = false;  // WiscKey: `value` holds a 16-byte VlogPtr, not the value
 };
 
+// One committed logical op exported for a point-in-time (PITR) archive: the commit
+// Seq, the key, and the INLINE value. A WiscKey vlog pointer is derefed to its
+// value at export time, so the archive stays self-contained / portable (like a
+// logical backup). `vlog` is transient bookkeeping used only while gathering.
+struct ExportedOp {
+    Seq seq = kNoSeq;
+    Key key;
+    Value value;
+    bool tombstone = false;
+    bool vlog = false;
+};
+
 // The fixed framing constants (the on-disk contract).
 inline constexpr std::uint32_t kWalMagic = 0x4C57414Cu;  // 'LWAL'
 inline constexpr std::size_t kWalHeaderBytes = 21;       // magic+type+seq+klen+vlen
@@ -839,7 +851,87 @@ public:
         return obsoleted_ids_;
     }
 
+    // PITR SUPPORT (point-in-time recovery archive): export the committed logical
+    // op-log with seq >= `from_seq` into `out`, in strict Seq order, with WiscKey
+    // vlog pointers DEREFED to inline values (so the archive is self-contained /
+    // portable, exactly like a logical backup). READ-ONLY: touches no durable byte
+    // and mutates no engine state (the durability core is untouched).
+    //
+    // The op-log source is the in-memory memtable, which holds EVERY committed
+    // version until it is flushed to an SSTable. A flush ERASES the flushed
+    // versions from the memtable (even before WAL truncation), so once any flush
+    // has happened the memtable is no longer the whole op-log. export_ops DETECTS
+    // that as a Seq GAP and REFUSES rather than emit a partial log with a hole:
+    // the exported seqs MUST be exactly the contiguous run [max(from_seq,1) ..
+    // last_seq()] (V-PITR-COMPLETE). For the in-memory-default engine (no flush)
+    // the full history is resident, so this always holds. A caller that has
+    // flushed must archive BEFORE the flush (continuous archiving) or take a base
+    // backup instead — the refusal is honest, never a silent gap.
+    [[nodiscard]] Future<Error> export_ops(Seq from_seq, std::vector<ExportedOp>& out) {
+        Promise<Error> p = make_promise<Error>(sched_);
+        Future<Error> f = p.get_future();
+        sched_->spawn(export_ops_task(std::move(p), from_seq, &out));
+        return f;
+    }
+
 private:
+    // Gather every memtable version with seq >= from_seq, sort by Seq, verify the
+    // run is a gap-free [max(from_seq,1) .. last_seq_] (else REFUSE — a flush ate a
+    // prefix), then deref vlog pointers to inline values. On success `*out` holds
+    // the ops in ascending Seq order; on failure `*out` is cleared and the Error is
+    // returned. NO memtable reference is held across the deref await (V-RKV1): the
+    // versions are copied into `ops` first, then derefed.
+    core::Task export_ops_task(Promise<Error> p, Seq from_seq, std::vector<ExportedOp>* out) {
+        out->clear();
+        std::vector<ExportedOp> ops;
+        for (const auto& [key, versions] : mem_.entries()) {
+            for (const Memtable::Version& v : versions) {
+                if (v.seq < from_seq) {
+                    continue;
+                }
+                ExportedOp op;
+                op.seq = v.seq;
+                op.key = key;
+                op.value = v.value;  // may be a 16-byte vlog pointer (derefed below)
+                op.tombstone = v.tombstone;
+                op.vlog = v.vlog;
+                ops.push_back(std::move(op));
+            }
+        }
+        std::sort(ops.begin(), ops.end(),
+                  [](const ExportedOp& a, const ExportedOp& b) { return a.seq < b.seq; });
+        // Completeness: the exported seqs must be exactly the contiguous committed
+        // run [s0 .. last_seq_]. Each commit gets a unique Seq (V-MONO), so a matching
+        // front/back/count is sufficient to prove no gap and no duplicate.
+        const Seq s0 = from_seq < 1 ? 1 : from_seq;
+        if (last_seq_ >= s0) {
+            const std::uint64_t want = static_cast<std::uint64_t>(last_seq_ - s0 + 1);
+            if (ops.empty() || ops.front().seq != s0 || ops.back().seq != last_seq_ ||
+                static_cast<std::uint64_t>(ops.size()) != want) {
+                p.set_value(Error{ErrorCode::Corruption,
+                                  "pitr: op-log incomplete (flushed/truncated) — archive before flush"});
+                co_return;
+            }
+        } else {
+            ops.clear();  // from_seq is beyond the committed tip — nothing to archive.
+        }
+        for (ExportedOp& op : ops) {
+            if (op.vlog) {
+                const std::optional<Value> v = co_await deref_value(op.value);
+                if (!v.has_value()) {
+                    p.set_value(Error{ErrorCode::Corruption,
+                                      "pitr: vlog value did not resolve (dangling pointer)"});
+                    co_return;
+                }
+                op.value = *v;
+                op.vlog = false;
+            }
+        }
+        *out = std::move(ops);
+        p.set_value(Error{});
+        co_return;
+    }
+
     // The write path: assign Seq, append the CRC-tagged record (awaiting the
     // disk), then insert the MVCC version. The Seq is assigned UP FRONT and is
     // monotonic (V-MONO). We hold NO memtable reference across the co_await — the
