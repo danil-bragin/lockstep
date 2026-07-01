@@ -70,10 +70,63 @@
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
 
+#include <lockstep/core/Scheduler.hpp>          // hashcheck: scratch state-machine apply
+#include <lockstep/sim/SeededRandom.hpp>
+#include <lockstep/sim/SimDisk.hpp>
+#include <lockstep/storage/KeyedOp.hpp>
+#include <lockstep/storage/StateHash.hpp>
+#include <lockstep/storage/WalEngine.hpp>
+
 namespace {
 
 namespace core = lockstep::core;
 namespace prod = lockstep::prod;
+namespace sim = lockstep::sim;
+namespace storage = lockstep::storage;
+
+// hashcheck apply-seam: apply a committed-log prefix into `en` (a scratch state machine)
+// via the keyed-op codec. A FREE function over a stable pointer (never an inline lambda
+// coroutine — that would capture into a destroyed temp; ASan stack-use-after-scope).
+inline core::Task hashcheck_apply(storage::Engine& en, const std::vector<std::string>* committed,
+                                  std::uint64_t upto) {
+    for (std::uint64_t j = 0; j < upto && j < committed->size(); ++j) {
+        const std::string& raw = (*committed)[static_cast<std::size_t>(j)];
+        storage::KeyedOp op;
+        if (storage::decode_keyed_op(raw, op)) {
+            // A structured keyed mutation.
+            if (op.del) {
+                (void)co_await en.del(op.key);
+            } else {
+                (void)co_await en.put(op.key, op.value);
+            }
+        } else {
+            // A plain/opaque committed value: apply it as a self-keyed insert so ANY
+            // committed log materialises a deterministic keyspace to cross-check. Two
+            // replicas with the same committed prefix still reach the same keyspace.
+            (void)co_await en.put(raw, raw);
+        }
+    }
+    (void)co_await en.sync();
+    co_return;
+}
+
+// Materialise a committed prefix into a scratch WalEngine and return its keyspace hash.
+// The hash is a pure function of the applied (key,value) set (the sim seed is fixed and
+// does not affect the deterministic backup image / CRC).
+inline storage::KeyspaceHash hash_committed_prefix(const std::vector<std::string>& committed,
+                                                   std::uint64_t upto) {
+    core::Scheduler sched;
+    core::SimClock clock(sched);
+    sim::SeededRandom rng(0x9E37'79B9u);
+    sim::DiskFaultConfig fc;
+    fc.latency_min = 0;
+    fc.latency_max = 0;
+    sim::SimDisk disk(sched, clock, rng, fc);
+    storage::WalEngine e(sched, disk);
+    sched.spawn(hashcheck_apply(e, &committed, upto));
+    sched.run();
+    return storage::keyspace_hash(sched, e, e.last_seq());
+}
 
 // A distinct client endpoint id (well above any node/admin id so it never collides).
 constexpr std::uint64_t kClientId = 9'000'000'001ULL;
@@ -1078,6 +1131,70 @@ int cmd_metrics(const std::vector<std::uint16_t>& hosts) {
     return 0;
 }
 
+// CROSS-REPLICA HASHCHECK (plan P3) — query each host's committed log, materialise the
+// applied keyspace at a COMMON commit index, and compare hashes across replicas. Agreement
+// confirms the replicas hold identical applied state; a mismatch is a CORRUPT alarm (silent
+// divergence the per-node file scrub cannot see). Exit 0 all-agree / 1 divergence / 2 error.
+int cmd_hashcheck(const std::vector<std::uint16_t>& hosts) {
+    struct Row {
+        std::uint16_t port = 0;
+        bool ok = false;
+        prod::AdminStatus st;
+    };
+    std::vector<Row> rows;
+    // The COMMON prefix length to compare = the smallest, across replicas, of what each
+    // replica has BOTH committed AND returned in its digest: min(commit_index, digest
+    // size). Comparing only committed+returned entries is race-safe — a StatusRep may
+    // momentarily skew its commit_index field against the log digest it serialised, and an
+    // UNcommitted tail entry may legitimately differ across replicas (not yet agreed).
+    // Committed prefixes agree (Raft Log Matching), so any common committed prefix is
+    // identical across replicas; a mismatch there is real corruption.
+    std::uint64_t common = UINT64_MAX;
+    for (std::uint16_t port : hosts) {
+        Row r;
+        r.port = port;
+        r.ok = do_status(port, r.st);
+        if (r.ok) {
+            const std::uint64_t applicable =
+                std::min<std::uint64_t>(r.st.commit_index, r.st.committed.size());
+            common = std::min<std::uint64_t>(common, applicable);
+        }
+        rows.push_back(std::move(r));
+    }
+    if (common == UINT64_MAX) common = 0;
+
+    std::vector<storage::ReplicaHash> hashes;
+    for (const Row& r : rows) {
+        if (!r.ok) {
+            std::printf("HASHCHECK port=%u ok=0 (unreachable)\n", static_cast<unsigned>(r.port));
+            continue;
+        }
+        const storage::KeyspaceHash h = hash_committed_prefix(r.st.committed, common);
+        std::printf("HASHCHECK port=%u ok=1 commit=%llu common=%llu crc=%08x bytes=%llu\n",
+                    static_cast<unsigned>(r.port),
+                    static_cast<unsigned long long>(r.st.commit_index),
+                    static_cast<unsigned long long>(common), h.crc,
+                    static_cast<unsigned long long>(h.payload_len));
+        hashes.push_back(storage::ReplicaHash{std::to_string(r.port), h});
+    }
+    std::fflush(stdout);
+    if (hashes.size() < 2) {
+        std::printf("HASHCHECK: fewer than 2 replicas responded — nothing to compare\n");
+        return hashes.empty() ? 2 : 0;
+    }
+    const auto d = storage::find_hash_divergence(hashes);
+    if (d.has_value()) {
+        std::printf("HASHCHECK: CORRUPT — replicas DIVERGE @commit %llu: port %s (crc=%08x) != "
+                    "port %s (crc=%08x)\n",
+                    static_cast<unsigned long long>(d->at), d->ref_node.c_str(), d->ref_crc,
+                    d->other_node.c_str(), d->other_crc);
+        return 1;
+    }
+    std::printf("HASHCHECK: OK — all %zu replicas agree on applied keyspace @commit %llu\n",
+                hashes.size(), static_cast<unsigned long long>(common));
+    return 0;
+}
+
 // S8.4 DURABLE CONFIRMATION — given an accepted {value, index}, decide whether it is
 // COMMITTED on `port`: poll STATUS until commit_index >= index AND the entry at that
 // 1-based index is STILL `value`. The committed-log digest STATUS returns is the FULL
@@ -1303,6 +1420,8 @@ int main(int argc, char** argv) {
         std::fprintf(
             stderr,
             "usage: lockstep_admin status --host PORT [--host PORT ...]\n"
+            "       lockstep_admin hashcheck --host PORT [--host PORT ...] "
+            "(cross-replica applied-keyspace agreement; exit 1 on divergence)\n"
             "       lockstep_admin commit --host PORT [--host PORT ...]\n"
             "       lockstep_admin metrics --host PORT [--host PORT ...] "
             "(scrape Prometheus metrics)\n"
@@ -1431,6 +1550,9 @@ int main(int argc, char** argv) {
     }
     if (verb == "metrics") {
         return cmd_metrics(hosts);
+    }
+    if (verb == "hashcheck") {
+        return cmd_hashcheck(hosts);
     }
     if (verb == "submit") {
         return cmd_submit(value, hosts, await_durable);

@@ -108,6 +108,7 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_warnings
         lockstep_sanitizers
         lockstep_consensus
+        lockstep_storage
         lockstep_runtime
         lockstep_providers_sim
         lockstep_providers_prod)

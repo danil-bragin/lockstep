@@ -175,6 +175,29 @@ else
 fi
 
 echo
+echo "=== (2b) HASHCHECK — cross-replica applied-keyspace agreement (shard 0's 3 replicas) ==="
+# admin_port(proc p, shard s) = BASE + (p-1)*(2M) + M + s. Compare shard 0 across all procs.
+HC_HOSTS=()
+for ((p=1;p<=N;p++)); do HC_HOSTS+=(--host $(( BASE + (p-1)*2*M + M + 0 ))); done
+# Let shard-0's followers settle to the leader's commit so the compared prefix is
+# non-trivial (all 3 replicas at the same commit_index >= 1). Bounded.
+HC_DL=$(( $(now_ms) + 15000 ))
+while [ "$(now_ms)" -lt "$HC_DL" ]; do
+  s0="$("$ADMIN" rstatus $RTOPO 2>/dev/null | grep 'shard=0 ')"
+  commits="$(echo "$s0" | sed -n 's/.*commit=\([0-9]*\).*/\1/p')"
+  mn="$(echo "$commits" | sort -n | head -1)"; mx="$(echo "$commits" | sort -n | tail -1)"
+  [ -n "$mn" ] && [ "$mn" = "$mx" ] && [ "$mn" -ge 1 ] && break
+  sleep 0.3
+done
+HC_OUT="$("$ADMIN" hashcheck "${HC_HOSTS[@]}" 2>/dev/null)"
+echo "$HC_OUT" | sed 's/^/  /'
+if echo "$HC_OUT" | grep -q '^HASHCHECK: OK'; then
+  echo "PASS hashcheck: shard-0 replicas AGREE on applied keyspace hash (cross-replica corrupt-check)"
+else
+  fail "shard-0 replicas did not agree on keyspace hash (hashcheck)"
+fi
+
+echo
 echo "=== (3) HA — SIGKILL proc 2 (one replica of EVERY shard); shards stay available ==="
 kill_proc 2
 echo "  proc 2 killed; each shard now runs on $((N-1)) live replicas (still a quorum of $N)"
