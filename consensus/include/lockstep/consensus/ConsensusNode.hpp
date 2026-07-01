@@ -336,6 +336,15 @@ struct NodeConfig {
     // by orders of magnitude. The threshold is INVISIBLE to the committed log (compaction
     // is transparent per Snapshot.tla), so A and B stay byte-identical for equal values.
     std::size_t snapshot_threshold = 8;
+
+    // CLUSTER IDENTITY (P2 restore-new-cluster). A token distinguishing THIS cluster
+    // incarnation from any other. Every peer message carries it; a node drops a message
+    // whose token differs, so a stale node from a decommissioned cluster (same ids/ports
+    // after a snapshot-restore onto a fresh cluster) can neither vote nor replicate into
+    // the new one — the split-brain guard. 0 = unset/legacy: a single-cluster deployment
+    // leaves it 0 and every message matches, so behavior is byte-identical. An impl that
+    // does not consult it (e.g. impl B) simply ignores the field.
+    std::uint64_t cluster_token = 0;
 };
 
 // THE FACTORY. Returns ONE replica wired to its deps + config. The ClusterDriver

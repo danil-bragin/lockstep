@@ -247,6 +247,12 @@ struct RaftMsg {
     Term term = 0;
     std::uint64_t source = 0;
     std::uint64_t dest = 0;
+    // CLUSTER IDENTITY (restore-new-cluster split-brain guard, plan P2). A per-cluster
+    // token stamped on every message; a node DROPS any message whose token differs from
+    // its own, so a stale node from an old/decommissioned cluster (same ids + ports after
+    // a snapshot-restore onto a fresh cluster) can never vote or replicate into it. 0 =
+    // the unset/legacy token (a single-cluster deployment leaves it 0 — byte-identical).
+    std::uint64_t cluster_token = 0;
 
     // RequestVote
     Index last_log_index = 0;
@@ -289,6 +295,7 @@ struct RaftMsg {
     wire::put_u64(body, m.term);
     wire::put_u64(body, m.source);
     wire::put_u64(body, m.dest);
+    wire::put_u64(body, m.cluster_token);  // cluster-identity guard (P2)
     switch (m.type) {
         case MsgType::RequestVote:
             wire::put_u64(body, m.last_log_index);
@@ -372,6 +379,7 @@ struct RaftMsg {
     out.term = r.u64();
     out.source = r.u64();
     out.dest = r.u64();
+    out.cluster_token = r.u64();  // cluster-identity guard (P2)
     switch (out.type) {
         case MsgType::RequestVote:
             out.last_log_index = r.u64();
@@ -563,7 +571,8 @@ public:
           net_(deps.net),
           disk_(deps.disk),
           cfg_(cfg),
-          self_(cfg.self_id) {
+          self_(cfg.self_id),
+          cluster_token_(cfg.cluster_token) {
         peers_.reserve(cfg.cluster.size());
         for (std::uint64_t id : cfg.cluster) {
             if (id != self_) {
@@ -856,7 +865,9 @@ private:
             }
             RaftMsg m;
             if (self->recovered_ && decode(msg.payload, m) &&
-                m.dest == self->self_) {
+                m.dest == self->self_ && m.cluster_token == self->cluster_token_) {
+                // Foreign-cluster messages (a stale node from a decommissioned cluster
+                // with the same id/port after a restore) are DROPPED here (V-CLUSTER-ID).
                 self->dispatch(m);
             }
         }
@@ -2096,7 +2107,9 @@ private:
     }
 
     void send_to(std::uint64_t dest, const RaftMsg& m) {
-        sched_->spawn(send_task(net_, dest, encode(m)));
+        RaftMsg out = m;
+        out.cluster_token = cluster_token_;  // stamp our cluster identity on every send (P2)
+        sched_->spawn(send_task(net_, dest, encode(out)));
     }
 
     static core::Task send_task(INetwork* net, std::uint64_t dest,
@@ -2183,6 +2196,7 @@ private:
     IDisk* disk_;
     NodeConfig cfg_;
     std::uint64_t self_;
+    std::uint64_t cluster_token_;  // cluster-identity guard (P2 restore-new-cluster)
     std::vector<std::uint64_t> peers_;
 
     // ---- raft state (in-memory; the spec's per-server variables) ----------

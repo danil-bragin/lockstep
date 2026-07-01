@@ -111,6 +111,11 @@ struct ClusterConfig {
     // value is still opaque to consensus (the linearizability tracking compares
     // whatever bytes were submitted). Must be a pure function of its args (no clock).
     std::function<std::string(std::uint64_t client_id, std::uint64_t i, std::uint64_t op_id)> value_fn;
+
+    // OPTIONAL per-node cluster-identity token (P2). UNSET ⇒ every node gets 0 (a run is
+    // byte-identical to before). A test sets it to give a node a FOREIGN token so the
+    // cross-cluster guard excludes it. Must be a pure function of the node id.
+    std::function<std::uint64_t(std::uint64_t node_id)> cluster_token_fn;
 };
 
 namespace detail {
@@ -621,6 +626,12 @@ inline std::uint64_t compute_step_cap(const ClusterConfig* cfg) {
         nc.election_timeout_max = cfg.election_timeout_max;
         nc.heartbeat_interval = cfg.heartbeat_interval;
         nc.request_deadline = cfg.request_deadline;
+        // P2 cluster-identity: an OPTIONAL per-node token (UNSET ⇒ 0 for all, so a run
+        // is byte-identical to before). A test sets it to give one node a FOREIGN token
+        // and assert the cluster excludes it (the split-brain guard).
+        if (cfg.cluster_token_fn) {
+            nc.cluster_token = cfg.cluster_token_fn(i);
+        }
 
         st->nodes.push_back(factory(deps, nc));
     }
