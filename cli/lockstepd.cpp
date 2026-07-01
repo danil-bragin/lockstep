@@ -94,6 +94,7 @@ void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 #include <lockstep/prod/ProdNetwork.hpp>
 #include <lockstep/prod/ProdReactor.hpp>
 #include <lockstep/prod/ProdServerNode.hpp>  // keyed-KV wire::Server daemon (--wire-server)
+#include <lockstep/prod/ProdPgServer.hpp>    // PostgreSQL-wire daemon (--pg-port)
 #include <lockstep/prod/ProdShardRunner.hpp>  // Phase 9 S9.1 multi-shard orchestrator
 
 #include <lockstep/consensus/ConsensusNode.hpp>
@@ -158,6 +159,13 @@ struct Args {
     // Query keyed transactional KV with READS) on --admin-port, instead of the consensus
     // admin protocol. Lets a wire client benchmark the real read+write keyed path.
     bool wire_server = false;
+
+    // POSTGRESQL-WIRE mode (--pg-port P): serve a SqlEngine over the PG v3 wire shim so
+    // psql / any PG driver connects. Optional --pg-user/--pg-password enable auth.
+    std::uint16_t pg_port = 0;
+    std::string pg_user;
+    std::string pg_password;
+    bool pg_auth = false;
     // CROSS-MACHINE replicated shards: dial host per process id (proc_hosts[q-1] = proc q's
     // IP). Empty => 127.0.0.1 (single-host, the default). Set via --proc-host ID:HOST.
     std::vector<std::string> proc_hosts;
@@ -277,6 +285,14 @@ Args parse_args(int argc, char** argv) {
             a.cluster_size = parse_u64(v, a.cluster_size);
         } else if (std::strcmp(k, "--wire-server") == 0) {
             a.wire_server = (parse_u64(v, 0) != 0);
+        } else if (std::strcmp(k, "--pg-port") == 0) {
+            a.pg_port = static_cast<std::uint16_t>(parse_u64(v, 0));
+        } else if (std::strcmp(k, "--pg-user") == 0) {
+            a.pg_user = v;
+            a.pg_auth = true;
+        } else if (std::strcmp(k, "--pg-password") == 0) {
+            a.pg_password = v;
+            a.pg_auth = true;
         } else if (std::strcmp(k, "--proc-host") == 0) {
             // --proc-host ID:HOST — record process ID's dial IP for cross-machine repl shards.
             const char* colon = (v != nullptr) ? std::strchr(v, ':') : nullptr;
@@ -407,6 +423,47 @@ int run_repl_multishard(const Args& args) {
     return prod::run_repl_shards(cfg);
 }
 
+// --pg-port: serve a SqlEngine over the PostgreSQL v3 wire shim on a raw-TCP listener, so
+// `psql` / any PG driver connects to lockstepd. SQL state persists under the data dir
+// (recovered on restart). Optional --pg-user/--pg-password gate with a cleartext password.
+// This is the single-node SQL surface co-located in the daemon; serving SQL over the
+// REPLICATED cluster (SQL-over-Raft) is a separate, larger piece.
+int run_pg_server(const Args& args) {
+    core::Scheduler d_sched;
+    core::Scheduler c_sched;
+    prod::ProdDisk d_disk(d_sched, args.data_dir + "/lockstepd-pg-data.wal");
+    prod::ProdDisk c_disk(c_sched, args.data_dir + "/lockstepd-pg-catalog.wal");
+    lockstep::query::sql::SqlEngine engine(d_sched, d_disk, c_sched, c_disk);
+    engine.recover(d_disk.logical_len(), c_disk.logical_len());
+
+    prod::ProdReactor reactor;
+    if (!reactor.valid()) {
+        std::fprintf(stderr, "lockstepd --pg-port: failed to create epoll reactor\n");
+        return 1;
+    }
+    prod::ProdPgServer::AuthFn auth;
+    if (args.pg_auth) {
+        auth = [u = args.pg_user, p = args.pg_password](const std::string& user, const std::string& pw) {
+            return user == u && pw == p;
+        };
+    }
+    prod::ProdPgServer pg(reactor, args.pg_port,
+                          [&engine](const std::string& s) { return engine.exec(s); }, auth);
+    if (!pg.valid()) {
+        std::fprintf(stderr, "lockstepd --pg-port: bind failed on port %u\n",
+                     static_cast<unsigned>(args.pg_port));
+        return 1;
+    }
+    std::printf("lockstepd: PostgreSQL-wire on 127.0.0.1:%u (data-dir=%s, auth=%s)\n",
+                static_cast<unsigned>(args.pg_port), args.data_dir.c_str(),
+                args.pg_auth ? "password" : "trust");
+    std::fflush(stdout);
+    const core::Tick deadline =
+        reactor.now() + static_cast<core::Tick>(args.run_seconds) * 1'000'000'000LL;
+    reactor.run_until([] { return false; }, deadline);
+    return 0;
+}
+
 // --wire-server: host a single-node keyed-KV wire::Server (Put/Get/Query + reads) on
 // --admin-port. A wire client (lockstep_kvbench) drives the REAL read+write keyed path —
 // the bench's read-heavy / read-mix vectors that the consensus admin path (write-only
@@ -485,6 +542,9 @@ int main(int argc, char** argv) {
     // (with --shard-base-port + --shards M): this process hosts M shard-replicas, each
     // shard an N-node Raft group across the N processes. Takes precedence over the S9.1
     // single-node multi-shard path below.
+    if (args.pg_port != 0) {
+        return run_pg_server(args);
+    }
     if (args.wire_server) {
         return run_wire_server(args);
     }
