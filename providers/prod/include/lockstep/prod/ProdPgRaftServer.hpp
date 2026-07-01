@@ -106,6 +106,10 @@ public:
     [[nodiscard]] bool valid() const noexcept { return listen_fd_ >= 0; }
 
 private:
+    struct Portal {
+        std::string sql;                            // the query with $N params substituted
+        std::optional<psql::ExecResult> cached;     // filled by Describe, consumed by Execute
+    };
     struct Conn {
         std::vector<std::byte> buf;
         bool started = false;
@@ -113,6 +117,10 @@ private:
         bool pending = false;
         consensus::Index pending_index = 0;
         std::string pending_sql;
+        bool pending_ready = false;  // simple query -> pump appends ReadyForQuery; extended -> Sync does
+        // EXTENDED protocol (prepared statements): name -> SQL, portal -> bound query.
+        std::map<std::string, std::string> stmts;
+        std::map<std::string, Portal> portals;
     };
 
     static void set_nonblock(int fd) {
@@ -198,65 +206,236 @@ private:
                 close_conn(fd);
                 return;
             }
-            if (type == 'Q') {
-                // Payload is a single C-string (the SQL). len = 4 + strlen + 1.
-                std::string sql;
-                if (len > 5) {
-                    sql.assign(reinterpret_cast<const char*>(c.buf.data() + 5),
-                               static_cast<std::size_t>(len) - 5);
-                }
-                erase_front(c, total);
-                handle_query(fd, c, sql, out);
-                continue;
-            }
-            // Any other message type (extended protocol etc.) — acknowledge as unsupported so
-            // the client isn't wedged, then continue.
+            // Copy the payload (bytes after the 5-byte header) before erasing the frame.
+            const std::size_t plen = static_cast<std::size_t>(len) - 4;
+            std::vector<std::byte> payload(c.buf.begin() + 5, c.buf.begin() + static_cast<std::ptrdiff_t>(total));
             erase_front(c, total);
-            pgw::pg_error_response(out, "only the simple query protocol is supported here");
-            pgw::pg_ready_for_query(out);
+            const std::byte* p = payload.data();
+            switch (type) {
+                case 'Q': {  // simple query — one C-string
+                    std::string sql;
+                    if (!payload.empty()) {
+                        sql.assign(reinterpret_cast<const char*>(p), plen ? plen - 1 : 0);
+                    }
+                    handle_query(c, sql, out);
+                    break;
+                }
+                case 'P':  // Parse
+                    ext_parse(c, p, plen, out);
+                    break;
+                case 'B':  // Bind
+                    ext_bind(c, p, plen, out);
+                    break;
+                case 'D':  // Describe
+                    ext_describe(c, p, plen, out);
+                    break;
+                case 'E':  // Execute
+                    ext_execute(c, p, plen, out);
+                    break;
+                case 'C':  // Close
+                    ext_close(c, p, plen, out);
+                    break;
+                case 'S':  // Sync — end of an extended-protocol batch
+                    pgw::pg_ready_for_query(out);
+                    break;
+                case 'H':  // Flush — results are flushed at the end of process() anyway
+                    break;
+                default:
+                    pgw::pg_error_response(out, "unsupported message type");
+                    pgw::pg_ready_for_query(out);
+                    break;
+            }
         }
         if (!out.empty()) {
             write_all(fd, out);
         }
     }
 
-    void handle_query(int fd, Conn& c, const std::string& sql, std::vector<std::byte>& out) {
-        (void)fd;
+    // A statement that produces rows is a READ (served from local applied state); everything
+    // else is a WRITE (routed through Raft). VALUES/TABLE/EXPLAIN/SHOW count as reads.
+    static bool is_write(const std::string& sql) { return !pgw::pg_is_select(sql); }
+
+    void handle_query(Conn& c, const std::string& sql, std::vector<std::byte>& out) {
         if (is_blank(sql)) {
             pgw::pg_detail::emit(out, 'I', {});  // EmptyQueryResponse
             pgw::pg_ready_for_query(out);
             return;
         }
-        if (pgw::pg_is_select(sql)) {  // READ — answer from local applied state
-            const psql::ExecResult r = exec_(sql);
-            if (!r.ok) {
-                pgw::pg_error_response_code(out, "42000", r.error);
-            } else {
-                pgw::pg_row_description(out, pgw::pg_cols_of(r));
-                for (const psql::ResultRow& row : r.rows) {
-                    pgw::pg_data_row(out, row);
-                }
-                pgw::pg_command_complete(out, pgw::pg_command_tag(sql, r, true));
-            }
-            pgw::pg_ready_for_query(out);
-            return;
+        if (is_write(sql)) {
+            defer_write(c, sql, /*add_ready=*/true, out);
+        } else {
+            reply_read(sql, std::nullopt, /*include_row_desc=*/true, /*add_ready=*/true, out);
         }
-        // WRITE — must go through Raft. Reject on a follower; DEFER on the leader.
+    }
+
+    // Answer a READ from the local applied SqlEngine. `precomputed` reuses a Describe cache
+    // (extended protocol) so Execute doesn't re-run the statement.
+    void reply_read(const std::string& sql, std::optional<psql::ExecResult> precomputed,
+                    bool include_row_desc, bool add_ready, std::vector<std::byte>& out) {
+        const psql::ExecResult r = precomputed ? *precomputed : exec_(sql);
+        if (!r.ok) {
+            pgw::pg_error_response_code(out, "42000", r.error);
+        } else {
+            const bool is_sel = pgw::pg_is_select(sql) || !r.rows.empty();
+            if (include_row_desc) pgw::pg_row_description(out, pgw::pg_cols_of(r));
+            for (const psql::ResultRow& row : r.rows) pgw::pg_data_row(out, row);
+            pgw::pg_command_complete(out, pgw::pg_command_tag(sql, r, is_sel));
+        }
+        if (add_ready) pgw::pg_ready_for_query(out);
+    }
+
+    // Route a WRITE through Raft: reject on a follower (leader routing), DEFER on the leader
+    // until the commit lands. `add_ready` = whether the completion pump should append
+    // ReadyForQuery (true for simple query; false for extended, where Sync does it).
+    void defer_write(Conn& c, const std::string& sql, bool add_ready, std::vector<std::byte>& out) {
         if (!is_leader_()) {
             pgw::pg_error_response_code(out, "25006",
                                         "cannot execute a write on a follower — reconnect to the leader");
-            pgw::pg_ready_for_query(out);
+            if (add_ready) pgw::pg_ready_for_query(out);
             return;
         }
         const consensus::SubmitResult sr = submit_(sql);
         if (!sr.accepted) {
             pgw::pg_error_response_code(out, "25006", "not the leader — reconnect to the leader");
-            pgw::pg_ready_for_query(out);
+            if (add_ready) pgw::pg_ready_for_query(out);
             return;
         }
         c.pending = true;  // reply deferred until applied_() >= sr.index (completion pump)
         c.pending_index = sr.index;
         c.pending_sql = sql;
+        c.pending_ready = add_ready;
+    }
+
+    // ---- EXTENDED protocol (prepared statements) over the Raft path ------------------------
+    static std::string rd_cstr(const std::byte* p, std::size_t plen, std::size_t& pos) {
+        std::string s;
+        while (pos < plen && std::to_integer<char>(p[pos]) != 0) s += std::to_integer<char>(p[pos++]);
+        if (pos < plen) ++pos;  // skip the NUL
+        return s;
+    }
+
+    void ext_parse(Conn& c, const std::byte* p, std::size_t plen, std::vector<std::byte>& out) {
+        std::size_t pos = 0;
+        const std::string name = rd_cstr(p, plen, pos);
+        const std::string query = rd_cstr(p, plen, pos);
+        c.stmts[name] = query;  // param types ignored — we substitute $N textually
+        pgw::pg_parse_complete(out);
+    }
+
+    void ext_bind(Conn& c, const std::byte* p, std::size_t plen, std::vector<std::byte>& out) {
+        std::size_t pos = 0;
+        const std::string portal = rd_cstr(p, plen, pos);
+        const std::string stmt = rd_cstr(p, plen, pos);
+        if (pos + 2 <= plen) {
+            const std::int16_t nfmt = pgw::pg_get_i16(p + pos);
+            pos += 2 + static_cast<std::size_t>(nfmt < 0 ? 0 : nfmt) * 2;  // skip format codes
+        }
+        std::vector<std::string> lits;
+        if (pos + 2 <= plen) {
+            const std::int16_t nparams = pgw::pg_get_i16(p + pos);
+            pos += 2;
+            for (std::int16_t k = 0; k < nparams && pos + 4 <= plen; ++k) {
+                const std::int32_t vlen = pgw::pg_get_i32(p + pos);
+                pos += 4;
+                if (vlen < 0) {
+                    lits.push_back(pgw::pg_param_literal("", true));
+                } else {
+                    std::string v(reinterpret_cast<const char*>(p + pos), static_cast<std::size_t>(vlen));
+                    pos += static_cast<std::size_t>(vlen);
+                    lits.push_back(pgw::pg_param_literal(v, false));
+                }
+            }
+        }
+        const auto it = c.stmts.find(stmt);
+        const std::string sql =
+            (it != c.stmts.end()) ? pgw::pg_substitute_params(it->second, lits) : std::string();
+        c.portals[portal] = Portal{sql, std::nullopt};
+        pgw::pg_bind_complete(out);
+    }
+
+    void ext_describe(Conn& c, const std::byte* p, std::size_t plen, std::vector<std::byte>& out) {
+        if (plen < 1) return;
+        const char what = std::to_integer<char>(p[0]);
+        std::size_t pos = 1;
+        const std::string name = rd_cstr(p, plen, pos);
+        if (what == 'S') {
+            const auto it = c.stmts.find(name);
+            pgw::pg_parameter_description(out, it != c.stmts.end() ? count_params(it->second) : 0);
+            pgw::pg_no_data(out);  // columns unknown before execution
+            return;
+        }
+        const auto it = c.portals.find(name);
+        if (it == c.portals.end()) {
+            pgw::pg_no_data(out);
+            return;
+        }
+        // A WRITE describes as NoData and is NOT exec'd here (that would bypass Raft). A READ
+        // is exec'd locally + cached so the following Execute reuses it.
+        if (is_write(it->second.sql)) {
+            pgw::pg_no_data(out);
+            return;
+        }
+        it->second.cached = exec_(it->second.sql);
+        const psql::ExecResult& r = *it->second.cached;
+        if (r.ok && (pgw::pg_is_select(it->second.sql) || !r.rows.empty())) {
+            pgw::pg_row_description(out, pgw::pg_cols_of(r));
+        } else {
+            pgw::pg_no_data(out);
+        }
+    }
+
+    void ext_execute(Conn& c, const std::byte* p, std::size_t plen, std::vector<std::byte>& out) {
+        std::size_t pos = 0;
+        const std::string portal = rd_cstr(p, plen, pos);
+        const auto it = c.portals.find(portal);
+        if (it == c.portals.end()) {
+            pgw::pg_error_response(out, "unknown portal");
+            return;
+        }
+        const std::string sql = it->second.sql;
+        if (is_write(sql)) {
+            it->second.cached.reset();
+            defer_write(c, sql, /*add_ready=*/false, out);  // Sync sends ReadyForQuery
+            return;
+        }
+        const bool had_describe = it->second.cached.has_value();
+        const std::optional<psql::ExecResult> pre = it->second.cached;
+        it->second.cached.reset();
+        reply_read(sql, pre, /*include_row_desc=*/!had_describe, /*add_ready=*/false, out);
+    }
+
+    void ext_close(Conn& c, const std::byte* p, std::size_t plen, std::vector<std::byte>& out) {
+        if (plen >= 1) {
+            const char what = std::to_integer<char>(p[0]);
+            std::size_t pos = 1;
+            const std::string name = rd_cstr(p, plen, pos);
+            if (what == 'S') {
+                c.stmts.erase(name);
+            } else {
+                c.portals.erase(name);
+            }
+        }
+        pgw::pg_close_complete(out);
+    }
+
+    static std::int16_t count_params(const std::string& sql) {
+        std::int16_t maxn = 0;
+        bool in_str = false;
+        for (std::size_t i = 0; i < sql.size(); ++i) {
+            if (sql[i] == '\'') {
+                in_str = !in_str;
+            } else if (!in_str && sql[i] == '$' && i + 1 < sql.size() && sql[i + 1] >= '1' &&
+                       sql[i + 1] <= '9') {
+                std::int16_t n = 0;
+                std::size_t j = i + 1;
+                while (j < sql.size() && sql[j] >= '0' && sql[j] <= '9') {
+                    n = static_cast<std::int16_t>(n * 10 + (sql[j] - '0'));
+                    ++j;
+                }
+                if (n > maxn) maxn = n;
+            }
+        }
+        return maxn;
     }
 
     // Periodic pump: complete any connection whose pending write has been applied locally.
@@ -285,8 +464,11 @@ private:
                 } else {
                     pgw::pg_error_response(out, "write committed but its result was unavailable");
                 }
-                pgw::pg_ready_for_query(out);
+                if (c.pending_ready) {
+                    pgw::pg_ready_for_query(out);  // simple query — extended defers to Sync
+                }
                 c.pending = false;
+                c.pending_ready = false;
                 c.pending_sql.clear();
                 c.pending_index = 0;
                 self->write_all(fd, out);
