@@ -135,16 +135,20 @@ int main() {
     {
         const auto ms = parse_backend(session.feed(sp(query("SELECT id, name FROM t"))));
         // RowDescription 'T' with two columns named id, name.
-        bool cols_ok = false;
+        bool cols_ok = false, oids_ok = false;
         for (const Msg& m : ms)
             if (m.type == 'T') {
                 std::size_t p = 2;  // skip the int16 field count
                 const std::string c0 = cstring(m.body, p);
+                const std::int32_t oid0 = pw::pg_get_i32(m.body.data() + p + 6);  // typeOID @ +6
                 p += 18;  // skip the 18 fixed field bytes
                 const std::string c1 = cstring(m.body, p);
+                const std::int32_t oid1 = pw::pg_get_i32(m.body.data() + p + 6);
                 cols_ok = (geti16(m.body.data()) == 2 && c0 == "id" && c1 == "name");
+                oids_ok = (oid0 == 20 && oid1 == 25);  // id=int8(20), name=text(25)
             }
         check(cols_ok, "SELECT -> RowDescription columns [id, name]");
+        check(oids_ok, "SELECT -> per-type OIDs: id=int8(20), name=text(25)");
         int datarows = 0;
         std::vector<std::string> first_vals;
         for (const Msg& m : ms)

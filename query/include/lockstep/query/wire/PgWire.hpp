@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <lockstep/query/sql/Engine.hpp>
@@ -59,8 +60,31 @@ inline void pg_put_bytes(std::vector<std::byte>& b, const std::string& s) {
     for (char c : s) b.push_back(static_cast<std::byte>(static_cast<unsigned char>(c)));
 }
 
-// The `text` type OID (25) — every column is advertised as text/format-0 in this shim.
+// The `text` type OID (25) — the fallback when a column's type is unknown.
 inline constexpr std::int32_t kPgTextOid = 25;
+
+// Map a Lockstep Datum's type to the closest PostgreSQL type OID. Values are still sent
+// in TEXT format; the OID tells a type-aware client how to PARSE that text (int vs string
+// vs date vs numeric), so a driver returns a native int/Decimal/date instead of a string.
+[[nodiscard]] inline std::int32_t pg_oid_for_datum(const sql::Datum& d) {
+    if (d.type == sql::Type::Text) return kPgTextOid;  // text / varchar / char / enum label
+    switch (d.logical) {                                // Int base, logical subtype (F9b/F13)
+        case 1: return 1700;  // numeric  (DECIMAL)
+        case 2: return 1082;  // date
+        case 3: return 1114;  // timestamp
+        case 8: return 1083;  // time
+        default: return 20;   // int8 (Lockstep ints are 64-bit)
+    }
+}
+// The (column name, type OID) list for a result — from the first row's cells (the OID is
+// the same for a column across rows). Empty for a 0-row result (types then default text).
+[[nodiscard]] inline std::vector<std::pair<std::string, std::int32_t>>
+pg_cols_of(const sql::ExecResult& r) {
+    std::vector<std::pair<std::string, std::int32_t>> cols;
+    if (!r.rows.empty())
+        for (const auto& cell : r.rows.front().cells) cols.emplace_back(cell.first, pg_oid_for_datum(cell.second));
+    return cols;
+}
 
 // ---- backend message builders (each writes ONE self-framed message) --------------------
 // A message is: [type byte][int32 length-incl-self][payload]. `emit` writes the header +
@@ -89,18 +113,19 @@ inline void pg_ready_for_query(std::vector<std::byte>& out) {
     p.push_back(static_cast<std::byte>('I'));  // 'I' = idle (not in a transaction block)
     pg_detail::emit(out, 'Z', p);
 }
-// RowDescription: one field per column name, all typed as text/format-0.
-inline void pg_row_description(std::vector<std::byte>& out, const std::vector<std::string>& cols) {
+// RowDescription: one field per column (name + type OID), all in text format.
+inline void pg_row_description(std::vector<std::byte>& out,
+                              const std::vector<std::pair<std::string, std::int32_t>>& cols) {
     std::vector<std::byte> p;
     pg_put_i16(p, static_cast<std::int16_t>(cols.size()));
-    for (const std::string& name : cols) {
+    for (const auto& [name, oid] : cols) {
         pg_put_str(p, name);
-        pg_put_i32(p, 0);            // table OID (unknown)
-        pg_put_i16(p, 0);            // column attribute number
-        pg_put_i32(p, kPgTextOid);   // type OID = text
-        pg_put_i16(p, -1);           // type size (variable)
-        pg_put_i32(p, -1);           // type modifier
-        pg_put_i16(p, 0);            // format code: 0 = text
+        pg_put_i32(p, 0);       // table OID (unknown)
+        pg_put_i16(p, 0);       // column attribute number
+        pg_put_i32(p, oid);     // type OID
+        pg_put_i16(p, -1);      // type size (variable)
+        pg_put_i32(p, -1);      // type modifier
+        pg_put_i16(p, 0);       // format code: 0 = text
     }
     pg_detail::emit(out, 'T', p);
 }
@@ -251,10 +276,7 @@ inline void pg_reply_for_statement(std::vector<std::byte>& out, const std::strin
     }
     const bool is_sel = pg_is_select(sql) || !r.rows.empty();
     if (is_sel) {
-        std::vector<std::string> cols;
-        if (!r.rows.empty())
-            for (const auto& cell : r.rows.front().cells) cols.push_back(cell.first);
-        pg_row_description(out, cols);
+        pg_row_description(out, pg_cols_of(r));
         for (const sql::ResultRow& row : r.rows) pg_data_row(out, row);
     }
     pg_command_complete(out, pg_command_tag(sql, r, is_sel));
@@ -421,10 +443,7 @@ private:
         it->second.cached = exec_(it->second.sql);
         const sql::ExecResult& r = *it->second.cached;
         if (r.ok && (pg_is_select(it->second.sql) || !r.rows.empty())) {
-            std::vector<std::string> cols;
-            if (!r.rows.empty())
-                for (const auto& c : r.rows.front().cells) cols.push_back(c.first);
-            pg_row_description(out, cols);
+            pg_row_description(out, pg_cols_of(r));
         } else {
             pg_no_data(out);
         }
@@ -442,10 +461,7 @@ private:
         if (!r.ok) { pg_error_response(out, r.error); return; }
         const bool is_sel = pg_is_select(it->second.sql) || !r.rows.empty();
         if (!had_describe && is_sel) {  // no prior Describe -> include RowDescription
-            std::vector<std::string> cols;
-            if (!r.rows.empty())
-                for (const auto& c : r.rows.front().cells) cols.push_back(c.first);
-            pg_row_description(out, cols);
+            pg_row_description(out, pg_cols_of(r));
         }
         for (const sql::ResultRow& row : r.rows) pg_data_row(out, row);
         pg_command_complete(out, pg_command_tag(it->second.sql, r, is_sel));
