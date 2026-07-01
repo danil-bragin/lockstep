@@ -113,6 +113,20 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_providers_sim
         lockstep_providers_prod)
 
+    # --- lockstep_pgd — a PostgreSQL-wire daemon (SqlEngine over a real socket) [LINUX ONLY] -
+    # Serves the SqlEngine over the PG v3 wire shim (query/wire/PgWire.hpp) on a raw TCP
+    # listener (providers/prod/ProdPgServer), so `psql` / any PG driver connects to Lockstep.
+    add_executable(lockstep_pgd lockstep_pgd.cpp)
+    target_link_libraries(lockstep_pgd
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_query
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_prod)
+
     # --- lockstep_kvbench — keyed-KV load driver for lockstepd --wire-server [LINUX ONLY] -
     # Drives Connection.put / Connection.get over the wire stub (the REAL read+write keyed
     # path). Same link set as prod_server_test (the query wire client + prod providers).
