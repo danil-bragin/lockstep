@@ -81,6 +81,8 @@ public:
             case StmtKind::CreateIndex:
             case StmtKind::DropIndex:
             case StmtKind::DropTable:
+            case StmtKind::CreateView:   // H1: DDL (schema replicated) -> every shard
+            case StmtKind::DropView:     // H1
             case StmtKind::Truncate:  // E2: a DDL/all-rows op -> every shard
             case StmtKind::CreateSchema:  // E4
             case StmtKind::DropSchema:
@@ -89,6 +91,9 @@ public:
             case StmtKind::Begin:
             case StmtKind::Commit:
             case StmtKind::Rollback:
+            case StmtKind::Savepoint:           // G6: txn-local control -> every shard
+            case StmtKind::RollbackToSavepoint:
+            case StmtKind::ReleaseSavepoint:
                 return broadcast(sql);
             case StmtKind::Insert:
                 return route_or_broadcast(sql, st.insert.table, pk_value_of(st.insert));

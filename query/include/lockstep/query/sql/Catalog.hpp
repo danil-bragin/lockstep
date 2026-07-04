@@ -249,6 +249,16 @@ struct Table {
     }
 };
 
+// H1: a VIEW — a named, stored SELECT. Kept as its RAW SELECT source text (re-parsed on
+// every reference) so it is durable + engine-version-independent (no AST is serialized).
+// `columns` (optional) renames the view's output columns. Views share the table NAMESPACE
+// (a name is a table OR a view, never both) so a FROM reference resolves unambiguously.
+struct View {
+    std::string name;
+    std::string select_src;             // raw SELECT source text
+    std::vector<std::string> columns;   // optional output-column renames ("" list = inherit)
+};
+
 // ----------------------------------------------------------------------------
 // A scalar VALUE the SQL layer manipulates: an INT (signed 64-bit) or a TEXT
 // (opaque bytes). Kept as a small typed variant (no std::variant overhead beyond a
@@ -1486,6 +1496,9 @@ class Catalog {
 public:
     // Register a new table. Returns false if the name already exists (dup table). E4: the name is
     // schema-qualified through the search_path (bare names unchanged when search_path is empty).
+    // H1: table<->view name exclusion is enforced at the DDL layer (exec_create / exec_create_view),
+    // NOT here — an ephemeral CTE/derived/view materialization deliberately (re)uses a view's own name
+    // as a transient table that shadows it for the duration of the query, so create() must allow it.
     [[nodiscard]] bool create(Table t) {
         t.name = qualify(t.name);
         if (tables_.count(t.name) != 0) {
@@ -1572,8 +1585,38 @@ public:
     // F3: iterate every table (ordered => deterministic) — used to find FK references on DELETE.
     [[nodiscard]] const std::map<std::string, Table>& all() const { return tables_; }
 
+    // ---- H1: VIEWS (share the table namespace; resolved as an inline SELECT at query time) ----
+    // Register a new view. Returns false if the (qualified) name is already a table or a view.
+    [[nodiscard]] bool create_view(View v) {
+        v.name = qualify(v.name);
+        if (tables_.count(v.name) != 0 || views_.count(v.name) != 0) return false;
+        views_.emplace(v.name, std::move(v));
+        return true;
+    }
+    // CREATE OR REPLACE VIEW — overwrite an existing view (or create). Rejected iff a TABLE owns
+    // the name (a table is never replaced by a view). Returns false on that clash.
+    [[nodiscard]] bool replace_view(View v) {
+        v.name = qualify(v.name);
+        if (tables_.count(v.name) != 0) return false;
+        views_[v.name] = std::move(v);
+        return true;
+    }
+    // RECOVERY: re-register a view from its durable record (name already qualified when stored).
+    [[nodiscard]] bool insert_recovered_view(View v) {
+        if (tables_.count(v.name) != 0) return false;
+        views_[v.name] = std::move(v);
+        return true;
+    }
+    [[nodiscard]] const View* find_view(const std::string& name) const {
+        const auto it = views_.find(qualify(name));
+        return it == views_.end() ? nullptr : &it->second;
+    }
+    bool remove_view(const std::string& name) { return views_.erase(qualify(name)) != 0; }
+    [[nodiscard]] const std::map<std::string, View>& all_views() const { return views_; }
+
 private:
     std::map<std::string, Table> tables_;  // ordered => deterministic
+    std::map<std::string, View> views_;    // H1: views (ordered => deterministic)
     std::uint32_t next_id_ = 1;            // 0 reserved (no table)
     std::set<std::string> schemas_;        // E4: registered schema names
     std::string search_path_;              // E4: current schema for bare names ("" == bare/global)

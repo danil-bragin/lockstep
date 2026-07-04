@@ -425,6 +425,17 @@ public:
             if (is_tombstone(kv.second)) continue;
             (void)catalog_.create_schema(kv.first.substr(1), true);
         }
+        // H1: recover view records ('\x04' + name -> serialized View).
+        std::vector<storage::KeyValue> vrecs;
+        {
+            Query<Strict> q;
+            q.scan(std::string(1, '\x04'), std::string(1, '\x05'));
+            collect(catalog_db_.run(q), vrecs);
+        }
+        for (const storage::KeyValue& kv : vrecs) {
+            if (is_tombstone(kv.second)) continue;
+            (void)catalog_.insert_recovered_view(deserialize_view(kv.second));
+        }
     }
 
     // True iff the catalog store is disk-backed (4-arg ctor) — the caller then persists the
@@ -862,6 +873,27 @@ public:
         return v;
     }
     static Key catalog_key(const std::string& name) { return std::string(1, '\x01') + name; }
+    // H1: view records live in their OWN durable namespace (0x04), clear of the table (0x01) and
+    // empty-schema-marker (0x02) key ranges the recovery scans use.
+    static Key view_key(const std::string& name) { return std::string(1, '\x04') + name; }
+
+    static std::string serialize_view(const View& v) {
+        std::string o;
+        cat_put_s(o, v.name);
+        cat_put_s(o, v.select_src);
+        cat_put_u32(o, static_cast<std::uint32_t>(v.columns.size()));
+        for (const std::string& c : v.columns) cat_put_s(o, c);
+        return o;
+    }
+    static View deserialize_view(const std::string& s) {
+        View v;
+        std::size_t p = 0;
+        v.name = cat_get_s(s, p);
+        v.select_src = cat_get_s(s, p);
+        const std::uint32_t n = cat_get_u32(s, p);
+        for (std::uint32_t i = 0; i < n; ++i) v.columns.push_back(cat_get_s(s, p));
+        return v;
+    }
 
     static std::string serialize_schema(const Table& t) {
         std::string o;
@@ -1038,6 +1070,20 @@ public:
         (void)commit_batch(catalog_db_, {{catalog_key(catalog_.qualify(name)), tombstone_marker()}},
                            /*nosync=*/false);
     }
+    // H1: durably (re)write a view's record (raw SELECT text + optional column renames). Keyed by the
+    // QUALIFIED name (== v->name) so CREATE/DROP match keys. Catalog store, own Seq line (like tables).
+    void persist_view(const std::string& name) {
+        const View* v = catalog_.find_view(name);
+        if (v != nullptr) {
+            (void)commit_batch(catalog_db_, {{view_key(v->name), serialize_view(*v)}},
+                               /*nosync=*/false);
+        }
+    }
+    // H1: durably tombstone a view record (DROP VIEW) so a restart does not resurrect it.
+    void retire_view(const std::string& name) {
+        (void)commit_batch(catalog_db_, {{view_key(catalog_.qualify(name)), tombstone_marker()}},
+                           /*nosync=*/false);
+    }
 
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
     ExecResult exec(const std::string& sql) {
@@ -1067,6 +1113,10 @@ public:
                 return exec_drop_index(st.drop_index);
             case StmtKind::DropTable:
                 return exec_drop_table(st.drop_table);
+            case StmtKind::CreateView:
+                return exec_create_view(st.create_view);
+            case StmtKind::DropView:
+                return exec_drop_view(st.drop_view);
             case StmtKind::Truncate:
                 return exec_truncate(st.truncate);
             case StmtKind::Alter:
@@ -1530,6 +1580,9 @@ private:
             if (c.if_not_exists) return ExecResult{};  // E2: no-op
             return ExecResult::failure("table '" + c.table + "' already exists");
         }
+        if (catalog_.find_view(c.table) != nullptr) {  // H1: shared namespace (a view owns the name)
+            return ExecResult::failure("'" + c.table + "' is a view, not a table");
+        }
         if (!c.like_table.empty()) return exec_create_like(c);  // E2
         if (c.as_select) return exec_create_as_select(c);       // E3
         Table t;
@@ -1662,6 +1715,24 @@ private:
         commit_writes(writes);
         mt->next_auto_id = auto_id;
         persist_schema(name);
+        return std::nullopt;
+    }
+
+    // H1: apply a view's explicit output-column list to its just-materialized ephemeral table. Renames
+    // the VISIBLE columns (the hidden synthetic `_ctid` PK is skipped) in order; the name count must
+    // match the query's output arity. In-memory only (the table is dropped after the query). Returns
+    // an error string on an arity mismatch, std::nullopt on success.
+    std::optional<std::string> rename_materialized_columns(const std::string& table,
+                                                           const std::vector<std::string>& names) {
+        Table* t = catalog_.find_mut(table);
+        if (t == nullptr) return std::string("internal: materialized view table '" + table + "' missing");
+        std::vector<std::size_t> visible;
+        for (std::size_t i = 0; i < t->columns.size(); ++i)
+            if (!t->columns[i].dropped) visible.push_back(i);
+        if (visible.size() != names.size())
+            return "view column list has " + std::to_string(names.size()) +
+                   " name(s) but the view query yields " + std::to_string(visible.size());
+        for (std::size_t k = 0; k < visible.size(); ++k) t->columns[visible[k]].name = names[k];
         return std::nullopt;
     }
 
@@ -2194,6 +2265,45 @@ private:
         concat_cache_.clear();
         text_dict_cache_.clear();
         zone_cache_.clear();
+        return ExecResult{};
+    }
+
+    // H1: CREATE [OR REPLACE] VIEW — register/overwrite a named SELECT and durably persist it. The
+    // body already parsed at parse time; re-validate here (CREATE OR REPLACE may carry a body that
+    // parses but references a missing table — that surfaces at query time, matching PostgreSQL's
+    // late binding, so we do NOT resolve the body's tables here).
+    ExecResult exec_create_view(const CreateViewStmt& c) {
+        if (catalog_.find(c.name) != nullptr) {
+            return ExecResult::failure("'" + c.name + "' is a table, not a view");
+        }
+        const bool exists = catalog_.find_view(c.name) != nullptr;
+        if (exists && !c.or_replace) {
+            if (c.if_not_exists) return ExecResult{};  // no-op
+            return ExecResult::failure("view '" + c.name + "' already exists");
+        }
+        View v;
+        v.name = c.name;
+        v.select_src = c.select_src;
+        v.columns = c.columns;
+        if (c.or_replace) {
+            if (!catalog_.replace_view(std::move(v)))
+                return ExecResult::failure("'" + c.name + "' is a table, not a view");
+        } else {
+            if (!catalog_.create_view(std::move(v)))
+                return ExecResult::failure("view '" + c.name + "' already exists");
+        }
+        persist_view(c.name);  // durable (survives a restart)
+        return ExecResult{};
+    }
+
+    // H1: DROP VIEW [IF EXISTS] — forget the view + durably tombstone it.
+    ExecResult exec_drop_view(const DropViewStmt& d) {
+        if (catalog_.find_view(d.name) == nullptr) {
+            if (d.if_exists) return ExecResult{};  // no-op
+            return ExecResult::failure("unknown view '" + d.name + "'");
+        }
+        retire_view(d.name);
+        catalog_.remove_view(d.name);
         return ExecResult{};
     }
 
@@ -5923,7 +6033,26 @@ private:
         // is an error (schema is inferred from the rows, like CREATE TABLE AS SELECT).
         bool has_derived = false;
         for (const JoinEntry& je : sel.from) if (je.subquery) { has_derived = true; break; }
-        if (!sel.ctes.empty() || has_derived) {
+        // H1: a FROM entry naming a VIEW (not a real table, not a subquery) expands to the view's
+        // stored SELECT — re-parsed here and materialized like a derived table (recursively: a view
+        // body may reference other views). A real table of the same name always wins (shadows the
+        // view). Collect them first so the trigger below fires even for a plain `SELECT * FROM v`.
+        std::vector<std::size_t> view_idx;                     // from-entry indices that are views
+        std::vector<std::shared_ptr<SelectStmt>> view_body;    // parsed view bodies (parallel to view_idx)
+        for (std::size_t i = 0; i < sel.from.size(); ++i) {
+            const JoinEntry& je = sel.from[i];
+            if (je.subquery || catalog_.find(je.table) != nullptr) continue;
+            const View* v = catalog_.find_view(je.table);
+            if (v == nullptr) continue;
+            ParseResult pr = parse_sql(v->select_src);
+            if (!pr.ok())
+                return ExecResult::failure("view '" + je.table + "': " + pr.error().render());
+            if (pr.stmt().kind != StmtKind::Select)
+                return ExecResult::failure("view '" + je.table + "' body is not a SELECT");
+            view_idx.push_back(i);
+            view_body.push_back(std::make_shared<SelectStmt>(pr.stmt().select));
+        }
+        if (!sel.ctes.empty() || has_derived || !view_idx.empty()) {
             std::vector<std::string> created;
             auto materialize = [&](const std::string& nm, const SelectStmt& sub) -> ExecResult {
                 if (catalog_.find(nm) != nullptr) {
@@ -5937,7 +6066,27 @@ private:
                 created.push_back(nm);
                 return ExecResult{};
             };
-            for (const auto& [name, sub] : sel.ctes) {       // CTEs first (derived may read them)
+            // Views first (a CTE/derived table may read a view). Each is materialized under its
+            // binding alias; a cycle (a view whose body reaches itself) is refused, not looped.
+            for (std::size_t k = 0; k < view_idx.size(); ++k) {
+                const JoinEntry& je = sel.from[view_idx[k]];
+                const std::string vname = je.table;  // the VIEW name (before body rewrites it to alias)
+                if (expanding_views_.count(vname) != 0) {
+                    drop_materialized(created);
+                    return ExecResult::failure("recursive view '" + vname + "' is not supported");
+                }
+                expanding_views_.insert(vname);
+                const ExecResult m = materialize(je.alias, *view_body[k]);
+                expanding_views_.erase(vname);
+                if (!m.ok) return m;
+                if (const View* v = catalog_.find_view(vname); v != nullptr && !v->columns.empty()) {
+                    if (auto e = rename_materialized_columns(je.alias, v->columns)) {
+                        drop_materialized(created);
+                        return ExecResult::failure(*e);
+                    }
+                }
+            }
+            for (const auto& [name, sub] : sel.ctes) {       // CTEs next (derived may read them)
                 if (const ExecResult m = materialize(name, *sub); !m.ok) return m;
             }
             for (const JoinEntry& je : sel.from) {           // then the derived tables
@@ -5948,6 +6097,10 @@ private:
             SelectStmt body = sel;
             body.ctes.clear();
             for (JoinEntry& je : body.from) je.subquery.reset();  // now plain table refs (== alias)
+            for (std::size_t idx : view_idx) {                // a view ref now resolves to its ephemeral
+                body.from[idx].table = body.from[idx].alias;  // table (named by the alias)
+                if (body.table == sel.from[idx].table) body.table = body.from[idx].alias;
+            }
             const ExecResult r = exec_select(body);
             drop_materialized(created);
             return r;
@@ -10572,6 +10725,7 @@ private:
     // truncates txn_writes_ back to that length (undoing writes since the savepoint) and drops
     // savepoints established after it; RELEASE just forgets the savepoint (keeps the writes).
     std::vector<std::pair<std::string, std::size_t>> savepoints_;
+    std::set<std::string> expanding_views_;  // H1: view names on the current expansion stack (cycle guard)
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change

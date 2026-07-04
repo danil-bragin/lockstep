@@ -1042,6 +1042,16 @@ private:
     // CREATE TABLE t (...) | CREATE INDEX name ON t (col)
     ParseResult parse_create() {
         advance();  // CREATE
+        bool or_replace = false;
+        if (is_kw("or")) {  // H1: CREATE OR REPLACE VIEW
+            advance();
+            if (auto e = expect_kw("replace")) return ParseResult{*e};
+            if (!is_kw("view")) return err("expected VIEW after CREATE OR REPLACE");
+            or_replace = true;
+        }
+        if (is_kw("view")) {  // H1: CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT ...
+            return parse_create_view(or_replace);  // consumes VIEW itself
+        }
         if (is_kw("unique")) {  // E5: CREATE UNIQUE INDEX
             advance();  // UNIQUE
             if (!is_kw("index")) return err("expected INDEX after CREATE UNIQUE");
@@ -1266,6 +1276,54 @@ private:
         return ParseResult{std::move(st)};
     }
 
+    // H1: CREATE [OR REPLACE] VIEW <name> [(<col>, ...)] AS <SELECT ...>. The view body is captured
+    // as its RAW SELECT source text (from the SELECT keyword to end-of-statement) — it is re-parsed
+    // on every reference, so no AST is stored (durable + version-independent). `is_kw("view")` is
+    // still current on entry.
+    ParseResult parse_create_view(bool or_replace) {
+        advance();  // VIEW
+        Statement st;
+        st.kind = StmtKind::CreateView;
+        st.create_view.or_replace = or_replace;
+        if (is_kw("if")) {  // CREATE VIEW IF NOT EXISTS
+            advance();
+            if (auto e = expect_kw("not")) return ParseResult{*e};
+            if (auto e = expect_kw("exists")) return ParseResult{*e};
+            st.create_view.if_not_exists = true;
+        }
+        if (auto e = expect_table_name("a view name after CREATE VIEW", st.create_view.name)) {
+            return ParseResult{*e};
+        }
+        if (cur_.kind == Tok::LParen) {  // optional explicit output-column list
+            advance();
+            for (;;) {
+                std::string col;
+                if (auto e = expect_ident("a column name in the view column list", col)) return ParseResult{*e};
+                st.create_view.columns.push_back(std::move(col));
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
+            if (auto e = expect(Tok::RParen, "')' to close the view column list")) return ParseResult{*e};
+        }
+        if (auto e = expect_kw("as")) return ParseResult{*e};
+        if (!is_kw("select")) {
+            return err("expected SELECT after CREATE VIEW ... AS");
+        }
+        // Capture the raw SELECT source text (re-parsed on reference). Validate it parses NOW so a
+        // malformed view is rejected at definition time, not at first use.
+        const std::size_t start = cur_.pos;
+        SelectStmt probe;
+        if (auto e = parse_select_stmt(probe)) return ParseResult{*e};
+        const std::size_t end = cur_.pos;  // at the trailing ';' or end-of-input
+        std::string text = lex_.src().substr(start, end > start ? end - start : 0);
+        while (!text.empty() && (text.back() == ' ' || text.back() == '\t' ||
+                                 text.back() == '\n' || text.back() == '\r' || text.back() == ';')) {
+            text.pop_back();
+        }
+        st.create_view.select_src = std::move(text);
+        return ParseResult{std::move(st)};
+    }
+
     // CREATE INDEX <name> ON <table> (<col>) — single-column secondary index. A
     // multi-column list (a comma after the column) is a clean "OUT in v1" error.
     ParseResult parse_create_index(bool unique) {
@@ -1358,6 +1416,16 @@ private:
             st.kind = StmtKind::DropTable;
             st.drop_table.if_exists = parse_if_exists();  // E2
             if (auto e = expect_table_name("a table name after DROP TABLE", st.drop_table.table)) {
+                return ParseResult{*e};
+            }
+            return ParseResult{std::move(st)};
+        }
+        if (is_kw("view")) {  // H1: DROP VIEW [IF EXISTS] name
+            advance();  // VIEW
+            Statement st;
+            st.kind = StmtKind::DropView;
+            st.drop_view.if_exists = parse_if_exists();
+            if (auto e = expect_table_name("a view name after DROP VIEW", st.drop_view.name)) {
                 return ParseResult{*e};
             }
             return ParseResult{std::move(st)};

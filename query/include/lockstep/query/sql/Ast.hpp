@@ -471,6 +471,25 @@ struct AlterStmt {
     std::string constraint_name;  // DropConstraint target; AddCheck/AddUnique explicit name ("" = auto)
 };
 
+// CREATE [OR REPLACE] VIEW <name> [(<col>, ...)] AS <SELECT ...>. A view is a NAMED, stored
+// SELECT: referencing it in a FROM clause expands to its query (like an inline CTE). The
+// definition is kept as its RAW SELECT source text (re-parsed on reference) so it survives a
+// restart through the catalog store — no AST is serialized. `columns` (optional) renames the
+// output columns; empty = inherit the SELECT's own labels.
+struct CreateViewStmt {
+    std::string name;
+    std::string select_src;             // raw SELECT source text (re-parsed on every reference)
+    std::vector<std::string> columns;   // optional explicit output column names ("" list = inherit)
+    bool if_not_exists = false;         // CREATE VIEW IF NOT EXISTS — no-op if it already exists
+    bool or_replace = false;            // CREATE OR REPLACE VIEW — overwrite an existing view
+};
+
+// DROP VIEW <name> — forget a view (durably tombstoned). Unknown name is an error unless IF EXISTS.
+struct DropViewStmt {
+    std::string name;
+    bool if_exists = false;
+};
+
 enum class StmtKind : std::uint8_t {
     Create = 0,
     Insert = 1,
@@ -494,6 +513,8 @@ enum class StmtKind : std::uint8_t {
     Savepoint = 19,          // G6: SAVEPOINT name
     RollbackToSavepoint = 20,  // G6: ROLLBACK TO [SAVEPOINT] name
     ReleaseSavepoint = 21,     // G6: RELEASE [SAVEPOINT] name
+    CreateView = 22,           // H1: CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT ...
+    DropView = 23,             // H1: DROP VIEW [IF EXISTS] name
 };
 
 struct Statement {
@@ -512,6 +533,8 @@ struct Statement {
     bool schema_if_exists = false;      // E4
     AlterStmt alter;
     std::string savepoint_name;  // G6: SAVEPOINT / ROLLBACK TO / RELEASE target
+    CreateViewStmt create_view;  // H1
+    DropViewStmt drop_view;      // H1
 };
 
 }  // namespace lockstep::query::sql
