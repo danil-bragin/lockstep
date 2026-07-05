@@ -437,6 +437,19 @@ public:
             if (is_tombstone(kv.second)) continue;
             (void)catalog_.insert_recovered_view(deserialize_view(kv.second));
         }
+        // MATERIALIZED VIEW sources ('\x06' + qualified name -> raw SELECT text). The backing
+        // table recovered above via the normal 0x01 table records; this restores REFRESH-ability.
+        matviews_.clear();
+        std::vector<storage::KeyValue> mvrecs;
+        {
+            Query<Strict> q;
+            q.scan(std::string(1, '\x06'), std::string(1, '\x07'));
+            collect(catalog_db_.run(q), mvrecs);
+        }
+        for (const storage::KeyValue& kv : mvrecs) {
+            if (is_tombstone(kv.second)) continue;
+            matviews_[kv.first.substr(1)] = kv.second;
+        }
     }
 
     // True iff the catalog store is disk-backed (4-arg ctor) — the caller then persists the
@@ -1085,6 +1098,20 @@ public:
         (void)commit_batch(catalog_db_, {{view_key(catalog_.qualify(name)), tombstone_marker()}},
                            /*nosync=*/false);
     }
+    // MATERIALIZED VIEW: the refreshable source, keyed at catalog namespace 0x06 (clear of the
+    // table 0x01 / marker 0x02 / view 0x04 recovery scans). The backing table persists normally.
+    static Key matview_key(const std::string& name) { return std::string(1, '\x06') + name; }
+    void persist_matview(const std::string& name) {
+        const std::string qn = catalog_.qualify(name);
+        const auto it = matviews_.find(qn);
+        if (it != matviews_.end()) {
+            (void)commit_batch(catalog_db_, {{matview_key(qn), it->second}}, /*nosync=*/false);
+        }
+    }
+    void retire_matview(const std::string& name) {
+        (void)commit_batch(catalog_db_, {{matview_key(catalog_.qualify(name)), tombstone_marker()}},
+                           /*nosync=*/false);
+    }
 
     // W3.1: set the per-statement query-memory cap in bytes (0 = unlimited, the default).
     // Deterministic (byte-counted, not allocator-based), so a replicated statement hits the
@@ -1162,6 +1189,8 @@ public:
                 return exec_drop_view(st.drop_view);
             case StmtKind::SetParam:
                 return exec_set_param(st.set_param_name, st.set_param_value);
+            case StmtKind::RefreshMatView:
+                return exec_refresh_matview(st.truncate.table);
             case StmtKind::Truncate:
                 return exec_truncate(st.truncate);
             case StmtKind::Alter:
@@ -1700,6 +1729,34 @@ private:
     // SELECT *), and INSERT every result row.
     ExecResult exec_create_as_select(const CreateStmt& c) {
         if (auto e = materialize_select(c.table, *c.as_select)) return ExecResult::failure(*e);
+        if (c.materialized) {  // record the refreshable source, durably.
+            matviews_[catalog_.qualify(c.table)] = c.source_sql;
+            persist_matview(c.table);
+        }
+        return ExecResult{};
+    }
+
+    // REFRESH MATERIALIZED VIEW name — recompute the stored source and replace the table's rows.
+    // Implemented as drop + re-materialize (non-incremental), so the result is exactly the query
+    // over the current base data. Deterministic (same source + same data -> same rows).
+    ExecResult exec_refresh_matview(const std::string& name) {
+        const std::string qn = catalog_.qualify(name);
+        const auto it = matviews_.find(qn);
+        if (it == matviews_.end()) {
+            return ExecResult::failure("'" + name + "' is not a materialized view");
+        }
+        const std::string src = it->second;  // copy (drop below mutates the catalog)
+        ParseResult pr = parse_sql(src);
+        if (!pr.ok() || pr.stmt().kind != StmtKind::Select) {
+            return ExecResult::failure("materialized view '" + name + "': stored source is not a SELECT");
+        }
+        // Drop the current backing table, then re-materialize under the same name.
+        DropTableStmt d;
+        d.table = name;
+        d.if_exists = true;
+        (void)exec_drop_table(d, /*keep_matview=*/true);  // keep the matview registration
+        if (auto e = materialize_select(name, pr.stmt().select)) return ExecResult::failure(*e);
+        persist_matview(name);  // re-assert the source (drop tombstoned the schema record)
         return ExecResult{};
     }
 
@@ -2613,7 +2670,7 @@ private:
     // restart does not resurrect it). The row/columnar/index/zone DATA under the table's monotonic
     // id is left orphaned-but-invisible (no query can name a dropped table; a re-CREATE gets a NEW
     // id) — the same no-space-reclaim model DROP INDEX uses. Unknown table => error.
-    ExecResult exec_drop_table(const DropTableStmt& dt) {
+    ExecResult exec_drop_table(const DropTableStmt& dt, bool keep_matview = false) {
         if (catalog_.find(dt.table) == nullptr) {
             if (dt.if_exists) return ExecResult{};  // E2: no-op
             return ExecResult::failure("unknown table '" + dt.table + "'");
@@ -2622,6 +2679,14 @@ private:
         (void)commit_batch(catalog_db_, {{catalog_key(dt.table), tombstone_marker()}},
                            /*nosync=*/false);
         catalog_.remove(dt.table);
+        // If this was a materialized view, forget its source too (unless a REFRESH is
+        // re-materializing it under the same name, which keeps the registration).
+        if (!keep_matview) {
+            const std::string qn = catalog_.qualify(dt.table);
+            if (matviews_.erase(qn) != 0) {
+                retire_matview(dt.table);
+            }
+        }
         // Invalidate any decoded-block / zone caches that keyed on this table's flush_gen.
         chunk_cache_.clear();
         concat_cache_.clear();
@@ -11669,6 +11734,7 @@ private:
     // savepoints established after it; RELEASE just forgets the savepoint (keeps the writes).
     std::vector<std::pair<std::string, std::size_t>> savepoints_;
     std::set<std::string> expanding_views_;  // H1: view names on the current expansion stack (cycle guard)
+    std::map<std::string, std::string> matviews_;  // materialized view (qualified name) -> refreshable source SQL
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
 
     // W3.1 RESOURCE GOVERNANCE — per-statement query memory accounting. A DETERMINISTIC

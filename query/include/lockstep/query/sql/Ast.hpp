@@ -65,6 +65,8 @@ struct CreateStmt {
     bool if_not_exists = false;       // E2: CREATE TABLE IF NOT EXISTS — no-op if it already exists
     std::string like_table;           // E2: CREATE TABLE t LIKE other — copy other's schema (no data)
     std::shared_ptr<SelectStmt> as_select;  // E3: CREATE TABLE t AS SELECT ... (populate from a query)
+    bool materialized = false;              // CREATE MATERIALIZED VIEW — a table + a refreshable source
+    std::string source_sql;                 // the raw SELECT text stored for REFRESH MATERIALIZED VIEW
 };
 
 // CREATE INDEX <name> ON <table> (<col>) — a single-column SECONDARY INDEX. The
@@ -522,6 +524,7 @@ enum class StmtKind : std::uint8_t {
     CreateView = 22,           // H1: CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT ...
     DropView = 23,             // H1: DROP VIEW [IF EXISTS] name
     SetParam = 24,             // W3.1: SET <name> = <value> (session parameter, e.g. lockstep.max_query_memory)
+    RefreshMatView = 25,       // REFRESH MATERIALIZED VIEW name — recompute a materialized view
 };
 
 struct Statement {

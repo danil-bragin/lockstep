@@ -395,6 +395,15 @@ public:
         ParseResult r = err("unreachable");
         if (kw == "create") {
             r = parse_create();
+        } else if (kw == "refresh") {  // REFRESH MATERIALIZED VIEW name
+            advance();  // REFRESH
+            if (auto e = expect_kw("materialized")) return ParseResult{*e};
+            if (auto e = expect_kw("view")) return ParseResult{*e};
+            Statement st;
+            st.kind = StmtKind::RefreshMatView;
+            if (auto e = expect_table_name("a name after REFRESH MATERIALIZED VIEW", st.truncate.table))
+                return ParseResult{*e};
+            r = ParseResult{std::move(st)};
         } else if (kw == "insert") {
             r = parse_insert();
         } else if (kw == "update") {
@@ -1077,6 +1086,11 @@ private:
         if (is_kw("view")) {  // H1: CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT ...
             return parse_create_view(or_replace);  // consumes VIEW itself
         }
+        if (is_kw("materialized")) {  // CREATE MATERIALIZED VIEW name AS SELECT ...
+            advance();  // MATERIALIZED
+            if (auto e = expect_kw("view")) return ParseResult{*e};
+            return parse_create_matview();
+        }
         if (is_kw("unique")) {  // E5: CREATE UNIQUE INDEX
             advance();  // UNIQUE
             if (!is_kw("index")) return err("expected INDEX after CREATE UNIQUE");
@@ -1349,6 +1363,37 @@ private:
         return ParseResult{std::move(st)};
     }
 
+    // CREATE MATERIALIZED VIEW name AS SELECT ... — materialize the query into a table AND
+    // store the raw SELECT text so REFRESH MATERIALIZED VIEW can recompute it.
+    ParseResult parse_create_matview() {
+        Statement st;
+        st.kind = StmtKind::Create;
+        st.create.materialized = true;
+        if (is_kw("if")) {  // IF NOT EXISTS
+            advance();
+            if (auto e = expect_kw("not")) return ParseResult{*e};
+            if (auto e = expect_kw("exists")) return ParseResult{*e};
+            st.create.if_not_exists = true;
+        }
+        if (auto e = expect_table_name("a name after CREATE MATERIALIZED VIEW", st.create.table)) {
+            return ParseResult{*e};
+        }
+        if (auto e = expect_kw("as")) return ParseResult{*e};
+        if (!is_kw("select")) return err("expected SELECT after CREATE MATERIALIZED VIEW ... AS");
+        const std::size_t start = cur_.pos;
+        auto sel = std::make_shared<SelectStmt>();
+        if (auto e = parse_select_stmt(*sel)) return ParseResult{*e};
+        const std::size_t end = cur_.pos;
+        std::string text = lex_.src().substr(start, end > start ? end - start : 0);
+        while (!text.empty() && (text.back() == ' ' || text.back() == '\t' ||
+                                 text.back() == '\n' || text.back() == '\r' || text.back() == ';')) {
+            text.pop_back();
+        }
+        st.create.source_sql = std::move(text);
+        st.create.as_select = std::move(sel);
+        return ParseResult{std::move(st)};
+    }
+
     // CREATE INDEX <name> ON <table> (<col>) — single-column secondary index. A
     // multi-column list (a comma after the column) is a clean "OUT in v1" error.
     ParseResult parse_create_index(bool unique) {
@@ -1443,6 +1488,16 @@ private:
             if (auto e = expect_table_name("a table name after DROP TABLE", st.drop_table.table)) {
                 return ParseResult{*e};
             }
+            return ParseResult{std::move(st)};
+        }
+        if (is_kw("materialized")) {  // DROP MATERIALIZED VIEW [IF EXISTS] name — drops the table
+            advance();  // MATERIALIZED
+            if (auto e = expect_kw("view")) return ParseResult{*e};
+            Statement st;
+            st.kind = StmtKind::DropTable;
+            st.drop_table.if_exists = parse_if_exists();
+            if (auto e = expect_table_name("a name after DROP MATERIALIZED VIEW", st.drop_table.table))
+                return ParseResult{*e};
             return ParseResult{std::move(st)};
         }
         if (is_kw("view")) {  // H1: DROP VIEW [IF EXISTS] name
