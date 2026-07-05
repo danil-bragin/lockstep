@@ -9,6 +9,7 @@
 // query::wire::PgSession -> SqlEngine::exec() path. BOUNDED by an absolute deadline so it
 // always terminates. The SQL engine + wire shim are UNCHANGED — this is pure assembly.
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,11 +42,14 @@ int main(int argc, char** argv) {
     std::string req_password;
     bool require_auth = false;
     std::int64_t stmt_timeout_ms = 0;  // W3.3: 0 = no statement timeout
+    std::int64_t slow_query_ms = 0;    // W3.7: 0 = no slow-query log
     for (int i = 1; i + 1 < argc; i += 2) {
         if (std::strcmp(argv[i], "--port") == 0) {
             port = static_cast<std::uint16_t>(parse_u64(argv[i + 1], port));
         } else if (std::strcmp(argv[i], "--data-dir") == 0) {
             data_dir = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--slow-query-ms") == 0) {
+            slow_query_ms = static_cast<std::int64_t>(parse_u64(argv[i + 1], 0));
         } else if (std::strcmp(argv[i], "--stmt-timeout-ms") == 0) {
             stmt_timeout_ms = static_cast<std::int64_t>(parse_u64(argv[i + 1], 0));
         } else if (std::strcmp(argv[i], "--run-seconds") == 0) {
@@ -81,8 +85,24 @@ int main(int argc, char** argv) {
     }
     // W3.3: install the cancel flag onto the engine for the duration of a query; the server's
     // watchdog flips it if the query outruns --stmt-timeout-ms, aborting it with "query canceled".
-    prod::ProdPgServer pg(reactor, port,
-                          [&engine](const std::string& s) { return engine.exec(s); }, auth,
+    // W3.7: if --slow-query-ms is set, log any query whose wall-clock exceeds it (observability).
+    auto exec_fn = [&engine, slow_query_ms](const std::string& s) {
+        if (slow_query_ms <= 0) {
+            return engine.exec(s);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = engine.exec(s);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        if (ms >= slow_query_ms) {
+            std::fprintf(stderr, "lockstep_pgd: slow query %lldms: %s\n",
+                         static_cast<long long>(ms), s.c_str());
+            std::fflush(stderr);
+        }
+        return r;
+    };
+    prod::ProdPgServer pg(reactor, port, exec_fn, auth,
                           [&engine](const std::atomic<bool>* f) { engine.set_cancel_flag(f); },
                           stmt_timeout_ms);
     if (!pg.valid()) {
