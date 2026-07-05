@@ -134,6 +134,16 @@ int main() {
               "(G) key_column_usage maps the PK column 'id'");
     }
 
+    // (H) pg_catalog.pg_namespace + pg_class for psql-style introspection.
+    {
+        const ExecResult rn = e.exec("SELECT nspname FROM pg_namespace");
+        check(has(col_texts(rn, "nspname"), "public"), "(H) pg_namespace lists 'public'");
+        const ExecResult rc = e.exec("SELECT relname, relkind FROM pg_class WHERE relname = 'active'");
+        check(has(col_texts(rc, "relkind"), "v"), "(H) pg_class reports the view as relkind 'v'");
+        const ExecResult rt = e.exec("SELECT relkind FROM pg_class WHERE relname = 'users'");
+        check(has(col_texts(rt, "relkind"), "r"), "(H) pg_class reports a table as relkind 'r'");
+    }
+
     if (g_fail != 0) {
         std::printf("sql_information_schema_test: FAILURES\n");
         return 1;

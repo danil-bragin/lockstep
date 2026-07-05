@@ -1884,7 +1884,11 @@ private:
                lower_name == "information_schema.table_constraints" ||
                lower_name == "information_schema.key_column_usage" ||
                lower_name == "pg_catalog.pg_tables" ||
-               lower_name == "pg_tables";
+               lower_name == "pg_tables" ||
+               lower_name == "pg_catalog.pg_namespace" ||
+               lower_name == "pg_namespace" ||
+               lower_name == "pg_catalog.pg_class" ||
+               lower_name == "pg_class";
     }
 
     // W9: build the (columns, rows) of a synthesised system relation from the live catalog.
@@ -1929,6 +1933,27 @@ private:
                 const auto [sch, nm] = split_schema(qn);
                 rows.push_back({Datum::make_text(sch), Datum::make_text(nm),
                                 Datum::make_text("lockstep")});
+            }
+        } else if (lower_name == "pg_catalog.pg_namespace" || lower_name == "pg_namespace") {
+            cols = {{"nspname", Type::Text}};
+            std::set<std::string> schemas{"public", "information_schema", "pg_catalog"};
+            for (const auto& [qn, t] : catalog_.all()) {
+                (void)t;
+                if (is_ephemeral(qn)) continue;
+                schemas.insert(split_schema(qn).first);
+            }
+            for (const std::string& s : schemas) rows.push_back({Datum::make_text(s)});
+        } else if (lower_name == "pg_catalog.pg_class" || lower_name == "pg_class") {
+            // relkind: 'r' ordinary table, 'v' view (the two we synthesise).
+            cols = {{"relname", Type::Text}, {"relkind", Type::Text}};
+            for (const auto& [qn, t] : catalog_.all()) {
+                (void)t;
+                if (is_ephemeral(qn)) continue;
+                rows.push_back({Datum::make_text(split_schema(qn).second), Datum::make_text("r")});
+            }
+            for (const auto& [qn, v] : catalog_.all_views()) {
+                (void)v;
+                rows.push_back({Datum::make_text(split_schema(qn).second), Datum::make_text("v")});
             }
         } else if (lower_name == "information_schema.table_constraints") {
             cols = {{"constraint_catalog", Type::Text}, {"constraint_schema", Type::Text},
