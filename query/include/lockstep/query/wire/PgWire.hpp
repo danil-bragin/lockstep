@@ -304,6 +304,19 @@ public:
 
     [[nodiscard]] bool closed() const noexcept { return closed_; }
 
+    // W3.4: the server assigns this session's cancel key BEFORE the handshake, so accept()
+    // can advertise it in BackendKeyData. 0/0 (the default) suppresses BackendKeyData.
+    void set_backend_key(std::int32_t pid, std::int32_t secret) noexcept {
+        backend_pid_ = pid;
+        backend_secret_ = secret;
+    }
+    // W3.4: true iff this connection was a PG CancelRequest (not a normal session). The
+    // server reads the named target key and, if it matches a live session, sets that
+    // session's cancel flag. A CancelRequest connection carries no query and is closed.
+    [[nodiscard]] bool is_cancel_request() const noexcept { return is_cancel_request_; }
+    [[nodiscard]] std::int32_t cancel_target_pid() const noexcept { return cancel_pid_; }
+    [[nodiscard]] std::int32_t cancel_target_secret() const noexcept { return cancel_secret_; }
+
     // Feed raw bytes read off the socket; returns raw bytes to write back (possibly empty).
     [[nodiscard]] std::vector<std::byte> feed(std::span<const std::byte> input) {
         buf_.insert(buf_.end(), input.begin(), input.end());
@@ -319,6 +332,16 @@ public:
                     out.push_back(static_cast<std::byte>('N'));
                     buf_.erase(buf_.begin(), buf_.begin() + len);
                     continue;  // the client resends a real StartupMessage.
+                }
+                if (code == 80877102) {  // W3.4 CancelRequest: [len=16][code][pid][secret].
+                    if (len >= 16) {
+                        cancel_pid_ = pg_get_i32(buf_.data() + 8);
+                        cancel_secret_ = pg_get_i32(buf_.data() + 12);
+                        is_cancel_request_ = true;
+                    }
+                    buf_.erase(buf_.begin(), buf_.begin() + len);
+                    closed_ = true;  // a cancel connection carries no query; the server acts + closes.
+                    break;
                 }
                 // A real StartupMessage (protocol 3.0 = 196608).
                 user_ = startup_user(buf_.data(), static_cast<std::size_t>(len));
@@ -393,6 +416,13 @@ private:
         pg_auth_ok(out);
         pg_parameter_status(out, "server_version", "14.0 (Lockstep)");
         pg_parameter_status(out, "client_encoding", "UTF8");
+        // W3.4: advertise this session's cancel key so the client can later CancelRequest it.
+        if (backend_pid_ != 0 || backend_secret_ != 0) {
+            std::vector<std::byte> k;
+            pg_put_i32(k, backend_pid_);
+            pg_put_i32(k, backend_secret_);
+            pg_detail::emit(out, 'K', k);  // BackendKeyData
+        }
         pg_ready_for_query(out);
     }
     // Extract the "user" parameter from a StartupMessage ([int32 len][int32 code][k\0 v\0 ...]).
@@ -583,6 +613,14 @@ private:
     bool closed_ = false;
     std::map<std::string, std::string> stmts_;  // prepared statements: name -> query
     std::map<std::string, Portal> portals_;     // bound portals: name -> {sql, cached}
+    // W3.4 PG CancelRequest: the server assigns this session a (pid, secret) that is sent to
+    // the client in BackendKeyData; the client opens a SEPARATE connection and sends a
+    // CancelRequest carrying them, which the server matches to this session's cancel flag.
+    std::int32_t backend_pid_ = 0;
+    std::int32_t backend_secret_ = 0;
+    bool is_cancel_request_ = false;   // this connection was a CancelRequest (no normal session)
+    std::int32_t cancel_pid_ = 0;      // the target backend pid it named
+    std::int32_t cancel_secret_ = 0;   // the target backend secret it named
 };
 
 }  // namespace lockstep::query::wire

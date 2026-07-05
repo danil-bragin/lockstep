@@ -301,6 +301,27 @@ int main() {
         check(session.closed(), "Terminate 'X' closes the session");
     }
 
+    // (W3.4) BackendKeyData on accept + CancelRequest recognition.
+    {
+        pw::PgSession keyed([&engine](const std::string& s) -> ExecResult { return engine.exec(s); });
+        keyed.set_backend_key(4242, 0x1337BEEF);
+        const auto ms = parse_backend(keyed.feed(sp(startup())));
+        check(has_type(ms, 'K'), "W3.4: startup with a backend key emits BackendKeyData 'K'");
+
+        // A CancelRequest packet: [len=16][code=80877102][pid][secret].
+        std::vector<std::byte> cr;
+        pw::pg_put_i32(cr, 16);
+        pw::pg_put_i32(cr, 80877102);
+        pw::pg_put_i32(cr, 4242);
+        pw::pg_put_i32(cr, 0x1337BEEF);
+        pw::PgSession canceler([&engine](const std::string& s) -> ExecResult { return engine.exec(s); });
+        (void)canceler.feed(sp(cr));
+        check(canceler.is_cancel_request(), "W3.4: CancelRequest recognized");
+        check(canceler.cancel_target_pid() == 4242 && canceler.cancel_target_secret() == 0x1337BEEF,
+              "W3.4: CancelRequest carries the target (pid, secret)");
+        check(canceler.closed(), "W3.4: a CancelRequest connection is closed");
+    }
+
     if (g_fail) { std::printf("pg_wire_test: FAILED\n"); return 1; }
     std::printf("pg_wire_test: OK (handshake + simple query + EXTENDED protocol (bound $1) + "
                 "per-type OIDs + cleartext-password auth)\n");
