@@ -2488,6 +2488,23 @@ private:
             }
         }
 
+        // K10 TIME TRAVEL: AS OF SEQ n — read the MVCC state as of version n. A friendly
+        // PostgreSQL/Cockroach-style alias for AT SNAPSHOT n (the SEQ/SNAPSHOT/VERSION
+        // keyword after AS OF is optional). At this tail position an `AS` can only be
+        // `AS OF` (projection/table aliases were already consumed upstream).
+        if (is_kw("as")) {
+            advance();
+            if (auto e = expect_kw("of")) return e;
+            if (is_kw("seq") || is_kw("snapshot") || is_kw("version")) advance();
+            Datum d;
+            if (auto e = expect_literal(d)) return e;
+            if (d.type != Type::Int || d.i < 0) {
+                return make_err("AS OF SEQ requires a non-negative integer version");
+            }
+            sel.level = Level::Snapshot;
+            sel.snapshot_version = static_cast<Seq>(d.i);
+        }
+
         // Optional AT <level> — the CALL-SITE-VISIBLE D5 annotation (V-D5-SAFE).
         if (is_kw("at")) {
             advance();
