@@ -8,13 +8,16 @@
 // LINUX-ONLY (epoll + sockets). Demo-grade: level-triggered epoll (a half-drained socket
 // re-wakes), small replies written inline. providers/prod is the lint-exempt boundary —
 // raw syscalls live here, never in core/query/txn.
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -37,8 +40,19 @@ public:
     // Bind + listen on 127.0.0.1:`port` and register the accept handler on `reactor`.
     // `exec` runs one SQL statement (typically SqlEngine::exec). `auth` (optional) gates
     // each connection with a cleartext password; unset = trust. valid() reports bind ok.
-    ProdPgServer(ProdReactor& reactor, std::uint16_t port, ExecFn exec, AuthFn auth = {})
-        : reactor_(&reactor), exec_(std::move(exec)), auth_(std::move(auth)) {
+    // W3.3: `cancel_setter` installs a cancel flag onto the SQL engine for the duration of a
+    // query (typically [&](f){ engine.set_cancel_flag(f); }); `stmt_timeout_ms` (>0) arms a
+    // watchdog thread that flips the flag when a query outruns the deadline, so a long query
+    // aborts with "query canceled" even though the reactor is single-threaded and blocked in
+    // exec. Both default off (unchanged behavior).
+    using CancelSetter = std::function<void(const std::atomic<bool>*)>;
+    ProdPgServer(ProdReactor& reactor, std::uint16_t port, ExecFn exec, AuthFn auth = {},
+                 CancelSetter cancel_setter = {}, std::int64_t stmt_timeout_ms = 0)
+        : reactor_(&reactor),
+          exec_(std::move(exec)),
+          auth_(std::move(auth)),
+          cancel_setter_(std::move(cancel_setter)),
+          stmt_timeout_ms_(stmt_timeout_ms) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             return;
@@ -57,6 +71,10 @@ public:
         }
         set_nonblock(listen_fd_);
         reactor_->add_fd(listen_fd_, EPOLLIN, [this](std::uint32_t) { accept_ready(); });
+        // W3.3: arm the statement-timeout watchdog thread (real thread — this is prod).
+        if (cancel_setter_ && stmt_timeout_ms_ > 0) {
+            watchdog_ = std::thread([this] { watchdog_loop(); });
+        }
     }
 
     ProdPgServer(const ProdPgServer&) = delete;
@@ -65,6 +83,10 @@ public:
     ProdPgServer& operator=(ProdPgServer&&) = delete;
 
     ~ProdPgServer() {
+        stop_.store(true);
+        if (watchdog_.joinable()) {
+            watchdog_.join();
+        }
         for (auto& [fd, sess] : conns_) {
             reactor_->remove_fd(fd);
             ::close(fd);
@@ -110,14 +132,46 @@ private:
         }
         std::vector<std::byte> in(static_cast<std::size_t>(n));
         std::memcpy(in.data(), buf, static_cast<std::size_t>(n));
+        // W3.3: for the duration of feed() (which runs the query synchronously on this reactor
+        // thread), point the engine at cur_cancel_ and arm the deadline. The watchdog thread
+        // flips cur_cancel_ if the query outruns it; the engine polls it and aborts.
+        const bool guarded = static_cast<bool>(cancel_setter_) && stmt_timeout_ms_ > 0;
+        if (guarded) {
+            cur_cancel_.store(false);
+            cur_deadline_ns_.store(now_ns() + stmt_timeout_ms_ * 1'000'000);
+            cancel_setter_(&cur_cancel_);
+        }
         const std::vector<std::byte> out =
             it->second->feed(std::span<const std::byte>(in.data(), in.size()));
+        if (guarded) {
+            cur_deadline_ns_.store(0);
+            cancel_setter_(nullptr);
+        }
         if (!out.empty()) {
             write_all(fd, out);
         }
         if (it->second->closed()) {
             close_conn(fd);
         }
+    }
+
+    // W3.3: the statement-timeout watchdog. Sleeps in short ticks; when a query is active
+    // (cur_deadline_ns_ != 0) and has outrun its deadline, sets cur_cancel_ so the engine's
+    // next poll aborts. A separate thread so it fires even while the reactor is blocked in exec.
+    void watchdog_loop() {
+        while (!stop_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const std::int64_t dl = cur_deadline_ns_.load();
+            if (dl != 0 && now_ns() > dl) {
+                cur_cancel_.store(true);
+            }
+        }
+    }
+
+    [[nodiscard]] static std::int64_t now_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     }
 
     static void write_all(int fd, const std::vector<std::byte>& bytes) {
@@ -145,6 +199,13 @@ private:
     AuthFn auth_;
     int listen_fd_ = -1;
     std::map<int, std::unique_ptr<query::wire::PgSession>> conns_;
+    // W3.3 statement-timeout state (shared with the watchdog thread).
+    CancelSetter cancel_setter_;
+    std::int64_t stmt_timeout_ms_ = 0;
+    std::atomic<bool> cur_cancel_{false};        // engine points here during a query
+    std::atomic<std::int64_t> cur_deadline_ns_{0};  // 0 = no active guarded query
+    std::atomic<bool> stop_{false};
+    std::thread watchdog_;
 };
 
 }  // namespace lockstep::prod

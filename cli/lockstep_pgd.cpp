@@ -8,6 +8,7 @@
 // ProdReactor (epoll loop), and a ProdPgServer that pipes each PG connection through the
 // query::wire::PgSession -> SqlEngine::exec() path. BOUNDED by an absolute deadline so it
 // always terminates. The SQL engine + wire shim are UNCHANGED — this is pure assembly.
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,11 +40,14 @@ int main(int argc, char** argv) {
     std::string req_user;
     std::string req_password;
     bool require_auth = false;
+    std::int64_t stmt_timeout_ms = 0;  // W3.3: 0 = no statement timeout
     for (int i = 1; i + 1 < argc; i += 2) {
         if (std::strcmp(argv[i], "--port") == 0) {
             port = static_cast<std::uint16_t>(parse_u64(argv[i + 1], port));
         } else if (std::strcmp(argv[i], "--data-dir") == 0) {
             data_dir = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--stmt-timeout-ms") == 0) {
+            stmt_timeout_ms = static_cast<std::int64_t>(parse_u64(argv[i + 1], 0));
         } else if (std::strcmp(argv[i], "--run-seconds") == 0) {
             run_seconds = parse_u64(argv[i + 1], run_seconds);
         } else if (std::strcmp(argv[i], "--user") == 0) {
@@ -75,8 +79,12 @@ int main(int argc, char** argv) {
             return u == req_user && p == req_password;
         };
     }
+    // W3.3: install the cancel flag onto the engine for the duration of a query; the server's
+    // watchdog flips it if the query outruns --stmt-timeout-ms, aborting it with "query canceled".
     prod::ProdPgServer pg(reactor, port,
-                          [&engine](const std::string& s) { return engine.exec(s); }, auth);
+                          [&engine](const std::string& s) { return engine.exec(s); }, auth,
+                          [&engine](const std::atomic<bool>* f) { engine.set_cancel_flag(f); },
+                          stmt_timeout_ms);
     if (!pg.valid()) {
         std::fprintf(stderr, "lockstep_pgd: could not bind port %u\n", static_cast<unsigned>(port));
         return 1;

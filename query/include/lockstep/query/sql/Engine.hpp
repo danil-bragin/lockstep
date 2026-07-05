@@ -8758,7 +8758,9 @@ private:
         const bool left_fill = je.kind == JoinKind::Left || je.kind == JoinKind::Full;
         const bool right_fill = je.kind == JoinKind::Right || je.kind == JoinKind::Full;
         std::vector<bool> rmatched(rt.rows.size(), false);
+        std::size_t jpoll = 0;
         for (const auto& ljr : left) {
+            if ((++jpoll & 0x3FFu) == 0 && canceled()) return std::string("query canceled");  // W3.2
             const Datum& lk = ljr[left_idx];
             bool matched = false;
             if (!lk.is_null) {
@@ -8810,7 +8812,9 @@ private:
         const bool left_fill = je.kind == JoinKind::Left || je.kind == JoinKind::Full;
         const bool right_fill = je.kind == JoinKind::Right || je.kind == JoinKind::Full;
         std::vector<bool> rmatched(rt.rows.size(), false);
+        std::size_t jpoll = 0;
         for (const auto& ljr : left) {
+            if ((++jpoll & 0x3FFu) == 0 && canceled()) return std::string("query canceled");  // W3.2
             bool matched = false;
             for (std::size_t rj = 0; rj < rt.rows.size(); ++rj) {
                 const auto& rrow = rt.rows[rj];
