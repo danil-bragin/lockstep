@@ -5210,7 +5210,7 @@ private:
         const bool would_parallelize =
             parallel_executor_ != nullptr && parallel_executor_->workers() > 1 &&
             static_cast<std::int64_t>(count) >= kParallelMinRows;
-        if (!has_having && !gs_mode_ && !would_parallelize && gcols.size() == 1 &&
+        if (!has_having && !gs_mode_ && gcols.size() == 1 &&
             t.columns[gcols[0]].type == Type::Int && t.columns[gcols[0]].logical == 0 &&
             !t.columns[gcols[0]].nullable) {
             bool all_ok = true;
@@ -5227,52 +5227,122 @@ private:
                 const std::size_t nf = fuse_cols.size();
                 std::vector<const std::int64_t*> ap(nf);
                 for (std::size_t k = 0; k < nf; ++k) ap[k] = cols[fuse_cols[k]]->ints.data();
-                std::size_t cap = 256;  // power of 2
-                std::vector<std::int32_t> slots(cap, -1);
                 std::vector<std::int64_t> keys;
                 std::vector<std::int64_t> cnt;
                 std::vector<IntFold> folds;  // G*nf flat (group g, col k => folds[g*nf+k])
-                const std::hash<std::int64_t> H;
-                auto reinsert = [&](std::int32_t gi) {
-                    std::size_t p = H(keys[static_cast<std::size_t>(gi)]) & (cap - 1);
-                    while (slots[p] >= 0) p = (p + 1) & (cap - 1);
-                    slots[p] = gi;
-                };
-                for (std::uint32_t r = 0; r < count; ++r) {
-                    if (has_filter && !passes(r)) continue;  // inline WHERE — no idx vectors, no gather
-                    const std::int64_t k = gk[r];
-                    std::size_t p = H(k) & (cap - 1);
-                    std::int32_t gi = -1;
-                    while (true) {
-                        if (slots[p] < 0) {
-                            if ((keys.size() + 1) * 10 >= cap * 7) {  // grow + rehash at load 0.7
-                                cap *= 2;
-                                slots.assign(cap, -1);
-                                for (std::int32_t g = 0; g < static_cast<std::int32_t>(keys.size()); ++g)
-                                    reinsert(g);
-                                p = H(k) & (cap - 1);
-                                continue;
+                // Accumulate rows [lo,hi) into a LOCAL open-addressing hash accumulator
+                // (keys/cnt/folds by reference). Shared by the serial and per-worker paths.
+                auto accumulate = [&](std::uint32_t lo, std::uint32_t hi,
+                                      std::vector<std::int64_t>& lkeys,
+                                      std::vector<std::int64_t>& lcnt,
+                                      std::vector<IntFold>& lfolds) {
+                    std::size_t cap = 256;  // power of 2
+                    std::vector<std::int32_t> slots(cap, -1);
+                    const std::hash<std::int64_t> H;
+                    auto reinsert = [&](std::int32_t gi) {
+                        std::size_t p = H(lkeys[static_cast<std::size_t>(gi)]) & (cap - 1);
+                        while (slots[p] >= 0) p = (p + 1) & (cap - 1);
+                        slots[p] = gi;
+                    };
+                    for (std::uint32_t r = lo; r < hi; ++r) {
+                        if (has_filter && !passes(r)) continue;  // inline WHERE — no gather
+                        const std::int64_t k = gk[r];
+                        std::size_t p = H(k) & (cap - 1);
+                        std::int32_t gi = -1;
+                        while (true) {
+                            if (slots[p] < 0) {
+                                if ((lkeys.size() + 1) * 10 >= cap * 7) {  // grow + rehash at 0.7
+                                    cap *= 2;
+                                    slots.assign(cap, -1);
+                                    for (std::int32_t g = 0; g < static_cast<std::int32_t>(lkeys.size()); ++g)
+                                        reinsert(g);
+                                    p = H(k) & (cap - 1);
+                                    continue;
+                                }
+                                gi = static_cast<std::int32_t>(lkeys.size());
+                                slots[p] = gi;
+                                lkeys.push_back(k);
+                                lcnt.push_back(0);
+                                lfolds.insert(lfolds.end(), nf, IntFold{0, INT64_MAX, INT64_MIN});
+                                break;
                             }
-                            gi = static_cast<std::int32_t>(keys.size());
-                            slots[p] = gi;
-                            keys.push_back(k);
-                            cnt.push_back(0);
-                            folds.insert(folds.end(), nf, IntFold{0, INT64_MAX, INT64_MIN});
-                            break;
+                            if (lkeys[static_cast<std::size_t>(slots[p])] == k) { gi = slots[p]; break; }
+                            p = (p + 1) & (cap - 1);
                         }
-                        if (keys[static_cast<std::size_t>(slots[p])] == k) { gi = slots[p]; break; }
-                        p = (p + 1) & (cap - 1);
-                    }
-                    ++cnt[static_cast<std::size_t>(gi)];
-                    if (nf > 0) {  // (a COUNT(*)-only query has no fold columns)
-                        IntFold* f = &folds[static_cast<std::size_t>(gi) * nf];
-                        for (std::size_t kk = 0; kk < nf; ++kk) {
-                            const std::int64_t x = ap[kk][r];
-                            f[kk].sum = wrap_add(f[kk].sum, x);
-                            f[kk].mn = f[kk].mn < x ? f[kk].mn : x;
-                            f[kk].mx = f[kk].mx > x ? f[kk].mx : x;
+                        ++lcnt[static_cast<std::size_t>(gi)];
+                        if (nf > 0) {
+                            IntFold* f = &lfolds[static_cast<std::size_t>(gi) * nf];
+                            for (std::size_t kk = 0; kk < nf; ++kk) {
+                                const std::int64_t x = ap[kk][r];
+                                f[kk].sum = wrap_add(f[kk].sum, x);
+                                f[kk].mn = f[kk].mn < x ? f[kk].mn : x;
+                                f[kk].mx = f[kk].mx > x ? f[kk].mx : x;
+                            }
                         }
                     }
+                };
+                // W4: PARALLEL ONE-PASS INT-key hash aggregate. Each worker accumulates its row
+                // range into a LOCAL hash accumulator; the locals then merge BY KEY into the final
+                // one. Byte-identical to serial (wrap_add assoc+commut; MIN/MAX/COUNT order-indep),
+                // and safe for any INT key distribution (no array-sizing assumption). Replaces the
+                // generic two-pass parallel gather for this shape.
+                if (would_parallelize) {
+                    const std::size_t W =
+                        std::min<std::size_t>(parallel_executor_->workers(), count);
+                    std::vector<std::vector<std::int64_t>> lkeys(W), lcnt(W);
+                    std::vector<std::vector<IntFold>> lfolds(W);
+                    const std::uint32_t per = static_cast<std::uint32_t>((count + W - 1) / W);
+                    parallel_executor_->parallel_for(W, [&](std::size_t w) {
+                        const std::uint32_t lo = static_cast<std::uint32_t>(w) * per;
+                        const std::uint32_t hi = std::min<std::uint32_t>(count, lo + per);
+                        accumulate(lo, hi, lkeys[w], lcnt[w], lfolds[w]);
+                    });
+                    // Merge by key into the final keys/cnt/folds (deterministic worker order 0..W-1).
+                    std::size_t mcap = 256;
+                    std::vector<std::int32_t> mslots(mcap, -1);
+                    const std::hash<std::int64_t> H;
+                    auto mreinsert = [&](std::int32_t gi) {
+                        std::size_t p = H(keys[static_cast<std::size_t>(gi)]) & (mcap - 1);
+                        while (mslots[p] >= 0) p = (p + 1) & (mcap - 1);
+                        mslots[p] = gi;
+                    };
+                    for (std::size_t w = 0; w < W; ++w) {
+                        for (std::size_t g = 0; g < lkeys[w].size(); ++g) {
+                            const std::int64_t k = lkeys[w][g];
+                            std::size_t p = H(k) & (mcap - 1);
+                            std::int32_t gi = -1;
+                            while (true) {
+                                if (mslots[p] < 0) {
+                                    if ((keys.size() + 1) * 10 >= mcap * 7) {
+                                        mcap *= 2;
+                                        mslots.assign(mcap, -1);
+                                        for (std::int32_t gg = 0; gg < static_cast<std::int32_t>(keys.size()); ++gg)
+                                            mreinsert(gg);
+                                        p = H(k) & (mcap - 1);
+                                        continue;
+                                    }
+                                    gi = static_cast<std::int32_t>(keys.size());
+                                    mslots[p] = gi;
+                                    keys.push_back(k);
+                                    cnt.push_back(0);
+                                    folds.insert(folds.end(), nf, IntFold{0, INT64_MAX, INT64_MIN});
+                                    break;
+                                }
+                                if (keys[static_cast<std::size_t>(mslots[p])] == k) { gi = mslots[p]; break; }
+                                p = (p + 1) & (mcap - 1);
+                            }
+                            cnt[static_cast<std::size_t>(gi)] += lcnt[w][g];
+                            for (std::size_t kk = 0; kk < nf; ++kk) {
+                                IntFold& d = folds[static_cast<std::size_t>(gi) * nf + kk];
+                                const IntFold& s = lfolds[w][g * nf + kk];
+                                d.sum = wrap_add(d.sum, s.sum);
+                                if (s.mn < d.mn) d.mn = s.mn;
+                                if (s.mx > d.mx) d.mx = s.mx;
+                            }
+                        }
+                    }
+                } else {
+                    accumulate(0, count, keys, cnt, folds);
                 }
                 std::vector<std::size_t> order(keys.size());
                 for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
