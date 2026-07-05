@@ -302,6 +302,12 @@ public:
     explicit PgSession(ExecFn exec, AuthFn auth = {})
         : exec_(std::move(exec)), auth_(std::move(auth)) {}
 
+    // W3.5 backpressure: the largest single protocol frame accepted. A frame claiming more
+    // (a firehose / oversized query) is rejected with a 54000 error and the connection closed,
+    // BEFORE its bytes are accumulated — so a hostile client can't grow the input buffer
+    // unbounded. 64 MiB comfortably exceeds any real query / bind payload.
+    static constexpr std::int32_t kMaxMessageBytes = 64 * 1024 * 1024;
+
     [[nodiscard]] bool closed() const noexcept { return closed_; }
 
     // W3.4: the server assigns this session's cancel key BEFORE the handshake, so accept()
@@ -326,6 +332,14 @@ public:
                 // The startup phase has NO type byte: [int32 len][int32 code][params...].
                 if (buf_.size() < 8) break;
                 const std::int32_t len = pg_get_i32(buf_.data());
+                // W3.5: reject an over-large startup frame BEFORE accumulating its bytes (a
+                // firehose/oversized message must not grow buf_ unbounded).
+                if (len > kMaxMessageBytes) {
+                    pg_error_response_code(out, "54000",
+                                           "startup message too large (backpressure limit)");
+                    closed_ = true;
+                    break;
+                }
                 if (len < 8 || buf_.size() < static_cast<std::size_t>(len)) break;
                 const std::int32_t code = pg_get_i32(buf_.data() + 4);
                 if (code == 80877103) {  // SSLRequest: decline (plaintext shim).
@@ -379,6 +393,12 @@ public:
             if (buf_.size() < 5) break;
             const char type = std::to_integer<char>(buf_[0]);
             const std::int32_t len = pg_get_i32(buf_.data() + 1);
+            // W3.5: reject an over-large frame BEFORE accumulating its payload (backpressure).
+            if (len > kMaxMessageBytes) {
+                pg_error_response_code(out, "54000", "message too large (backpressure limit)");
+                closed_ = true;
+                break;
+            }
             if (len < 4 || buf_.size() < static_cast<std::size_t>(len) + 1) break;
             const std::byte* payload = buf_.data() + 5;
             const std::size_t plen = static_cast<std::size_t>(len) - 4;

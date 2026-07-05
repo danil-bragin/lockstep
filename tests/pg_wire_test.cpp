@@ -322,6 +322,20 @@ int main() {
         check(canceler.closed(), "W3.4: a CancelRequest connection is closed");
     }
 
+    // (W3.5) backpressure: a frame claiming more than the cap is rejected + the connection
+    // closed BEFORE its bytes are accumulated (a firehose can't grow the buffer unbounded).
+    {
+        pw::PgSession bp([&engine](const std::string& s) -> ExecResult { return engine.exec(s); });
+        (void)bp.feed(sp(startup()));  // complete the handshake -> regular phase
+        // Regular-phase frame 'Q' with a bogus huge length (only the 5-byte header is sent).
+        std::vector<std::byte> hdr;
+        hdr.push_back(static_cast<std::byte>('Q'));
+        pw::pg_put_i32(hdr, 200 * 1024 * 1024);  // 200 MiB > 64 MiB cap
+        const auto ms = parse_backend(bp.feed(sp(hdr)));
+        check(has_type(ms, 'E'), "W3.5: oversized frame -> ErrorResponse 'E'");
+        check(bp.closed(), "W3.5: oversized frame closes the connection (no unbounded buffering)");
+    }
+
     if (g_fail) { std::printf("pg_wire_test: FAILED\n"); return 1; }
     std::printf("pg_wire_test: OK (handshake + simple query + EXTENDED protocol (bound $1) + "
                 "per-type OIDs + cleartext-password auth)\n");
