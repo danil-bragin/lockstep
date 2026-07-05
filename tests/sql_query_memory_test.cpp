@@ -123,6 +123,25 @@ int main() {
               "(E) non-numeric memory value rejected");
     }
 
+    // (F) FLAT RESULT SET — a plain SELECT (no derived table) that returns a large result
+    // is also bounded: the returned rows are charged at the top-level exec, so a runaway
+    // result is refused before it is handed back to the client.
+    {
+        SqlEngine e;
+        seed(e, 200);
+        // No cap → the flat scan returns all rows.
+        check(e.exec("SELECT id, payload FROM t").rows.size() == 200,
+              "(F) no cap: flat SELECT returns all rows");
+        // Tiny cap → the flat result is refused.
+        e.set_max_query_memory(100);
+        const ExecResult r = e.exec("SELECT id, payload FROM t");
+        check(!r.ok && r.error.find("query memory limit exceeded") != std::string::npos,
+              "(F) tiny cap: flat SELECT result is bounded and refused");
+        // A cap the small single-row result fits under still works.
+        check(e.exec("SELECT id FROM t WHERE id = 1").ok,
+              "(F) a small result still fits under the same cap");
+    }
+
     if (g_fail != 0) {
         std::printf("sql_query_memory_test: FAILURES\n");
         return 1;

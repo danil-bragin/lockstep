@@ -1115,8 +1115,18 @@ public:
                 return exec_update(st.update);
             case StmtKind::Delete:
                 return exec_delete(st.del);
-            case StmtKind::Select:
-                return exec_select(st.select);
+            case StmtKind::Select: {
+                ExecResult r = exec_select(st.select);
+                // W3.1: charge the returned result set against the per-statement budget
+                // (bounds a runaway result before it is handed back / serialized to the
+                // client). Deterministic; inert when max_query_mem_ == 0 (the default).
+                if (r.ok && max_query_mem_ != 0) {
+                    std::size_t sz = 0;
+                    for (const ResultRow& row : r.rows) sz += result_row_bytes(row);
+                    if (auto e = charge_query_mem(sz)) return ExecResult::failure(*e);
+                }
+                return r;
+            }
             case StmtKind::CreateIndex:
                 return exec_create_index(st.create_index);
             case StmtKind::DropIndex:
