@@ -7246,6 +7246,25 @@ private:
         }
         const std::string& f = e.func;
         auto need = [&](std::size_t n) { return a.size() == n; };
+        // W9 CONNECTION / SESSION functions — drivers and ORMs call these on connect. Zero-arg,
+        // pure, constant per session (args, if any, ignored). version() reports a PostgreSQL-
+        // compatible string so a driver's `PostgreSQL <major>` parse succeeds.
+        if (f == "VERSION") {
+            out = Datum::make_text("PostgreSQL 16.0 (Lockstep 0.1.0)");
+            return std::nullopt;
+        }
+        if (f == "CURRENT_DATABASE" || f == "CURRENT_CATALOG") {
+            out = Datum::make_text("lockstep");
+            return std::nullopt;
+        }
+        if (f == "CURRENT_SCHEMA") {
+            out = Datum::make_text("public");
+            return std::nullopt;
+        }
+        if (f == "CURRENT_USER" || f == "SESSION_USER" || f == "USER") {
+            out = Datum::make_text("lockstep");
+            return std::nullopt;
+        }
         if (f == "CAST") {
             if (!need(1)) return "CAST takes one argument";
             if (a[0].is_null) { out = Datum::make_null(e.cast_type); return std::nullopt; }
