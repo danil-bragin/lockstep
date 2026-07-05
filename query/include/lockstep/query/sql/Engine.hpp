@@ -151,6 +151,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -1091,6 +1092,11 @@ public:
     void set_max_query_memory(std::size_t bytes) noexcept { max_query_mem_ = bytes; }
     [[nodiscard]] std::size_t query_memory_used() const noexcept { return query_mem_used_; }
 
+    // W3.2: install (or clear, with nullptr) the cooperative cancellation flag. The engine polls
+    // it during execution; when it reads true, the current statement aborts with "query canceled".
+    void set_cancel_flag(const std::atomic<bool>* flag) noexcept { cancel_ = flag; }
+    [[nodiscard]] bool canceled() const noexcept { return cancel_ != nullptr && cancel_->load(); }
+
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
     ExecResult exec(const std::string& sql) {
         // W9.2 PARSE CACHE: parsing is a pure function of the SQL text (the parser has no
@@ -1120,6 +1126,9 @@ public:
         // materialization calls exec_select, not exec(Statement) — but guard by depth so a
         // future nested exec() can never clear a parent's accounting mid-flight).
         StmtMemGuard mem_guard(*this);
+        if (canceled()) {  // W3.2: an already-canceled session aborts before doing any work.
+            return ExecResult::failure("query canceled");
+        }
         switch (st.kind) {
             case StmtKind::Create:
                 return exec_create(st.create);
@@ -1762,6 +1771,7 @@ private:
     }
 
     std::optional<std::string> materialize_select(const std::string& name, const SelectStmt& sel) {
+        if (canceled()) return std::string("query canceled");  // W3.2: before a nested materialize
         const ExecResult q = exec_select(sel);
         if (!q.ok) return q.error;
         // W3.1: charge the materialized intermediate against the per-statement memory budget
@@ -3817,8 +3827,12 @@ private:
         // Emit pk-ascending. Base was pre-filtered by pk_between; overlay/delta rows are not,
         // so re-apply the pk range at output.
         rows_out.reserve(merged.size());
+        std::size_t polled = 0;
         for (auto& [k, row] : merged) {
             (void)k;
+            if ((++polled & 0xFFFFu) == 0 && canceled()) {  // W3.2: cancel a long columnar build
+                return std::string("query canceled");
+            }
             if (pk_between) {
                 const Datum& pk = row[t.pk_index];
                 if (pk.less_than(sel.lo_value) || sel.hi_value.less_than(pk)) {
@@ -8659,9 +8673,14 @@ private:
             return err;
         }
         rows_out.reserve(kvs.size());
+        std::size_t polled = 0;
         for (const storage::KeyValue& kv : kvs) {
             if (is_tombstone(kv.second)) {
                 continue;
+            }
+            // W3.2: poll the cancel flag every 64K decoded rows (cheap; a long scan aborts).
+            if ((++polled & 0xFFFFu) == 0 && canceled()) {
+                return std::string("query canceled");
             }
             rows_out.push_back(decode_row(t, kv.first, kv.second));
         }
@@ -11578,6 +11597,15 @@ private:
     // W9.2: parse cache (sql text -> parsed AST). Always valid (parsing is catalog-independent).
     static constexpr std::size_t kParseCacheCap = 1024;
     std::unordered_map<std::string, Statement> parse_cache_;
+
+    // W3.2 CANCELLATION seam. An externally-owned flag (the prod reactor's statement-timeout
+    // deadline timer, or a PG CancelRequest handler, sets it; a test sets it deterministically).
+    // Null => no cancellation (the default; zero overhead + deterministic in sim). The SQL engine
+    // polls it at statement entry, before each intermediate materialization, and at coarse row-loop
+    // boundaries — cooperative cancellation, so a long-running query aborts with a deterministic
+    // "query canceled" error. Read with a plain load (no explicit memory_order — eventual
+    // visibility is fine for a cancel poll; the forbidden-call lint permits a bare std::atomic).
+    const std::atomic<bool>* cancel_ = nullptr;
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change
     // only on flush). Perf-only: a pure function of the committed blocks, so results +
