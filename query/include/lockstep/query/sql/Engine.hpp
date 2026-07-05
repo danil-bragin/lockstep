@@ -1085,6 +1085,12 @@ public:
                            /*nosync=*/false);
     }
 
+    // W3.1: set the per-statement query-memory cap in bytes (0 = unlimited, the default).
+    // Deterministic (byte-counted, not allocator-based), so a replicated statement hits the
+    // limit identically on every replica.
+    void set_max_query_memory(std::size_t bytes) noexcept { max_query_mem_ = bytes; }
+    [[nodiscard]] std::size_t query_memory_used() const noexcept { return query_mem_used_; }
+
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
     ExecResult exec(const std::string& sql) {
         ParseResult pr = parse_sql(sql);
@@ -1096,6 +1102,10 @@ public:
 
     // Execute an already-parsed statement.
     ExecResult exec(const Statement& st) {
+        // W3.1: reset the per-statement memory counter at the OUTERMOST exec() only (nested
+        // materialization calls exec_select, not exec(Statement) — but guard by depth so a
+        // future nested exec() can never clear a parent's accounting mid-flight).
+        StmtMemGuard mem_guard(*this);
         switch (st.kind) {
             case StmtKind::Create:
                 return exec_create(st.create);
@@ -1663,9 +1673,56 @@ private:
     // default INT; plus a hidden synthetic `_ctid` identity PK). Reused by CREATE TABLE AS SELECT
     // (E3) and by the WITH-CTE / FROM-subquery materialization (D3/D4). Returns an error string on
     // failure, std::nullopt on success.
+    // W3.1: RAII reset of the per-statement memory counter at the outermost exec() only.
+    // Increments stmt_depth_ on entry; when it transitions 0->1 the counter is cleared, so a
+    // (hypothetical) nested exec(Statement) never clears a parent's accounting mid-statement.
+    struct StmtMemGuard {
+        SqlEngine& e;
+        explicit StmtMemGuard(SqlEngine& eng) : e(eng) {
+            if (e.stmt_depth_++ == 0) e.query_mem_used_ = 0;
+        }
+        ~StmtMemGuard() { --e.stmt_depth_; }
+        StmtMemGuard(const StmtMemGuard&) = delete;
+        StmtMemGuard& operator=(const StmtMemGuard&) = delete;
+    };
+
+    // W3.1: deterministic byte size of one result row (cell count overhead + value bytes).
+    // Counts the logical payload, not the allocator footprint, so it is identical on every
+    // replica regardless of platform/allocator.
+    [[nodiscard]] static std::size_t result_row_bytes(const ResultRow& r) {
+        std::size_t n = 0;
+        for (const auto& cell : r.cells) {
+            // column label + a fixed Datum footprint (type/int/flags) + the TEXT payload.
+            n += cell.first.size() + 24 + cell.second.s.size();
+        }
+        return n;
+    }
+
+    // W3.1: charge `bytes` to the current statement's memory budget. Returns a deterministic
+    // error string if the cap (max_query_mem_, when non-zero) is exceeded; std::nullopt
+    // otherwise. The cap is off (0) by default → this is inert and results are unchanged.
+    [[nodiscard]] std::optional<std::string> charge_query_mem(std::size_t bytes) {
+        query_mem_used_ += bytes;
+        if (max_query_mem_ != 0 && query_mem_used_ > max_query_mem_) {
+            return std::string("query memory limit exceeded (") +
+                   std::to_string(query_mem_used_) + " > " + std::to_string(max_query_mem_) +
+                   " bytes); raise lockstep.max_query_memory or narrow the query";
+        }
+        return std::nullopt;
+    }
+
     std::optional<std::string> materialize_select(const std::string& name, const SelectStmt& sel) {
         const ExecResult q = exec_select(sel);
         if (!q.ok) return q.error;
+        // W3.1: charge the materialized intermediate against the per-statement memory budget
+        // (derived tables / CTEs / views build this fully before it is consumed — the common
+        // unbounded-intermediate OOM vector). Deterministic: same rows → same charge → same
+        // verdict on every replica. Inert when max_query_mem_ == 0 (the default).
+        {
+            std::size_t sz = 0;
+            for (const ResultRow& r : q.rows) sz += result_row_bytes(r);
+            if (auto e = charge_query_mem(sz)) return e;
+        }
         // Determine the output column names + types. Names from the result labels; a type from the
         // first non-NULL value in each column (default INT if a column is entirely NULL/empty).
         std::size_t ncol = q.rows.empty() ? 0 : q.rows[0].cells.size();
@@ -10727,6 +10784,17 @@ private:
     std::vector<std::pair<std::string, std::size_t>> savepoints_;
     std::set<std::string> expanding_views_;  // H1: view names on the current expansion stack (cycle guard)
     std::uint64_t auto_flush_rows_ = 0;  // auto-flush a columnar table past this delta (0=off)
+
+    // W3.1 RESOURCE GOVERNANCE — per-statement query memory accounting. A DETERMINISTIC
+    // byte counter (charged from row/cell byte sizes, never from the allocator) so the SAME
+    // query + SAME limit yields the SAME error on every replica — replicated statement
+    // execution stays byte-identical. max_query_mem_ = 0 disables the limit (the default;
+    // conformance runs with it off, so the accounting is inert and results are unchanged).
+    // Charged at intermediate MATERIALIZATION points (derived tables / CTEs / views), the
+    // common unbounded-intermediate OOM vector, where the code path already returns an error.
+    std::size_t max_query_mem_ = 0;      // per-statement cap in bytes (0 = unlimited)
+    std::size_t query_mem_used_ = 0;     // bytes charged so far in the current top-level statement
+    int stmt_depth_ = 0;                 // >0 while inside a top-level exec() (reset guard)
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change
     // only on flush). Perf-only: a pure function of the committed blocks, so results +

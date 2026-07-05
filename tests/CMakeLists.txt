@@ -1367,6 +1367,15 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_view_test COMMAND lockstep_sql_view_test)
 
+  # sql_query_memory_test (W3.1): per-statement query memory accounting — off-by-default,
+  # enforced with a cap, deterministic error across replicas, per-statement reset.
+  add_executable(lockstep_sql_query_memory_test sql_query_memory_test.cpp)
+  target_include_directories(lockstep_sql_query_memory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_query_memory_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_query_memory_test COMMAND lockstep_sql_query_memory_test)
+
   # sql_distinct_agg_test (C1): COUNT/SUM/AVG(DISTINCT col), grouped + ungrouped, row + columnar.
   add_executable(lockstep_sql_distinct_agg_test sql_distinct_agg_test.cpp)
   target_include_directories(lockstep_sql_distinct_agg_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
