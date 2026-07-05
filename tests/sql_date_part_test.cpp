@@ -66,6 +66,19 @@ int main() {
     check(e.exec("SELECT EXTRACT(dow FROM d) FROM ev WHERE id = 1").rows[0].cells[0].second.i == 6,
           "EXTRACT(dow FROM date) = 6");
 
+    // DATE_TRUNC('unit', ts) truncates and preserves the type (verify via re-extraction).
+    check(e.exec("SELECT DATE_PART('month', DATE_TRUNC('year', d)) FROM ev WHERE id = 1")
+              .rows[0].cells[0].second.i == 1,
+          "DATE_TRUNC('year') zeroes month -> month 1");
+    check(e.exec("SELECT DATE_PART('day', DATE_TRUNC('month', d)) FROM ev WHERE id = 1")
+              .rows[0].cells[0].second.i == 1,
+          "DATE_TRUNC('month') sets day 1");
+    check(e.exec("SELECT DATE_PART('minute', DATE_TRUNC('hour', ts)) FROM ev WHERE id = 1")
+              .rows[0].cells[0].second.i == 0,
+          "DATE_TRUNC('hour') zeroes minutes");
+    check(!e.exec("SELECT DATE_TRUNC('decade', d) FROM ev WHERE id = 1").ok,
+          "DATE_TRUNC unknown unit errors");
+
     // Bad field is an error; a non-date argument is an error.
     check(!e.exec("SELECT DATE_PART('century', d) FROM ev WHERE id = 1").ok,
           "unknown DATE_PART field errors");

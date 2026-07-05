@@ -7864,6 +7864,37 @@ private:
             out = Datum::make_int(res);
             return std::nullopt;
         }
+        if (f == "DATE_TRUNC") {  // DATE_TRUNC('unit', date|timestamp) -> same type, truncated
+            if (!need(2)) return "DATE_TRUNC takes two arguments";
+            if (a[0].is_null || a[1].is_null) { out = a[1]; out.is_null = true; return std::nullopt; }
+            if (a[0].type != Type::Text) return "DATE_TRUNC unit must be TEXT";
+            const std::uint8_t lg = a[1].logical;
+            if (a[1].type != Type::Int || (lg != 2 && lg != 3))
+                return "DATE_TRUNC requires a DATE or TIMESTAMP argument";
+            std::string unit;
+            for (char c : a[0].s) unit.push_back((c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c);
+            const std::int64_t raw = a[1].i;
+            const std::int64_t secs = (lg == 3) ? raw : raw * 86400;
+            std::int64_t days = secs / 86400;
+            std::int64_t tod = secs - days * 86400;
+            if (tod < 0) { tod += 86400; --days; }
+            std::int64_t y = 0;
+            unsigned mo = 0, d = 0;
+            days_to_civil(days, y, mo, d);
+            std::int64_t out_days = days;
+            std::int64_t out_tod = 0;  // truncated units below drop the time-of-day
+            if (unit == "year") out_days = civil_to_days(y, 1, 1);
+            else if (unit == "month") out_days = civil_to_days(y, mo, 1);
+            else if (unit == "day") { /* out_days = days, tod=0 */ }
+            else if (unit == "hour") out_tod = (tod / 3600) * 3600;
+            else if (unit == "minute") out_tod = (tod / 60) * 60;
+            else if (unit == "second") out_tod = tod;
+            else return "DATE_TRUNC: unknown unit '" + a[0].s + "'";
+            const std::int64_t out_secs = out_days * 86400 + out_tod;
+            out = Datum::make_int(lg == 3 ? out_secs : out_days);
+            out.logical = lg;  // preserve DATE (2) / TIMESTAMP (3)
+            return std::nullopt;
+        }
         if (f == "ABS") {
             if (!need(1)) return "ABS takes one argument";
             if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
