@@ -5110,6 +5110,17 @@ private:
                 }
             }
         }
+        // W4: whether the general (composite-key) path can accumulate ONE-PASS: no HAVING and
+        // every aggregate is COUNT(*) or an INT-NOT-NULL fusable fold (so no per-group gather /
+        // compute_agg_soa is needed and {cnt, folds} fully determine the output).
+        bool gen_all_fusable = !has_having;
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar &&
+                !agg_fusable(item.agg, t)) {
+                gen_all_fusable = false;
+                break;
+            }
+        }
         auto compute_group_row = [&](const std::vector<Datum>& keyd,
                                      const std::vector<std::uint32_t>& idxs, ResultRow& out,
                                      bool& keep) -> std::optional<std::string> {
@@ -5590,6 +5601,99 @@ private:
             }
             if (auto e = emit_all(refs)) {
                 return ExecResult::failure(*e);
+            }
+        } else if (par_group && gen_all_fusable && !gcols.empty()) {
+            // W4: PARALLEL ONE-PASS general (composite-key) GROUP BY. Each worker accumulates
+            // {cnt, folds} per composite key into a LOCAL ordered map; the locals merge BY KEY.
+            // Byte-identical to the two-pass gather: the per-group folds are the same aggregate,
+            // and wrap_add/MIN/MAX/COUNT are reassociation-safe, so the partition does not matter.
+            // Handles multi-column and NULLABLE keys (group_key_field encodes the key + NULLs).
+            auto key_of = [&](std::uint32_t rr) {
+                std::vector<std::string> key;
+                key.reserve(gcols.size());
+                for (const std::size_t g : gcols) key.push_back(group_key_field(cols[g]->at(rr)));
+                return key;
+            };
+            auto key_datum_of = [&](std::uint32_t rr) {
+                std::vector<Datum> kd;
+                kd.reserve(gcols.size());
+                for (const std::size_t g : gcols) kd.push_back(cols[g]->at(rr));
+                return kd;
+            };
+            const std::size_t nf = fuse_cols.size();
+            std::vector<const std::int64_t*> ap(nf);
+            for (std::size_t k = 0; k < nf; ++k) ap[k] = cols[fuse_cols[k]]->ints.data();
+            struct GAcc {
+                std::vector<Datum> keyd;
+                std::int64_t cnt = 0;
+                std::vector<IntFold> folds;
+            };
+            const std::size_t W = std::min<std::size_t>(parallel_executor_->workers(), count);
+            std::vector<std::map<std::vector<std::string>, GAcc>> parts(W);
+            const std::uint32_t per = static_cast<std::uint32_t>((count + W - 1) / W);
+            parallel_executor_->parallel_for(W, [&](std::size_t w) {
+                const std::uint32_t lo = static_cast<std::uint32_t>(w) * per;
+                const std::uint32_t hi = std::min<std::uint32_t>(count, lo + per);
+                auto& m = parts[w];
+                for (std::uint32_t rr = lo; rr < hi; ++rr) {
+                    if (has_filter && !passes(rr)) continue;
+                    GAcc& a = m[key_of(rr)];
+                    if (a.keyd.empty()) {
+                        a.keyd = key_datum_of(rr);
+                        a.folds.assign(nf, IntFold{0, INT64_MAX, INT64_MIN});
+                    }
+                    ++a.cnt;
+                    for (std::size_t kk = 0; kk < nf; ++kk) {
+                        const std::int64_t x = ap[kk][rr];
+                        IntFold& f = a.folds[kk];
+                        f.sum = wrap_add(f.sum, x);
+                        f.mn = f.mn < x ? f.mn : x;
+                        f.mx = f.mx > x ? f.mx : x;
+                    }
+                }
+            });
+            std::map<std::vector<std::string>, GAcc> merged;
+            for (std::size_t w = 0; w < W; ++w) {
+                for (auto& [k, a] : parts[w]) {
+                    GAcc& d = merged[k];
+                    if (d.keyd.empty()) {
+                        d.keyd = std::move(a.keyd);
+                        d.folds = std::move(a.folds);
+                        d.cnt = a.cnt;
+                    } else {
+                        d.cnt += a.cnt;
+                        for (std::size_t kk = 0; kk < nf; ++kk) {
+                            IntFold& x = d.folds[kk];
+                            const IntFold& s = a.folds[kk];
+                            x.sum = wrap_add(x.sum, s.sum);
+                            if (s.mn < x.mn) x.mn = s.mn;
+                            if (s.mx > x.mx) x.mx = s.mx;
+                        }
+                    }
+                }
+            }
+            for (auto& [k, a] : merged) {  // std::map => sorted by composite key == output order
+                (void)k;
+                ResultRow out;
+                for (const SelectItem& item : sel.items) {
+                    if (item.kind == SelectItemKind::Column) {
+                        const std::size_t ci = *t.column_index(item.column);
+                        Datum d;
+                        for (std::size_t j = 0; j < gcols.size(); ++j) {
+                            if (gcols[j] == ci) { d = a.keyd[j]; break; }
+                        }
+                        out.cells.emplace_back(item.label, d);
+                    } else if (item.agg.kind == AggKind::CountStar) {
+                        out.cells.emplace_back(item.label, Datum::make_int(a.cnt));
+                    } else {
+                        const std::size_t ci = *t.column_index(item.agg.column);
+                        out.cells.emplace_back(
+                            item.label,
+                            agg_from_fold(item.agg.kind,
+                                          a.folds[static_cast<std::size_t>(col_to_fuse[ci])], a.cnt));
+                    }
+                }
+                r.rows.push_back(std::move(out));
             }
         } else {
             // GENERAL path: group-key tuple (group_key_field). Key buffer reused across rows.
