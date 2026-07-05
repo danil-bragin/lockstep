@@ -127,3 +127,24 @@ Commit version-1 fixture files under `tests/fixtures/format/`; a test opens each
 every future build (backward-compat canary — a later version bump that breaks old reads fails
 here). A hand-corrupted `version=0xFFFF` fixture per format MUST be refused (teeth). See
 `docs/FORMAT_VERSIONS.md` (W2.5) for the bump policy.
+
+### W2 status (2026-07-05)
+
+DONE (core crash-recovery durability path, each fail-closed + canary teeth, host+ASan):
+- SSTable footer version (fe662dc)
+- WAL one-time stream header (7b328d7)
+- manifest one-time stream header (416336c)
+- `storage/Format.hpp` central registry + stream-header helpers
+
+DEFERRED (additive, low-urgency — do when the format is next touched or at W5.3 migration):
+- **catalog logical marker** (namespace 0x00): the catalog's PHYSICAL container (WAL/SSTable/
+  manifest) is already versioned above; a 0x00 marker would additionally version the
+  serialize_table/serialize_view LOGICAL encoding. Fail-closed refuse needs reprime→recover
+  error plumbing.
+- **value-log stream header**: pointer-addressed + per-generation rotation (each generation
+  file needs its own header + vlog_len_ base accounting); format is stable.
+- **raft durable Meta version** (both impls): SACROSANCT consensus — must be strictly
+  additive AND keep the dual cross-check / state-hash byte-identical; defer to a dedicated
+  careful pass.
+- **internal wire hello version**: RPC/admin connect frame; needs both ends bumped together
+  (PG wire carries its own protocol version already).
