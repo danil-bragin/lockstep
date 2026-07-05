@@ -99,6 +99,25 @@ int main() {
         check(r.ok && types.size() == 1 && types[0] == "VIEW", "(D) the view lists as table_type VIEW");
     }
 
+    // (E) information_schema.views lists the view + its definition; schemata lists schemas.
+    {
+        const ExecResult rv = e.exec("SELECT table_name FROM information_schema.views");
+        check(has(col_texts(rv, "table_name"), "active"), "(E) information_schema.views lists the view");
+        const ExecResult rs = e.exec("SELECT schema_name FROM information_schema.schemata");
+        const auto schemas = col_texts(rs, "schema_name");
+        check(has(schemas, "public") && has(schemas, "information_schema"),
+              "(E) information_schema.schemata lists public + information_schema");
+    }
+
+    // (F) pg_catalog.pg_tables (and the pg_tables alias) list base tables for psql.
+    {
+        const ExecResult r = e.exec("SELECT tablename FROM pg_catalog.pg_tables");
+        const auto names = col_texts(r, "tablename");
+        check(has(names, "users") && has(names, "orders"), "(F) pg_catalog.pg_tables lists base tables");
+        const ExecResult r2 = e.exec("SELECT tablename FROM pg_tables WHERE tablename = 'orders'");
+        check(col_texts(r2, "tablename").size() == 1, "(F) pg_tables alias + WHERE works");
+    }
+
     if (g_fail != 0) {
         std::printf("sql_information_schema_test: FAILURES\n");
         return 1;

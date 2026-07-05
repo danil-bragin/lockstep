@@ -1878,7 +1878,11 @@ private:
     // W9: recognise a system relation name (lower-cased) that SELECT synthesises on the fly.
     [[nodiscard]] static bool is_system_relation(const std::string& lower_name) {
         return lower_name == "information_schema.tables" ||
-               lower_name == "information_schema.columns";
+               lower_name == "information_schema.columns" ||
+               lower_name == "information_schema.views" ||
+               lower_name == "information_schema.schemata" ||
+               lower_name == "pg_catalog.pg_tables" ||
+               lower_name == "pg_tables";
     }
 
     // W9: build the (columns, rows) of a synthesised system relation from the live catalog.
@@ -1891,11 +1895,40 @@ private:
         std::vector<std::pair<std::string, Type>> cols;
         std::vector<std::vector<Datum>> rows;
         auto is_ephemeral = [](const std::string& n) {
-            // Skip the transient system/materialisation tables (names carrying a dot that are
-            // system relations, or synthetic aliases) is overkill; only hide info_schema itself.
-            return n.rfind("information_schema.", 0) == 0;
+            // Hide the transient system/materialisation relations so they never list themselves.
+            return n.rfind("information_schema.", 0) == 0 || n.rfind("pg_catalog.", 0) == 0 ||
+                   n.rfind("pg_", 0) == 0;
         };
-        if (lower_name == "information_schema.tables") {
+        if (lower_name == "information_schema.schemata") {
+            cols = {{"catalog_name", Type::Text}, {"schema_name", Type::Text}};
+            std::set<std::string> schemas{"public", "information_schema", "pg_catalog"};
+            for (const auto& [qn, t] : catalog_.all()) {
+                (void)t;
+                if (is_ephemeral(qn)) continue;
+                schemas.insert(split_schema(qn).first);
+            }
+            for (const std::string& s : schemas) {
+                rows.push_back({Datum::make_text("lockstep"), Datum::make_text(s)});
+            }
+        } else if (lower_name == "information_schema.views") {
+            cols = {{"table_catalog", Type::Text}, {"table_schema", Type::Text},
+                    {"table_name", Type::Text}, {"view_definition", Type::Text}};
+            for (const auto& [qn, v] : catalog_.all_views()) {
+                const auto [sch, nm] = split_schema(qn);
+                rows.push_back({Datum::make_text("lockstep"), Datum::make_text(sch),
+                                Datum::make_text(nm), Datum::make_text(v.select_src)});
+            }
+        } else if (lower_name == "pg_catalog.pg_tables" || lower_name == "pg_tables") {
+            cols = {{"schemaname", Type::Text}, {"tablename", Type::Text},
+                    {"tableowner", Type::Text}};
+            for (const auto& [qn, t] : catalog_.all()) {
+                (void)t;
+                if (is_ephemeral(qn)) continue;
+                const auto [sch, nm] = split_schema(qn);
+                rows.push_back({Datum::make_text(sch), Datum::make_text(nm),
+                                Datum::make_text("lockstep")});
+            }
+        } else if (lower_name == "information_schema.tables") {
             cols = {{"table_catalog", Type::Text}, {"table_schema", Type::Text},
                     {"table_name", Type::Text}, {"table_type", Type::Text}};
             for (const auto& [qn, t] : catalog_.all()) {
