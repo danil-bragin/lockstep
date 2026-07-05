@@ -569,6 +569,70 @@ void test_determinism() {
                  a.probe_reads.size());
 }
 
+// ===========================================================================
+// (F) W2 FORMAT VERSION — the footer carries a format_version; the reader accepts
+// version==known and REFUSES an unknown (future) version, fail-closed. The refuse
+// is distinct from a CRC failure: we re-CRC the footer after bumping the version so
+// the table is byte-consistent and ONLY the version is unexpected — proving the
+// version gate rejects on its own, not incidentally via the checksum. This is the
+// W2.4 canary teeth: a later format bump that forgets to handle old images shows up
+// here as a table the current reader must reject rather than silently mis-decode.
+// ===========================================================================
+void test_format_version() {
+    using lockstep::storage::SSTableReader;
+    using lockstep::storage::SSTableLoader;
+    using lockstep::storage::kSstFooterBytes;
+    using lockstep::storage::format::kSstableVersion;
+
+    // Build a normal, current-version SSTable image.
+    std::vector<lockstep::storage::SstEntry> entries;
+    entries.push_back({"alpha", "one", 1, false, false});
+    entries.push_back({"bravo", "two", 2, false, false});
+    entries.push_back({"charlie", "three", 3, false, false});
+    const auto res = SSTableBuilder::build(entries);
+    std::vector<std::byte> img = res.bytes;
+
+    // Positive: the current-version image parses.
+    SSTableReader r_ok;
+    CHECK(SSTableLoader::parse(img, /*id=*/1, r_ok),
+          "(F) version: a current-version (v%u) SSTable must parse",
+          static_cast<unsigned>(kSstableVersion));
+
+    // Footer version field sits at [n-52 .. n-48); magic [n-48..n-44); crc [n-4..n).
+    const std::size_t n = img.size();
+    std::byte* f = img.data() + (n - kSstFooterBytes);
+    // Sanity: the field really holds the known version.
+    CHECK(lockstep::storage::get_u32(f + 40) == kSstableVersion,
+          "(F) version: footer version field mismatch (expected %u)",
+          static_cast<unsigned>(kSstableVersion));
+
+    // Overwrite a u32 in place, little-endian (matches Codec put_u32).
+    const auto poke_u32 = [](std::byte* p, std::uint32_t v) {
+        p[0] = static_cast<std::byte>(v & 0xFFu);
+        p[1] = static_cast<std::byte>((v >> 8) & 0xFFu);
+        p[2] = static_cast<std::byte>((v >> 16) & 0xFFu);
+        p[3] = static_cast<std::byte>((v >> 24) & 0xFFu);
+    };
+    // Bump to an unknown FUTURE version and re-CRC so the image is byte-consistent.
+    poke_u32(f + 40, kSstableVersion + 1000u);
+    const std::uint32_t recrc = lockstep::storage::Crc32::compute(
+        std::span<const std::byte>(f, kSstFooterBytes - 4));
+    poke_u32(f + (kSstFooterBytes - 4), recrc);
+
+    // Teeth: the current reader MUST refuse the future-version image (fail-closed),
+    // NOT mis-decode it. (Pre-W2 the reader had no version field to check → it would
+    // parse the bytes as if current.)
+    SSTableReader r_future;
+    CHECK(!SSTableLoader::parse(img, /*id=*/1, r_future),
+          "(F) version: a FUTURE-version (v%u) SSTable must be REFUSED, not parsed",
+          static_cast<unsigned>(kSstableVersion + 1000u));
+
+    std::fprintf(stderr,
+                 "[ok] (F) format version: v%u parses; future v%u refused (fail-closed)\n",
+                 static_cast<unsigned>(kSstableVersion),
+                 static_cast<unsigned>(kSstableVersion + 1000u));
+}
+
 }  // namespace
 
 int main() {
@@ -578,6 +642,7 @@ int main() {
     test_crash_during_flush();
     test_bloom_no_false_negative();
     test_determinism();
+    test_format_version();
     if (g_failures != 0) {
         std::fprintf(stderr, "storage_sstable_test: %d FAILURE(S)\n", g_failures);
         return 1;

@@ -69,3 +69,61 @@ Each step: differential + crash + MVCC + mutation, through the batch-2 merge gat
 - BACKPROP (P3 step-5 compaction, latent SSTable READ bug surfaced by GC): SSTableReader::lookup(k,at) used a sparse-index seek that lands on the LAST block whose first_key ≤ k and scanned FORWARD only. A key with MANY versions SPANS several blocks (and may START mid-block, packed after a smaller key), so the forward-only scan from the last block SILENTLY DROPPED the key's EARLIER (older) versions → a read at an old snapshot saw ∅ where a live value exists. Invisible until compaction merged a key's full version chain into ONE big multi-block SSTable, then a watermark-floor read missed it. FIX (V-NOTORN/V-SNAP read-completeness): before forward-scanning, BACK UP to the run's FIRST block — over preceding blocks whose first_key == k (pure spill), then ONE more predecessor whose first_key < k (the key may begin mid-block in it). LESSON: a sparse index addresses a key's block RANGE, not a single block; lookup/scan MUST cover every block the key's versions occupy. Caught by the compaction GC-safety + metamorphic tests.
 - Go WIDE (plan): the merge gate is real now → fan agents across §5 steps once the interface+oracle+harness (step 1) land. Keep WAL/recovery/MVCC spec-anchored; let SSTable/bloom/bench run broader.
 - D4 tuning (compaction strategy, level sizing, bloom bits, block size) = EMPIRICAL via §C3.7 bench, ⊥ guessed now.
+
+## §7 W2 — on-disk & wire format versioning
+
+**Problem.** Every persisted record type carries a `magic` (frame/type discriminator) but
+NO `format_version`. Any future layout change silently mis-decodes existing bytes; a
+mixed-version cluster is undefined. Cheap to stamp now, impossible to retrofit onto
+already-written data later. Prerequisite for every rolling-upgrade story (W5.3) and for the
+K9 flight-recorder recording format.
+
+### W2.1 — inventory of persisted record types
+
+| # | Stream / record | magic | file | version today |
+|---|---|---|---|---|
+| 1 | WAL record (KV/query/catalog) | `LWAL` 0x4C57414C (per-record) | storage/WalEngine.hpp | none |
+| 2 | SSTable footer | `LSST` 0x4C535354 | storage/SSTable.hpp | none |
+| 3 | Manifest INSTALL record | `LMAN` 0x4C4D414E | storage/SSTable.hpp | none |
+| 4 | Manifest OBSOLETE record | `OSBM` 0x4D42534F | storage/SSTable.hpp | none |
+| 5 | Manifest WAL-TRUNCATE record | `LTRM` 0x4D52544C | storage/SSTable.hpp | none |
+| 6 | Value-log record | `LVLG` 0x474C564C (per-record) | storage/ValueLog.hpp | none |
+| 7 | Raft durable records (Meta/Entry/Trunc/Snapshot/SnapshotDelta/Config) | RecKind u8 tag, CRC+len frame | consensus/raft_a/RaftNodeA.hpp, raft_b/RaftNodeB.hpp | none |
+| 8 | Catalog store records (table 0x01 / marker 0x02 / view 0x04) | key-prefix byte | query/sql/Engine.hpp | none |
+| 9 | Backup archive | — | storage/Backup.hpp | **kBackupVersion=1** |
+| 10 | SQL backup archive | — | query/sql/Engine.hpp | **kSqlBackupVersion=1** |
+| 11 | PITR op-log archive | — | storage/Pitr.hpp | **kPitrVersion=1** |
+| 12 | Internal RPC / admin wire hello | — | providers/prod | none (PG wire carries its own protocol version — untouched) |
+
+Rows 9–11 (the archive formats) are ALREADY versioned. The gap is rows 1–8 (the core
+record streams) and row 12 (internal wire hello).
+
+### W2.2 — stamping design (additive, backward-refusing)
+
+- **File/stream-framed formats** (SSTable footer row 2; manifest records rows 3–5): add a
+  `u16 format_version` field next to the existing magic. Reader checks
+  `version <= kKnownVersion`, else refuses with a loud, named error carrying both versions.
+  Current version = 1. `< known` is reserved for a future migration hook (no migration yet
+  → treat `!= known` as refuse-with-hint until W5.3 adds N/N−1 read).
+- **Per-record streams** (WAL row 1, vlog row 6): a per-record version byte would bloat every
+  record; instead write a one-time **stream header** `[u32 STREAM_MAGIC][u16 version][u16 flags]`
+  at offset 0 of the file, validated before the record scan begins. The record magics are
+  unchanged (torn-tail detection still works exactly as today).
+- **Raft durable records** (row 7): the first durable record is the `Meta` record; carry the
+  version in a new `Meta` field (recovered first, gates the rest of the replay). Additive —
+  a pre-version image is refused loudly by a node that expects the field (acceptable: this is
+  a research repo with no persisted production data; the deliverable is FUTURE detection).
+- **Catalog store** (row 8): a dedicated version marker key (namespace 0x00) written on first
+  catalog write, checked in `reprime_catalog_from_store`.
+- **Wire hello** (row 12): a version field in the internal RPC/admin connect frame; mismatch
+  refused with both versions named.
+
+Policy: a single `storage/Format.hpp` centralizes the `kFormatVersion` constants and the
+`encode_stream_header` / `check_stream_header` helpers so every format refuses uniformly.
+
+### W2.4 — fixture canaries
+
+Commit version-1 fixture files under `tests/fixtures/format/`; a test opens each fixture on
+every future build (backward-compat canary — a later version bump that breaks old reads fails
+here). A hand-corrupted `version=0xFFFF` fixture per format MUST be refused (teeth). See
+`docs/FORMAT_VERSIONS.md` (W2.5) for the bump policy.

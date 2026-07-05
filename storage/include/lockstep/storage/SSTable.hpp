@@ -46,9 +46,9 @@
 //   FOOTER (fixed 48 bytes at end-of-file):
 //       [0]  u64 index_off | [8]  u32 index_len | [12] u64 bloom_off |
 //       [20] u32 bloom_len | [24] u64 min_seq   | [32] u64 max_seq   |
-//       [40] u32 magic(=0x4C535354 'LSST') | [44] u32 crc
-//   crc = CRC32 over the first 44 footer bytes. The reader reads the last 48
-//   bytes, checks magic+crc, then seeks index/bloom by their framed offsets.
+//       [40] u32 version(W2) | [44] u32 magic(=0x4C535354 'LSST') | [48] u32 crc
+//   crc = CRC32 over the first 48 footer bytes. The reader reads the last 52
+//   bytes, checks magic+crc+version, then seeks index/bloom by their framed offsets.
 //
 // ----------------------------------------------------------------------------
 // MANIFEST ON-DISK FORMAT (its own append-structured IDisk; the atomic-install
@@ -96,6 +96,7 @@
 
 #include <lockstep/storage/Codec.hpp>   // Crc32, put_u32/u64, get_u32/u64
 #include <lockstep/storage/Engine.hpp>  // Key, Value, Seq, kNoSeq
+#include <lockstep/storage/Format.hpp>  // W2: format::kSstableVersion
 
 namespace lockstep::storage {
 
@@ -129,7 +130,7 @@ inline constexpr std::uint32_t kManMagic = 0x4C4D414Eu;   // 'LMAN' (manifest IN
 //     (the WAL prefix below it is reclaimable). A monotonic high-water mark.
 inline constexpr std::uint32_t kManObsoleteMagic = 0x4D42534Fu;  // 'OSBM' obsolete
 inline constexpr std::uint32_t kManWalTruncMagic = 0x4D52544Cu;  // 'LTRM' wal-trunc
-inline constexpr std::size_t kSstFooterBytes = 48;        // see FOOTER layout
+inline constexpr std::size_t kSstFooterBytes = 52;        // see FOOTER layout (W2: +u32 version)
 inline constexpr std::size_t kBlockCrcBytes = 4;
 inline constexpr std::size_t kSstTargetBlockBytes = 256;  // small ⇒ many blocks
 inline constexpr std::size_t kManRecordBytes = 4 + 8 + 8 + 8 + 8 + 8 + 4;  // 48
@@ -327,6 +328,7 @@ public:
         put_u32(footer, bloom_len);
         put_u64(footer, res.min_seq);
         put_u64(footer, res.max_seq);
+        put_u32(footer, format::kSstableVersion);  // W2: format version (before magic)
         put_u32(footer, kSstMagic);
         const std::uint32_t fcrc =
             Crc32::compute(std::span<const std::byte>(footer.data(), footer.size()));
@@ -369,7 +371,7 @@ private:
 
 // ---------------------------------------------------------------------------
 // SSTableReader — an in-memory view over a durable SSTable, loaded by reading
-// the footer (last 40 bytes), then the index + bloom blocks, each CRC-checked.
+// the footer (last kSstFooterBytes), then the index + bloom blocks, each CRC-checked.
 // load() is async (reads via IDisk). After load, lookup()/scan() are pure +
 // synchronous over the cached index/bloom but read DATA blocks lazily via the
 // disk — which is async — so they are coroutines too. To keep the read path
@@ -673,17 +675,24 @@ public:
         if (n < kSstFooterBytes) {
             return false;
         }
-        // Footer layout (48 bytes): index_off[0..8) index_len[8..12)
+        // Footer layout (52 bytes): index_off[0..8) index_len[8..12)
         //   bloom_off[12..20) bloom_len[20..24) min_seq[24..32) max_seq[32..40)
-        //   magic[40..44) crc[44..48).
+        //   version[40..44) magic[44..48) crc[48..52).
         const std::byte* f = image.data() + (n - kSstFooterBytes);
-        if (get_u32(f + 40) != kSstMagic) {
+        if (get_u32(f + 44) != kSstMagic) {
             return false;
         }
-        const std::uint32_t want_crc = get_u32(f + 44);
+        const std::uint32_t want_crc = get_u32(f + 48);
         const std::uint32_t got_crc =
             Crc32::compute(std::span<const std::byte>(f, kSstFooterBytes - 4));
         if (want_crc != got_crc) {
+            return false;
+        }
+        // W2: refuse an unknown (future) format version, fail-closed — a newer-format
+        // SSTable is never mis-decoded; it is rejected exactly like a corrupt table
+        // (recovery stops at it, honoring Seq-contiguity). CRC is validated first so a
+        // bit-flipped version field reads as corruption, not a spurious version refuse.
+        if (get_u32(f + 40) != format::kSstableVersion) {
             return false;
         }
         const std::uint64_t index_off = get_u64(f + 0);
