@@ -135,3 +135,14 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
       partial group aggregates merged (better when the join key has ≫ more values than #groups)
 - [ ] open: SUM/AVG(DISTINCT) shuffle (only COUNT shuffles now) · true snowflake (dim→dim) ·
       projection broadcast-join + global ORDER BY merge-sort · cost-based pushdown-vs-broadcast choice
+
+## K10 + W3 + W9 (2026-07-05 session)
+
+- [x] **K10 time travel** — `SELECT ... AS OF SEQ n` (alias for AT SNAPSHOT n; keyword SEQ/SNAPSHOT/VERSION optional). MVCC read-as-of; backed by existing snapshots + PITR. `sql_time_travel_test`.
+- [x] **W3.1 query memory governance** — deterministic per-statement byte cap (off by default): `set_max_query_memory()` C++ + `SET lockstep.max_query_memory = N` SQL; charged at intermediate materialization (derived/CTE/view) AND the returned result set; deterministic "query memory limit exceeded" error, byte-identical across replicas. `sql_query_memory_test`.
+- [x] **W9 information_schema** — tables · columns · views · schemata · table_constraints · key_column_usage. Synthesised on the fly from the live catalog (materialize_typed → ephemeral table → normal SELECT path, so WHERE/projection/joins work; a real table wins).
+- [x] **W9 pg_catalog** — pg_tables (+ `pg_tables` alias) · pg_namespace · pg_class (relname/relkind r/v). Plain SELECTs work; full psql `\d` (oids/joins) is a later step. `sql_information_schema_test`.
+- [x] **W9 session functions** — version() (PG-compat string) · current_database/current_catalog/current_schema/current_user/session_user/user(). `sql_connection_funcs_test`.
+- [x] **W9 scalar functions** — NULLIF · GREATEST · LEAST · MOD · SIGN · REVERSE · REPEAT · LEFT · RIGHT · LTRIM · RTRIM · STRPOS/POSITION. `sql_scalar_funcs_test`.
+- [ ] open (W9): sequences (CREATE SEQUENCE/nextval — needs a deterministic-replication design) · COPY FROM/TO · prepared-statement plan cache · pg_catalog oids for real `\d` · table_constraints for CHECK · cursors.
+- [ ] open (W5): cost-based JOIN reorder + hash-join build-side swap (stats via ANALYZE already exist; swap changes join output-column layout — needs care).
