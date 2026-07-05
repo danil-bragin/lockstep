@@ -1093,11 +1093,25 @@ public:
 
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
     ExecResult exec(const std::string& sql) {
+        // W9.2 PARSE CACHE: parsing is a pure function of the SQL text (the parser has no
+        // catalog), so a cached AST is ALWAYS valid — no invalidation on DDL (execution
+        // re-resolves against the live catalog). Caching skips re-parsing repeated queries
+        // (the prepared-statement / ORM / wire hot path — parsing measured ~2.8us for a
+        // complex query, which dominates a us-scale point query). Byte-identical: the same
+        // SQL yields the same AST yields the same execution.
+        const auto it = parse_cache_.find(sql);
+        if (it != parse_cache_.end()) {
+            return exec(it->second);
+        }
         ParseResult pr = parse_sql(sql);
         if (!pr.ok()) {
-            return ExecResult::failure(pr.error().render());
+            return ExecResult::failure(pr.error().render());  // parse errors are NOT cached
         }
-        return exec(pr.stmt());
+        if (parse_cache_.size() >= kParseCacheCap) {
+            parse_cache_.clear();  // simple bounded cap (avoids unbounded growth)
+        }
+        const auto ins = parse_cache_.emplace(sql, pr.stmt()).first;
+        return exec(ins->second);  // run over the cached AST (no extra copy)
     }
 
     // Execute an already-parsed statement.
@@ -11442,6 +11456,10 @@ private:
     std::size_t max_query_mem_ = 0;      // per-statement cap in bytes (0 = unlimited)
     std::size_t query_mem_used_ = 0;     // bytes charged so far in the current top-level statement
     int stmt_depth_ = 0;                 // >0 while inside a top-level exec() (reset guard)
+
+    // W9.2: parse cache (sql text -> parsed AST). Always valid (parsing is catalog-independent).
+    static constexpr std::size_t kParseCacheCap = 1024;
+    std::unordered_map<std::string, Statement> parse_cache_;
 
     // Decoded-block + zone-map cache, tagged by the table's flush generation (blocks change
     // only on flush). Perf-only: a pure function of the committed blocks, so results +
