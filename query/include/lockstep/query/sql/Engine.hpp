@@ -7731,6 +7731,91 @@ private:
             out = Datum::make_int(pos == std::string::npos ? 0 : static_cast<std::int64_t>(pos + 1));
             return std::nullopt;
         }
+        if (f == "SPLIT_PART") {  // SPLIT_PART(text, delim, n) — 1-based field, '' if out of range
+            if (!need(3)) return "SPLIT_PART takes three arguments";
+            if (a[0].is_null || a[1].is_null || a[2].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text || a[1].type != Type::Text || a[2].type != Type::Int)
+                return "SPLIT_PART requires (TEXT, TEXT, INT)";
+            const std::string& s = a[0].s;
+            const std::string& d = a[1].s;
+            const std::int64_t n = a[2].i;
+            std::string res;
+            if (n >= 1) {
+                std::int64_t idx = 1;
+                std::size_t start = 0;
+                if (d.empty()) {
+                    if (n == 1) res = s;
+                } else {
+                    while (true) {
+                        const std::size_t hit = s.find(d, start);
+                        if (idx == n) {
+                            res = s.substr(start, hit == std::string::npos ? std::string::npos : hit - start);
+                            break;
+                        }
+                        if (hit == std::string::npos) break;  // n beyond the last field -> ''
+                        start = hit + d.size();
+                        ++idx;
+                    }
+                }
+            }
+            out = Datum::make_text(std::move(res));
+            return std::nullopt;
+        }
+        if (f == "INITCAP") {  // capitalise the first letter of each word, lowercase the rest
+            if (!need(1)) return "INITCAP takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text) return "INITCAP requires a TEXT argument";
+            std::string s = a[0].s;
+            bool start_word = true;
+            for (char& c : s) {
+                const bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+                if (!alnum) { start_word = true; continue; }
+                if (start_word) c = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
+                else c = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+                start_word = false;
+            }
+            out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        if (f == "LPAD" || f == "RPAD") {  // pad/truncate to length with a fill string (default space)
+            if (a.size() != 2 && a.size() != 3) return f + " takes two or three arguments";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text || a[1].type != Type::Int) return f + " requires (TEXT, INT[, TEXT])";
+            const std::string fill = (a.size() == 3 && !a[2].is_null) ? a[2].s : std::string(" ");
+            const std::int64_t len = a[1].i;
+            const std::string& s = a[0].s;
+            std::string res;
+            if (len <= 0) {
+                res.clear();
+            } else if (static_cast<std::size_t>(len) <= s.size()) {
+                res = s.substr(0, static_cast<std::size_t>(len));
+            } else if (fill.empty()) {
+                res = s;
+            } else {
+                std::string pad;
+                const std::size_t need_pad = static_cast<std::size_t>(len) - s.size();
+                while (pad.size() < need_pad) pad += fill;
+                pad.resize(need_pad);
+                res = (f == "LPAD") ? pad + s : s + pad;
+            }
+            out = Datum::make_text(std::move(res));
+            return std::nullopt;
+        }
+        if (f == "ASCII") {  // codepoint of the first byte (0 for empty)
+            if (!need(1)) return "ASCII takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (a[0].type != Type::Text) return "ASCII requires a TEXT argument";
+            out = Datum::make_int(a[0].s.empty() ? 0 : static_cast<std::int64_t>(static_cast<unsigned char>(a[0].s[0])));
+            return std::nullopt;
+        }
+        if (f == "CHR") {  // single-byte char for a codepoint in 1..255
+            if (!need(1)) return "CHR takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Int) return "CHR requires an INT argument";
+            if (a[0].i < 1 || a[0].i > 255) return "CHR argument out of range (1..255)";
+            out = Datum::make_text(std::string(1, static_cast<char>(a[0].i)));
+            return std::nullopt;
+        }
         if (f == "ABS") {
             if (!need(1)) return "ABS takes one argument";
             if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }

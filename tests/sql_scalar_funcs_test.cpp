@@ -71,6 +71,16 @@ int main() {
     check(vi("STRPOS('hello', 'll')") == 3, "STRPOS('hello','ll') = 3 (1-based)");
     check(vi("STRPOS('hello', 'z')") == 0, "STRPOS not found = 0");
 
+    // SPLIT_PART / INITCAP / LPAD / RPAD / ASCII / CHR
+    check(vs("SPLIT_PART('a,b,c', ',', 2)") == "b", "SPLIT_PART field 2 = 'b'");
+    check(vs("SPLIT_PART('a,b,c', ',', 9)") == "", "SPLIT_PART out of range = ''");
+    check(vs("INITCAP('hello world')") == "Hello World", "INITCAP capitalises each word");
+    check(vs("LPAD('7', 3, '0')") == "007", "LPAD pads left with '0'");
+    check(vs("RPAD('7', 3, '0')") == "700", "RPAD pads right with '0'");
+    check(vs("LPAD('hello', 3)") == "hel", "LPAD truncates to length");
+    check(vi("ASCII('A')") == 65, "ASCII('A') = 65");
+    check(vs("CHR(65)") == "A", "CHR(65) = 'A'");
+
     if (g_fail != 0) {
         std::printf("sql_scalar_funcs_test: FAILURES\n");
         return 1;
