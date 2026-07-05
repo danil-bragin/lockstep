@@ -96,6 +96,7 @@
 
 #include <lockstep/storage/Codec.hpp>
 #include <lockstep/storage/Engine.hpp>
+#include <lockstep/storage/Format.hpp>
 #include <lockstep/storage/SSTable.hpp>
 #include <lockstep/storage/ValueLog.hpp>
 
@@ -140,6 +141,15 @@ struct ExportedOp {
 
 // The fixed framing constants (the on-disk contract).
 inline constexpr std::uint32_t kWalMagic = 0x4C57414Cu;  // 'LWAL'
+
+// W2: OPTIONAL one-time WAL STREAM HEADER at offset 0: [u32 kWalStreamMagic][u32
+// version]. Distinct from kWalMagic so recovery SELF-IDENTIFIES it — a stream that
+// starts with kWalStreamMagic consumes the 8-byte header (and refuses an unknown
+// version, fail-closed); a stream that starts with kWalMagic (no header) is read as
+// records from offset 0 (backward-compatible). A torn/partial header at offset 0
+// simply fails to decode and yields the empty prefix — identical to a torn first
+// record — so it can never fabricate a committed value.
+inline constexpr std::uint32_t kWalStreamMagic = 0x4C57534Du;  // 'LWSM' (stream)
 inline constexpr std::size_t kWalHeaderBytes = 21;       // magic+type+seq+klen+vlen
 inline constexpr std::size_t kWalCrcBytes = 4;
 
@@ -984,6 +994,19 @@ private:
         rec.value = stored;
         const std::vector<std::byte> bytes = encode_record(rec);
 
+        // W2: write the one-time stream header before the very first WAL record.
+        // If it io-faults (no bytes) the record still lands at offset 0 as a normal
+        // kWalMagic record and recovery reads it via the backward-compatible
+        // headerless path — so this is best-effort and never blocks a commit.
+        if (!wal_started_) {
+            wal_started_ = true;
+            std::vector<std::byte> hdr;
+            format::put_stream_header(hdr, kWalStreamMagic, format::kWalStreamVersion);
+            Offset hoff = 0;
+            (void)co_await disk_->append(
+                std::span<const std::byte>(hdr.data(), hdr.size()), hoff);
+        }
+
         Offset off = 0;
         // Await the disk append. The Error is the co_await value (set_value path).
         const Error e =
@@ -1598,6 +1621,27 @@ private:
         // the WAL prefix extends it. We do NOT reset it to 0 here.
         mem_.clear();
         std::size_t pos = 0;
+        // W2: a non-empty WAL means the first-commit point was passed, so a fresh
+        // commit after recovery must NOT re-write the stream header.
+        wal_started_ = image.size() > 0;
+        // W2: consume the OPTIONAL one-time stream header at offset 0. If the stream
+        // starts with kWalStreamMagic, validate + skip it (refuse an unknown/future
+        // version fail-closed: keep the SSTable prefix, drop the WAL — same as a WAL
+        // read fault). A stream that starts with kWalMagic (no header) is read from 0
+        // (backward-compatible). A torn/partial header falls through to the record
+        // loop, fails try_decode, and yields the empty prefix.
+        if (image.size() >= format::kStreamHeaderBytes &&
+            get_u32(image.data()) == kWalStreamMagic) {
+            if (!format::check_stream_header(
+                    std::span<const std::byte>(image.data(), image.size()),
+                    kWalStreamMagic, format::kWalStreamVersion)) {
+                // Unknown/future WAL format → refuse the WAL, keep SSTables only.
+                mem_.clear();
+                p.set_value(Error{});
+                co_return;
+            }
+            pos = format::kStreamHeaderBytes;
+        }
         // WAL-TRUNCATION (C3.4): records with seq <= wal_trunc_seq_ are durably
         // covered by the loaded SSTable set, so the WAL prefix below the watermark
         // is reclaimable — recovery SKIPS replaying it (proving the SSTables alone
@@ -1663,6 +1707,9 @@ private:
     IDisk* disk_;
     Memtable mem_;
     Seq last_seq_ = kNoSeq;
+    // W2: false until we have passed the first-commit point on this WAL (or recovered
+    // a non-empty WAL). Gates the one-time stream-header write in commit_task.
+    bool wal_started_ = false;
 
     // ---- LSM state (null/empty in step-2 WAL-only mode) -------------------
     IDisk* manifest_disk_ = nullptr;          // the atomic-install log backing

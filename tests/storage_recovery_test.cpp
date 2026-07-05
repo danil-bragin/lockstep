@@ -135,6 +135,28 @@ int main() {
     check(ins.records.size() >= 9 && ins.records[8].type == 1, "del record decoded as a tombstone (type 1)");
     check(verify_image(wal).error.ok(), "verify: clean WAL is ok");
 
+    // (1b) W2 FORMAT VERSION teeth. The WAL now opens with a one-time stream header
+    // (kWalStreamMagic + version). It is still recognised as a WAL, and the record
+    // walk skips it (record count above already == committed). Bump the header version
+    // to a future value: the stream is still a WAL by magic, but the current reader can
+    // no longer read past the header (fail-closed) — the recoverable prefix collapses
+    // to 0 rather than mis-decoding the header bytes as records.
+    check(wal.size() >= lockstep::storage::format::kStreamHeaderBytes &&
+              lockstep::storage::get_u32(wal.data()) == lockstep::storage::kWalStreamMagic,
+          "W2: WAL opens with the stream header magic");
+    {
+        std::vector<std::byte> future = wal;
+        const std::uint32_t bumped = lockstep::storage::format::kWalStreamVersion + 1000u;
+        future[4] = static_cast<std::byte>(bumped & 0xFFu);
+        future[5] = static_cast<std::byte>((bumped >> 8) & 0xFFu);
+        future[6] = static_cast<std::byte>((bumped >> 16) & 0xFFu);
+        future[7] = static_cast<std::byte>((bumped >> 24) & 0xFFu);
+        check(detect_format(sp(future)) == FileFormat::Wal,
+              "W2: future-version WAL still recognised as a WAL by magic");
+        check(inspect_wal(future).valid_prefix_len == 0,
+              "W2: future-version WAL is refused (recoverable prefix collapses to 0)");
+    }
+
     // (2) torn tail: append garbage past the last good record.
     {
         std::vector<std::byte> torn = wal;

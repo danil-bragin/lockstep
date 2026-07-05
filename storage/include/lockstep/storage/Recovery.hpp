@@ -46,7 +46,11 @@ enum class FileFormat : std::uint8_t { Unknown, Wal, Backup, PitrArchive, Manife
 // backup / PITR headers write their magic as literal ASCII — match each the way it is
 // written so there is no endianness ambiguity.
 [[nodiscard]] inline FileFormat detect_format(std::span<const std::byte> image) {
-    if (image.size() >= 4 && get_u32(image.data()) == kWalMagic) return FileFormat::Wal;
+    // A WAL starts with either a bare record magic (headerless/legacy) or the W2
+    // one-time stream header magic (kWalStreamMagic) — both classify as a WAL.
+    if (image.size() >= 4 &&
+        (get_u32(image.data()) == kWalMagic || get_u32(image.data()) == kWalStreamMagic))
+        return FileFormat::Wal;
     if (image.size() >= 4 && get_u32(image.data()) == kManMagic) return FileFormat::Manifest;
     if (image.size() >= kBackupHeaderBytes && detail::backup_magic_ok(image.data())) return FileFormat::Backup;
     if (image.size() >= kPitrHeaderBytes && detail::pitr_magic_ok(image.data())) return FileFormat::PitrArchive;
@@ -109,6 +113,15 @@ struct WalInspection {
     WalInspection ins;
     ins.total_len = image.size();
     std::size_t pos = 0;
+    // W2: consume the optional one-time stream header (kWalStreamMagic + known
+    // version) so record offsets/prefix length account for it. check_stream_header
+    // validates magic AND version: a headerless (kWalMagic) or future-version stream
+    // leaves pos=0 and the record loop below reports the prefix as it always did.
+    if (image.size() >= format::kStreamHeaderBytes &&
+        format::check_stream_header(std::span<const std::byte>(image.data(), image.size()),
+                                    kWalStreamMagic, format::kWalStreamVersion)) {
+        pos = format::kStreamHeaderBytes;
+    }
     while (pos < image.size()) {
         const DecodeResult dr = try_decode(image, pos);
         if (!dr.ok) break;  // consistent-prefix boundary.
