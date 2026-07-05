@@ -44,11 +44,14 @@ int main(int argc, char** argv) {
     std::int64_t stmt_timeout_ms = 0;  // W3.3: 0 = no statement timeout
     std::int64_t slow_query_ms = 0;    // W3.7: 0 = no slow-query log
     std::uint64_t max_query_mem = 0;   // W3.1: 0 = no per-query memory cap
+    std::uint64_t max_connections = 0;  // W3.6: 0 = unlimited
     for (int i = 1; i + 1 < argc; i += 2) {
         if (std::strcmp(argv[i], "--port") == 0) {
             port = static_cast<std::uint16_t>(parse_u64(argv[i + 1], port));
         } else if (std::strcmp(argv[i], "--data-dir") == 0) {
             data_dir = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--max-connections") == 0) {
+            max_connections = parse_u64(argv[i + 1], 0);
         } else if (std::strcmp(argv[i], "--max-query-mem") == 0) {
             max_query_mem = parse_u64(argv[i + 1], 0);
         } else if (std::strcmp(argv[i], "--slow-query-ms") == 0) {
@@ -110,7 +113,7 @@ int main(int argc, char** argv) {
     };
     prod::ProdPgServer pg(reactor, port, exec_fn, auth,
                           [&engine](const std::atomic<bool>* f) { engine.set_cancel_flag(f); },
-                          stmt_timeout_ms);
+                          stmt_timeout_ms, static_cast<std::size_t>(max_connections));
     if (!pg.valid()) {
         std::fprintf(stderr, "lockstep_pgd: could not bind port %u\n", static_cast<unsigned>(port));
         return 1;

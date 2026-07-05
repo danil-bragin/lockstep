@@ -47,12 +47,14 @@ public:
     // exec. Both default off (unchanged behavior).
     using CancelSetter = std::function<void(const std::atomic<bool>*)>;
     ProdPgServer(ProdReactor& reactor, std::uint16_t port, ExecFn exec, AuthFn auth = {},
-                 CancelSetter cancel_setter = {}, std::int64_t stmt_timeout_ms = 0)
+                 CancelSetter cancel_setter = {}, std::int64_t stmt_timeout_ms = 0,
+                 std::size_t max_connections = 0)
         : reactor_(&reactor),
           exec_(std::move(exec)),
           auth_(std::move(auth)),
           cancel_setter_(std::move(cancel_setter)),
-          stmt_timeout_ms_(stmt_timeout_ms) {
+          stmt_timeout_ms_(stmt_timeout_ms),
+          max_conns_(max_connections) {
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) {
             return;
@@ -110,6 +112,13 @@ private:
             const int c = ::accept(listen_fd_, nullptr, nullptr);
             if (c < 0) {
                 break;  // EAGAIN / no more pending connections.
+            }
+            // W3.6 admission control: cap the number of live connections. Beyond it, close the
+            // new fd immediately (the client sees a refused connection) rather than let idle
+            // connections grow the server's memory / fd use unbounded. 0 = unlimited.
+            if (max_conns_ > 0 && conns_.size() >= max_conns_) {
+                ::close(c);
+                continue;
             }
             set_nonblock(c);
             conns_.emplace(c, std::make_unique<query::wire::PgSession>(exec_, auth_));
@@ -206,6 +215,7 @@ private:
     std::atomic<std::int64_t> cur_deadline_ns_{0};  // 0 = no active guarded query
     std::atomic<bool> stop_{false};
     std::thread watchdog_;
+    std::size_t max_conns_ = 0;  // W3.6: max live connections (0 = unlimited)
 };
 
 }  // namespace lockstep::prod
