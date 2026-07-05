@@ -43,11 +43,14 @@ int main(int argc, char** argv) {
     bool require_auth = false;
     std::int64_t stmt_timeout_ms = 0;  // W3.3: 0 = no statement timeout
     std::int64_t slow_query_ms = 0;    // W3.7: 0 = no slow-query log
+    std::uint64_t max_query_mem = 0;   // W3.1: 0 = no per-query memory cap
     for (int i = 1; i + 1 < argc; i += 2) {
         if (std::strcmp(argv[i], "--port") == 0) {
             port = static_cast<std::uint16_t>(parse_u64(argv[i + 1], port));
         } else if (std::strcmp(argv[i], "--data-dir") == 0) {
             data_dir = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--max-query-mem") == 0) {
+            max_query_mem = parse_u64(argv[i + 1], 0);
         } else if (std::strcmp(argv[i], "--slow-query-ms") == 0) {
             slow_query_ms = static_cast<std::int64_t>(parse_u64(argv[i + 1], 0));
         } else if (std::strcmp(argv[i], "--stmt-timeout-ms") == 0) {
@@ -75,6 +78,9 @@ int main(int argc, char** argv) {
     prod::ProdDisk c_disk(c_sched, data_dir + "/pgd-catalog.wal");
     SqlEngine engine(d_sched, d_disk, c_sched, c_disk);
     engine.recover(d_disk.logical_len(), c_disk.logical_len());  // replay durable state (fresh dir -> no-op)
+    if (max_query_mem > 0) {  // W3.1: bound per-query memory (materialization + join row set)
+        engine.set_max_query_memory(static_cast<std::size_t>(max_query_mem));
+    }
 
     prod::ProdReactor reactor;
     prod::ProdPgServer::AuthFn auth;

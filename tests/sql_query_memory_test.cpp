@@ -142,6 +142,24 @@ int main() {
               "(F) a small result still fits under the same cap");
     }
 
+    // (G) JOIN memory is bounded: a cross join builds an O(n^2) joined row set; a small cap
+    // refuses it (deterministic error) instead of letting it grow unbounded (the OOM vector
+    // that a statement timeout otherwise has to catch). Off by default -> the join runs.
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE j (id INT, v INT, PRIMARY KEY (id))");
+        for (int i = 0; i < 500; ++i) {
+            e.exec("INSERT INTO j (id, v) VALUES (" + std::to_string(i) + ", " + std::to_string(i) + ")");
+        }
+        // No cap: the 500x500 = 250k-row cross join runs.
+        check(e.exec("SELECT COUNT(*) FROM j a, j b").ok, "(G) no cap: cross join runs");
+        // A small cap: the growing joined row set exceeds it and is refused.
+        e.set_max_query_memory(50'000);
+        const ExecResult r = e.exec("SELECT COUNT(*) FROM j a, j b");
+        check(!r.ok && r.error.find("query memory limit exceeded") != std::string::npos,
+              "(G) small cap: cross join bounded and refused (no unbounded growth)");
+    }
+
     if (g_fail != 0) {
         std::printf("sql_query_memory_test: FAILURES\n");
         return 1;

@@ -8759,8 +8759,17 @@ private:
         const bool right_fill = je.kind == JoinKind::Right || je.kind == JoinKind::Full;
         std::vector<bool> rmatched(rt.rows.size(), false);
         std::size_t jpoll = 0;
+        std::size_t mcharged = 0;  // W3.1: joined rows already charged to the memory budget
+        const std::size_t row_bytes_est = schema.cols.size() * 24 + 8;
         for (const auto& ljr : left) {
-            if ((++jpoll & 0x3FFu) == 0 && canceled()) return std::string("query canceled");  // W3.2
+            // W3.2: cancel poll per 1024 left rows (fires even when the join emits nothing).
+            if ((++jpoll & 0x3FFu) == 0 && canceled()) return std::string("query canceled");
+            // W3.1: charge the joined row set as it grows (per 4096 output rows) so an
+            // O(n*m) join is bounded by the memory cap instead of growing unbounded (OOM).
+            if (out.size() >= mcharged + 4096) {
+                if (auto e = charge_query_mem((out.size() - mcharged) * row_bytes_est)) return e;
+                mcharged = out.size();
+            }
             const Datum& lk = ljr[left_idx];
             bool matched = false;
             if (!lk.is_null) {
@@ -8813,8 +8822,17 @@ private:
         const bool right_fill = je.kind == JoinKind::Right || je.kind == JoinKind::Full;
         std::vector<bool> rmatched(rt.rows.size(), false);
         std::size_t jpoll = 0;
+        std::size_t mcharged = 0;  // W3.1: joined rows already charged to the memory budget
+        const std::size_t row_bytes_est = schema.cols.size() * 24 + 8;
         for (const auto& ljr : left) {
-            if ((++jpoll & 0x3FFu) == 0 && canceled()) return std::string("query canceled");  // W3.2
+            // W3.2: cancel poll per 1024 left rows (fires even when the join emits nothing).
+            if ((++jpoll & 0x3FFu) == 0 && canceled()) return std::string("query canceled");
+            // W3.1: charge the joined row set as it grows (per 4096 output rows) so an
+            // O(n*m) join is bounded by the memory cap instead of growing unbounded (OOM).
+            if (out.size() >= mcharged + 4096) {
+                if (auto e = charge_query_mem((out.size() - mcharged) * row_bytes_est)) return e;
+                mcharged = out.size();
+            }
             bool matched = false;
             for (std::size_t rj = 0; rj < rt.rows.size(); ++rj) {
                 const auto& rrow = rt.rows[rj];
