@@ -7816,6 +7816,39 @@ private:
             out = Datum::make_text(std::string(1, static_cast<char>(a[0].i)));
             return std::nullopt;
         }
+        if (f == "DATE_PART") {  // DATE_PART('field', date|timestamp) -> INT component
+            if (!need(2)) return "DATE_PART takes two arguments";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (a[0].type != Type::Text) return "DATE_PART field must be TEXT";
+            // The value must be a DATE (logical 2, days) or TIMESTAMP (logical 3, seconds).
+            const std::uint8_t lg = a[1].logical;
+            if (a[1].type != Type::Int || (lg != 2 && lg != 3))
+                return "DATE_PART requires a DATE or TIMESTAMP argument";
+            std::string field;
+            for (char c : a[0].s) field.push_back((c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c);
+            const std::int64_t raw = a[1].i;                     // days (DATE) or seconds (TIMESTAMP)
+            const std::int64_t secs = (lg == 3) ? raw : raw * 86400;
+            // Floor-divide to days + non-negative time-of-day remainder.
+            std::int64_t days = secs / 86400;
+            std::int64_t tod = secs - days * 86400;
+            if (tod < 0) { tod += 86400; --days; }
+            std::int64_t y = 0;
+            unsigned mo = 0, d = 0;
+            days_to_civil(days, y, mo, d);
+            std::int64_t res = 0;
+            if (field == "year") res = y;
+            else if (field == "month") res = mo;
+            else if (field == "day") res = d;
+            else if (field == "hour") res = tod / 3600;
+            else if (field == "minute") res = (tod % 3600) / 60;
+            else if (field == "second") res = tod % 60;
+            else if (field == "dow") res = ((days % 7) + 4 + 7) % 7;   // 0=Sunday (1970-01-01 = Thu)
+            else if (field == "doy") res = days - civil_to_days(y, 1, 1) + 1;
+            else if (field == "epoch") res = secs;
+            else return "DATE_PART: unknown field '" + a[0].s + "'";
+            out = Datum::make_int(res);
+            return std::nullopt;
+        }
         if (f == "ABS") {
             if (!need(1)) return "ABS takes one argument";
             if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
