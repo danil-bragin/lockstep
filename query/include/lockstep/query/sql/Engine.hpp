@@ -5309,7 +5309,7 @@ private:
         // The dictionary's codes are DENSE (0..G-1, cached flush-gen-tagged), so each group's
         // {count, per-column IntFold} accumulates by DIRECT code index — no hash, no idx vectors, no
         // gather. Emit sorted by the string value (== the byte-identical group order for NOT NULL TEXT).
-        if (!has_filter && !has_having && !gs_mode_ && !would_parallelize && gcols.size() == 1 &&
+        if (!has_filter && !has_having && !gs_mode_ && gcols.size() == 1 &&
             t.columns[gcols[0]].type == Type::Text && t.columns[gcols[0]].logical == 0 &&
             !t.columns[gcols[0]].nullable) {
             bool all_ok = true;
@@ -5330,16 +5330,61 @@ private:
                 for (std::size_t k = 0; k < nf; ++k) ap[k] = cols[fuse_cols[k]]->ints.data();
                 std::vector<std::int64_t> cnt(G, 0);
                 std::vector<IntFold> folds(G * nf, IntFold{0, INT64_MAX, INT64_MIN});
-                for (std::uint32_t rw = 0; rw < count; ++rw) {
-                    const std::size_t g = dict.codes[rw];  // dense code == group index (no hash)
-                    ++cnt[g];
-                    if (nf > 0) {
-                        IntFold* f = &folds[g * nf];
-                        for (std::size_t kk = 0; kk < nf; ++kk) {
-                            const std::int64_t x = ap[kk][rw];
-                            f[kk].sum = wrap_add(f[kk].sum, x);
-                            f[kk].mn = f[kk].mn < x ? f[kk].mn : x;
-                            f[kk].mx = f[kk].mx > x ? f[kk].mx : x;
+                // W4: PARALLEL ONE-PASS dict-code accumulation. Each worker folds a contiguous
+                // row range into a LOCAL {cnt[G], folds[G*nf]}, then the locals merge element-wise
+                // in worker order. Byte-identical to the serial accumulation: wrap_add is
+                // associative+commutative (two's-complement), MIN/MAX/COUNT are order-independent,
+                // so the merged per-group aggregate does not depend on the partition. This replaces
+                // the generic two-pass parallel gather (build idx vectors -> scattered fold) which
+                // was ~3x SLOWER than serial on a low-cardinality TEXT GROUP BY (profiled).
+                if (would_parallelize) {
+                    const std::size_t W =
+                        std::min<std::size_t>(parallel_executor_->workers(), count);
+                    std::vector<std::vector<std::int64_t>> lc(W, std::vector<std::int64_t>(G, 0));
+                    std::vector<std::vector<IntFold>> lf(
+                        W, std::vector<IntFold>(G * nf, IntFold{0, INT64_MAX, INT64_MIN}));
+                    const std::uint32_t per = static_cast<std::uint32_t>((count + W - 1) / W);
+                    parallel_executor_->parallel_for(W, [&](std::size_t w) {
+                        const std::uint32_t lo = static_cast<std::uint32_t>(w) * per;
+                        const std::uint32_t hi = std::min<std::uint32_t>(count, lo + per);
+                        std::int64_t* c = lc[w].data();
+                        IntFold* fbase = lf[w].data();
+                        for (std::uint32_t rw = lo; rw < hi; ++rw) {
+                            const std::size_t g = dict.codes[rw];
+                            ++c[g];
+                            if (nf > 0) {
+                                IntFold* f = &fbase[g * nf];
+                                for (std::size_t kk = 0; kk < nf; ++kk) {
+                                    const std::int64_t x = ap[kk][rw];
+                                    f[kk].sum = wrap_add(f[kk].sum, x);
+                                    f[kk].mn = f[kk].mn < x ? f[kk].mn : x;
+                                    f[kk].mx = f[kk].mx > x ? f[kk].mx : x;
+                                }
+                            }
+                        }
+                    });
+                    for (std::size_t w = 0; w < W; ++w) {
+                        for (std::size_t g = 0; g < G; ++g) cnt[g] += lc[w][g];
+                        for (std::size_t j = 0; j < G * nf; ++j) {
+                            IntFold& d = folds[j];
+                            const IntFold& s = lf[w][j];
+                            d.sum = wrap_add(d.sum, s.sum);
+                            if (s.mn < d.mn) d.mn = s.mn;
+                            if (s.mx > d.mx) d.mx = s.mx;
+                        }
+                    }
+                } else {
+                    for (std::uint32_t rw = 0; rw < count; ++rw) {
+                        const std::size_t g = dict.codes[rw];  // dense code == group index (no hash)
+                        ++cnt[g];
+                        if (nf > 0) {
+                            IntFold* f = &folds[g * nf];
+                            for (std::size_t kk = 0; kk < nf; ++kk) {
+                                const std::int64_t x = ap[kk][rw];
+                                f[kk].sum = wrap_add(f[kk].sum, x);
+                                f[kk].mn = f[kk].mn < x ? f[kk].mn : x;
+                                f[kk].mx = f[kk].mx > x ? f[kk].mx : x;
+                            }
                         }
                     }
                 }
