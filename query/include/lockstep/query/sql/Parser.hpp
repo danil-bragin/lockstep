@@ -505,15 +505,40 @@ public:
             st.kind = StmtKind::Describe;
             if (auto e = expect_table_name("a table name after DESCRIBE", st.truncate.table)) return ParseResult{*e};
             r = ParseResult{std::move(st)};
-        } else if (kw == "set") {  // E4: SET search_path TO s | DEFAULT
+        } else if (kw == "set") {  // E4: SET search_path TO s | DEFAULT ; W3.1: SET <name> = <value>
             advance();
-            if (auto e = expect_kw("search_path")) return ParseResult{*e};
-            if (is_kw("to") || cur_.kind == Tok::Eq) advance();
-            Statement st;
-            st.kind = StmtKind::SetSearchPath;
-            if (is_kw("default")) { advance(); st.schema_arg.clear(); }
-            else if (auto e = expect_ident("a schema name or DEFAULT", st.schema_arg)) return ParseResult{*e};
-            r = ParseResult{std::move(st)};
+            if (is_kw("search_path")) {
+                advance();
+                if (is_kw("to") || cur_.kind == Tok::Eq) advance();
+                Statement st;
+                st.kind = StmtKind::SetSearchPath;
+                if (is_kw("default")) { advance(); st.schema_arg.clear(); }
+                else if (auto e = expect_ident("a schema name or DEFAULT", st.schema_arg)) return ParseResult{*e};
+                r = ParseResult{std::move(st)};
+            } else {
+                // W3.1: generic session parameter — SET <dotted.name> [=|TO] <value>.
+                // The name may be dotted (e.g. lockstep.max_query_memory); lower-cased.
+                Statement st;
+                st.kind = StmtKind::SetParam;
+                std::string part;
+                if (auto e = expect_ident("a parameter name after SET", part)) return ParseResult{*e};
+                st.set_param_name = lower(part);
+                while (cur_.kind == Tok::Dot) {
+                    advance();
+                    if (auto e = expect_ident("a parameter name segment after '.'", part)) return ParseResult{*e};
+                    st.set_param_name += "." + lower(part);
+                }
+                if (is_kw("to") || cur_.kind == Tok::Eq) advance();
+                else return err("expected '=' or TO after the parameter name in SET");
+                // Accept an int / string / identifier value token.
+                if (cur_.kind == Tok::IntLit || cur_.kind == Tok::StrLit || cur_.kind == Tok::Ident) {
+                    st.set_param_value = cur_.text;
+                    advance();
+                } else {
+                    return err("expected a value after '=' in SET");
+                }
+                r = ParseResult{std::move(st)};
+            }
         } else {
             return err("unknown / unsupported statement keyword '" + cur_.text +
                        "' (v1 supports CREATE/INSERT/UPDATE/DELETE/SELECT)");

@@ -103,6 +103,26 @@ int main() {
         check(all_ok, "(D) per-statement reset: repeated queries all succeed under a per-stmt cap");
     }
 
+    // (E) SQL SET — the cap is settable over SQL (usable from any PG client), and an
+    // unknown parameter is accepted as a no-op (client compatibility).
+    {
+        SqlEngine e;
+        seed(e, 200);
+        const ExecResult s = e.exec("SET lockstep.max_query_memory = 100");
+        check(s.ok, "(E) SET lockstep.max_query_memory succeeds");
+        const ExecResult r = e.exec(kDerived);
+        check(!r.ok && r.error.find("query memory limit exceeded") != std::string::npos,
+              "(E) SQL-set cap enforced on the derived-table query");
+        // Raise it back to unlimited over SQL → the same query now succeeds.
+        check(e.exec("SET lockstep.max_query_memory = 0").ok, "(E) SET back to 0 (unlimited)");
+        check(e.exec(kDerived).ok, "(E) query succeeds again after raising the cap");
+        // An unknown parameter is a no-op (not an error).
+        check(e.exec("SET client_encoding = 'UTF8'").ok, "(E) unknown SET param is a no-op");
+        // A non-numeric memory value is rejected.
+        check(!e.exec("SET lockstep.max_query_memory = abc").ok,
+              "(E) non-numeric memory value rejected");
+    }
+
     if (g_fail != 0) {
         std::printf("sql_query_memory_test: FAILURES\n");
         return 1;

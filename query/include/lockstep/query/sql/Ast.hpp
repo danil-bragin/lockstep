@@ -515,6 +515,7 @@ enum class StmtKind : std::uint8_t {
     ReleaseSavepoint = 21,     // G6: RELEASE [SAVEPOINT] name
     CreateView = 22,           // H1: CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT ...
     DropView = 23,             // H1: DROP VIEW [IF EXISTS] name
+    SetParam = 24,             // W3.1: SET <name> = <value> (session parameter, e.g. lockstep.max_query_memory)
 };
 
 struct Statement {
@@ -535,6 +536,8 @@ struct Statement {
     std::string savepoint_name;  // G6: SAVEPOINT / ROLLBACK TO / RELEASE target
     CreateViewStmt create_view;  // H1
     DropViewStmt drop_view;      // H1
+    std::string set_param_name;   // W3.1: SET <name> = <value> — parameter name (lower-cased)
+    std::string set_param_value;  // W3.1: the raw value token (int/ident/string)
 };
 
 }  // namespace lockstep::query::sql

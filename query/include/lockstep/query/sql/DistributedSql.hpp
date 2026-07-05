@@ -87,6 +87,7 @@ public:
             case StmtKind::CreateSchema:  // E4
             case StmtKind::DropSchema:
             case StmtKind::SetSearchPath:
+            case StmtKind::SetParam:  // W3.1: session config (e.g. max_query_memory) -> every shard
             case StmtKind::Alter:
             case StmtKind::Begin:
             case StmtKind::Commit:

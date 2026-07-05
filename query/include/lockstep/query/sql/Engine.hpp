@@ -1127,6 +1127,8 @@ public:
                 return exec_create_view(st.create_view);
             case StmtKind::DropView:
                 return exec_drop_view(st.drop_view);
+            case StmtKind::SetParam:
+                return exec_set_param(st.set_param_name, st.set_param_value);
             case StmtKind::Truncate:
                 return exec_truncate(st.truncate);
             case StmtKind::Alter:
@@ -1709,6 +1711,30 @@ private:
                    " bytes); raise lockstep.max_query_memory or narrow the query";
         }
         return std::nullopt;
+    }
+
+    // W3.1: SET <name> = <value>. Known session parameters take effect; unknown ones are
+    // accepted as a no-op (PostgreSQL-compatible: clients SET client_encoding / datestyle /
+    // etc. which the engine need not model). The only knob acted on today is
+    // lockstep.max_query_memory (bytes; 0 = unlimited).
+    ExecResult exec_set_param(const std::string& name, const std::string& value) {
+        if (name == "lockstep.max_query_memory") {
+            std::size_t bytes = 0;
+            for (const char c : value) {
+                if (c < '0' || c > '9') {
+                    return ExecResult::failure(
+                        "SET lockstep.max_query_memory expects a non-negative integer (bytes)");
+                }
+                bytes = bytes * 10 + static_cast<std::size_t>(c - '0');
+            }
+            if (value.empty()) {
+                return ExecResult::failure(
+                    "SET lockstep.max_query_memory expects a non-negative integer (bytes)");
+            }
+            set_max_query_memory(bytes);
+        }
+        // Unknown parameter → accepted no-op (client-compat). Return an empty OK result.
+        return ExecResult{};
     }
 
     std::optional<std::string> materialize_select(const std::string& name, const SelectStmt& sel) {
