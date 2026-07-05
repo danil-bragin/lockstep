@@ -118,6 +118,22 @@ int main() {
         check(col_texts(r2, "tablename").size() == 1, "(F) pg_tables alias + WHERE works");
     }
 
+    // (G) table_constraints + key_column_usage expose the PRIMARY KEY (ORM relationship map).
+    {
+        const ExecResult rc = e.exec(
+            "SELECT constraint_type, constraint_name FROM information_schema.table_constraints "
+            "WHERE table_name = 'users'");
+        check(has(col_texts(rc, "constraint_type"), "PRIMARY KEY"),
+              "(G) table_constraints reports the PRIMARY KEY");
+        check(has(col_texts(rc, "constraint_name"), "users_pkey"),
+              "(G) PK constraint is named users_pkey");
+        const ExecResult rk = e.exec(
+            "SELECT column_name FROM information_schema.key_column_usage "
+            "WHERE table_name = 'users' AND constraint_name = 'users_pkey'");
+        check(has(col_texts(rk, "column_name"), "id"),
+              "(G) key_column_usage maps the PK column 'id'");
+    }
+
     if (g_fail != 0) {
         std::printf("sql_information_schema_test: FAILURES\n");
         return 1;

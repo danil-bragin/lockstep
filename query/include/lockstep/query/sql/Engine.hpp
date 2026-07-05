@@ -1881,6 +1881,8 @@ private:
                lower_name == "information_schema.columns" ||
                lower_name == "information_schema.views" ||
                lower_name == "information_schema.schemata" ||
+               lower_name == "information_schema.table_constraints" ||
+               lower_name == "information_schema.key_column_usage" ||
                lower_name == "pg_catalog.pg_tables" ||
                lower_name == "pg_tables";
     }
@@ -1927,6 +1929,50 @@ private:
                 const auto [sch, nm] = split_schema(qn);
                 rows.push_back({Datum::make_text(sch), Datum::make_text(nm),
                                 Datum::make_text("lockstep")});
+            }
+        } else if (lower_name == "information_schema.table_constraints") {
+            cols = {{"constraint_catalog", Type::Text}, {"constraint_schema", Type::Text},
+                    {"constraint_name", Type::Text}, {"table_schema", Type::Text},
+                    {"table_name", Type::Text}, {"constraint_type", Type::Text}};
+            for (const auto& [qn, t] : catalog_.all()) {
+                if (is_ephemeral(qn)) continue;
+                const auto [sch, nm] = split_schema(qn);
+                auto emit = [&](const std::string& cname, const std::string& ctype) {
+                    rows.push_back({Datum::make_text("lockstep"), Datum::make_text(sch),
+                                    Datum::make_text(cname), Datum::make_text(sch),
+                                    Datum::make_text(nm), Datum::make_text(ctype)});
+                };
+                if (!t.columns[t.pk_index].dropped) emit(nm + "_pkey", "PRIMARY KEY");
+                for (const Column& c : t.columns) {
+                    if (c.dropped) continue;
+                    if (c.unique) emit(nm + "_" + c.name + "_key", "UNIQUE");
+                    if (!c.fk_table.empty()) emit(nm + "_" + c.name + "_fkey", "FOREIGN KEY");
+                }
+            }
+        } else if (lower_name == "information_schema.key_column_usage") {
+            cols = {{"constraint_catalog", Type::Text}, {"constraint_schema", Type::Text},
+                    {"constraint_name", Type::Text}, {"table_schema", Type::Text},
+                    {"table_name", Type::Text}, {"column_name", Type::Text},
+                    {"ordinal_position", Type::Int}};
+            for (const auto& [qn, t] : catalog_.all()) {
+                if (is_ephemeral(qn)) continue;
+                const auto [sch, nm] = split_schema(qn);
+                auto emit = [&](const std::string& cname, const std::string& col, std::int64_t ord) {
+                    rows.push_back({Datum::make_text("lockstep"), Datum::make_text(sch),
+                                    Datum::make_text(cname), Datum::make_text(sch),
+                                    Datum::make_text(nm), Datum::make_text(col), Datum::make_int(ord)});
+                };
+                if (!t.columns[t.pk_index].dropped) {
+                    const std::vector<std::size_t>& pkc =
+                        t.pk_columns.empty() ? std::vector<std::size_t>{t.pk_index} : t.pk_columns;
+                    std::int64_t ord = 0;
+                    for (std::size_t ci : pkc) emit(nm + "_pkey", t.columns[ci].name, ++ord);
+                }
+                for (const Column& c : t.columns) {
+                    if (c.dropped) continue;
+                    if (c.unique) emit(nm + "_" + c.name + "_key", c.name, 1);
+                    if (!c.fk_table.empty()) emit(nm + "_" + c.name + "_fkey", c.name, 1);
+                }
             }
         } else if (lower_name == "information_schema.tables") {
             cols = {{"table_catalog", Type::Text}, {"table_schema", Type::Text},
