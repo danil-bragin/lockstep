@@ -26,6 +26,14 @@ CONSTANTS Server,            \* set of server ids
 \* Search bounds (used by StateConstraint; supplied as model values in the .cfg).
 CONSTANTS MaxTerm, MaxLogLen, MaxMsgs
 
+\* S9.2 DURABILITY TEETH toggle. FALSE in the real cfgs: an entry counts toward a
+\* commit quorum only once it is fsync-DURABLE on that server (durable[i] >= idx).
+\* TRUE only in the teeth cfg: reproduces the fixed-in-code bug — an entry counts the
+\* instant it is ENQUEUED/appended (Len(log[i]) >= idx), before its fsync completes —
+\* so TLC must report a CommitIsDurable violation. This is the spec-side proof that
+\* commit-follows-fsync is required, not incidental.
+CONSTANT TeethCommitOnEnqueue
+
 ----------------------------------------------------------------------------
 VARIABLES
     currentTerm,   \* [Server -> Nat]
@@ -33,10 +41,11 @@ VARIABLES
     votedFor,      \* [Server -> Server \cup {Nil}]
     log,           \* [Server -> Seq([term : Nat, value : Value])]
     commitIndex,   \* [Server -> Nat]
+    durable,       \* [Server -> Nat]  length of the fsync-DURABLE prefix of log[s] (S9.2)
     votesGranted,  \* [Server -> SUBSET Server]
     messages       \* set of in-flight messages (records)
 
-vars == <<currentTerm, state, votedFor, log, commitIndex, votesGranted, messages>>
+vars == <<currentTerm, state, votedFor, log, commitIndex, durable, votesGranted, messages>>
 
 ----------------------------------------------------------------------------
 \* Message schema (messages is a SET; re-delivery is idempotent).
@@ -89,6 +98,7 @@ Init ==
     /\ votedFor     = [s \in Server |-> Nil]
     /\ log          = [s \in Server |-> << >>]
     /\ commitIndex  = [s \in Server |-> 0]
+    /\ durable      = [s \in Server |-> 0]
     /\ votesGranted = [s \in Server |-> {}]
     /\ messages     = {}
 
@@ -111,7 +121,7 @@ Timeout(s) ==
              mlastLogIndex |-> LastIndex(log[s]),
              mlastLogTerm  |-> LastTerm(log[s]) ]
            : d \in Server \ {s} }
-    /\ UNCHANGED <<log, commitIndex>>
+    /\ UNCHANGED <<log, commitIndex, durable>>
 
 \* Step down on a higher-term message: adopt the term, revert to Follower, clear the vote.
 \* Modeled as its OWN action so that any log mutation (truncation) performed by a later
@@ -127,7 +137,7 @@ UpdateTerm(s) ==
         /\ state'        = [state        EXCEPT ![s] = Follower]
         /\ votedFor'     = [votedFor     EXCEPT ![s] = Nil]
         /\ votesGranted' = [votesGranted EXCEPT ![s] = {}]
-        /\ UNCHANGED <<log, commitIndex, messages>>
+        /\ UNCHANGED <<log, commitIndex, durable, messages>>
 
 \* Grant a vote iff term is current and candidate log is up-to-date; persist the vote
 \* atomically in this step (models "persist votedFor before reply").
@@ -150,7 +160,7 @@ HandleRequestVote(s) ==
                         msource |-> s,
                         mdest   |-> m.msource,
                         mgranted |-> grant ])
-              /\ UNCHANGED <<currentTerm, state, log, commitIndex, votesGranted>>
+              /\ UNCHANGED <<currentTerm, state, log, commitIndex, durable, votesGranted>>
 
 \* Candidate collects a granted vote response (for the current term).
 HandleVoteResponse(s) ==
@@ -161,21 +171,23 @@ HandleVoteResponse(s) ==
         /\ state[s] = Candidate
         /\ m.mgranted
         /\ votesGranted' = [votesGranted EXCEPT ![s] = votesGranted[s] \cup {m.msource}]
-        /\ UNCHANGED <<currentTerm, state, votedFor, log, commitIndex, messages>>
+        /\ UNCHANGED <<currentTerm, state, votedFor, log, commitIndex, durable, messages>>
 
 \* Become leader on a quorum of votes in the current term.
 BecomeLeader(s) ==
     /\ state[s] = Candidate
     /\ votesGranted[s] \in Quorum
     /\ state' = [state EXCEPT ![s] = Leader]
-    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, votesGranted, messages>>
+    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, durable, votesGranted, messages>>
 
 \* Leader accepts a client command.
 ClientRequest(s, v) ==
     /\ state[s] = Leader
     /\ Len(log[s]) < MaxLogLen                  \* bound the search
     /\ log' = [log EXCEPT ![s] = Append(@, [term |-> currentTerm[s], value |-> v])]
-    /\ UNCHANGED <<currentTerm, state, votedFor, commitIndex, votesGranted, messages>>
+    \* durable UNCHANGED: a freshly appended entry is page-cache-only until a later
+    \* Persist(s) fsyncs it. This is the enqueue->fsync window the S9.2 fix closes.
+    /\ UNCHANGED <<currentTerm, state, votedFor, commitIndex, durable, votesGranted, messages>>
 
 \* Replication: leader s sends entries (>=0) to follower d from some nextIndex.
 \* We let prevLogIndex range over any valid index of the leader's log; entries are a
@@ -202,7 +214,7 @@ AppendEntries(s, d) ==
                    mprevLogTerm  |-> prevLogTerm,
                    mentries      |-> entries,
                    mleaderCommit |-> commitIndex[s] ])
-    /\ UNCHANGED <<currentTerm, state, votedFor, log, commitIndex, votesGranted>>
+    /\ UNCHANGED <<currentTerm, state, votedFor, log, commitIndex, durable, votesGranted>>
 
 \* Follower handles AppendEntries: reject on prevLog mismatch; otherwise delete any
 \* conflicting suffix, append new entries (Log Matching), and adopt leaderCommit.
@@ -253,6 +265,16 @@ HandleAppendEntries(s) ==
                                    IF success
                                    THEN Max(commitIndex[s], Min(m.mleaderCommit, lastNew))
                                    ELSE commitIndex[s]]
+              \* Durability recedes over any conflicting suffix we just overwrote: the
+              \* entries at/after the first conflict are newly written (page-cache-only),
+              \* so durable clamps to the last byte-unchanged index. A pure append or a
+              \* rejected/subsumed AppendEntries leaves the old prefix intact (no clamp).
+              \* The genuinely-new tail is fsync'd by a later Persist(s), never here.
+              /\ LET unchangedPrefixLen ==
+                        IF success /\ firstConflict # 0
+                        THEN m.mprevLogIndex + firstConflict - 1
+                        ELSE Len(log[s])
+                 IN durable' = [durable EXCEPT ![s] = Min(durable[s], unchangedPrefixLen)]
               /\ Send([ mtype       |-> "AppendEntriesResponse",
                         mterm       |-> currentTerm[s],
                         msource     |-> s,
@@ -265,16 +287,34 @@ HandleAppendEntries(s) ==
 \* CURRENT term (the Raft commitment rule that makes StateMachineSafety hold).
 \* "Stored on a quorum" is established directly from the leader's own log being a prefix of
 \* the agreeing servers' logs; we read the agreement off the logs (matchIndex equivalent).
+\* "Stored durably" on server i: with the fix, an entry counts toward a commit quorum
+\* only once it is fsync-DURABLE on i (durable[i] >= idx) — a follower acks only after IT
+\* persists, and the lone leader self-commits only after its OWN fsync (the S9.2 fix). The
+\* teeth toggle degrades this to "merely enqueued" (Len(log[i]) >= idx), reproducing the
+\* pre-fix bug where commit could outrun durability.
+StoredForCommit(i, idx) ==
+    IF TeethCommitOnEnqueue THEN Len(log[i]) >= idx ELSE durable[i] >= idx
+
 AdvanceCommitIndex(s) ==
     /\ state[s] = Leader
     /\ \E newCommit \in (commitIndex[s] + 1) .. Len(log[s]) :
          /\ log[s][newCommit].term = currentTerm[s]      \* current-term entry only
          /\ LET agree == { i \in Server :
+                             /\ StoredForCommit(i, newCommit)
                              /\ Len(log[i]) >= newCommit
                              /\ log[i][newCommit] = log[s][newCommit] }
             IN agree \in Quorum
          /\ commitIndex' = [commitIndex EXCEPT ![s] = newCommit]
-    /\ UNCHANGED <<currentTerm, state, votedFor, log, votesGranted, messages>>
+    /\ UNCHANGED <<currentTerm, state, votedFor, log, durable, votesGranted, messages>>
+
+\* Persist: a server's fsync completes, extending its durable prefix toward the appended
+\* log length. Models the async io_uring fdatasync worker draining its queue. A commit can
+\* only follow once the entries it needs are durable here (StoredForCommit under the fix).
+Persist(s) ==
+    /\ durable[s] < Len(log[s])
+    /\ \E k \in (durable[s] + 1) .. Len(log[s]) :
+         durable' = [durable EXCEPT ![s] = k]
+    /\ UNCHANGED <<currentTerm, state, votedFor, log, commitIndex, votesGranted, messages>>
 
 Next ==
     \/ \E s \in Server : Timeout(s)
@@ -285,6 +325,7 @@ Next ==
     \/ \E s \in Server, v \in Value : ClientRequest(s, v)
     \/ \E s, d \in Server : AppendEntries(s, d)
     \/ \E s \in Server : HandleAppendEntries(s)
+    \/ \E s \in Server : Persist(s)
     \/ \E s \in Server : AdvanceCommitIndex(s)
 
 Spec == Init /\ [][Next]_vars
@@ -325,6 +366,22 @@ StateMachineSafety ==
         \A i \in 1 .. Min(commitIndex[a], commitIndex[b]) :
             log[a][i] = log[b][i]
 
+\* The durable prefix never claims more than the log holds (sanity: durable <= Len(log)).
+DurableBounded ==
+    \A s \in Server : durable[s] <= Len(log[s])
+
+\* S9.2 THE TEETH INVARIANT: every committed index is backed by a fsync-DURABLE quorum
+\* holding that exact entry. With the fix (StoredForCommit uses durable), a commit is
+\* only ever advanced over a durable quorum, and durability is monotonic at committed
+\* indices (committed entries never conflict-truncate), so this holds. With the teeth
+\* toggle a lone (or minority-durable) leader commits at ENQUEUE — the durable set is
+\* NOT a quorum — and TLC reports the violation. This is what makes the spec able to
+\* DISTINGUISH commit-follows-fsync from commit-at-enqueue (previously it could not).
+CommitIsDurable ==
+    \A s \in Server :
+        \A i \in 1 .. Min(commitIndex[s], Len(log[s])) :
+            { j \in Server : durable[j] >= i /\ log[j][i] = log[s][i] } \in Quorum
+
 \* A leader never overwrites or deletes entries in its own log (append-only while leader).
 \* Expressed as an action invariant — check with [][LeaderAppendOnly]_vars.
 LeaderAppendOnly ==
@@ -336,5 +393,6 @@ LeaderAppendOnly ==
 \* PROPERTY wrapper so the cfg can check the action invariant as a temporal property.
 LeaderAppendOnlyProp == [][LeaderAppendOnly]_vars
 
-THEOREM Spec => [](ElectionSafety /\ LogMatching /\ StateMachineSafety)
+THEOREM Spec => [](ElectionSafety /\ LogMatching /\ StateMachineSafety
+                   /\ DurableBounded /\ CommitIsDurable)
 =============================================================================

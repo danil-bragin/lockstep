@@ -162,18 +162,63 @@ UNCHANGED; only WHERE/WHEN the N=1 path calls it moved. N>=2 stays ack-driven, B
 IDENTICAL (proven: the A-vs-B cross-check + 5 conformance checkers at N=3/5 are byte-
 identical before/after; full output diff EMPTY).
 
-SPEC CONFORMANCE (no change needed). `AdvanceCommitIndex(s)` is a standalone enabled
-action: it MAY fire any time a Quorum (for N=1, the lone leader itself) stores a current-
-term entry, with no ordering constraint relative to other actions. The fix only DELAYS
-the concrete commit point to fsync completion — a SUBSET of the spec-permitted firing
-points (it never commits anything the spec forbids; commit still requires the entry on a
-quorum). It is strictly MORE conservative (commit-after-durable), so no invariant is
-weakened. TLC re-checked BOTH configs with no error:
-  - `Consensus1.cfg` (N=1): 79 distinct states, depth 9 — the four safety invariants hold.
-  - `Consensus.cfg`  (N=3): 288,361 distinct states, depth 20 — no error.
-The four invariants (ElectionSafety, LogMatching, StateMachineSafety, LeaderAppendOnly)
-remain verbatim. The prod teeth (`prod_consensus_durability_teeth_test`, io_uring +
-sync fallback) prove commit-follows-fsync: an appended-but-un-fsynced entry has
-`commit_index == 0`; after the fsync completes, `commit_index == 1` — no committed entry
-can be lost to an abrupt crash. (Pre-fix the teeth FAIL: the un-fsynced entry shows
-`commit_index == 1` — a committed-yet-un-durable entry.)
+SPEC CONFORMANCE (initially argued "no change needed"). `AdvanceCommitIndex(s)` is a
+standalone enabled action: it MAY fire any time a Quorum (for N=1, the lone leader itself)
+stores a current-term entry, with no ordering constraint relative to other actions. The fix
+only DELAYS the concrete commit point to fsync completion — a SUBSET of the spec-permitted
+firing points (it never commits anything the spec forbids; commit still requires the entry on
+a quorum). It is strictly MORE conservative (commit-after-durable), so no invariant is
+weakened.
+
+## W1.1 — the spec now MODELS durability (previously it was blind to it)
+
+The "no change needed" argument above is sound but leaves a GAP: the pre-W1.1 spec had no
+durability dimension, so it conformed to BOTH the correct impl AND the buggy commit-at-enqueue
+impl — it could not tell them apart. W1.1 closes that: the spec now carries the durability
+state the bug lives in, so TLC itself distinguishes commit-follows-fsync from
+commit-at-enqueue.
+
+Additive modeling (no existing invariant weakened; the four originals remain verbatim):
+
+- **`durable \in [Server -> Nat]`** — length of each server's fsync-DURABLE log prefix.
+  `Init`: all 0. Invariant `DurableBounded`: `durable[s] <= Len(log[s])` always.
+- **`Persist(s)`** — a new action modeling the async io_uring fdatasync worker draining its
+  queue: advances `durable[s]` to any `k \in (durable[s]+1) .. Len(log[s])`. `ClientRequest`
+  and `HandleAppendEntries` leave `durable` at (or clamp it to) the byte-unchanged prefix —
+  a freshly appended/overwritten entry is page-cache-only until a later `Persist` fsyncs it
+  (exactly the enqueue→fsync window).
+- **`AdvanceCommitIndex`** — the agreement quorum now requires `StoredForCommit(i, idx)`,
+  which under the fix is `durable[i] >= idx` (an entry counts toward a commit quorum only
+  once it is DURABLE on that server: a follower acks only after IT persists; the lone leader
+  self-commits only after its OWN fsync). Gated by the constant `TeethCommitOnEnqueue`.
+- **`CommitIsDurable`** (the teeth invariant) — every committed index is backed by a durable
+  quorum holding that exact entry. Stable under the fix (commits only advance over a durable
+  quorum; durability at committed indices never recedes because committed entries never
+  conflict-truncate). Violated the instant a commit outruns durability.
+
+**`TeethCommitOnEnqueue` toggle + `Consensus_teeth.cfg`** reproduce the bug IN THE SPEC:
+setting it TRUE degrades `StoredForCommit` to `Len(log[i]) >= idx` (merely enqueued). TLC
+then reports the counterexample — a lone leader at `commitIndex = 1` with `durable = 0`:
+
+```
+scripts/tlc.sh -config specs/Consensus_teeth.cfg specs/Consensus.tla
+Error: Invariant CommitIsDurable is violated.
+  Timeout -> BecomeLeader -> ClientRequest -> AdvanceCommitIndex
+  State 6: commitIndex = (s1 :> 1)  /\  durable = (s1 :> 0)   \* committed yet un-fsynced
+```
+
+With the fix (`TeethCommitOnEnqueue = FALSE`) TLC re-checked all three configs, no error,
+each exhaustive (`0 states left on queue`):
+  - `Consensus_teeth.cfg` (N=1, teeth=TRUE): **CommitIsDurable VIOLATED** (depth 6) — teeth bite.
+  - `Consensus1.cfg` (N=1, fixed): 172 distinct states, depth 10 — five invariants hold.
+  - `Consensus.cfg`  (N=3, fixed): 1,176,088 distinct states, depth 22, ~98s — no error.
+The `Persist` action expands the state space (N=3: 288,361 → 1.18M distinct) by modeling every
+partial-fsync interleaving; it still closes exhaustively. Five invariants now hold
+(ElectionSafety, LogMatching, StateMachineSafety, LeaderAppendOnly, **DurableBounded**,
+**CommitIsDurable**).
+
+The prod teeth (`prod_consensus_durability_teeth_test`, io_uring + sync fallback) prove the
+SAME property on the real IO stack: an appended-but-un-fsynced entry has `commit_index == 0`;
+after the fsync completes, `commit_index == 1` — no committed entry can be lost to an abrupt
+crash. (Pre-fix the teeth FAIL: the un-fsynced entry shows `commit_index == 1` — a
+committed-yet-un-durable entry.) Spec teeth + prod teeth now cover the bug at both levels.
