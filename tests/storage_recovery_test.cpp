@@ -256,6 +256,24 @@ int main() {
         const std::vector<std::byte> mimg = man.durable_snapshot();
         check(detect_format(sp(mimg)) == FileFormat::Manifest, "manifest recognised by magic");
         check(verify_image(mimg).error.ok(), "verify: good manifest ok");
+        // W2 manifest format-version teeth: the manifest opens with the stream header;
+        // a future header version keeps it a Manifest by magic but collapses the folded
+        // prefix to 0 (fail-closed, no mis-decode of the header bytes as records).
+        check(mimg.size() >= lockstep::storage::format::kStreamHeaderBytes &&
+                  lockstep::storage::get_u32(mimg.data()) == lockstep::storage::kManStreamMagic,
+              "W2: manifest opens with the stream header magic");
+        {
+            std::vector<std::byte> mfut = mimg;
+            const std::uint32_t bumped = lockstep::storage::format::kManifestVersion + 1000u;
+            mfut[4] = static_cast<std::byte>(bumped & 0xFFu);
+            mfut[5] = static_cast<std::byte>((bumped >> 8) & 0xFFu);
+            mfut[6] = static_cast<std::byte>((bumped >> 16) & 0xFFu);
+            mfut[7] = static_cast<std::byte>((bumped >> 24) & 0xFFu);
+            check(detect_format(sp(mfut)) == FileFormat::Manifest,
+                  "W2: future-version manifest still recognised as a Manifest by magic");
+            check(lockstep::storage::inspect_manifest(mfut).valid_prefix_len == 0,
+                  "W2: future-version manifest folds nothing (prefix collapses to 0)");
+        }
         {
             std::vector<std::byte> bad = mimg;
             check(bad.size() > 8, "manifest has content");

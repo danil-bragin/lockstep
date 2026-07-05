@@ -51,7 +51,9 @@ enum class FileFormat : std::uint8_t { Unknown, Wal, Backup, PitrArchive, Manife
     if (image.size() >= 4 &&
         (get_u32(image.data()) == kWalMagic || get_u32(image.data()) == kWalStreamMagic))
         return FileFormat::Wal;
-    if (image.size() >= 4 && get_u32(image.data()) == kManMagic) return FileFormat::Manifest;
+    if (image.size() >= 4 &&
+        (get_u32(image.data()) == kManMagic || get_u32(image.data()) == kManStreamMagic))
+        return FileFormat::Manifest;
     if (image.size() >= kBackupHeaderBytes && detail::backup_magic_ok(image.data())) return FileFormat::Backup;
     if (image.size() >= kPitrHeaderBytes && detail::pitr_magic_ok(image.data())) return FileFormat::PitrArchive;
     if (image.size() >= 48 && get_u32(image.data() + image.size() - 8) == kSstMagic) return FileFormat::SSTable;
@@ -73,6 +75,14 @@ struct ManifestInspection {
     ManifestInspection ins;
     ins.total_len = image.size();
     std::size_t pos = 0;
+    // W2: consume the optional one-time manifest stream header (magic + known version)
+    // so record offsets/prefix length account for it. A headerless or future-version
+    // manifest leaves pos=0 and the fold below behaves as it always did.
+    if (image.size() >= format::kStreamHeaderBytes &&
+        format::check_stream_header(std::span<const std::byte>(image.data(), image.size()),
+                                    kManStreamMagic, format::kManifestVersion)) {
+        pos = format::kStreamHeaderBytes;
+    }
     std::uint64_t expect = 1;  // entry_no is 1,2,3,… contiguous across every record kind.
     while (pos < image.size()) {
         const ManifestDecode d = decode_manifest(image, pos);

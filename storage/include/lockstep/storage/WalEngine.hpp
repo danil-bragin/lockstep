@@ -609,6 +609,21 @@ public:
         return value_threshold_ > 0 && factory_ != nullptr;
     }
 
+    // W2: the one-time manifest stream header ([kManStreamMagic][version]) to write
+    // before the very first manifest record — returned ONCE (marks manifest_started_),
+    // empty on every later call. Each manifest-append site co_awaits an append of these
+    // bytes first. Best-effort: an io-fault on the header leaves the record as a bare
+    // kManMagic record, read via the headerless recovery path.
+    [[nodiscard]] std::optional<std::vector<std::byte>> take_manifest_header() {
+        if (manifest_started_) {
+            return std::nullopt;
+        }
+        manifest_started_ = true;
+        std::vector<std::byte> hdr;
+        format::put_stream_header(hdr, kManStreamMagic, format::kManifestVersion);
+        return hdr;
+    }
+
     // Dereference a vlog-pointer (the encoded VlogPtr held as `ptr_bytes`) against
     // its generation's vlog disk. Reads ONLY the pointed-at record window and CRC-
     // verifies it; returns ∅ (never garbage) on a bad pointer / torn / missing
@@ -1133,6 +1148,12 @@ private:
         mr.min_seq = built.min_seq;
         mr.max_seq = built.max_seq;
         const std::vector<std::byte> mbytes = encode_manifest(mr);
+        // W2: write the one-time manifest stream header before the first record.
+        if (auto mh = take_manifest_header()) {
+            Offset mhoff = 0;
+            (void)co_await manifest_disk_->append(
+                std::span<const std::byte>(mh->data(), mh->size()), mhoff);
+        }
         Offset moff = 0;
         const Error me = co_await manifest_disk_->append(
             std::span<const std::byte>(mbytes.data(), mbytes.size()), moff);
@@ -1250,6 +1271,12 @@ private:
         mr.min_seq = built.min_seq;
         mr.max_seq = built.max_seq;
         const std::vector<std::byte> mbytes = encode_manifest(mr);
+        // W2: write the one-time manifest stream header before the first record.
+        if (auto mh = take_manifest_header()) {
+            Offset mhoff = 0;
+            (void)co_await manifest_disk_->append(
+                std::span<const std::byte>(mh->data(), mh->size()), mhoff);
+        }
         Offset moff = 0;
         const Error me = co_await manifest_disk_->append(
             std::span<const std::byte>(mbytes.data(), mbytes.size()), moff);
@@ -1389,6 +1416,12 @@ private:
         for (std::uint64_t oid : input_ids) {
             const std::vector<std::byte> ob =
                 encode_manifest_obsolete(++manifest_tip_, oid);
+            // W2: write the one-time manifest stream header before the first record.
+            if (auto mh = take_manifest_header()) {
+                Offset mhoff = 0;
+                (void)co_await manifest_disk_->append(
+                    std::span<const std::byte>(mh->data(), mh->size()), mhoff);
+            }
             Offset ooff = 0;
             const Error oe = co_await manifest_disk_->append(
                 std::span<const std::byte>(ob.data(), ob.size()), ooff);
@@ -1419,6 +1452,12 @@ private:
         if (covered_max > wal_trunc_seq_ && !mem_.any_resident()) {
             const std::vector<std::byte> tr =
                 encode_manifest_wal_trunc(++manifest_tip_, covered_max);
+            // W2: write the one-time manifest stream header before the first record.
+            if (auto mh = take_manifest_header()) {
+                Offset mhoff = 0;
+                (void)co_await manifest_disk_->append(
+                    std::span<const std::byte>(mh->data(), mh->size()), mhoff);
+            }
             Offset toff = 0;
             const Error te = co_await manifest_disk_->append(
                 std::span<const std::byte>(tr.data(), tr.size()), toff);
@@ -1513,7 +1552,24 @@ private:
             const Error mre =
                 co_await manifest_disk_->read(0, std::span<std::byte>(man.data(), man.size()));
             if (mre.ok()) {
+                // W2: a non-empty manifest means the header was written; a fresh
+                // record after recovery must not re-write it.
+                manifest_started_ = man.size() > 0;
                 std::size_t mpos = 0;
+                // W2: consume the optional one-time manifest stream header. A stream
+                // starting with kManStreamMagic is validated (unknown/future version →
+                // refuse: fold NOTHING, keep the WAL prefix — like a manifest read
+                // fault); a bare kManMagic manifest is folded from offset 0.
+                if (man.size() >= format::kStreamHeaderBytes &&
+                    get_u32(man.data()) == kManStreamMagic) {
+                    if (!format::check_stream_header(
+                            std::span<const std::byte>(man.data(), man.size()),
+                            kManStreamMagic, format::kManifestVersion)) {
+                        mpos = man.size();  // unknown version → fold no records.
+                    } else {
+                        mpos = format::kStreamHeaderBytes;
+                    }
+                }
                 std::uint64_t expect_entry = 1;
                 while (mpos < man.size()) {
                     const ManifestDecode md = decode_manifest(man, mpos);
@@ -1718,6 +1774,7 @@ private:
     std::vector<std::unique_ptr<SSTableReader>> sstables_;  // install order (old→new)
     std::uint64_t next_sstable_id_ = 0;       // next SSTable backing id
     std::uint64_t manifest_tip_ = 0;          // last committed manifest entry_no
+    bool manifest_started_ = false;           // W2: one-time manifest stream header written?
 
     // ---- compaction (C3.4) + GC (V-GC) + WAL-truncation state -------------
     std::size_t compaction_trigger_ = 0;      // live SSTable count to compact at (0=off)

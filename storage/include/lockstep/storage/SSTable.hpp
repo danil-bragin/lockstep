@@ -130,6 +130,11 @@ inline constexpr std::uint32_t kManMagic = 0x4C4D414Eu;   // 'LMAN' (manifest IN
 //     (the WAL prefix below it is reclaimable). A monotonic high-water mark.
 inline constexpr std::uint32_t kManObsoleteMagic = 0x4D42534Fu;  // 'OSBM' obsolete
 inline constexpr std::uint32_t kManWalTruncMagic = 0x4D52544Cu;  // 'LTRM' wal-trunc
+// W2: OPTIONAL one-time manifest STREAM HEADER at offset 0: [u32 kManStreamMagic]
+// [u32 version]. Distinct from every record magic so recovery self-identifies it and
+// skips it before the record fold (fail-closed on an unknown version); a headerless
+// (kManMagic-leading) manifest reads from offset 0 (backward-compatible).
+inline constexpr std::uint32_t kManStreamMagic = 0x4D4E5453u;  // 'MNTS' (manifest stream)
 inline constexpr std::size_t kSstFooterBytes = 52;        // see FOOTER layout (W2: +u32 version)
 inline constexpr std::size_t kBlockCrcBytes = 4;
 inline constexpr std::size_t kSstTargetBlockBytes = 256;  // small ⇒ many blocks
