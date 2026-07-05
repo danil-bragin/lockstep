@@ -1811,6 +1811,128 @@ private:
         return std::nullopt;
     }
 
+    // W9 (information_schema): materialize an ephemeral table with an EXPLICIT typed schema
+    // and pre-built rows (unlike materialize_select, which infers the schema from result
+    // rows and cannot represent an empty relation). Used to synthesize system catalogs so a
+    // plain SELECT (with its WHERE / projection / joins) runs over them via the normal path.
+    std::optional<std::string> materialize_typed(
+        const std::string& name,
+        const std::vector<std::pair<std::string, Type>>& cols,
+        const std::vector<std::vector<Datum>>& rows) {
+        if (catalog_.find(name) != nullptr) {
+            return std::string("system relation name '" + name + "' clashes with a table");
+        }
+        Table t;
+        t.name = name;
+        Column pk;  // hidden synthetic identity (as in materialize_select)
+        pk.name = "_ctid";
+        pk.type = Type::Int;
+        pk.auto_increment = true;
+        pk.nullable = false;
+        pk.dropped = true;
+        t.columns.push_back(pk);
+        t.pk_index = 0;
+        for (const auto& c : cols) {
+            Column col;
+            col.name = c.first;
+            col.type = c.second;
+            col.nullable = true;
+            t.columns.push_back(std::move(col));
+        }
+        t.col_stats.assign(t.columns.size(), Table::ColStat{});
+        (void)catalog_.create(std::move(t));
+        persist_schema(name);
+        Table* mt = catalog_.find_mut(name);
+        std::int64_t auto_id = 1;
+        std::vector<std::pair<Key, Value>> writes;
+        for (const auto& r : rows) {
+            std::vector<Datum> row(mt->columns.size());
+            row[0] = Datum::make_int(auto_id++);
+            for (std::size_t k = 0; k < cols.size(); ++k) row[k + 1] = r[k];
+            emit_row_writes(*mt, row, writes);
+        }
+        commit_writes(writes);
+        mt->next_auto_id = auto_id;
+        persist_schema(name);
+        return std::nullopt;
+    }
+
+    // W9: SQL data-type name for a column (information_schema.columns.data_type).
+    [[nodiscard]] static std::string sql_data_type_name(const Column& c) {
+        switch (c.logical) {
+            case 1: return "numeric";
+            case 2: return "date";
+            case 3: return "timestamp";
+            default: return c.type == Type::Text ? "text" : "integer";
+        }
+    }
+
+    // W9: split a (possibly schema-qualified) catalog name into (schema, table). A bare name
+    // defaults to the "public" schema, matching the PostgreSQL default search path.
+    [[nodiscard]] static std::pair<std::string, std::string> split_schema(const std::string& qn) {
+        const auto dot = qn.find('.');
+        if (dot == std::string::npos) return {"public", qn};
+        return {qn.substr(0, dot), qn.substr(dot + 1)};
+    }
+
+    // W9: recognise a system relation name (lower-cased) that SELECT synthesises on the fly.
+    [[nodiscard]] static bool is_system_relation(const std::string& lower_name) {
+        return lower_name == "information_schema.tables" ||
+               lower_name == "information_schema.columns";
+    }
+
+    // W9: build the (columns, rows) of a synthesised system relation from the live catalog.
+    // Both relations are all-TEXT except columns.ordinal_position (INT). The ephemeral table
+    // itself (materialised under an alias for the current query) is skipped so it never lists
+    // itself. Deterministic: catalog_.all() / all_views() iterate in name order (std::map).
+    [[nodiscard]] std::pair<std::vector<std::pair<std::string, Type>>,
+                            std::vector<std::vector<Datum>>>
+    build_system_relation(const std::string& lower_name) {
+        std::vector<std::pair<std::string, Type>> cols;
+        std::vector<std::vector<Datum>> rows;
+        auto is_ephemeral = [](const std::string& n) {
+            // Skip the transient system/materialisation tables (names carrying a dot that are
+            // system relations, or synthetic aliases) is overkill; only hide info_schema itself.
+            return n.rfind("information_schema.", 0) == 0;
+        };
+        if (lower_name == "information_schema.tables") {
+            cols = {{"table_catalog", Type::Text}, {"table_schema", Type::Text},
+                    {"table_name", Type::Text}, {"table_type", Type::Text}};
+            for (const auto& [qn, t] : catalog_.all()) {
+                (void)t;
+                if (is_ephemeral(qn)) continue;
+                const auto [sch, nm] = split_schema(qn);
+                rows.push_back({Datum::make_text("lockstep"), Datum::make_text(sch),
+                                Datum::make_text(nm), Datum::make_text("BASE TABLE")});
+            }
+            for (const auto& [qn, v] : catalog_.all_views()) {
+                (void)v;
+                const auto [sch, nm] = split_schema(qn);
+                rows.push_back({Datum::make_text("lockstep"), Datum::make_text(sch),
+                                Datum::make_text(nm), Datum::make_text("VIEW")});
+            }
+        } else {  // information_schema.columns
+            cols = {{"table_catalog", Type::Text}, {"table_schema", Type::Text},
+                    {"table_name", Type::Text}, {"column_name", Type::Text},
+                    {"ordinal_position", Type::Int}, {"data_type", Type::Text},
+                    {"is_nullable", Type::Text}};
+            for (const auto& [qn, t] : catalog_.all()) {
+                if (is_ephemeral(qn)) continue;
+                const auto [sch, nm] = split_schema(qn);
+                std::int64_t ord = 0;
+                for (const Column& c : t.columns) {
+                    if (c.dropped) continue;  // hidden synthetic PK / dropped columns
+                    ++ord;
+                    rows.push_back({Datum::make_text("lockstep"), Datum::make_text(sch),
+                                    Datum::make_text(nm), Datum::make_text(c.name),
+                                    Datum::make_int(ord), Datum::make_text(sql_data_type_name(c)),
+                                    Datum::make_text(c.nullable ? "YES" : "NO")});
+                }
+            }
+        }
+        return {std::move(cols), std::move(rows)};
+    }
+
     // H1: apply a view's explicit output-column list to its just-materialized ephemeral table. Renames
     // the VISIBLE columns (the hidden synthetic `_ctid` PK is skipped) in order; the name count must
     // match the query's output arity. In-memory only (the table is dropped after the query). Returns
@@ -6145,7 +6267,22 @@ private:
             view_idx.push_back(i);
             view_body.push_back(std::make_shared<SelectStmt>(pr.stmt().select));
         }
-        if (!sel.ctes.empty() || has_derived || !view_idx.empty()) {
+        // W9: FROM entries naming a system relation (information_schema.tables / .columns) are
+        // synthesised from the live catalog into an ephemeral table, then read via the normal
+        // path (so WHERE / projection / joins all work). A real table of the same name wins.
+        std::vector<std::size_t> sys_idx;
+        std::vector<std::string> sys_name;  // lower-cased relation name, parallel to sys_idx
+        for (std::size_t i = 0; i < sel.from.size(); ++i) {
+            const JoinEntry& je = sel.from[i];
+            if (je.subquery || catalog_.find(je.table) != nullptr) continue;
+            std::string low;
+            low.reserve(je.table.size());
+            for (char c : je.table) low.push_back((c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c);
+            if (!is_system_relation(low)) continue;
+            sys_idx.push_back(i);
+            sys_name.push_back(low);
+        }
+        if (!sel.ctes.empty() || has_derived || !view_idx.empty() || !sys_idx.empty()) {
             std::vector<std::string> created;
             auto materialize = [&](const std::string& nm, const SelectStmt& sub) -> ExecResult {
                 if (catalog_.find(nm) != nullptr) {
@@ -6179,6 +6316,21 @@ private:
                     }
                 }
             }
+            // W9: system relations (synthesised from the catalog) — materialise each under its
+            // binding alias, exactly like a view, then the rewrite below points the ref at it.
+            for (std::size_t k = 0; k < sys_idx.size(); ++k) {
+                const JoinEntry& je = sel.from[sys_idx[k]];
+                if (catalog_.find(je.alias) != nullptr) {
+                    drop_materialized(created);
+                    return ExecResult::failure("alias '" + je.alias + "' clashes with a table");
+                }
+                auto [scols, srows] = build_system_relation(sys_name[k]);
+                if (auto e = materialize_typed(je.alias, scols, srows)) {
+                    drop_materialized(created);
+                    return ExecResult::failure(*e);
+                }
+                created.push_back(je.alias);
+            }
             for (const auto& [name, sub] : sel.ctes) {       // CTEs next (derived may read them)
                 if (const ExecResult m = materialize(name, *sub); !m.ok) return m;
             }
@@ -6192,6 +6344,10 @@ private:
             for (JoinEntry& je : body.from) je.subquery.reset();  // now plain table refs (== alias)
             for (std::size_t idx : view_idx) {                // a view ref now resolves to its ephemeral
                 body.from[idx].table = body.from[idx].alias;  // table (named by the alias)
+                if (body.table == sel.from[idx].table) body.table = body.from[idx].alias;
+            }
+            for (std::size_t idx : sys_idx) {                 // W9: system-relation ref -> ephemeral table
+                body.from[idx].table = body.from[idx].alias;
                 if (body.table == sel.from[idx].table) body.table = body.from[idx].alias;
             }
             const ExecResult r = exec_select(body);
