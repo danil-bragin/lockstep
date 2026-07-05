@@ -7314,6 +7314,100 @@ private:
             out = a.empty() ? Datum::make_null(Type::Int) : Datum::make_null(a.back().type);
             return std::nullopt;
         }
+        // W9 extra scalar functions (pure, deterministic). NULLIF / GREATEST / LEAST follow
+        // PostgreSQL NULL semantics; the numeric ones require INT args, the string ones TEXT.
+        if (f == "NULLIF") {
+            if (!need(2)) return "NULLIF takes two arguments";
+            if (!a[0].is_null && !a[1].is_null && a[0] == a[1]) {
+                out = Datum::make_null(a[0].type);
+            } else {
+                out = a[0];
+            }
+            return std::nullopt;
+        }
+        if (f == "GREATEST" || f == "LEAST") {
+            const bool want_max = (f == "GREATEST");
+            bool have = false;
+            Datum best;
+            for (const Datum& d : a) {
+                if (d.is_null) continue;  // PG: NULLs are ignored
+                if (!have) { best = d; have = true; continue; }
+                const bool d_wins = want_max ? best.less_than(d) : d.less_than(best);
+                if (d_wins) best = d;
+            }
+            out = have ? best : Datum::make_null(a.empty() ? Type::Int : a.back().type);
+            return std::nullopt;
+        }
+        if (f == "MOD") {
+            if (!need(2)) return "MOD takes two arguments";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (a[0].type != Type::Int || a[1].type != Type::Int) return "MOD requires INT arguments";
+            if (a[1].i == 0) return "MOD by zero";
+            out = Datum::make_int(a[0].i % a[1].i);
+            return std::nullopt;
+        }
+        if (f == "SIGN") {
+            if (!need(1)) return "SIGN takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (a[0].type != Type::Int) return "SIGN requires an INT argument";
+            out = Datum::make_int(a[0].i > 0 ? 1 : (a[0].i < 0 ? -1 : 0));
+            return std::nullopt;
+        }
+        if (f == "REVERSE") {
+            if (!need(1)) return "REVERSE takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text) return "REVERSE requires a TEXT argument";
+            std::string s = a[0].s;
+            std::reverse(s.begin(), s.end());
+            out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        if (f == "REPEAT") {
+            if (!need(2)) return "REPEAT takes two arguments";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text || a[1].type != Type::Int) return "REPEAT requires (TEXT, INT)";
+            std::string s;
+            for (std::int64_t k = 0; k < a[1].i && k < 1'000'000; ++k) s += a[0].s;
+            out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        if (f == "LEFT" || f == "RIGHT") {
+            if (!need(2)) return f + " takes two arguments";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text || a[1].type != Type::Int) return f + " requires (TEXT, INT)";
+            const std::string& s = a[0].s;
+            const std::int64_t n = a[1].i;
+            std::string res;
+            if (n > 0) {
+                const std::size_t take = std::min<std::size_t>(static_cast<std::size_t>(n), s.size());
+                res = (f == "LEFT") ? s.substr(0, take) : s.substr(s.size() - take);
+            }  // n <= 0 -> empty (PG semantics for the simple case)
+            out = Datum::make_text(std::move(res));
+            return std::nullopt;
+        }
+        if (f == "LTRIM" || f == "RTRIM") {
+            if (!need(1)) return f + " takes one argument";
+            if (a[0].is_null) { out = Datum::make_null(Type::Text); return std::nullopt; }
+            if (a[0].type != Type::Text) return f + " requires a TEXT argument";
+            std::string s = a[0].s;
+            if (f == "LTRIM") {
+                std::size_t i = 0;
+                while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+                s.erase(0, i);
+            } else {
+                while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            }
+            out = Datum::make_text(std::move(s));
+            return std::nullopt;
+        }
+        if (f == "STRPOS" || f == "POSITION") {
+            if (!need(2)) return f + " takes two arguments";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (a[0].type != Type::Text || a[1].type != Type::Text) return f + " requires TEXT arguments";
+            const auto pos = a[0].s.find(a[1].s);
+            out = Datum::make_int(pos == std::string::npos ? 0 : static_cast<std::int64_t>(pos + 1));
+            return std::nullopt;
+        }
         if (f == "ABS") {
             if (!need(1)) return "ABS takes one argument";
             if (a[0].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
