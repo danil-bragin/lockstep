@@ -144,6 +144,20 @@ int main() {
         check(has(col_texts(rt, "relkind"), "r"), "(H) pg_class reports a table as relkind 'r'");
     }
 
+    // (I) constraint_column_usage names the referenced table/column of a FOREIGN KEY.
+    {
+        e.exec("CREATE TABLE line_items (li_id INT, order_id INT REFERENCES orders(oid), "
+               "PRIMARY KEY (li_id))");
+        const ExecResult r = e.exec(
+            "SELECT table_name, column_name, constraint_name "
+            "FROM information_schema.constraint_column_usage "
+            "WHERE constraint_name = 'line_items_order_id_fkey'");
+        check(has(col_texts(r, "table_name"), "orders"),
+              "(I) FK references table 'orders'");
+        check(has(col_texts(r, "column_name"), "oid"),
+              "(I) FK references column 'oid'");
+    }
+
     if (g_fail != 0) {
         std::printf("sql_information_schema_test: FAILURES\n");
         return 1;

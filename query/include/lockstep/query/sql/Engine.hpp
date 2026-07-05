@@ -1883,6 +1883,7 @@ private:
                lower_name == "information_schema.schemata" ||
                lower_name == "information_schema.table_constraints" ||
                lower_name == "information_schema.key_column_usage" ||
+               lower_name == "information_schema.constraint_column_usage" ||
                lower_name == "pg_catalog.pg_tables" ||
                lower_name == "pg_tables" ||
                lower_name == "pg_catalog.pg_namespace" ||
@@ -1972,6 +1973,24 @@ private:
                     if (c.dropped) continue;
                     if (c.unique) emit(nm + "_" + c.name + "_key", "UNIQUE");
                     if (!c.fk_table.empty()) emit(nm + "_" + c.name + "_fkey", "FOREIGN KEY");
+                }
+            }
+        } else if (lower_name == "information_schema.constraint_column_usage") {
+            // For a FOREIGN KEY, names the REFERENCED table + column (what the FK points at) —
+            // ORMs read this to resolve relationships. Keyed by the child's FK constraint name.
+            cols = {{"table_catalog", Type::Text}, {"table_schema", Type::Text},
+                    {"table_name", Type::Text}, {"column_name", Type::Text},
+                    {"constraint_name", Type::Text}};
+            for (const auto& [qn, t] : catalog_.all()) {
+                if (is_ephemeral(qn)) continue;
+                const auto [sch, nm] = split_schema(qn);
+                for (const Column& c : t.columns) {
+                    if (c.dropped || c.fk_table.empty()) continue;
+                    const auto [rsch, rnm] = split_schema(c.fk_table);
+                    const std::string refcol = c.fk_column.empty() ? std::string("id") : c.fk_column;
+                    rows.push_back({Datum::make_text("lockstep"), Datum::make_text(rsch),
+                                    Datum::make_text(rnm), Datum::make_text(refcol),
+                                    Datum::make_text(nm + "_" + c.name + "_fkey")});
                 }
             }
         } else if (lower_name == "information_schema.key_column_usage") {
