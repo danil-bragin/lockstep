@@ -4853,9 +4853,8 @@ private:
         bool has_i128_agg = false;
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
-                if (item.agg.kind == AggKind::ArrayAgg || item.agg.kind == AggKind::JsonAgg ||
-                    item.agg.kind == AggKind::StringAgg)
-                    return std::nullopt;  // F12 / JSON_AGG / STRING_AGG: row-AoS only
+                if (item.agg.kind >= AggKind::ArrayAgg)
+                    return std::nullopt;  // ARRAY/JSON/STRING_AGG + BOOL_*/BIT_*: row-AoS only
                 if (const auto idx = t.column_index(item.agg.column))
                     if (t.columns[*idx].logical >= 5) has_i128_agg = true;  // 5/6 only reach here (13 bailed)
             }
@@ -9288,9 +9287,8 @@ private:
             return std::string("SUM/AVG requires a numeric column (got TEXT column '" +
                                a.column + "')");
         }
-        if (a.kind == AggKind::ArrayAgg || a.kind == AggKind::JsonAgg ||
-            a.kind == AggKind::StringAgg)
-            return std::string("ARRAY_AGG / JSON_AGG / STRING_AGG are not supported in a join yet");
+        if (a.kind >= AggKind::ArrayAgg)  // ARRAY/JSON/STRING_AGG + BOOL_*/BIT_*
+            return std::string("collecting/bitwise aggregates are not supported in a join yet");
         return std::nullopt;
     }
 
@@ -11177,6 +11175,25 @@ private:
             if (!d.is_null) {
                 present.push_back(&d);
             }
+        }
+        // BOOL_AND / BOOL_OR / BIT_AND / BIT_OR — fold the non-NULL INT values (0 = false);
+        // an all-NULL / empty group yields SQL NULL (PostgreSQL semantics).
+        if (a.kind == AggKind::BoolAnd || a.kind == AggKind::BoolOr ||
+            a.kind == AggKind::BitAnd || a.kind == AggKind::BitOr) {
+            if (ty != Type::Int) return std::string("BOOL_*/BIT_* aggregate requires an INT column");
+            if (present.empty()) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            std::int64_t acc = (a.kind == AggKind::BitAnd || a.kind == AggKind::BoolAnd) ? ~0LL : 0LL;
+            bool ba = true, bo = false;
+            for (const Datum* p : present) {
+                acc = (a.kind == AggKind::BitAnd) ? (acc & p->i)
+                    : (a.kind == AggKind::BitOr)  ? (acc | p->i)
+                                                  : acc;
+                if (p->i == 0) ba = false; else bo = true;
+            }
+            if (a.kind == AggKind::BoolAnd) out = Datum::make_int(ba ? 1 : 0);
+            else if (a.kind == AggKind::BoolOr) out = Datum::make_int(bo ? 1 : 0);
+            else out = Datum::make_int(acc);
+            return std::nullopt;
         }
         // C1: COUNT/SUM/AVG(DISTINCT col) — keep only the FIRST occurrence of each distinct value
         // (deterministic: dedup by the order-preserving value encoding). COUNT(DISTINCT) then counts

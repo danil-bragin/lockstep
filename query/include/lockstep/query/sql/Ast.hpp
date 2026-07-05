@@ -169,6 +169,10 @@ enum class AggKind : std::uint8_t {
     ArrayAgg = 6,   // F12: ARRAY_AGG(col) — collect the group's values (in scan order) into an array
     JsonAgg = 7,    // JSON_AGG(col) — collect the group's values into a JSON array (canonical text)
     StringAgg = 8,  // STRING_AGG(col, delim) / GROUP_CONCAT — join the group's non-NULL values
+    BoolAnd = 9,    // BOOL_AND(col) — 1 iff every non-NULL value is nonzero (else 0)
+    BoolOr = 10,    // BOOL_OR(col)  — 1 iff any non-NULL value is nonzero
+    BitAnd = 11,    // BIT_AND(col)  — bitwise AND of the non-NULL INT values
+    BitOr = 12,     // BIT_OR(col)   — bitwise OR of the non-NULL INT values
 };
 
 // One aggregate expression: a kind + (for non-CountStar) the target column name.

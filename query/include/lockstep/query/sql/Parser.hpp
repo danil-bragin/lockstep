@@ -1718,6 +1718,14 @@ private:
             kind = AggKind::JsonAgg;
         } else if (fn == "string_agg" || fn == "group_concat") {
             kind = AggKind::StringAgg;
+        } else if (fn == "bool_and") {
+            kind = AggKind::BoolAnd;
+        } else if (fn == "bool_or") {
+            kind = AggKind::BoolOr;
+        } else if (fn == "bit_and") {
+            kind = AggKind::BitAnd;
+        } else if (fn == "bit_or") {
+            kind = AggKind::BitOr;
         } else {
             return std::nullopt;  // not an aggregate name
         }
