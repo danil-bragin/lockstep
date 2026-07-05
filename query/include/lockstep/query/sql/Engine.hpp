@@ -4853,8 +4853,9 @@ private:
         bool has_i128_agg = false;
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Aggregate && item.agg.kind != AggKind::CountStar) {
-                if (item.agg.kind == AggKind::ArrayAgg || item.agg.kind == AggKind::JsonAgg)
-                    return std::nullopt;  // F12 / JSON_AGG: row-AoS only
+                if (item.agg.kind == AggKind::ArrayAgg || item.agg.kind == AggKind::JsonAgg ||
+                    item.agg.kind == AggKind::StringAgg)
+                    return std::nullopt;  // F12 / JSON_AGG / STRING_AGG: row-AoS only
                 if (const auto idx = t.column_index(item.agg.column))
                     if (t.columns[*idx].logical >= 5) has_i128_agg = true;  // 5/6 only reach here (13 bailed)
             }
@@ -9256,8 +9257,9 @@ private:
             return std::string("SUM/AVG requires a numeric column (got TEXT column '" +
                                a.column + "')");
         }
-        if (a.kind == AggKind::ArrayAgg || a.kind == AggKind::JsonAgg)
-            return std::string("ARRAY_AGG / JSON_AGG are not supported in a join yet");
+        if (a.kind == AggKind::ArrayAgg || a.kind == AggKind::JsonAgg ||
+            a.kind == AggKind::StringAgg)
+            return std::string("ARRAY_AGG / JSON_AGG / STRING_AGG are not supported in a join yet");
         return std::nullopt;
     }
 
@@ -11119,6 +11121,22 @@ private:
             json::serialize(v, canon);
             out = Datum::make_text(std::move(canon));
             out.logical = 11;  // JSON
+            return std::nullopt;
+        }
+        // STRING_AGG / GROUP_CONCAT — join the group's non-NULL values (scan order) with the
+        // separator. Each value is rendered like a projected cell. NULLs are skipped (PG);
+        // an all-NULL/empty group yields SQL NULL (like the other value-collecting aggregates).
+        if (a.kind == AggKind::StringAgg) {
+            std::string s;
+            bool any = false;
+            for (const auto* rp : grp.rows) {
+                const Datum& d = (*rp)[ci];
+                if (d.is_null) continue;
+                if (any) s += a.delim;
+                s += (d.type == Type::Text ? d.s : d.render());
+                any = true;
+            }
+            out = any ? Datum::make_text(std::move(s)) : Datum::make_null(Type::Text);
             return std::nullopt;
         }
         // Collect the PRESENT (non-NULL) values of the aggregated column.

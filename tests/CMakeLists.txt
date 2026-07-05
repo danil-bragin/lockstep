@@ -1432,6 +1432,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_cancel_test COMMAND lockstep_sql_cancel_test)
 
+  # sql_string_agg_test: STRING_AGG(col, delim) / GROUP_CONCAT aggregate.
+  add_executable(lockstep_sql_string_agg_test sql_string_agg_test.cpp)
+  target_include_directories(lockstep_sql_string_agg_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_string_agg_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_string_agg_test COMMAND lockstep_sql_string_agg_test)
+
   # sql_distinct_agg_test (C1): COUNT/SUM/AVG(DISTINCT col), grouped + ungrouped, row + columnar.
   add_executable(lockstep_sql_distinct_agg_test sql_distinct_agg_test.cpp)
   target_include_directories(lockstep_sql_distinct_agg_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -1716,6 +1716,8 @@ private:
             kind = AggKind::ArrayAgg;  // F12
         } else if (fn == "json_agg") {
             kind = AggKind::JsonAgg;
+        } else if (fn == "string_agg" || fn == "group_concat") {
+            kind = AggKind::StringAgg;
         } else {
             return std::nullopt;  // not an aggregate name
         }
@@ -1766,6 +1768,14 @@ private:
             agg.qualifier = qual;
             agg.column = col;
             agg.distinct = distinct;
+            // STRING_AGG(col, 'delim') — an optional string-literal separator (default ",").
+            if (kind == AggKind::StringAgg && cur_.kind == Tok::Comma) {
+                advance();
+                Datum d;
+                if (auto e = expect_literal(d)) return e;
+                if (d.type != Type::Text) return make_err("STRING_AGG separator must be a string");
+                agg.delim = d.s;
+            }
             const std::string body = (qual.empty() ? col : qual + "." + col);
             label = upper(fn) + "(" + (distinct ? "DISTINCT " : "") + body + ")";
         }

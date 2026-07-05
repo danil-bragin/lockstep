@@ -168,6 +168,7 @@ enum class AggKind : std::uint8_t {
     Avg = 5,        // AVG(col) — INT truncation toward zero (documented; see Engine)
     ArrayAgg = 6,   // F12: ARRAY_AGG(col) — collect the group's values (in scan order) into an array
     JsonAgg = 7,    // JSON_AGG(col) — collect the group's values into a JSON array (canonical text)
+    StringAgg = 8,  // STRING_AGG(col, delim) / GROUP_CONCAT — join the group's non-NULL values
 };
 
 // One aggregate expression: a kind + (for non-CountStar) the target column name.
@@ -178,6 +179,7 @@ struct AggExpr {
     std::string qualifier;  // v3: optional table/alias qualifier ("" == unqualified)
     std::string column;     // empty for COUNT(*)
     bool distinct = false;  // C1: COUNT/SUM/AVG(DISTINCT col) — dedup values per group first
+    std::string delim = ",";  // STRING_AGG separator (default "," for GROUP_CONCAT)
 };
 
 // Forward declaration: a subquery node carries a nested SELECT (defined below). It is
