@@ -2108,6 +2108,27 @@ private:
                 advance();
                 auto n = mk_expr(ExprKind::Func);
                 n->func = upper(name);
+                // W9: EXTRACT(field FROM expr) — SQL-standard syntax, rewritten to the
+                // DATE_PART('field', expr) function that evaluates it.
+                if (n->func == "EXTRACT") {
+                    if (cur_.kind != Tok::Ident) {
+                        return make_err("expected a field name after EXTRACT(");
+                    }
+                    const std::string field = lower(cur_.text);
+                    advance();
+                    if (!is_kw("from")) return make_err("expected FROM in EXTRACT(field FROM ...)");
+                    advance();
+                    std::shared_ptr<Expr> val;
+                    if (auto e = parse_scalar_expr(val)) return e;
+                    if (auto e = expect(Tok::RParen, "')' to close EXTRACT")) return e;
+                    auto litf = mk_expr(ExprKind::Lit);
+                    litf->lit = Datum::make_text(field);
+                    n->func = "DATE_PART";
+                    n->args.push_back(litf);
+                    n->args.push_back(val);
+                    out = n;
+                    return std::nullopt;
+                }
                 if (cur_.kind != Tok::RParen) {
                     for (;;) {
                         std::shared_ptr<Expr> a;

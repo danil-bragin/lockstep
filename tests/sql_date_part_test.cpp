@@ -58,6 +58,14 @@ int main() {
     check(tpart("minute") == 45, "TIMESTAMP minute = 45");
     check(tpart("second") == 9, "TIMESTAMP second = 9");
 
+    // EXTRACT(field FROM expr) — SQL-standard syntax, same result as DATE_PART.
+    check(e.exec("SELECT EXTRACT(YEAR FROM d) FROM ev WHERE id = 1").rows[0].cells[0].second.i == 2026,
+          "EXTRACT(YEAR FROM date) = 2026");
+    check(e.exec("SELECT EXTRACT(HOUR FROM ts) FROM ev WHERE id = 1").rows[0].cells[0].second.i == 13,
+          "EXTRACT(HOUR FROM timestamp) = 13");
+    check(e.exec("SELECT EXTRACT(dow FROM d) FROM ev WHERE id = 1").rows[0].cells[0].second.i == 6,
+          "EXTRACT(dow FROM date) = 6");
+
     // Bad field is an error; a non-date argument is an error.
     check(!e.exec("SELECT DATE_PART('century', d) FROM ev WHERE id = 1").ok,
           "unknown DATE_PART field errors");
