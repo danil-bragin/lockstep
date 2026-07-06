@@ -2579,6 +2579,36 @@ private:
                     break;
                 }
                 if (auto e = expect(Tok::RParen, "')' to close GROUPING SETS")) return e;
+            } else if (is_kw("rollup") || is_kw("cube")) {
+                // GROUP BY ROLLUP(a,b,..) / CUBE(a,b,..) — expand into equivalent grouping sets.
+                const bool is_cube = is_kw("cube");
+                advance();
+                if (auto e = expect(Tok::LParen, "'(' after ROLLUP/CUBE")) return e;
+                std::vector<std::string> cols;
+                for (;;) {
+                    std::string q, c;
+                    if (auto e = expect_qualified_column("a column in ROLLUP/CUBE", q, c)) return e;
+                    cols.push_back(q.empty() ? c : q + "." + c);
+                    if (cur_.kind == Tok::Comma) { advance(); continue; }
+                    break;
+                }
+                if (auto e = expect(Tok::RParen, "')' to close ROLLUP/CUBE")) return e;
+                const std::size_t n = cols.size();
+                if (is_cube) {
+                    // Power set, from the full set down to the empty set (deterministic order).
+                    for (std::size_t mask = (std::size_t{1} << n); mask-- > 0;) {
+                        std::vector<std::string> set;
+                        for (std::size_t k = 0; k < n; ++k)
+                            if (mask & (std::size_t{1} << k)) set.push_back(cols[k]);
+                        sel.grouping_sets.push_back(std::move(set));
+                    }
+                } else {
+                    // Prefixes: (a,b,c), (a,b), (a), ().
+                    for (std::size_t k = n + 1; k-- > 0;) {
+                        sel.grouping_sets.push_back(
+                            std::vector<std::string>(cols.begin(), cols.begin() + k));
+                    }
+                }
             } else
             for (;;) {
                 // v3: a GROUP BY column may be qualified (table.col); we store the

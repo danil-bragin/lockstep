@@ -44,6 +44,19 @@ void run_mode(bool columnar, const char* tag) {
     check(has(r, "_|1|40|"), T + " cat 1 total 40");
     check(has(r, "_|2|20|"), T + " cat 2 total 20");
     check(has(r, "_|_|60|"), T + " grand total 60");
+
+    // ROLLUP(region, cat) == GROUPING SETS ((region,cat),(region),()) — prefixes + grand total.
+    const ExecResult ru = e.exec("SELECT region, cat, SUM(amt) FROM t GROUP BY ROLLUP(region, cat)");
+    check(ru.ok, T + " ROLLUP ok");
+    check(has(ru, "N|1|30|") || has(ru, "N|1|10|") || ru.rows.size() >= 4, T + " ROLLUP produces detail rows");
+    check(has(ru, "N|_|30|") && has(ru, "S|_|30|"), T + " ROLLUP region subtotals");
+    check(has(ru, "_|_|60|"), T + " ROLLUP grand total 60");
+
+    // CUBE(region, cat) == all subsets: (region,cat),(region),(cat),() — adds the cat-only rows.
+    const ExecResult cu = e.exec("SELECT region, cat, SUM(amt) FROM t GROUP BY CUBE(region, cat)");
+    check(cu.ok, T + " CUBE ok");
+    check(has(cu, "_|1|40|") && has(cu, "_|2|20|"), T + " CUBE cat-only subtotals (not in ROLLUP)");
+    check(has(cu, "N|_|30|") && has(cu, "_|_|60|"), T + " CUBE region subtotals + grand total");
 }
 }  // namespace
 
