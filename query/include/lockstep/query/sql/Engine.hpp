@@ -1952,9 +1952,13 @@ private:
         const ExecResult b = exec_select(base);
         if (!b.ok) return b.error;
         if (b.rows.empty()) return std::string("recursive CTE '" + name + "' has an empty base term");
-        // The CTE's column names are fixed by the base term (the recursive term maps by position).
-        std::vector<std::string> col_names;
-        for (const auto& cell : b.rows[0].cells) col_names.push_back(cell.first);
+        // The CTE's column names come from an explicit WITH cte(cols) list if given, else the base
+        // term (the recursive term maps by position either way).
+        std::vector<std::string> col_names = sub.cte_columns;
+        if (col_names.empty())
+            for (const auto& cell : b.rows[0].cells) col_names.push_back(cell.first);
+        else if (col_names.size() != b.rows[0].cells.size())
+            return std::string("recursive CTE '" + name + "' column list arity mismatch");
         std::vector<ResultRow> accumulated = b.rows, working = b.rows;
         std::set<std::string> seen;
         if (!all) for (const ResultRow& r : accumulated) seen.insert(row_key(r));
@@ -6866,6 +6870,12 @@ private:
                     continue;
                 }
                 if (const ExecResult m = materialize(name, *sub); !m.ok) return m;
+                if (!sub->cte_columns.empty()) {  // WITH cte(col, ...) explicit output names
+                    if (auto e = rename_materialized_columns(name, sub->cte_columns)) {
+                        drop_materialized(created);
+                        return ExecResult::failure(*e);
+                    }
+                }
             }
             for (const JoinEntry& je : sel.from) {           // then the derived tables
                 if (je.subquery) {

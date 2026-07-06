@@ -87,6 +87,25 @@ int main() {
                   "UNION ALL SELECT n+1 FROM x WHERE n < 3) SELECT n FROM x").ok,
           "(D) empty base term errors");
 
+    // (E) explicit CTE column list — WITH cte(col) AS (...) names the output.
+    {
+        const ExecResult r = e.exec(
+            "WITH RECURSIVE s(x) AS ("
+            "  SELECT n FROM seed"
+            "  UNION ALL"
+            "  SELECT x + 1 FROM s WHERE x < 4"      // references the renamed column 'x'
+            ") SELECT x FROM s ORDER BY x");
+        const auto v = ints(r);
+        check(r.ok && v == (std::vector<std::int64_t>{1, 2, 3, 4}),
+              "(E) recursive CTE column list names the self-ref column ('x')");
+    }
+    {
+        const ExecResult r = e.exec("WITH t(a, b) AS (SELECT n, n + 10 FROM seed) SELECT a, b FROM t");
+        check(r.ok && r.rows.size() == 1 && r.rows[0].cells[0].first == "a" &&
+                  r.rows[0].cells[1].first == "b" && r.rows[0].cells[1].second.i == 11,
+              "(E) non-recursive CTE column list (a, b) renames outputs");
+    }
+
     if (g_fail != 0) { std::printf("sql_recursive_cte_test: FAILURES\n"); return 1; }
     std::printf("sql_recursive_cte_test: ALL PASS\n");
     return 0;

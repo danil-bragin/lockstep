@@ -2355,6 +2355,18 @@ private:
             if (cur_.kind != Tok::Ident) return make_err("expected a CTE name after WITH");
             std::string name = cur_.text;
             advance();
+            std::vector<std::string> cte_cols;  // optional explicit output column names
+            if (cur_.kind == Tok::LParen) {
+                advance();
+                for (;;) {
+                    std::string c;
+                    if (auto e = expect_ident("a column name in the CTE column list", c)) return ParseResult{*e};
+                    cte_cols.push_back(std::move(c));
+                    if (cur_.kind == Tok::Comma) { advance(); continue; }
+                    break;
+                }
+                if (auto e = expect(Tok::RParen, "')' to close the CTE column list")) return ParseResult{*e};
+            }
             if (!is_kw("as")) return make_err("expected AS after the CTE name");
             advance();  // AS
             if (cur_.kind != Tok::LParen) return make_err("expected ( before the CTE body");
@@ -2365,6 +2377,7 @@ private:
             // A CTE body may carry a trailing set-op chain (e.g. a recursive `base UNION recursive`).
             if (auto e = parse_set_op_tail(*sub)) return ParseResult{*e};
             sub->recursive = recursive;
+            sub->cte_columns = std::move(cte_cols);
             if (cur_.kind != Tok::RParen) return make_err("expected ) to close the CTE body");
             advance();  // )
             ctes.emplace_back(std::move(name), std::move(sub));
