@@ -161,6 +161,8 @@ enum class OperandKind : std::uint8_t {
     Expr = 2,    // J1: a scalar expression LHS (e.g. a+b, doc->>'k', UPPER(x)) — evaluated per row
 };
 
+struct Predicate;  // defined below; AggExpr::filter holds one by shared_ptr (FILTER clause)
+
 enum class AggKind : std::uint8_t {
     CountStar = 0,  // COUNT(*)
     Count = 1,      // COUNT(col)
@@ -186,6 +188,7 @@ struct AggExpr {
     std::string column;     // empty for COUNT(*)
     bool distinct = false;  // C1: COUNT/SUM/AVG(DISTINCT col) — dedup values per group first
     std::string delim = ",";  // STRING_AGG separator (default "," for GROUP_CONCAT)
+    std::shared_ptr<Predicate> filter;  // agg(x) FILTER (WHERE ...) — only passing rows contribute
 };
 
 // Forward declaration: a subquery node carries a nested SELECT (defined below). It is

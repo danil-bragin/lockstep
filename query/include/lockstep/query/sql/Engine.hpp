@@ -4944,6 +4944,12 @@ private:
             // single-run clean-delta case (restored by compaction).
             return std::nullopt;
         }
+        // A per-aggregate FILTER (WHERE ...) needs the row-AoS fold (compute_agg applies it); the
+        // SoA fast path has no per-aggregate predicate, so bail to the generic path.
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Aggregate && item.agg.filter && item.agg.filter->present())
+                return std::nullopt;
+        }
         soa_overflow_ = false;  // K1: set if a 128-bit SoA SUM overflows => bail (the row path errors)
         std::vector<VecTerm> vterms;
         const bool has_filter = sel.filter.present();
@@ -9792,6 +9798,13 @@ private:
         }
         mark_pred(sel.filter);
         mark_pred(sel.having);
+        // A per-aggregate FILTER (WHERE ...) predicate references columns too — decode them.
+        for (const SelectItem& item : sel.items) {
+            if (item.kind == SelectItemKind::Aggregate && item.agg.filter && item.agg.filter->present()) {
+                if (has_expr_operand(*item.agg.filter)) return std::vector<bool>(t.columns.size(), true);
+                mark_pred(*item.agg.filter);
+            }
+        }
         // The PK is needed by ORDER BY's PK tie-break (apply_order_by) AND is cheap to
         // decode from the key; always include it so the deterministic tie-break holds.
         need[t.pk_index] = true;
@@ -11373,6 +11386,19 @@ private:
     [[nodiscard]] std::optional<std::string> compute_agg(const AggExpr& a,
                                                          const Table& t,
                                                          const Group& grp, Datum& out) {
+        // FILTER (WHERE ...): keep only the rows that pass, then aggregate them without the filter.
+        if (a.filter && a.filter->present()) {
+            Group fg;
+            for (const auto* rp : grp.rows) {
+                bool truth = false;
+                if (auto e = eval_pred(*a.filter, a.filter->root, t, *rp, /*group=*/nullptr, truth))
+                    return e;
+                if (truth) fg.rows.push_back(rp);
+            }
+            AggExpr nf = a;
+            nf.filter.reset();
+            return compute_agg(nf, t, fg, out);
+        }
         if (a.kind == AggKind::CountStar) {
             out = Datum::make_int(static_cast<std::int64_t>(grp.rows.size()));
             return std::nullopt;

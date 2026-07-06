@@ -1845,6 +1845,16 @@ private:
         if (auto e = expect(Tok::RParen, "')' to close the aggregate")) {
             return e;
         }
+        // FILTER (WHERE <predicate>) — only rows passing the predicate contribute (conditional agg).
+        if (is_kw("filter")) {
+            advance();
+            if (auto e = expect(Tok::LParen, "'(' after FILTER")) return e;
+            if (auto e = expect_kw("where")) return e;
+            auto pred = std::make_shared<Predicate>();
+            if (auto e = parse_predicate(*pred, /*allow_agg=*/false)) return e;
+            if (auto e = expect(Tok::RParen, "')' to close the FILTER clause")) return e;
+            agg.filter = std::move(pred);
+        }
         matched = true;
         return std::nullopt;
     }
