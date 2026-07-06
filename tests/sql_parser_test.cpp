@@ -75,7 +75,8 @@ void test_create() {
           "lowercase keywords parse");
 
     expect_err("CREATE TABLE t (id INT, name TEXT)", "missing PRIMARY KEY");
-    expect_err("CREATE TABLE t (id FLOAT, PRIMARY KEY (id))", "unsupported type FLOAT");
+    // F14: FLOAT / DOUBLE / REAL are now supported (see sql_real_test). An unknown type still errors.
+    expect_err("CREATE TABLE t (id ZONKZ, PRIMARY KEY (id))", "expected a column type");
     expect_err("CREATE TABLE t (id INT, PRIMARY KEY (missing))",
                "PK names an undeclared column");
     (void)ok_parse("CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))");  // F1: composite PK now parses

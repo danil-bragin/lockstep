@@ -150,11 +150,15 @@ int main() {
         e.exec("INSERT INTO t (id, xs) VALUES (3, ARRAY[])");
         check(e.exec("SELECT UNNEST(xs) FROM t WHERE id = 3").rows.empty(), "empty array -> 0 rows");
     }
-    // teeth: nested arrays rejected; FLOAT[] rejected.
+    // teeth: nested arrays rejected. F14: FLOAT[] (a REAL array) is now accepted and round-trips
+    // (the array codec is generic over the element's logical type).
     {
         SqlEngine e;
         check(!e.exec("CREATE TABLE x (id INT, m INT[][], PRIMARY KEY (id))").ok, "nested array rejected");
-        check(!e.exec("CREATE TABLE y (id INT, m FLOAT[], PRIMARY KEY (id))").ok, "FLOAT[] rejected");
+        check(e.exec("CREATE TABLE y (id INT, m FLOAT[], PRIMARY KEY (id))").ok, "FLOAT[] accepted (F14)");
+        check(e.exec("INSERT INTO y (id,m) VALUES (1, ARRAY[1.5, 2.5])").ok, "insert REAL array");
+        check(e.exec("SELECT m FROM y WHERE id = 1").rows.at(0).cells.at(0).second.render() == "{1.5,2.5}",
+              "REAL array renders {1.5,2.5}");
     }
     // durable: array column survives a restart (element type recovered).
     {

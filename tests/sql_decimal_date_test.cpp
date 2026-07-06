@@ -81,8 +81,9 @@ int main() {
     // teeth: FLOAT/DOUBLE still rejected.
     {
         SqlEngine e;
-        check(!e.exec("CREATE TABLE f (id INT, x FLOAT, PRIMARY KEY (id))").ok, "FLOAT rejected");
-        check(!e.exec("CREATE TABLE g (id INT, x DOUBLE, PRIMARY KEY (id))").ok, "DOUBLE rejected");
+        // F14: FLOAT / DOUBLE are now accepted (REAL, logical=14); see sql_real_test for coverage.
+        check(e.exec("CREATE TABLE f (id INT, x FLOAT, PRIMARY KEY (id))").ok, "FLOAT accepted (F14)");
+        check(e.exec("CREATE TABLE g (id INT, x DOUBLE, PRIMARY KEY (id))").ok, "DOUBLE accepted (F14)");
     }
     // durable: DECIMAL + DATE survive a restart (schema logical/scale recovered).
     {

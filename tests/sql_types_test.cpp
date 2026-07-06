@@ -37,10 +37,10 @@ int main() {
     // VARCHAR behaves as TEXT.
     check(e.exec("SELECT name FROM t WHERE id = 2").rows[0].cells[0].second.s == "bob", "VARCHAR text");
 
-    // teeth: FLOAT / DOUBLE rejected (non-deterministic). DECIMAL is now ACCEPTED (F9b: exact
-    // INT-backed fixed-point) — its own coverage lives in sql_decimal_date_test.
-    check(!e.exec("CREATE TABLE f (id INT, x FLOAT, PRIMARY KEY (id))").ok, "FLOAT rejected");
-    check(!e.exec("CREATE TABLE f (id INT, x DOUBLE, PRIMARY KEY (id))").ok, "DOUBLE rejected");
+    // F14: FLOAT / DOUBLE / REAL are now ACCEPTED (IEEE-754 double, logical=14; deterministic bit
+    // pattern) — full coverage lives in sql_real_test. DECIMAL is exact INT-backed fixed-point.
+    check(e.exec("CREATE TABLE f (id INT, x FLOAT, PRIMARY KEY (id))").ok, "FLOAT accepted (F14)");
+    check(e.exec("CREATE TABLE f2 (id INT, x DOUBLE, PRIMARY KEY (id))").ok, "DOUBLE accepted (F14)");
     check(e.exec("CREATE TABLE dok (id INT, x DECIMAL(8,2), PRIMARY KEY (id))").ok, "DECIMAL accepted");
 
     if (g_fail) { std::printf("sql_types_test: FAILED\n"); return 1; }
