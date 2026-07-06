@@ -1896,6 +1896,92 @@ private:
     // and pre-built rows (unlike materialize_select, which infers the schema from result
     // rows and cannot represent an empty relation). Used to synthesize system catalogs so a
     // plain SELECT (with its WHERE / projection / joins) runs over them via the normal path.
+    // A canonical dedup key for a result row (type + null + value per cell). Used by
+    // UNION-based recursive CTEs to detect when the fixpoint stops producing new rows.
+    [[nodiscard]] static std::string row_key(const ResultRow& r) {
+        std::string k;
+        for (const auto& cell : r.cells) {
+            k.push_back(cell.second.is_null ? 'N' : (cell.second.type == Type::Text ? 'T' : 'I'));
+            if (!cell.second.is_null) {
+                k += (cell.second.type == Type::Text) ? cell.second.s : std::to_string(cell.second.i);
+            }
+            k.push_back('\x1f');
+        }
+        return k;
+    }
+
+    // Materialize a NON-EMPTY result row set into a fresh table `name`, inferring the schema from
+    // the rows (labels + first non-NULL type per column). Used by recursive-CTE fixpoint iteration.
+    std::optional<std::string> materialize_rows(const std::string& name,
+                                                const std::vector<ResultRow>& rows,
+                                                const std::vector<std::string>& col_names = {}) {
+        if (rows.empty()) return std::string("internal: materialize_rows over an empty set");
+        const std::size_t ncol = rows[0].cells.size();
+        std::vector<std::pair<std::string, Type>> cols(ncol);
+        for (std::size_t k = 0; k < ncol; ++k) {
+            // Column names come from the override (recursive CTE: fixed by the base term,
+            // positional) or the rows' own labels.
+            cols[k].first = (k < col_names.size()) ? col_names[k] : rows[0].cells[k].first;
+            cols[k].second = Type::Int;
+            for (const ResultRow& r : rows)
+                if (!r.cells[k].second.is_null) { cols[k].second = r.cells[k].second.type; break; }
+        }
+        std::vector<std::vector<Datum>> drows;
+        drows.reserve(rows.size());
+        for (const ResultRow& r : rows) {
+            std::vector<Datum> row(ncol);
+            for (std::size_t k = 0; k < ncol; ++k) row[k] = r.cells[k].second;
+            drows.push_back(std::move(row));
+        }
+        return materialize_typed(name, cols, drows);
+    }
+
+    // WITH RECURSIVE: fixpoint-materialize `name` from `<base> UNION [ALL] <recursive>`. The base
+    // seeds the working set; the recursive term (which reads `name`) runs against the working set,
+    // its fresh rows (deduped for UNION) accumulate, and iteration stops when no new rows appear
+    // (bounded to avoid a non-terminating recursion). Finally `name` = the full accumulated set.
+    std::optional<std::string> materialize_recursive_cte(const std::string& name,
+                                                         const SelectStmt& sub) {
+        if (sub.set_op != SetOp::Union || !sub.set_op_rhs) {
+            return std::string("a recursive CTE must be `<base> UNION [ALL] <recursive>`");
+        }
+        const bool all = sub.set_op_all;
+        SelectStmt base = sub;  // the base term = sub without its set-op tail
+        base.set_op = SetOp::None;
+        base.set_op_rhs.reset();
+        const ExecResult b = exec_select(base);
+        if (!b.ok) return b.error;
+        if (b.rows.empty()) return std::string("recursive CTE '" + name + "' has an empty base term");
+        // The CTE's column names are fixed by the base term (the recursive term maps by position).
+        std::vector<std::string> col_names;
+        for (const auto& cell : b.rows[0].cells) col_names.push_back(cell.first);
+        std::vector<ResultRow> accumulated = b.rows, working = b.rows;
+        std::set<std::string> seen;
+        if (!all) for (const ResultRow& r : accumulated) seen.insert(row_key(r));
+        const SelectStmt& rec = *sub.set_op_rhs;
+        for (int iter = 0; iter < 100000 && !working.empty(); ++iter) {
+            if (catalog_.find(name) != nullptr) {
+                DropTableStmt d; d.table = name; d.if_exists = true;
+                (void)exec_drop_table(d);
+            }
+            if (auto e = materialize_rows(name, working, col_names)) return e;  // name := working set
+            const ExecResult step = exec_select(rec);                // recursive term reads `name`
+            if (!step.ok) return step.error;
+            std::vector<ResultRow> fresh;
+            for (const ResultRow& r : step.rows) {
+                if (all || seen.insert(row_key(r)).second) fresh.push_back(r);
+            }
+            if (fresh.empty()) break;
+            for (const ResultRow& r : fresh) accumulated.push_back(r);
+            working = std::move(fresh);
+        }
+        if (catalog_.find(name) != nullptr) {
+            DropTableStmt d; d.table = name; d.if_exists = true;
+            (void)exec_drop_table(d);
+        }
+        return materialize_rows(name, accumulated, col_names);  // name := the full result
+    }
+
     std::optional<std::string> materialize_typed(
         const std::string& name,
         const std::vector<std::pair<std::string, Type>>& cols,
@@ -6767,6 +6853,18 @@ private:
                 created.push_back(je.alias);
             }
             for (const auto& [name, sub] : sel.ctes) {       // CTEs next (derived may read them)
+                if (sub->recursive) {  // WITH RECURSIVE — fixpoint materialization
+                    if (catalog_.find(name) != nullptr) {
+                        drop_materialized(created);
+                        return ExecResult::failure("CTE name '" + name + "' clashes with a table");
+                    }
+                    if (auto e = materialize_recursive_cte(name, *sub)) {
+                        drop_materialized(created);
+                        return ExecResult::failure(*e);
+                    }
+                    created.push_back(name);
+                    continue;
+                }
                 if (const ExecResult m = materialize(name, *sub); !m.ok) return m;
             }
             for (const JoinEntry& je : sel.from) {           // then the derived tables

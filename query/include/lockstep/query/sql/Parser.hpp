@@ -2348,6 +2348,8 @@ private:
     // engine materializes them before running the main query. Non-recursive (no RECURSIVE keyword).
     ParseResult parse_with() {
         advance();  // WITH
+        bool recursive = false;
+        if (is_kw("recursive")) { advance(); recursive = true; }
         std::vector<std::pair<std::string, std::shared_ptr<SelectStmt>>> ctes;
         for (;;) {
             if (cur_.kind != Tok::Ident) return make_err("expected a CTE name after WITH");
@@ -2360,6 +2362,9 @@ private:
             if (!is_kw("select")) return make_err("a CTE body must be a SELECT");
             auto sub = std::make_shared<SelectStmt>();
             if (auto e = parse_select_stmt(*sub)) return ParseResult{*e};
+            // A CTE body may carry a trailing set-op chain (e.g. a recursive `base UNION recursive`).
+            if (auto e = parse_set_op_tail(*sub)) return ParseResult{*e};
+            sub->recursive = recursive;
             if (cur_.kind != Tok::RParen) return make_err("expected ) to close the CTE body");
             advance();  // )
             ctes.emplace_back(std::move(name), std::move(sub));
@@ -2382,37 +2387,35 @@ private:
         // D1/D2: trailing set operations — `... UNION [ALL] SELECT ...` (also INTERSECT/EXCEPT),
         // right-linked through set_op_rhs. A trailing ORDER BY/LIMIT lands on the LAST arm and the
         // executor applies it to the whole combined result.
-        SelectStmt* tail = &st.select;
+        if (auto e = parse_set_op_tail(st.select)) return ParseResult{*e};
+        return ParseResult{std::move(st)};
+    }
+
+    // D1/D2: parse a trailing set-operation chain (UNION/INTERSECT/EXCEPT [ALL] SELECT ...)
+    // onto `first`, right-linked through set_op_rhs. Reused by the CTE body (so a recursive
+    // CTE's `base UNION recursive` parses inside the parentheses).
+    [[nodiscard]] std::optional<ParseError> parse_set_op_tail(SelectStmt& first) {
+        SelectStmt* tail = &first;
         for (;;) {
             SetOp op = SetOp::None;
-            if (is_kw("union")) {
-                op = SetOp::Union;
-            } else if (is_kw("intersect")) {
-                op = SetOp::Intersect;
-            } else if (is_kw("except")) {
-                op = SetOp::Except;
-            } else {
-                break;
-            }
+            if (is_kw("union")) op = SetOp::Union;
+            else if (is_kw("intersect")) op = SetOp::Intersect;
+            else if (is_kw("except")) op = SetOp::Except;
+            else break;
             advance();
             bool all = false;
-            if (is_kw("all")) {
-                all = true;
-                advance();
-            }
+            if (is_kw("all")) { all = true; advance(); }
             if (!is_kw("select")) {
                 return make_err("expected SELECT after a set operator (UNION/INTERSECT/EXCEPT)");
             }
             auto rhs = std::make_shared<SelectStmt>();
-            if (auto e = parse_select_stmt(*rhs)) {
-                return ParseResult{*e};
-            }
+            if (auto e = parse_select_stmt(*rhs)) return e;
             tail->set_op = op;
             tail->set_op_all = all;
             tail->set_op_rhs = rhs;
             tail = rhs.get();
         }
-        return ParseResult{std::move(st)};
+        return std::nullopt;
     }
 
     // v4: parse a SELECT body into `sel`. Factored out of parse_select() so a SUBQUERY

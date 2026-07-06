@@ -406,6 +406,7 @@ struct SelectStmt {
     // this query; a FROM entry whose table matches a CTE name reads that materialized table.
     // (Non-recursive; shared_ptr keeps SelectStmt copyable with this self-referential member.)
     std::vector<std::pair<std::string, std::shared_ptr<SelectStmt>>> ctes;
+    bool recursive = false;  // WITH RECURSIVE — set on each CTE body; the engine fixpoint-materializes it
 
     // D3: a derived table — `FROM (SELECT ...) AS alias`. When set on a JoinEntry (below, via
     // `subquery`), the engine materializes it into an ephemeral table named by the alias. Held
