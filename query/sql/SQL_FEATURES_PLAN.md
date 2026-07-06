@@ -146,3 +146,14 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 - [x] **W9 scalar functions** — NULLIF · GREATEST · LEAST · MOD · SIGN · REVERSE · REPEAT · LEFT · RIGHT · LTRIM · RTRIM · STRPOS/POSITION. `sql_scalar_funcs_test`.
 - [ ] open (W9): sequences (CREATE SEQUENCE/nextval — needs a deterministic-replication design) · COPY FROM/TO · prepared-statement plan cache · pg_catalog oids for real `\d` · table_constraints for CHECK · cursors.
 - [ ] open (W5): cost-based JOIN reorder + hash-join build-side swap (stats via ANALYZE already exist; swap changes join output-column layout — needs care).
+
+## Batch 2026-07-06 (session cont'd) — aggregates, window fns, matviews, governance
+
+- [x] **aggregates**: STRING_AGG(col, delim) / GROUP_CONCAT · BOOL_AND · BOOL_OR · BIT_AND · BIT_OR (non-fusable, row-AoS).
+- [x] **window functions**: DENSE_RANK · LAG(col) · LEAD(col) · FIRST_VALUE(col) · LAST_VALUE(col) · NTILE(n) · AVG(col) OVER — complementing ROW_NUMBER/RANK/SUM/COUNT/MIN/MAX OVER.
+- [x] **date/time**: DATE_PART('field', date|ts) · EXTRACT(field FROM ...) · DATE_TRUNC('unit', ...) (year..second, dow/doy/epoch).
+- [x] **scalar**: NULLIF · GREATEST · LEAST · MOD · SIGN · REVERSE · REPEAT · LEFT · RIGHT · LTRIM · RTRIM · STRPOS/POSITION · SPLIT_PART · INITCAP · LPAD · RPAD · ASCII · CHR · version()/current_database()/current_schema()/current_user()/session_user().
+- [x] **K5 materialized views**: CREATE/REFRESH/DROP MATERIALIZED VIEW (non-incremental; backing table + source durable).
+- [x] **W3 governance**: SET lockstep.max_query_memory · per-statement mem cap (materialize + JOIN) · cancellation seam · AS OF SEQ time travel (K10) · parse cache.
+- [x] **information_schema / pg_catalog**: tables/columns/views/schemata/table_constraints/key_column_usage/constraint_column_usage + pg_tables/pg_namespace/pg_class.
+- [ ] open: incremental IVM (auto-refresh matview on base change) · window frames (ROWS/RANGE BETWEEN) · RECURSIVE CTE · COPY · CREATE SEQUENCE (deterministic-replication design) · off-reactor concurrency.
