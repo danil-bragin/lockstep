@@ -1901,18 +1901,38 @@ private:
                                                                std::string& agg_label) {
         is_window = false;
         is_agg = false;
-        // ROW_NUMBER() / RANK() — window-only.
-        if (is_kw("row_number") || is_kw("rank")) {
-            const bool is_rank = is_kw("rank");
+        // ROW_NUMBER() / RANK() / DENSE_RANK() — window-only, no arguments.
+        if (is_kw("row_number") || is_kw("rank") || is_kw("dense_rank")) {
+            const std::string fn = lower(cur_.text);
             advance();
             if (auto e = expect(Tok::LParen, "'(' after the window function")) return e;
-            if (auto e = expect(Tok::RParen, "')' (ROW_NUMBER/RANK take no arguments)")) return e;
+            if (auto e = expect(Tok::RParen, "')' (ROW_NUMBER/RANK/DENSE_RANK take no arguments)")) return e;
             auto w = std::make_shared<WindowFunc>();
-            w->kind = is_rank ? WinKind::Rank : WinKind::RowNumber;
+            w->kind = fn == "rank" ? WinKind::Rank
+                    : fn == "dense_rank" ? WinKind::DenseRank
+                                         : WinKind::RowNumber;
             if (auto e = parse_over(*w)) return e;
             item.kind = SelectItemKind::Window;
             item.win = std::move(w);
-            item.label = is_rank ? "RANK()" : "ROW_NUMBER()";
+            item.label = upper(fn) + "()";
+            is_window = true;
+            return std::nullopt;
+        }
+        // LAG(col) / LEAD(col) OVER — window-only offset functions (offset 1).
+        if (is_kw("lag") || is_kw("lead")) {
+            const bool is_lead = is_kw("lead");
+            advance();
+            if (auto e = expect(Tok::LParen, "'(' after LAG/LEAD")) return e;
+            std::string qual, col;
+            if (auto e = expect_qualified_column("a column inside LAG/LEAD", qual, col)) return e;
+            if (auto e = expect(Tok::RParen, "')' to close LAG/LEAD")) return e;
+            auto w = std::make_shared<WindowFunc>();
+            w->kind = is_lead ? WinKind::Lead : WinKind::Lag;
+            w->arg_column = col;
+            if (auto e = parse_over(*w)) return e;
+            item.kind = SelectItemKind::Window;
+            item.win = std::move(w);
+            item.label = (is_lead ? "LEAD(" : "LAG(") + col + ")";
             is_window = true;
             return std::nullopt;
         }
@@ -1926,7 +1946,8 @@ private:
                 case AggKind::Sum: w->kind = WinKind::Sum; break;
                 case AggKind::Min: w->kind = WinKind::Min; break;
                 case AggKind::Max: w->kind = WinKind::Max; break;
-                default: return make_err("AVG OVER is not supported (use SUM/COUNT)");
+                case AggKind::Avg: w->kind = WinKind::Avg; break;
+                default: return make_err("that aggregate is not supported as a window function");
             }
             w->arg_column = agg.column;
             if (auto e = parse_over(*w)) return e;

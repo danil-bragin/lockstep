@@ -313,7 +313,13 @@ struct OrderKey {
 // One SELECT-list item: either a plain column or an aggregate expression. A v1
 // `SELECT id, name` is all-Column items; a v2 `SELECT k, COUNT(*)` mixes them.
 // C3: a window function — ROW_NUMBER()/RANK(), or an aggregate OVER a partition.
-enum class WinKind : std::uint8_t { RowNumber = 0, Rank = 1, Sum = 2, Count = 3, Min = 4, Max = 5, CountStar = 6 };
+enum class WinKind : std::uint8_t {
+    RowNumber = 0, Rank = 1, Sum = 2, Count = 3, Min = 4, Max = 5, CountStar = 6,
+    DenseRank = 7,  // like Rank but no gaps on ties
+    Lag = 8,        // LAG(col) — the prior row's value in the ordered partition (NULL at the start)
+    Lead = 9,       // LEAD(col) — the next row's value (NULL at the end)
+    Avg = 10,       // AVG(col) OVER — whole-partition average (INT truncation)
+};
 struct WindowFunc {
     WinKind kind = WinKind::RowNumber;
     std::string arg_column;                 // Sum/Min/Max/Count(col): the aggregated column

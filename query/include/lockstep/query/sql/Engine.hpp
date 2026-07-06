@@ -7567,7 +7567,8 @@ private:
         }
         std::size_t argc = 0;
         if (w.kind == WinKind::Sum || w.kind == WinKind::Min || w.kind == WinKind::Max ||
-            w.kind == WinKind::Count) {
+            w.kind == WinKind::Count || w.kind == WinKind::Avg || w.kind == WinKind::Lag ||
+            w.kind == WinKind::Lead) {
             const auto i = t.column_index(w.arg_column);
             if (!i) return "unknown column '" + w.arg_column + "' in window function";
             argc = *i;
@@ -7606,6 +7607,26 @@ private:
                     if (!tie) rank = static_cast<std::int64_t>(k2 + 1);  // gaps on ties
                     out[idxs[k2]] = Datum::make_int(rank);
                 }
+            } else if (w.kind == WinKind::DenseRank) {
+                std::int64_t rank = 0;
+                for (std::size_t k2 = 0; k2 < idxs.size(); ++k2) {
+                    bool tie = false;
+                    if (k2 > 0 && !ocols.empty()) {
+                        tie = true;
+                        for (const std::size_t oc : ocols)
+                            if (cmp_datum(rows[idxs[k2]][oc], rows[idxs[k2 - 1]][oc]) != 0) { tie = false; break; }
+                    }
+                    if (!tie) ++rank;  // NO gaps on ties (dense)
+                    out[idxs[k2]] = Datum::make_int(rank);
+                }
+            } else if (w.kind == WinKind::Lag || w.kind == WinKind::Lead) {
+                for (std::size_t k2 = 0; k2 < idxs.size(); ++k2) {
+                    const std::size_t n = idxs.size();
+                    const bool have = (w.kind == WinKind::Lag) ? (k2 > 0) : (k2 + 1 < n);
+                    const std::size_t src = (w.kind == WinKind::Lag) ? k2 - 1 : k2 + 1;
+                    out[idxs[k2]] = have ? rows[idxs[src]][argc]
+                                         : Datum::make_null(t.columns[argc].type);
+                }
             } else {
                 // Whole-partition aggregate (same value for every row in the partition).
                 std::int64_t total = static_cast<std::int64_t>(idxs.size());
@@ -7629,6 +7650,8 @@ private:
                 if (w.kind == WinKind::CountStar) v = Datum::make_int(total);
                 else if (w.kind == WinKind::Count) v = Datum::make_int(npres);
                 else if (w.kind == WinKind::Sum) v = Datum::make_int(sum);
+                else if (w.kind == WinKind::Avg)  // INT truncation toward zero; NULL over an empty partition
+                    v = npres > 0 ? Datum::make_int(sum / npres) : Datum::make_null(Type::Int);
                 else v = any ? best : Datum::make_null(t.columns[argc].type);  // Min/Max
                 for (const std::size_t r : idxs) out[r] = v;
             }

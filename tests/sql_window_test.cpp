@@ -52,6 +52,36 @@ void run_mode(bool columnar, const char* tag) {
     } else {
         check(false, T + " RANK query");
     }
+
+    // DENSE_RANK() — same tie, no gap: dept A by sal desc -> 1,1,2 (id1->2, id2->1, id4->1).
+    const ExecResult dr = e.exec(
+        "SELECT id, DENSE_RANK() OVER (PARTITION BY dept ORDER BY sal DESC) AS dr FROM t WHERE dept = 'A' ORDER BY id");
+    if (dr.ok && dr.rows.size() == 3) {
+        check(dr.rows[0].cells[1].second.i == 2, T + " DENSE_RANK id1 = 2 (no gap)");
+        check(dr.rows[1].cells[1].second.i == 1, T + " DENSE_RANK id2 = 1");
+        check(dr.rows[2].cells[1].second.i == 1, T + " DENSE_RANK id4 = 1");
+    } else {
+        check(false, T + " DENSE_RANK query");
+    }
+
+    // LAG/LEAD over dept A by id asc (id1,id2,id4 with sal 100,200,200).
+    const ExecResult lg = e.exec(
+        "SELECT id, LAG(sal) OVER (PARTITION BY dept ORDER BY id) AS pv, "
+        "LEAD(sal) OVER (PARTITION BY dept ORDER BY id) AS nv, "
+        "AVG(sal) OVER (PARTITION BY dept) AS av FROM t WHERE dept = 'A' ORDER BY id");
+    if (lg.ok && lg.rows.size() == 3) {
+        // id1: LAG=NULL, LEAD=200, AVG=(100+200+200)/3=166
+        check(lg.rows[0].cells[1].second.is_null, T + " LAG id1 = NULL (partition start)");
+        check(lg.rows[0].cells[2].second.i == 200, T + " LEAD id1 = 200");
+        check(lg.rows[0].cells[3].second.i == 166, T + " AVG dept A = 166 (int trunc)");
+        // id2: LAG=100, LEAD=200
+        check(lg.rows[1].cells[1].second.i == 100, T + " LAG id2 = 100");
+        check(lg.rows[1].cells[2].second.i == 200, T + " LEAD id2 = 200");
+        // id4 (last): LEAD=NULL
+        check(lg.rows[2].cells[2].second.is_null, T + " LEAD id4 = NULL (partition end)");
+    } else {
+        check(false, T + " LAG/LEAD/AVG query");
+    }
 }
 }  // namespace
 
