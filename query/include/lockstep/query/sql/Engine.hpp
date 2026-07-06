@@ -3935,6 +3935,7 @@ private:
                 }
                 row[c] = cch[j].at(*idx);
             }
+            tag_logical_cols(t, row);  // at() is untagged; stamp logical/scale like decode_row (F14)
             return row;
         }
         return std::nullopt;  // no blocks, or pk absent
@@ -8380,6 +8381,33 @@ private:
                     out = Datum::make_int(static_cast<std::int64_t>(k + 1));
                     break;
                 }
+            return std::nullopt;
+        }
+        // K1 (vector search): distance / similarity over two equal-length numeric vectors (REAL[] or
+        // INT[]). Returns a REAL. `ORDER BY l2_distance(embedding, ARRAY[...]) LIMIT k` is brute-force
+        // k-NN. L2_DISTANCE = Euclidean; INNER_PRODUCT / DOT_PRODUCT = dot; COSINE_DISTANCE =
+        // 1 - cosine similarity (a zero-magnitude vector yields distance 1, i.e. no similarity).
+        if (f == "L2_DISTANCE" || f == "EUCLIDEAN_DISTANCE" || f == "COSINE_DISTANCE" ||
+            f == "INNER_PRODUCT" || f == "DOT_PRODUCT") {
+            if (!need(2)) return f + " takes (vector, vector)";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); out.logical = 14; return std::nullopt; }
+            if (!is_array(a[0]) || !is_array(a[1])) return f + " requires two ARRAY (vector) arguments";
+            const std::vector<Datum> u = Datum::decode_array(a[0].s), v = Datum::decode_array(a[1].s);
+            if (u.size() != v.size()) return f + " requires vectors of equal length";
+            const auto dbl = [](const Datum& d) { return d.is_real() ? d.real_value() : static_cast<double>(d.i); };
+            double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
+            for (std::size_t k = 0; k < u.size(); ++k) {
+                if (u[k].is_null || v[k].is_null) return f + " does not accept NULL vector elements";
+                const double x = dbl(u[k]), y = dbl(v[k]);
+                dot += x * y; sq += (x - y) * (x - y); nu += x * x; nv += y * y;
+            }
+            double r = 0.0;
+            if (f == "L2_DISTANCE" || f == "EUCLIDEAN_DISTANCE") r = std::sqrt(sq);
+            else if (f == "COSINE_DISTANCE") {
+                const double denom = std::sqrt(nu) * std::sqrt(nv);
+                r = (denom == 0.0) ? 1.0 : 1.0 - dot / denom;
+            } else r = dot;  // INNER_PRODUCT / DOT_PRODUCT
+            out = Datum::make_real(r);
             return std::nullopt;
         }
         if (f == "ARRAY_APPEND") {  // array_append(arr, x) -> arr with x added
