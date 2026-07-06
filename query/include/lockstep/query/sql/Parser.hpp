@@ -838,10 +838,16 @@ private:
             return std::nullopt;
         }
         if (is_kw("float") || is_kw("double") || is_kw("real")) {
-            return make_err("FLOAT/DOUBLE are OUT — they break byte-determinism; use DECIMAL "
-                            "(exact fixed-point)");
+            // F14: REAL / DOUBLE PRECISION / FLOAT — an IEEE-754 double stored as an 8-byte payload
+            // (logical=14 over TEXT physical). Determinism holds: the bit pattern is fixed and every
+            // arithmetic op is IEEE-deterministic given the same inputs and evaluation order.
+            advance();
+            if (is_kw("precision")) advance();  // "DOUBLE PRECISION"
+            col.logical = 14;
+            out = Type::Text;
+            return std::nullopt;
         }
-        return make_err("expected a column type (INT/BIGINT/BOOL/DECIMAL/DATE/TIMESTAMP or TEXT)");
+        return make_err("expected a column type (INT/BIGINT/BOOL/DECIMAL/REAL/DATE/TIMESTAMP or TEXT)");
     }
 
     // Consume a literal (int or string) into `out`. Used by INSERT/UPDATE/WHERE.

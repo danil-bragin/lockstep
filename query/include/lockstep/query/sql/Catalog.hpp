@@ -54,6 +54,9 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <charconv>  // F14: std::to_chars for a deterministic, locale-free double render
+#include <cmath>     // F14: isnan/isinf for REAL total order + render
+#include <cstring>   // F14: memcpy for the double <-> 8-byte bit codec
 
 #include <lockstep/query/Query.hpp>  // Key, Value (== txn opaque bytes)
 #include <lockstep/query/sql/Uint256.hpp>  // u256: the UINT256 (logical 13) backing type
@@ -288,6 +291,48 @@ struct Datum {
     // A typed NULL (carries the column type for type-checking, but no value).
     static Datum make_null(Type t) { return Datum{t, 0, {}, true}; }
 
+    // F14: REAL (double, logical=14) — the 8-byte IEEE-754 little-endian bit pattern is carried
+    // in `s` as a TEXT-physical value (so storage/codec treat it like any TEXT-logical type; the
+    // logical tag comes from the column schema on decode). Arithmetic/compare/render decode it.
+    static std::string encode_double(double d) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &d, sizeof(bits));
+        std::string out(8, '\0');
+        for (int k = 0; k < 8; ++k) out[static_cast<std::size_t>(k)] = static_cast<char>((bits >> (8 * k)) & 0xFF);
+        return out;
+    }
+    static double decode_double(const std::string& s) {
+        std::uint64_t bits = 0;
+        for (int k = 0; k < 8 && static_cast<std::size_t>(k) < s.size(); ++k)
+            bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(s[static_cast<std::size_t>(k)])) << (8 * k);
+        double d = 0.0;
+        std::memcpy(&d, &bits, sizeof(d));
+        return d;
+    }
+    static Datum make_real(double d) {
+        Datum r;
+        r.type = Type::Text;
+        r.s = encode_double(d);
+        r.logical = 14;
+        return r;
+    }
+    [[nodiscard]] bool is_real() const { return type == Type::Text && logical == 14; }
+    [[nodiscard]] double real_value() const { return decode_double(s); }
+    static std::string render_double(double d) {
+        if (std::isnan(d)) return "NaN";
+        if (std::isinf(d)) return d < 0 ? "-Infinity" : "Infinity";
+        char buf[40];
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), d);
+        (void)ec;
+        return std::string(buf, ptr);
+    }
+    // Total order over doubles (deterministic; NaN sorts greatest and equals NaN, PostgreSQL).
+    static int real_cmp(double a, double b) {
+        const bool an = std::isnan(a), bn = std::isnan(b);
+        if (an || bn) return an == bn ? 0 : (an ? 1 : -1);
+        return a < b ? -1 : (a > b ? 1 : 0);
+    }
+
     [[nodiscard]] bool operator==(const Datum& o) const {
         // NULL is not equal to anything (incl. another NULL) under SQL three-valued
         // logic; but for the structural identity DISTINCT/render uses we treat two
@@ -298,12 +343,14 @@ struct Datum {
         if (type != o.type) {
             return false;
         }
+        if (is_real() && o.is_real()) return real_cmp(real_value(), o.real_value()) == 0;  // F14
         return type == Type::Int ? (i == o.i) : (s == o.s);
     }
 
     // Total deterministic order WITHIN one type (the PK ordering the range relies
     // on). Cross-type compare is never invoked (a column has ONE type).
     [[nodiscard]] bool less_than(const Datum& o) const {
+        if (is_real() && o.is_real()) return real_cmp(real_value(), o.real_value()) < 0;  // F14
         return type == Type::Int ? (i < o.i) : (s < o.s);
     }
 
@@ -323,6 +370,7 @@ struct Datum {
             if (logical == 12) return render_month_interval(i);  // F13b: MONTH-INTERVAL (year/month)
         }
         if (type == Type::Text && logical == 7) return render_array(s);  // F12: ARRAY
+        if (type == Type::Text && logical == 14) return render_double(decode_double(s));  // F14: REAL
         if (type == Type::Text && logical >= 5) {  // F9e: INT128 / DECIMAL128 (16-byte payload in s)
             if (logical == 5) return render_i128(decode_i128(s));
             if (logical == 6) return render_decimal128(decode_i128(s), scale);

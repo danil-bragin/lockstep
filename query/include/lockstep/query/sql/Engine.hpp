@@ -2890,6 +2890,27 @@ private:
             if (col.logical == 9) out.s = col.enum_labels[static_cast<std::size_t>(v)];
             return check_domain(col, out, for_write);
         }
+        // F14: a REAL column (logical 14, physical TEXT). Accept a bare INT (widened), a numeric
+        // string literal ('3.14', '-2e3'), or another REAL — store the IEEE-754 double payload.
+        if (col.type == Type::Text && col.logical == 14) {
+            double d = 0.0;
+            if (in.is_real()) {
+                d = in.real_value();
+            } else if (in.type == Type::Int) {
+                d = static_cast<double>(in.i);
+            } else if (in.type == Type::Text) {
+                const char* first = in.s.data();
+                const char* last = first + in.s.size();
+                const auto res = std::from_chars(first, last, d);
+                if (res.ec != std::errc{} || res.ptr != last) {
+                    return std::string("invalid REAL literal '") + in.s + "' for column '" + col.name + "'";
+                }
+            } else {
+                return std::string("type mismatch for column '") + col.name + "': expected REAL";
+            }
+            out = Datum::make_real(d);
+            return check_domain(col, out, for_write);
+        }
         // F13: a JSON column (logical 11, physical TEXT). Parse + store the CANONICAL form (sorted
         // keys, compact, normalized numbers) so equal documents are byte-identical.
         if (col.type == Type::Text && col.logical == 11) {
@@ -4949,6 +4970,12 @@ private:
         for (const SelectItem& item : sel.items) {
             if (item.kind == SelectItemKind::Aggregate && item.agg.filter && item.agg.filter->present())
                 return std::nullopt;
+        }
+        // F14: a REAL column (logical=14, TEXT-physical) is NOT one of the SoA folders' shapes (its
+        // 8-byte payload would be misread by the logical>=5 128-bit paths); any REAL column takes the
+        // row-AoS path, which handles it via cmp_datum + a double-fold in compute_agg.
+        for (const Column& c : t.columns) {
+            if (c.logical == 14) return std::nullopt;
         }
         soa_overflow_ = false;  // K1: set if a 128-bit SoA SUM overflows => bail (the row path errors)
         std::vector<VecTerm> vterms;
@@ -10818,6 +10845,11 @@ private:
             if (ea.size() < eb.size()) return -1;
             if (ea.size() > eb.size()) return 1;
             return 0;
+        }
+        // F14: REAL (logical=14) — decode the 8-byte doubles and compare numerically (a raw byte
+        // compare of the bit pattern mis-orders negatives). NaN sorts greatest (real_cmp).
+        if (a.logical == 14 && b.logical == 14) {
+            return Datum::real_cmp(Datum::decode_double(a.s), Datum::decode_double(b.s));
         }
         if (a.type == Type::Int) {
             if (a.i < b.i) return -1;
