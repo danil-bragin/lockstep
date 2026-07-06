@@ -7437,6 +7437,29 @@ private:
                 if (l.logical == 5 || l.logical == 6 || r.logical == 5 || r.logical == 6) {
                     return eval_bin_i128(e.op, l, r, out);
                 }
+                // F14: REAL arithmetic — if either operand is a REAL, compute in IEEE-754 double. A
+                // plain INT operand widens in; any other logical type (DECIMAL/temporal) mixed with a
+                // REAL is a clean error (no silent use of a scaled/encoded int as a double).
+                if (l.is_real() || r.is_real()) {
+                    if ((!l.is_real() && (l.type != Type::Int || l.logical != 0)) ||
+                        (!r.is_real() && (r.type != Type::Int || r.logical != 0)))
+                        return "REAL arithmetic requires a plain INT or REAL operand";
+                    const double a = l.is_real() ? l.real_value() : static_cast<double>(l.i);
+                    const double b = r.is_real() ? r.real_value() : static_cast<double>(r.i);
+                    double v = 0.0;
+                    switch (e.op) {
+                        case BinOp::Add: v = a + b; break;
+                        case BinOp::Sub: v = a - b; break;
+                        case BinOp::Mul: v = a * b; break;
+                        case BinOp::Div:
+                            if (b == 0.0) return "division by zero";
+                            v = a / b;
+                            break;
+                        default: return "unsupported operation on a REAL operand";
+                    }
+                    out = Datum::make_real(v);
+                    return std::nullopt;
+                }
                 if (l.type != Type::Int || r.type != Type::Int)
                     return "arithmetic requires INT operands";
                 // F13: temporal arithmetic (DATE/TIMESTAMP/TIME/INTERVAL — all INT-backed seconds,

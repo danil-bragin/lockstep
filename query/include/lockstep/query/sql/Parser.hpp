@@ -39,6 +39,7 @@
 // "unsupported" / "expected X" error.
 
 #include <cstdint>
+#include <charconv>  // F14: locale-free double parse for float literals
 #include <optional>
 #include <string>
 #include <variant>
@@ -91,6 +92,7 @@ private:
 enum class Tok : std::uint8_t {
     Ident,    // identifier or keyword text (raw, original case)
     IntLit,   // a signed integer literal
+    FloatLit, // F14: a floating-point literal (has a '.' fraction or an exponent) -> REAL
     StrLit,   // a single-quoted string literal (decoded)
     LParen,   // (
     RParen,   // )
@@ -309,13 +311,36 @@ private:
         while (i_ < src_.size() && is_digit(src_[i_])) {
             ++i_;
         }
-        // Reject e.g. "12abc" as an identifier-adjacent number (a stray suffix).
+        // F14: a fractional part ('.' followed by a digit) and/or an exponent (e[+-]?digits)
+        // make this a FLOAT literal (a REAL). A bare '.' with no following digit is left alone
+        // (it stays a Dot token, e.g. a qualified name never has digit.digit).
+        bool is_float = false;
+        if (i_ + 1 < src_.size() && src_[i_] == '.' && is_digit(src_[i_ + 1])) {
+            is_float = true;
+            ++i_;  // consume '.'
+            while (i_ < src_.size() && is_digit(src_[i_])) ++i_;
+        }
+        if (i_ < src_.size() && (src_[i_] == 'e' || src_[i_] == 'E')) {
+            std::size_t j = i_ + 1;
+            if (j < src_.size() && (src_[j] == '+' || src_[j] == '-')) ++j;
+            if (j < src_.size() && is_digit(src_[j])) {  // a real exponent (else leave 'e' to the tokenizer)
+                is_float = true;
+                i_ = j;
+                while (i_ < src_.size() && is_digit(src_[i_])) ++i_;
+            }
+        }
+        // Reject e.g. "12abc" / "1.5x" as an identifier-adjacent number (a stray suffix).
         if (i_ < src_.size() && is_ident_cont(src_[i_])) {
             t.kind = Tok::Bad;
             t.bad_msg = "malformed numeric literal";
             return t;
         }
         std::string digits = src_.substr(start, i_ - start);
+        if (is_float) {
+            t.kind = Tok::FloatLit;
+            t.text = std::move(digits);  // the raw literal; parsed to a double in expect_literal
+            return t;
+        }
         t.kind = Tok::IntLit;
         t.int_val = parse_i64(digits, t.int_overflow);  // F11: flag values past int64
         t.text = std::move(digits);                     // raw digits (used when int_overflow)
@@ -866,6 +891,19 @@ private:
             // INT128/DECIMAL128 column parses it losslessly, and an INT64 column gets a clean type
             // error instead of a silent saturation).
             out = cur_.int_overflow ? Datum::make_text(cur_.text) : Datum::make_int(cur_.int_val);
+            advance();
+            return std::nullopt;
+        }
+        if (cur_.kind == Tok::FloatLit) {
+            // F14: a floating-point literal -> a REAL Datum (double). Locale-free parse.
+            double d = 0.0;
+            const char* first = cur_.text.data();
+            const char* last = first + cur_.text.size();
+            const auto res = std::from_chars(first, last, d);
+            if (res.ec != std::errc{} || res.ptr != last) {
+                return make_err("malformed floating-point literal '" + cur_.text + "'");
+            }
+            out = Datum::make_real(d);
             advance();
             return std::nullopt;
         }
@@ -2190,6 +2228,20 @@ private:
             auto n = mk_expr(ExprKind::Lit);
             n->lit = cur_.int_overflow ? Datum::make_text(cur_.text)  // F11
                                        : Datum::make_int(cur_.int_val);
+            advance();
+            out = n;
+            return std::nullopt;
+        }
+        if (cur_.kind == Tok::FloatLit) {  // F14: a REAL literal in an expression (e.g. x * 1.5)
+            double d = 0.0;
+            const char* first = cur_.text.data();
+            const char* last = first + cur_.text.size();
+            const auto res = std::from_chars(first, last, d);
+            if (res.ec != std::errc{} || res.ptr != last) {
+                return make_err("malformed floating-point literal '" + cur_.text + "'");
+            }
+            auto n = mk_expr(ExprKind::Lit);
+            n->lit = Datum::make_real(d);
             advance();
             out = n;
             return std::nullopt;

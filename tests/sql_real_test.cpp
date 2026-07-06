@@ -63,6 +63,29 @@ int main() {
         check(!e.exec("INSERT INTO m (id,x) VALUES (9,'not-a-number')").ok, "invalid REAL literal errors");
     }
 
+    // Bare (unquoted) float literals + REAL arithmetic.
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE a (id INT, x REAL NOT NULL, y REAL NOT NULL, PRIMARY KEY (id))");
+        check(e.exec("INSERT INTO a (id,x,y) VALUES (1, 3.5, 2.0), (2, -1.5, 4.0), (3, 10, 3)").ok,
+              "INSERT bare float literals (3.5, -1.5) + bare int (10)");
+        // Arithmetic widens a plain INT operand into double; results render shortest round-trip.
+        check(cell0(e.exec("SELECT x * 2 FROM a WHERE id = 1")) == "7", "x*2 = 7 (INT widens)");
+        check(cell0(e.exec("SELECT x + 0.5 FROM a WHERE id = 1")) == "4", "x + 0.5 = 4");
+        check(cell0(e.exec("SELECT x / y FROM a WHERE id = 3")) == "3.3333333333333335", "10/3 double");
+        check(cell0(e.exec("SELECT x / y FROM a WHERE id = 2")) == "-0.375", "-1.5/4 = -0.375");
+        // Exponent literal.
+        check(cell0(e.exec("SELECT x FROM a WHERE id = 1")) == "3.5" &&
+                  e.exec("INSERT INTO a (id,x,y) VALUES (4, 1.5e3, 1)").ok,
+              "exponent literal 1.5e3 accepted");
+        check(cell0(e.exec("SELECT x FROM a WHERE id = 4")) == "1500", "1.5e3 = 1500");
+        // Division by zero is a clean error.
+        check(!e.exec("SELECT x / 0.0 FROM a WHERE id = 1").ok, "REAL division by zero errors");
+        // Expression in WHERE (REAL compared to an INT literal). x*2: 7, -3, 20, 3000 -> >5 keeps 1,3,4.
+        const ExecResult w = e.exec("SELECT id FROM a WHERE x * 2 > 5 ORDER BY id");
+        check(w.ok && w.rows.size() == 3, "WHERE x*2 > 5 -> id 1 (7), 3 (20), 4 (3000)");
+    }
+
     // Durability: a REAL column recovers byte-exact across a restart.
     {
         lockstep::core::Scheduler sched;
