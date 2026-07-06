@@ -7568,7 +7568,8 @@ private:
         std::size_t argc = 0;
         if (w.kind == WinKind::Sum || w.kind == WinKind::Min || w.kind == WinKind::Max ||
             w.kind == WinKind::Count || w.kind == WinKind::Avg || w.kind == WinKind::Lag ||
-            w.kind == WinKind::Lead) {
+            w.kind == WinKind::Lead || w.kind == WinKind::FirstValue ||
+            w.kind == WinKind::LastValue) {
             const auto i = t.column_index(w.arg_column);
             if (!i) return "unknown column '" + w.arg_column + "' in window function";
             argc = *i;
@@ -7626,6 +7627,24 @@ private:
                     const std::size_t src = (w.kind == WinKind::Lag) ? k2 - 1 : k2 + 1;
                     out[idxs[k2]] = have ? rows[idxs[src]][argc]
                                          : Datum::make_null(t.columns[argc].type);
+                }
+            } else if (w.kind == WinKind::FirstValue || w.kind == WinKind::LastValue) {
+                if (!idxs.empty()) {
+                    const Datum& v = (w.kind == WinKind::FirstValue) ? rows[idxs.front()][argc]
+                                                                     : rows[idxs.back()][argc];
+                    for (const std::size_t r : idxs) out[r] = v;
+                }
+            } else if (w.kind == WinKind::Ntile) {
+                // Bucket 1..n: the first (size mod n) buckets get one extra row (PostgreSQL).
+                const std::int64_t sz = static_cast<std::int64_t>(idxs.size());
+                const std::int64_t n = w.ntile_n < 1 ? 1 : w.ntile_n;
+                const std::int64_t base = sz / n, rem = sz % n;
+                std::int64_t pos = 0, bucket = 1;
+                for (std::size_t k2 = 0; k2 < idxs.size(); ++k2) {
+                    const std::int64_t cap = base + (bucket <= rem ? 1 : 0);
+                    if (pos >= cap && bucket < n) { ++bucket; pos = 0; }
+                    out[idxs[k2]] = Datum::make_int(bucket);
+                    ++pos;
                 }
             } else {
                 // Whole-partition aggregate (same value for every row in the partition).

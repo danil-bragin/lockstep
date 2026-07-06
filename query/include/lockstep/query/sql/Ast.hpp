@@ -319,12 +319,16 @@ enum class WinKind : std::uint8_t {
     Lag = 8,        // LAG(col) — the prior row's value in the ordered partition (NULL at the start)
     Lead = 9,       // LEAD(col) — the next row's value (NULL at the end)
     Avg = 10,       // AVG(col) OVER — whole-partition average (INT truncation)
+    FirstValue = 11,  // FIRST_VALUE(col) — the ordered partition's first value
+    LastValue = 12,   // LAST_VALUE(col) — the ordered partition's last value
+    Ntile = 13,       // NTILE(n) — bucket number 1..n over the ordered partition
 };
 struct WindowFunc {
     WinKind kind = WinKind::RowNumber;
     std::string arg_column;                 // Sum/Min/Max/Count(col): the aggregated column
     std::vector<std::string> partition_by;  // OVER (PARTITION BY ...)
     std::vector<OrderKey> order_by;         // OVER (... ORDER BY ...)
+    std::int64_t ntile_n = 1;               // NTILE(n): the number of buckets
 };
 
 enum class SelectItemKind : std::uint8_t { Column = 0, Aggregate = 1, Expr = 2, Window = 3 };

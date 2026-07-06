@@ -1918,21 +1918,42 @@ private:
             is_window = true;
             return std::nullopt;
         }
-        // LAG(col) / LEAD(col) OVER — window-only offset functions (offset 1).
-        if (is_kw("lag") || is_kw("lead")) {
-            const bool is_lead = is_kw("lead");
+        // Column-argument window functions: LAG / LEAD / FIRST_VALUE / LAST_VALUE (col) OVER.
+        if (is_kw("lag") || is_kw("lead") || is_kw("first_value") || is_kw("last_value")) {
+            const std::string fn = lower(cur_.text);
             advance();
-            if (auto e = expect(Tok::LParen, "'(' after LAG/LEAD")) return e;
+            if (auto e = expect(Tok::LParen, "'(' after the window function")) return e;
             std::string qual, col;
-            if (auto e = expect_qualified_column("a column inside LAG/LEAD", qual, col)) return e;
-            if (auto e = expect(Tok::RParen, "')' to close LAG/LEAD")) return e;
+            if (auto e = expect_qualified_column("a column inside the window function", qual, col)) return e;
+            if (auto e = expect(Tok::RParen, "')' to close the window function")) return e;
             auto w = std::make_shared<WindowFunc>();
-            w->kind = is_lead ? WinKind::Lead : WinKind::Lag;
+            w->kind = fn == "lag" ? WinKind::Lag
+                    : fn == "lead" ? WinKind::Lead
+                    : fn == "first_value" ? WinKind::FirstValue
+                                          : WinKind::LastValue;
             w->arg_column = col;
             if (auto e = parse_over(*w)) return e;
             item.kind = SelectItemKind::Window;
             item.win = std::move(w);
-            item.label = (is_lead ? "LEAD(" : "LAG(") + col + ")";
+            item.label = upper(fn) + "(" + col + ")";
+            is_window = true;
+            return std::nullopt;
+        }
+        // NTILE(n) OVER — bucket the ordered partition into n groups (n is an integer literal).
+        if (is_kw("ntile")) {
+            advance();
+            if (auto e = expect(Tok::LParen, "'(' after NTILE")) return e;
+            Datum d;
+            if (auto e = expect_literal(d)) return e;
+            if (d.type != Type::Int || d.i < 1) return make_err("NTILE(n) needs a positive integer");
+            if (auto e = expect(Tok::RParen, "')' to close NTILE")) return e;
+            auto w = std::make_shared<WindowFunc>();
+            w->kind = WinKind::Ntile;
+            w->ntile_n = d.i;
+            if (auto e = parse_over(*w)) return e;
+            item.kind = SelectItemKind::Window;
+            item.win = std::move(w);
+            item.label = "NTILE(" + std::to_string(d.i) + ")";
             is_window = true;
             return std::nullopt;
         }

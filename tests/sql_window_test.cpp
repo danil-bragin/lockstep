@@ -82,6 +82,23 @@ void run_mode(bool columnar, const char* tag) {
     } else {
         check(false, T + " LAG/LEAD/AVG query");
     }
+
+    // FIRST_VALUE / LAST_VALUE / NTILE over dept A by sal asc (id1=100,id2=200,id4=200).
+    const ExecResult fv = e.exec(
+        "SELECT id, FIRST_VALUE(sal) OVER (PARTITION BY dept ORDER BY sal) AS fv, "
+        "LAST_VALUE(sal) OVER (PARTITION BY dept ORDER BY sal) AS lv, "
+        "NTILE(2) OVER (PARTITION BY dept ORDER BY sal) AS nt FROM t WHERE dept = 'A' ORDER BY id");
+    if (fv.ok && fv.rows.size() == 3) {
+        // partition first sal = 100 (id1), last = 200. NTILE(2) over 3 rows -> buckets 1,1,2.
+        check(fv.rows[0].cells[1].second.i == 100, T + " FIRST_VALUE dept A = 100");
+        check(fv.rows[0].cells[2].second.i == 200, T + " LAST_VALUE dept A = 200");
+        // by sal asc: id1(bucket1), then id2/id4(200) — id1 in bucket1; the two 200s in buckets 1,2.
+        std::int64_t total_buckets = 0;
+        for (const auto& row : fv.rows) total_buckets += row.cells[3].second.i;
+        check(total_buckets == 1 + 1 + 2, T + " NTILE(2) buckets sum to 4 (1,1,2)");
+    } else {
+        check(false, T + " FIRST_VALUE/LAST_VALUE/NTILE query");
+    }
 }
 }  // namespace
 
