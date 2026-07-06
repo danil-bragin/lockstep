@@ -1888,7 +1888,45 @@ private:
                 break;
             }
         }
+        // Optional ROWS frame: ROWS BETWEEN <start> AND <end> | ROWS <start> (= .. AND CURRENT ROW).
+        if (is_kw("rows")) {
+            advance();
+            w.has_frame = true;
+            if (is_kw("between")) {
+                advance();
+                if (auto e = parse_frame_bound(w.frame_start)) return e;
+                if (auto e = expect_kw("and")) return e;
+                if (auto e = parse_frame_bound(w.frame_end)) return e;
+            } else {
+                if (auto e = parse_frame_bound(w.frame_start)) return e;
+                w.frame_end.kind = FrameBoundKind::CurrentRow;  // single bound -> up to current row
+            }
+        }
         return expect(Tok::RParen, "')' to close OVER");
+    }
+
+    // Parse one ROWS-frame bound: UNBOUNDED PRECEDING | CURRENT ROW | n PRECEDING | n FOLLOWING |
+    // UNBOUNDED FOLLOWING.
+    [[nodiscard]] std::optional<ParseError> parse_frame_bound(FrameBound& b) {
+        if (is_kw("unbounded")) {
+            advance();
+            if (is_kw("preceding")) { advance(); b.kind = FrameBoundKind::UnboundedPreceding; return std::nullopt; }
+            if (is_kw("following")) { advance(); b.kind = FrameBoundKind::UnboundedFollowing; return std::nullopt; }
+            return make_err("expected PRECEDING/FOLLOWING after UNBOUNDED");
+        }
+        if (is_kw("current")) {
+            advance();
+            if (auto e = expect_kw("row")) return e;
+            b.kind = FrameBoundKind::CurrentRow;
+            return std::nullopt;
+        }
+        Datum d;
+        if (auto e = expect_literal(d)) return e;
+        if (d.type != Type::Int || d.i < 0) return make_err("a frame offset must be a non-negative integer");
+        b.offset = d.i;
+        if (is_kw("preceding")) { advance(); b.kind = FrameBoundKind::Preceding; return std::nullopt; }
+        if (is_kw("following")) { advance(); b.kind = FrameBoundKind::Following; return std::nullopt; }
+        return make_err("expected PRECEDING/FOLLOWING after the frame offset");
     }
 
     // C3: try to parse a WINDOW function at the cursor — ROW_NUMBER()/RANK() OVER (...) or an

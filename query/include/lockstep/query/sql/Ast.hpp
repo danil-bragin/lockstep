@@ -323,12 +323,23 @@ enum class WinKind : std::uint8_t {
     LastValue = 12,   // LAST_VALUE(col) — the ordered partition's last value
     Ntile = 13,       // NTILE(n) — bucket number 1..n over the ordered partition
 };
+// A ROWS-frame bound (physical row offsets within the ordered partition).
+enum class FrameBoundKind : std::uint8_t {
+    UnboundedPreceding = 0, Preceding = 1, CurrentRow = 2, Following = 3, UnboundedFollowing = 4,
+};
+struct FrameBound {
+    FrameBoundKind kind = FrameBoundKind::CurrentRow;
+    std::int64_t offset = 0;  // n for Preceding/Following
+};
 struct WindowFunc {
     WinKind kind = WinKind::RowNumber;
     std::string arg_column;                 // Sum/Min/Max/Count(col): the aggregated column
     std::vector<std::string> partition_by;  // OVER (PARTITION BY ...)
     std::vector<OrderKey> order_by;         // OVER (... ORDER BY ...)
     std::int64_t ntile_n = 1;               // NTILE(n): the number of buckets
+    bool has_frame = false;                 // an explicit ROWS BETWEEN frame was given
+    FrameBound frame_start;                 // default CURRENT ROW (unused unless has_frame)
+    FrameBound frame_end;
 };
 
 enum class SelectItemKind : std::uint8_t { Column = 0, Aggregate = 1, Expr = 2, Window = 3 };

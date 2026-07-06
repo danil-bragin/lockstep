@@ -7646,6 +7646,51 @@ private:
                     out[idxs[k2]] = Datum::make_int(bucket);
                     ++pos;
                 }
+            } else if (w.has_frame) {
+                // ROWS-frame aggregate: for each row, aggregate over its frame slice of the
+                // ordered partition (running total / moving average). Physical row offsets.
+                const std::int64_t sz = static_cast<std::int64_t>(idxs.size());
+                auto bound_pos = [&](const FrameBound& b, std::int64_t k2) -> std::int64_t {
+                    switch (b.kind) {
+                        case FrameBoundKind::UnboundedPreceding: return 0;
+                        case FrameBoundKind::Preceding: return k2 - b.offset;
+                        case FrameBoundKind::CurrentRow: return k2;
+                        case FrameBoundKind::Following: return k2 + b.offset;
+                        case FrameBoundKind::UnboundedFollowing: return sz - 1;
+                    }
+                    return k2;
+                };
+                for (std::int64_t k2 = 0; k2 < sz; ++k2) {
+                    std::int64_t lo = bound_pos(w.frame_start, k2);
+                    std::int64_t hi = bound_pos(w.frame_end, k2);
+                    if (lo < 0) lo = 0;
+                    if (hi > sz - 1) hi = sz - 1;
+                    std::int64_t npres = 0, sum = 0, total = 0;
+                    Datum best;
+                    bool any = false;
+                    for (std::int64_t p = lo; p <= hi; ++p) {  // empty frame if lo > hi
+                        ++total;
+                        const Datum& d = rows[idxs[static_cast<std::size_t>(p)]][argc];
+                        if (w.kind == WinKind::CountStar) continue;
+                        if (d.is_null) continue;
+                        ++npres;
+                        if (d.type == Type::Int && add_ovf(sum, d.i, sum))
+                            return "integer overflow in window SUM";
+                        if (!any) { best = d; any = true; }
+                        else {
+                            const int c = cmp_datum(d, best);
+                            if ((w.kind == WinKind::Min && c < 0) || (w.kind == WinKind::Max && c > 0)) best = d;
+                        }
+                    }
+                    Datum v;
+                    if (w.kind == WinKind::CountStar) v = Datum::make_int(total);
+                    else if (w.kind == WinKind::Count) v = Datum::make_int(npres);
+                    else if (w.kind == WinKind::Sum) v = Datum::make_int(sum);
+                    else if (w.kind == WinKind::Avg)
+                        v = npres > 0 ? Datum::make_int(sum / npres) : Datum::make_null(Type::Int);
+                    else v = any ? best : Datum::make_null(t.columns[argc].type);
+                    out[idxs[static_cast<std::size_t>(k2)]] = v;
+                }
             } else {
                 // Whole-partition aggregate (same value for every row in the partition).
                 std::int64_t total = static_cast<std::int64_t>(idxs.size());

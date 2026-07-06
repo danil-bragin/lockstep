@@ -99,6 +99,30 @@ void run_mode(bool columnar, const char* tag) {
     } else {
         check(false, T + " FIRST_VALUE/LAST_VALUE/NTILE query");
     }
+
+    // ROWS frame — running total over dept A by id (sal 100,200,200 -> 100,300,500).
+    const ExecResult rt = e.exec(
+        "SELECT id, SUM(sal) OVER (PARTITION BY dept ORDER BY id "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rsum FROM t WHERE dept = 'A' ORDER BY id");
+    if (rt.ok && rt.rows.size() == 3) {
+        check(rt.rows[0].cells[1].second.i == 100, T + " running SUM id1 = 100");
+        check(rt.rows[1].cells[1].second.i == 300, T + " running SUM id2 = 300");
+        check(rt.rows[2].cells[1].second.i == 500, T + " running SUM id4 = 500");
+    } else {
+        check(false, T + " running-total frame query");
+    }
+
+    // Moving window — SUM over the current + 1 preceding row (100, 100+200=300, 200+200=400).
+    const ExecResult mv = e.exec(
+        "SELECT id, SUM(sal) OVER (PARTITION BY dept ORDER BY id "
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS msum FROM t WHERE dept = 'A' ORDER BY id");
+    if (mv.ok && mv.rows.size() == 3) {
+        check(mv.rows[0].cells[1].second.i == 100, T + " moving SUM id1 = 100");
+        check(mv.rows[1].cells[1].second.i == 300, T + " moving SUM id2 = 300 (100+200)");
+        check(mv.rows[2].cells[1].second.i == 400, T + " moving SUM id4 = 400 (200+200)");
+    } else {
+        check(false, T + " moving-window frame query");
+    }
 }
 }  // namespace
 
