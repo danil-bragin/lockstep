@@ -86,6 +86,24 @@ int main() {
         check(w.ok && w.rows.size() == 3, "WHERE x*2 > 5 -> id 1 (7), 3 (20), 4 (3000)");
     }
 
+    // REAL aggregates (SUM/AVG fold in double; MIN/MAX via cmp_datum). Row + columnar.
+    for (bool columnar : {false, true}) {
+        SqlEngine e;
+        if (columnar) e.set_columnar_default(true);
+        e.exec("CREATE TABLE g (id INT, grp TEXT NOT NULL, x REAL NOT NULL, PRIMARY KEY (id))");
+        e.exec("INSERT INTO g (id,grp,x) VALUES (1,'a',1.5),(2,'a',2.5),(3,'b',10.0),(4,'b',-4.0)");
+        if (columnar) e.flush_columnar("g");
+        const std::string tag = columnar ? "columnar " : "row ";
+        check(cell0(e.exec("SELECT SUM(x) FROM g")) == "10", tag + "SUM = 10");
+        check(cell0(e.exec("SELECT AVG(x) FROM g")) == "2.5", tag + "AVG = 2.5");
+        check(cell0(e.exec("SELECT MIN(x) FROM g")) == "-4", tag + "MIN = -4");
+        check(cell0(e.exec("SELECT MAX(x) FROM g")) == "10", tag + "MAX = 10");
+        const ExecResult gr = e.exec("SELECT grp, SUM(x) FROM g GROUP BY grp ORDER BY grp");
+        check(gr.ok && gr.rows.size() == 2 && gr.rows[0].cells[1].second.render() == "4" &&
+                  gr.rows[1].cells[1].second.render() == "6",
+              tag + "GROUP BY REAL SUM (a=4, b=6)");
+    }
+
     // Durability: a REAL column recovers byte-exact across a restart.
     {
         lockstep::core::Scheduler sched;

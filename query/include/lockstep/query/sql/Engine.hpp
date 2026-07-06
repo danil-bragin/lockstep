@@ -4069,6 +4069,10 @@ private:
                         row[c] = cc[c]->at(i);
                     }
                 }
+                // ColumnChunk::at() yields an UNTAGGED Datum (logical=0); stamp the logical/scale
+                // from the schema so a materialised REAL/DECIMAL/DATE compares & renders like the
+                // row-path decode (F14: REAL MIN/MAX via cmp_datum needs the logical=14 tag).
+                tag_logical_cols(t, row);
                 base.push_back(std::move(row));
             }
         }
@@ -11564,7 +11568,10 @@ private:
         if (present.empty()) {
             // A NON-empty group whose aggregated column is ALL NULL: SUM=0; MIN/MAX/AVG
             // = typed NULL (the SQL three-valued result for an all-NULL aggregate).
-            out = (a.kind == AggKind::Sum) ? Datum::make_int(0) : Datum::make_null(ty);
+            if (a.kind == AggKind::Sum)
+                out = (t.columns[ci].logical == 14) ? Datum::make_real(0.0) : Datum::make_int(0);  // F14
+            else
+                out = Datum::make_null(ty);
             return std::nullopt;
         }
         if (a.kind == AggKind::Min || a.kind == AggKind::Max) {
@@ -11594,6 +11601,15 @@ private:
             }
             out = Datum::make_text(u256_encode(acc));
             out.logical = 13;
+            return std::nullopt;
+        }
+        // F14: SUM / AVG over a REAL column — fold in IEEE-754 double (MIN/MAX handled above via
+        // cmp_datum). AVG divides by the present (non-NULL) count, like every other numeric type.
+        if (t.columns[ci].logical == 14) {
+            double acc = 0.0;
+            for (const Datum* d : present) acc += d->real_value();
+            if (a.kind == AggKind::Avg) acc /= static_cast<double>(present.size());  // present non-empty
+            out = Datum::make_real(acc);
             return std::nullopt;
         }
         // F9f: SUM / AVG over a 128-bit column (INT128/DECIMAL128) — accumulate in __int128 (checked).
