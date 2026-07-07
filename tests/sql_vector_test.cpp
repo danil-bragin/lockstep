@@ -43,6 +43,15 @@ void seed_vec(SqlEngine& e) {
     e.exec("INSERT INTO items (id,emb) VALUES "
            "(1, '[1,0,0]'), (2, ARRAY[0.0,1.0,0.0]), (3, '[0.9, 0.1, 0]'), (4, '[0,0,1]')");
 }
+// K1.3: two well-separated clusters (A near the origin, B near [10,10]) + an IVFFLAT index
+// with lists=2 — the deterministic k-means must split them, so probes=1 finds a whole cluster.
+void seed_ann(SqlEngine& e) {
+    e.exec("CREATE TABLE ann (id INT, emb VECTOR(2) NOT NULL, PRIMARY KEY (id))");
+    e.exec("INSERT INTO ann (id,emb) VALUES "
+           "(1,'[0,0]'), (2,'[1,0]'), (3,'[0,1]'), (4,'[1,1]'), (5,'[0.5,0.5]'), "
+           "(6,'[10,10]'), (7,'[11,10]'), (8,'[10,11]'), (9,'[11,11]'), (10,'[10.5,10.5]')");
+    e.exec("CREATE INDEX ann_ivf ON ann (emb) USING IVFFLAT WITH (lists = 2, probes = 1)");
+}
 }  // namespace
 
 int main() {
@@ -181,6 +190,65 @@ int main() {
         // A dimension outside 1..16000 is rejected.
         check(!e.exec("CREATE TABLE bad2 (id INT, v VECTOR(0), PRIMARY KEY (id))").ok,
               tag + "VECTOR(0) rejected");
+
+        // --- K1.3: IVFFLAT approximate k-NN index ---
+        seed_ann(e);
+        if (columnar) e.flush_columnar("ann");
+        // probes=1 near cluster A. Distances from [0,0]: id1=0, id5~0.707, id2=id3=1 (PK breaks
+        // the tie -> id2). The whole cluster lives in the probed list, so this matches exact.
+        {
+            const ExecResult r = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 3");
+            check(ids(r) == (std::vector<std::int64_t>{1, 5, 2}), tag + "ivfflat k-NN cluster A");
+        }
+        {
+            const ExecResult ref = e.exec(
+                "SELECT id, l2_distance(emb,'[0,0]') AS d FROM ann ORDER BY d LIMIT 3");
+            check(ids(ref) == (std::vector<std::int64_t>{1, 5, 2}),
+                  tag + "brute-force reference agrees");
+        }
+        // Maintenance: INSERT lands in the right list; DELETE disappears; UPDATE moves the row.
+        e.exec("INSERT INTO ann (id,emb) VALUES (11, '[0.1,0.1]')");
+        {
+            const ExecResult r = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 2");
+            check(ids(r) == (std::vector<std::int64_t>{1, 11}), tag + "ivfflat INSERT maintained");
+        }
+        e.exec("DELETE FROM ann WHERE id = 11");
+        {
+            const ExecResult r = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 2");
+            check(ids(r) == (std::vector<std::int64_t>{1, 5}), tag + "ivfflat DELETE maintained");
+        }
+        e.exec("UPDATE ann SET emb = '[10,10.1]' WHERE id = 1");  // id 1 moves to cluster B
+        {
+            const ExecResult r = e.exec("SELECT id FROM ann ORDER BY emb <-> '[10,10]' LIMIT 2");
+            check(ids(r) == (std::vector<std::int64_t>{6, 1}), tag + "ivfflat UPDATE moved the row");
+        }
+        e.exec("UPDATE ann SET emb = '[0,0]' WHERE id = 1");  // restore
+        // Differential gate: probes = lists probes EVERY entry, so the index result must equal
+        // the brute-force scan EXACTLY (same rows, same order — shared kernel + PK tie-break).
+        e.exec("DROP INDEX ann_ivf ON ann");
+        check(e.exec("CREATE INDEX ann_ivf2 ON ann (emb) USING IVFFLAT WITH (lists = 2, probes = 2)").ok,
+              tag + "CREATE IVFFLAT probes=lists");
+        {
+            const ExecResult a = e.exec("SELECT id FROM ann ORDER BY emb <-> '[5,5]' LIMIT 10");
+            const ExecResult b = e.exec(
+                "SELECT id, l2_distance(emb,'[5,5]') AS d FROM ann ORDER BY d LIMIT 10");
+            check(a.ok && b.ok && ids(a) == ids(b) && a.rows.size() == 10,
+                  tag + "probes=lists == exact scan (differential gate)");
+        }
+        // A WHERE alongside the distance ORDER BY falls back to the exact path (still correct).
+        {
+            const ExecResult r = e.exec(
+                "SELECT id FROM ann WHERE id <= 5 ORDER BY emb <-> '[0,0]' LIMIT 2");
+            check(ids(r) == (std::vector<std::int64_t>{1, 5}), tag + "WHERE + <-> exact fallback");
+        }
+        // Teeth: IVFFLAT demands a dimensioned VECTOR(n) column and rejects UNIQUE.
+        check(!e.exec("CREATE INDEX bad_ivf ON ann (id) USING IVFFLAT").ok,
+              tag + "IVFFLAT on non-VECTOR rejected");
+        check(!e.exec("CREATE UNIQUE INDEX bad_ivf2 ON ann (emb) USING IVFFLAT").ok,
+              tag + "UNIQUE IVFFLAT rejected");
+        e.exec("CREATE TABLE annu (id INT, emb VECTOR, PRIMARY KEY (id))");
+        check(!e.exec("CREATE INDEX bad_ivf3 ON annu (emb) USING IVFFLAT").ok,
+              tag + "undimensioned VECTOR rejected");
     }
 
     // Durability: embeddings recover; k-NN still works after a restart.
@@ -190,7 +258,7 @@ int main() {
         lockstep::sim::SeededRandom rng(0x7EC70ull);
         lockstep::sim::DiskFaultConfig dc;
         lockstep::sim::SimDisk data(sched, clock, rng, dc), cat(sched, clock, rng, dc);
-        { SqlEngine e(sched, data, sched, cat); seed(e); seed_vec(e); }
+        { SqlEngine e(sched, data, sched, cat); seed(e); seed_vec(e); seed_ann(e); }
         {
             SqlEngine e(sched, data, sched, cat);
             e.recover(data.logical_len(), cat.logical_len());
@@ -206,6 +274,14 @@ int main() {
             const ExecResult vknn = e.exec(
                 "SELECT id, l2_distance(emb, '[1,0,0]') AS d FROM items ORDER BY d LIMIT 2");
             check(ids(vknn) == (std::vector<std::int64_t>{1, 3}), "VECTOR k-NN after restart -> id 1, 3");
+            // K1.3: the IVFFLAT index (centroids included) recovers with the catalog — the ANN
+            // path works, and a fresh INSERT is bucketed by the RECOVERED centroids.
+            const ExecResult aknn = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 3");
+            check(ids(aknn) == (std::vector<std::int64_t>{1, 5, 2}), "ivfflat k-NN after restart");
+            e.exec("INSERT INTO ann (id,emb) VALUES (11, '[0.1,0.1]')");
+            const ExecResult aknn2 = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 2");
+            check(ids(aknn2) == (std::vector<std::int64_t>{1, 11}),
+                  "ivfflat INSERT after restart uses recovered centroids");
         }
     }
 

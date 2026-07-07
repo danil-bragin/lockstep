@@ -162,6 +162,15 @@ struct Index {
     // entry per ARRAY element (encoded as the element's physical type), so a containment lookup
     // (`<const> = ANY(arr_col)`) finds every row whose array holds that value. `columns` == {arr_col}.
     bool gin = false;
+    // K1.3: IVFFLAT (approximate k-NN) index over ONE VECTOR(n) column. Entries are bucketed by
+    // the nearest CENTROID: key = prefix ++ put_index_col(INT list_id) ++ pk, value = the VECTOR
+    // payload (a probe computes exact distances without a row fetch). Centroids come from a
+    // DETERMINISTIC k-means (PK-ordered seeding, fixed iteration count — no rng, replica-identical)
+    // and are FROZEN at CREATE (pgvector semantics: build the index after loading the data).
+    bool ivfflat = false;
+    std::uint32_t lists = 0;   // effective centroid count (the WITH (lists=N) knob, clamped)
+    std::uint32_t probes = 1;  // lists searched per k-NN query (WITH (probes=M))
+    std::string centroids;     // [dim:be32][k:be32] then k*dim little-endian 8-byte doubles
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).

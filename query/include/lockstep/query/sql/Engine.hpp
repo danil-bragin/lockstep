@@ -780,6 +780,7 @@ private:
         }
         o += ")";
         if (ix.gin) o += " USING GIN";
+        else if (ix.ivfflat) o += " USING IVFFLAT";  // K1.3 (WITH knobs are rebuild-time defaults)
         else if (ix.hash) o += " USING HASH";
         if (!ix.partial_src.empty()) o += " WHERE " + ix.partial_src;
         o += ";";
@@ -961,6 +962,10 @@ public:
             cat_put_s(o, ix.expr_src);  // J2: expression index source
             o.push_back(ix.expr_type == Type::Int ? 0 : 1);
             o.push_back(ix.gin ? 1 : 0);  // J3: GIN (array-element) index
+            o.push_back(ix.ivfflat ? 1 : 0);  // K1.3: IVFFLAT (approximate k-NN)
+            cat_put_u32(o, ix.lists);
+            cat_put_u32(o, ix.probes);
+            cat_put_s(o, ix.centroids);
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
         for (const std::string& chk : t.checks) {
@@ -1038,6 +1043,10 @@ public:
             ix.expr_src = cat_get_s(s, p);  // J2: expression index source
             ix.expr_type = (s[p++] == 0) ? Type::Int : Type::Text;
             ix.gin = s[p++] != 0;  // J3: GIN (array-element) index
+            ix.ivfflat = s[p++] != 0;  // K1.3: IVFFLAT (approximate k-NN)
+            ix.lists = cat_get_u32(s, p);
+            ix.probes = cat_get_u32(s, p);
+            ix.centroids = cat_get_s(s, p);
             t.indexes.push_back(std::move(ix));
         }
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
@@ -2359,6 +2368,9 @@ private:
             const ParseResult pr = parse_sql("SELECT * FROM " + ci.table + " WHERE " + ix.partial_src);
             if (!pr.ok()) return ExecResult::failure("invalid partial index WHERE: " + pr.error().render());
         }
+        if (ci.ivfflat && is_expr) {  // K1.3
+            return ExecResult::failure("an IVFFLAT index cannot be an expression index");
+        }
         if (is_expr) {
             // J2: EXPRESSION index. `columns` stays empty; the entry's leading token is the
             // evaluated expression value. Validate the expression parses + evaluates against the
@@ -2403,10 +2415,86 @@ private:
                 ix.gin = true;
                 ix.hash = false;  // GIN entries are ordered per element (range is moot)
             }
+            if (ci.ivfflat) {  // K1.3: IVFFLAT — one dimensioned VECTOR(n) column, non-unique
+                if (ix.columns.size() != 1) {
+                    return ExecResult::failure("USING IVFFLAT indexes exactly one VECTOR column");
+                }
+                const Column& vc = t->columns[ix.columns[0]];
+                if (vc.logical != 15 || vc.max_len == 0) {
+                    return ExecResult::failure(
+                        "USING IVFFLAT requires a dimensioned VECTOR(n) column (got '" +
+                        ci.column + "')");
+                }
+                if (ci.unique) return ExecResult::failure("an IVFFLAT index cannot be UNIQUE");
+                if (!ci.partial_src.empty()) {
+                    return ExecResult::failure("an IVFFLAT index cannot be partial");
+                }
+                if (t->composite_pk()) {
+                    return ExecResult::failure(
+                        "an IVFFLAT index is not supported on a composite-PK table");
+                }
+                ix.ivfflat = true;
+                ix.hash = false;
+                ix.lists = ci.lists != 0 ? ci.lists : 100;   // pgvector's default lists
+                ix.probes = ci.probes != 0 ? ci.probes : 1;  // pgvector's default probes
+            }
         }
         t->indexes.push_back(ix);
         persist_schema(ci.table);  // C7: the new index is part of the durable schema
         const std::uint32_t table_id = t->id;
+
+        // K1.3: IVFFLAT build — enumerate every live row FIRST (the k-means needs the full
+        // vector set), compute the FROZEN centroids (deterministic k-means over the PK-ordered
+        // vectors), re-persist the schema (centroids are part of it), then bucket-backfill one
+        // entry per row (value = the vector payload) through the verified write path.
+        if (ix.ivfflat) {
+            std::vector<std::vector<Datum>> all_rows;
+            if (t->columnar) {
+                SelectStmt full;
+                full.table = t->name;
+                full.level = Level::StrictSerializable;
+                std::vector<bool> all(t->columns.size(), true);
+                if (auto e = columnar_build_rows(*t, full, all, all_rows)) {
+                    t->indexes.pop_back();
+                    persist_schema(ci.table);
+                    return ExecResult::failure(*e);
+                }
+            } else {
+                std::vector<storage::KeyValue> kvs;
+                {
+                    Query<Strict> q;
+                    q.scan(table_prefix(table_id), table_prefix_end(table_id));
+                    collect(db_.run(q), kvs);
+                }
+                for (const storage::KeyValue& kv : kvs) {
+                    if (is_tombstone(kv.second)) continue;
+                    all_rows.push_back(decode_row(*t, kv.first, kv.second));
+                }
+            }
+            const std::size_t vcol = ix.columns[0];
+            const std::size_t dim = t->columns[vcol].max_len;
+            std::vector<std::vector<double>> vecs;
+            vecs.reserve(all_rows.size());
+            for (const auto& row : all_rows)
+                if (!row[vcol].is_null) vecs.push_back(ivf_payload_doubles(row[vcol].s));
+            // Effective list count: never more lists than vectors (each seed needs a vector).
+            const std::size_t k = std::max<std::size_t>(
+                1, std::min<std::size_t>(ix.lists, vecs.empty() ? 1 : vecs.size()));
+            const std::vector<std::vector<double>> cents = ivf_kmeans(vecs, k, dim);
+            Index& live = t->indexes.back();
+            live.lists = static_cast<std::uint32_t>(k);
+            live.centroids = ivf_encode_centroids(dim, cents);
+            persist_schema(ci.table);
+            for (const auto& row : all_rows) {
+                if (row[vcol].is_null) continue;
+                const std::size_t list = ivf_nearest(cents, ivf_payload_doubles(row[vcol].s));
+                commit_writes({{encode_index_entry(table_id, live,
+                                                   Datum::make_int(static_cast<std::int64_t>(list)),
+                                                   row[t->pk_index]),
+                                row[vcol].s}});
+            }
+            return ExecResult{};
+        }
 
         // BACKFILL: scan every live row and write its index entry. Read through the
         // verified scan path (a full table scan), then commit one index-entry write per
@@ -3212,6 +3300,94 @@ private:
         return std::nullopt;
     }
 
+    // --- K1.3: IVFFLAT helpers (all pure + deterministic — no rng, no wall-clock). -----------
+    // Decode a VECTOR payload (the ARRAY codec with REAL elements) into raw doubles.
+    static std::vector<double> ivf_payload_doubles(const std::string& payload) {
+        std::vector<double> v;
+        const std::vector<Datum> elems = Datum::decode_array(payload);
+        v.reserve(elems.size());
+        for (const Datum& d : elems) v.push_back(d.real_value());
+        return v;
+    }
+    // Centroid blob codec: [dim:be32][k:be32] then k*dim little-endian 8-byte doubles.
+    static std::string ivf_encode_centroids(std::size_t dim,
+                                            const std::vector<std::vector<double>>& cents) {
+        std::string o;
+        Datum::put_be32_(o, static_cast<std::uint32_t>(dim));
+        Datum::put_be32_(o, static_cast<std::uint32_t>(cents.size()));
+        for (const auto& c : cents)
+            for (std::size_t d = 0; d < dim; ++d) o += Datum::encode_double(d < c.size() ? c[d] : 0.0);
+        return o;
+    }
+    static void ivf_decode_centroids(const std::string& s, std::size_t& dim,
+                                     std::vector<std::vector<double>>& cents) {
+        cents.clear();
+        dim = 0;
+        if (s.size() < 8) return;
+        dim = Datum::get_be32_(s, 0);
+        const std::size_t k = Datum::get_be32_(s, 4);
+        if (dim == 0 || s.size() < 8 + k * dim * 8) return;
+        cents.resize(k, std::vector<double>(dim, 0.0));
+        std::size_t off = 8;
+        for (std::size_t c = 0; c < k; ++c)
+            for (std::size_t d = 0; d < dim; ++d, off += 8)
+                cents[c][d] = Datum::decode_double(s.substr(off, 8));
+    }
+    // Nearest centroid by squared L2; a tie breaks to the LOWEST index (deterministic).
+    static std::size_t ivf_nearest(const std::vector<std::vector<double>>& cents,
+                                   const std::vector<double>& v) {
+        std::size_t best = 0;
+        double bd = 0.0;
+        bool first = true;
+        for (std::size_t c = 0; c < cents.size(); ++c) {
+            double d2 = 0.0;
+            const std::size_t n = std::min(cents[c].size(), v.size());
+            for (std::size_t d = 0; d < n; ++d) {
+                const double x = cents[c][d] - v[d];
+                d2 += x * x;
+            }
+            if (first || d2 < bd) { bd = d2; best = c; first = false; }
+        }
+        return best;
+    }
+    // Deterministic k-means: seed centroids evenly over the PK-ordered input, then a FIXED
+    // number of Lloyd iterations (assignment ties -> lowest centroid; an empty cluster keeps
+    // its previous centroid). Same input order on every replica => byte-identical centroids.
+    static std::vector<std::vector<double>> ivf_kmeans(
+        const std::vector<std::vector<double>>& vecs, std::size_t k, std::size_t dim) {
+        std::vector<std::vector<double>> cents;
+        if (vecs.empty() || k == 0) {
+            cents.assign(std::max<std::size_t>(1, k), std::vector<double>(dim, 0.0));
+            return cents;
+        }
+        cents.reserve(k);
+        for (std::size_t i = 0; i < k; ++i) cents.push_back(vecs[(i * vecs.size()) / k]);
+        constexpr int kIters = 5;
+        for (int iter = 0; iter < kIters; ++iter) {
+            std::vector<std::vector<double>> sum(k, std::vector<double>(dim, 0.0));
+            std::vector<std::size_t> cnt(k, 0);
+            for (const auto& v : vecs) {
+                const std::size_t c = ivf_nearest(cents, v);
+                for (std::size_t d = 0; d < dim && d < v.size(); ++d) sum[c][d] += v[d];
+                ++cnt[c];
+            }
+            for (std::size_t c = 0; c < k; ++c)
+                if (cnt[c] != 0)
+                    for (std::size_t d = 0; d < dim; ++d)
+                        cents[c][d] = sum[c][d] / static_cast<double>(cnt[c]);
+        }
+        return cents;
+    }
+    // Does this scalar expression reference any column? (A constant query vector must not.)
+    // A CASE is conservatively treated as column-dependent (its WHEN predicates are not walked).
+    static bool expr_has_col(const Expr& e) {
+        if (e.kind == ExprKind::Col || e.kind == ExprKind::Case) return true;
+        if (e.left && expr_has_col(*e.left)) return true;
+        if (e.right && expr_has_col(*e.right)) return true;
+        for (const auto& a : e.args) if (a && expr_has_col(*a)) return true;
+        return false;
+    }
+
     static const char* logical_name(std::uint8_t lg) {
         switch (lg) {
             case 1: return "DECIMAL";
@@ -3368,6 +3544,20 @@ private:
                               std::vector<std::pair<Key, Value>>& out) {
         for (const Index& ix : t.indexes) {
             if (!row_matches_partial(t, ix, row)) continue;  // I5: outside the partial set
+            if (ix.ivfflat) {  // K1.3: one entry in the nearest-centroid list; value = the payload
+                const Datum& v = row[ix.columns[0]];
+                if (v.is_null) continue;  // a NULL vector gets no entry (like a NULL column)
+                std::size_t dim = 0;
+                std::vector<std::vector<double>> cents;
+                ivf_decode_centroids(ix.centroids, dim, cents);
+                if (cents.empty()) continue;  // defensive: unbuilt index
+                const std::size_t list = ivf_nearest(cents, ivf_payload_doubles(v.s));
+                out.emplace_back(
+                    encode_index_entry(t.id, ix, Datum::make_int(static_cast<std::int64_t>(list)),
+                                       row[t.pk_index]),
+                    tombstone ? tombstone_marker() : v.s);
+                continue;
+            }
             if (ix.gin) {  // J3: one entry per DISTINCT array element
                 for (const Datum& el : gin_elements(ix, row))
                     out.emplace_back(encode_index_entry(t.id, ix, el, row[t.pk_index]),
@@ -7067,6 +7257,12 @@ private:
             }
         }
 
+        // K1.3: IVFFLAT approximate k-NN — probe centroid lists instead of scanning when the
+        // query is the pgvector `ORDER BY vec <-> const LIMIT k` idiom (nullopt = exact path).
+        if (auto ann = ivfflat_try_knn(*t, sel)) {
+            return std::move(*ann);
+        }
+
         // (1) READ — pick the storage read (PK fast path vs full scan), run at the
         // call-site-visible D5 level. The fast path is taken only when the WHERE is
         // EXACTLY a PK eq / PK BETWEEN over the REAL PK column; the rest of the
@@ -10256,7 +10452,7 @@ private:
             const Index* ix = t.index_for_column(*col);
             // a SINGLE-column index on the leading column (a composite is the I1 prefix path instead).
             if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col || ix->gin ||
-                !query_implies_partial(sel, t, *ix))
+                ix->ivfflat || !query_implies_partial(sel, t, *ix))
                 continue;
             bool dup = false;
             for (const IndexPlan& p : eqs) if (p.index->column == *col) { dup = true; break; }
@@ -10443,8 +10639,8 @@ private:
             // query doesn't imply is skipped (a full index on the same column can still serve).
             const Index* ix = nullptr;
             for (const Index& cand : t.indexes)
-                if (!cand.columns.empty() && cand.columns[0] == *col && !cand.gin &&
-                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }  // J3: GIN excluded (per-element)
+                if (!cand.columns.empty() && cand.columns[0] == *col && !cand.gin && !cand.ivfflat &&
+                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }  // J3 GIN / K1.3 IVFFLAT excluded
             if (ix == nullptr) {
                 continue;
             }
@@ -10537,7 +10733,8 @@ private:
                 continue;
             }
             const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr || ix->hash || ix->gin || !query_implies_partial(sel, t, *ix)) {  // I7 hash; J3 GIN; I5 partial
+            if (ix == nullptr || ix->hash || ix->gin || ix->ivfflat ||
+                !query_implies_partial(sel, t, *ix)) {  // I7 hash; J3 GIN; K1.3 IVFFLAT; I5 partial
                 continue;
             }
             // Find a matching `col <= hi` conjunct on the SAME column.
@@ -10663,6 +10860,189 @@ private:
         return std::nullopt;
     }
 
+    // K1.3: IVFFLAT approximate k-NN. Matches the pgvector idiom
+    //   SELECT ... FROM t ORDER BY vec_col <-> <const vector> LIMIT k [OFFSET m]
+    // (no WHERE / GROUP BY / DISTINCT / aggregates / window / UNNEST) over an ivfflat-indexed
+    // VECTOR column: probe the `probes` nearest centroid lists, compute EXACT distances from
+    // the entry payloads, keep the top k+m by (distance, pk), then fetch + project those rows.
+    // Returns nullopt when the shape doesn't match (exact fallback); a malformed query vector
+    // is a clean failure. With probes >= lists the probed set is EVERY entry, so the result is
+    // EXACTLY the brute-force scan's — the differential gate in sql_vector_test relies on it.
+    [[nodiscard]] std::optional<ExecResult> ivfflat_try_knn(const Table& t, const SelectStmt& sel) {
+        if (sel.has_aggregates || !sel.group_by.empty() || sel.distinct || sel.filter.present() ||
+            sel.having.present() || !sel.has_limit || sel.order_by.size() != 1 || gs_mode_) {
+            return std::nullopt;
+        }
+        const OrderKey& okey = sel.order_by[0];
+        if (!okey.expr || okey.descending || okey.nulls != NullsOrder::Default) return std::nullopt;
+        for (const SelectItem& it : sel.items) {
+            if (it.kind == SelectItemKind::Window) return std::nullopt;
+            if (it.kind == SelectItemKind::Expr && it.expr && it.expr->kind == ExprKind::Func &&
+                it.expr->func == "UNNEST") {
+                return std::nullopt;
+            }
+        }
+        const Expr& e = *okey.expr;
+        if (e.kind != ExprKind::Func || e.args.size() != 2) return std::nullopt;
+        if (e.func != "<->" && e.func != "L2_DISTANCE" && e.func != "EUCLIDEAN_DISTANCE") {
+            return std::nullopt;  // the lists are k-means-built for L2 (v1: L2 only)
+        }
+        const Expr* colside = nullptr;
+        const Expr* vecside = nullptr;
+        for (int s = 0; s < 2; ++s) {
+            const Expr* a = e.args[static_cast<std::size_t>(s)].get();
+            const Expr* b = e.args[static_cast<std::size_t>(1 - s)].get();
+            if (a != nullptr && a->kind == ExprKind::Col && b != nullptr && !expr_has_col(*b)) {
+                colside = a;
+                vecside = b;
+                break;
+            }
+        }
+        if (colside == nullptr) return std::nullopt;
+        if (!colside->qualifier.empty() && colside->qualifier != t.name) return std::nullopt;
+        const auto cidx = t.column_index(colside->column);
+        if (!cidx) return std::nullopt;
+        const Index* ix = nullptr;
+        for (const Index& cand : t.indexes) {
+            if (cand.ivfflat && !cand.columns.empty() && cand.columns[0] == *cidx) {
+                ix = &cand;
+                break;
+            }
+        }
+        if (ix == nullptr || ix->centroids.empty()) return std::nullopt;
+
+        // Evaluate the CONSTANT query vector (no column refs — any row works as context).
+        Datum qd;
+        const std::vector<Datum> dummy(t.columns.size());
+        if (eval_expr(*vecside, t, dummy, qd)) return std::nullopt;  // un-evaluable => exact path
+        if (qd.type != Type::Text || qd.is_null) return std::nullopt;
+        std::vector<Datum> qelems;
+        if (qd.logical == 7 || qd.logical == 15) {
+            qelems = Datum::decode_array(qd.s);
+        } else if (qd.logical == 0) {
+            if (parse_vector_literal(qd.s, qelems)) return std::nullopt;
+        } else {
+            return std::nullopt;
+        }
+        std::vector<double> qv;
+        qv.reserve(qelems.size());
+        for (const Datum& el : qelems) {
+            if (el.is_null) return std::nullopt;
+            qv.push_back(el.is_real() ? el.real_value() : static_cast<double>(el.i));
+        }
+        std::size_t dim = 0;
+        std::vector<std::vector<double>> cents;
+        ivf_decode_centroids(ix->centroids, dim, cents);
+        if (cents.empty()) return std::nullopt;
+        if (qv.size() != dim) {
+            return ExecResult::failure(e.func + " requires vectors of equal length");
+        }
+
+        // Rank the lists by centroid distance; probe the nearest `probes` of them.
+        std::vector<std::pair<double, std::size_t>> ranked;
+        ranked.reserve(cents.size());
+        for (std::size_t c = 0; c < cents.size(); ++c) {
+            double d2 = 0.0;
+            for (std::size_t d = 0; d < dim; ++d) {
+                const double x = cents[c][d] - qv[d];
+                d2 += x * x;
+            }
+            ranked.emplace_back(d2, c);
+        }
+        std::stable_sort(ranked.begin(), ranked.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        const std::size_t nprobe =
+            std::min<std::size_t>(std::max<std::uint32_t>(1, ix->probes), ranked.size());
+
+        // Gather candidates from the probed lists (exact distance from the entry payload).
+        struct Cand {
+            double dist = 0.0;
+            Key pk_bytes;
+            Datum pk;
+        };
+        std::vector<Cand> cands;
+        std::size_t scanned = 0;
+        for (std::size_t p = 0; p < nprobe; ++p) {
+            Key lo = index_prefix(t.id, ix->id);
+            put_index_col(lo, Datum::make_int(static_cast<std::int64_t>(ranked[p].second)));
+            const Key hi = key_successor(lo);
+            std::vector<storage::KeyValue> kvs;
+            if (auto err = run_index_scan_at_level(sel, lo, hi, kvs)) {
+                return ExecResult::failure(*err);
+            }
+            for (const storage::KeyValue& ikv : kvs) {
+                if (is_tombstone(ikv.second)) continue;
+                ++scanned;
+                const std::vector<double> v = ivf_payload_doubles(ikv.second);
+                double d2 = 0.0;
+                for (std::size_t d = 0; d < dim && d < v.size(); ++d) {
+                    const double x = v[d] - qv[d];
+                    d2 += x * x;
+                }
+                Cand c;
+                c.dist = std::sqrt(d2);
+                c.pk = decode_index_entry_pk(t, ix->id, ikv.first);
+                c.pk_bytes = encode_pk(c.pk);
+                cands.push_back(std::move(c));
+            }
+        }
+        // Total deterministic order — (distance, PK bytes) — matching the exact path's
+        // ORDER BY distance with its PK tie-break (real_cmp keeps NaN total).
+        std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            const int c = Datum::real_cmp(a.dist, b.dist);
+            if (c != 0) return c < 0;
+            return a.pk_bytes < b.pk_bytes;
+        });
+        const std::size_t want = static_cast<std::size_t>(
+            std::max<std::int64_t>(0, sel.limit) + std::max<std::int64_t>(0, sel.offset));
+        if (cands.size() > want) cands.resize(want);
+
+        // Fetch + project the winners in distance order (already final — no sort needed).
+        ExecResult r;
+        for (const Cand& c : cands) {
+            std::vector<Datum> row;
+            if (t.columnar) {
+                auto rr = read_columnar_row(t, c.pk);
+                if (!rr) continue;  // entry with no live row (defensive)
+                row = std::move(*rr);
+            } else {
+                const Key rkey = encode_key(t, c.pk);
+                const ReadResult rv = point_get_at_level(sel, rkey);
+                if (!rv.has_value() || is_tombstone(*rv)) continue;
+                row = decode_row(t, rkey, *rv);
+            }
+            ResultRow out;
+            if (sel.star) {
+                for (std::size_t i = 0; i < t.columns.size(); ++i) {
+                    if (t.columns[i].dropped) continue;
+                    out.cells.emplace_back(t.columns[i].name, row[i]);
+                }
+            } else {
+                for (const SelectItem& item : sel.items) {
+                    Datum d;
+                    if (item.kind == SelectItemKind::Expr) {
+                        if (auto err = eval_expr(*item.expr, t, row, d)) {
+                            return ExecResult::failure(*err);
+                        }
+                    } else {
+                        const auto idx = t.column_index(item.column);
+                        if (!idx) return ExecResult::failure("unknown column '" + item.column + "'");
+                        d = row[*idx];
+                    }
+                    out.cells.emplace_back(item.label, d);
+                }
+            }
+            r.rows.push_back(std::move(out));
+        }
+        if (plan_stats_ != nullptr) {
+            plan_stats_->scanned = scanned;
+            plan_stats_->after_filter = r.rows.size();
+        }
+        apply_limit(sel, r.rows);
+        r.affected = r.rows.size();
+        return r;
+    }
+
     [[nodiscard]] std::optional<std::string> read_via_index(
         const Table& t, const SelectStmt& sel, const IndexPlan& plan,
         const std::vector<bool>& need, std::vector<std::vector<Datum>>& rows_out,
@@ -10785,7 +11165,7 @@ private:
                                   std::size_t pk_index) {
         // J2/J3: an expression index covers no stored column; a GIN entry holds a single ARRAY
         // element, not the array — neither can serve a covering (index-only) read.
-        if (!ix.expr_src.empty() || ix.gin) return false;
+        if (!ix.expr_src.empty() || ix.gin || ix.ivfflat) return false;  // K1.3: list-bucketed
         for (std::size_t c = 0; c < need.size(); ++c) {
             if (!need[c] || c == pk_index) continue;
             bool in_ix = false;
@@ -10821,7 +11201,9 @@ private:
                 }
             }
         };
-        if (ixp->gin) {
+        if (ixp->ivfflat) {
+            skip_token(Type::Int);  // K1.3: the leading token is the INT list id, not the column
+        } else if (ixp->gin) {
             skip_token(t.columns[ixp->columns[0]].elem_type);  // J3: one array-element token
         } else if (!ixp->expr_src.empty()) {
             skip_token(ixp->expr_type);  // J2: one expression-value token
