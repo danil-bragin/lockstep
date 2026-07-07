@@ -36,6 +36,13 @@ void seed(SqlEngine& e) {
            "(1, ARRAY[1.0,0.0,0.0]), (2, ARRAY[0.0,1.0,0.0]), "
            "(3, ARRAY[0.9,0.1,0.0]), (4, ARRAY[0.0,0.0,1.0])");
 }
+// K1.1: a dedicated VECTOR(3) table — the pgvector-style fixed-dimension type. Mixed literal
+// forms: ARRAY[...] and the pgvector '[x,y,z]' text.
+void seed_vec(SqlEngine& e) {
+    e.exec("CREATE TABLE items (id INT, emb VECTOR(3) NOT NULL, PRIMARY KEY (id))");
+    e.exec("INSERT INTO items (id,emb) VALUES "
+           "(1, '[1,0,0]'), (2, ARRAY[0.0,1.0,0.0]), (3, '[0.9, 0.1, 0]'), (4, '[0,0,1]')");
+}
 }  // namespace
 
 int main() {
@@ -78,6 +85,61 @@ int main() {
         // Dimension mismatch is a clean error.
         check(!e.exec("SELECT l2_distance(emb, ARRAY[1.0,0.0]) FROM docs WHERE id = 1").ok,
               tag + "dimension mismatch errors");
+
+        // --- K1.1: the VECTOR(n) type ---
+        seed_vec(e);
+        if (columnar) e.flush_columnar("items");
+        // Render is pgvector's '[x,y,z]' text form (canonical REAL payload).
+        {
+            const ExecResult r = e.exec("SELECT emb FROM items WHERE id = 1");
+            check(r.ok && r.rows.size() == 1 && r.rows[0].cells[0].second.render() == "[1,0,0]",
+                  tag + "VECTOR renders as [1,0,0]");
+        }
+        {
+            const ExecResult r = e.exec("SELECT emb FROM items WHERE id = 3");
+            check(r.ok && r.rows.size() == 1 && r.rows[0].cells[0].second.render() == "[0.9,0.1,0]",
+                  tag + "VECTOR renders [0.9,0.1,0]");
+        }
+        // Distance functions accept a VECTOR column + a '[x,y,z]' text literal query vector.
+        check(d0(e.exec("SELECT l2_distance(emb, '[1,0,0]') FROM items WHERE id = 1")) == 0.0,
+              tag + "VECTOR L2 to itself = 0");
+        check(d0(e.exec("SELECT cosine_distance(emb, '[1,0,0]') FROM items WHERE id = 2")) == 1.0,
+              tag + "VECTOR cosine orthogonal = 1");
+        // ...and an ARRAY[...] query vector against a VECTOR column.
+        check(d0(e.exec("SELECT inner_product(emb, ARRAY[1.0,1.0,1.0]) FROM items WHERE id = 3")) == 1.0,
+              tag + "VECTOR inner_product = 1.0");
+        // k-NN over the VECTOR column.
+        {
+            const ExecResult knn = e.exec(
+                "SELECT id, l2_distance(emb, '[1,0,0]') AS d FROM items ORDER BY d LIMIT 2");
+            check(ids(knn) == (std::vector<std::int64_t>{1, 3}), tag + "VECTOR k-NN -> id 1, 3");
+        }
+        // The declared dimension is enforced at INSERT (both literal forms), NULL elements and
+        // the empty vector are rejected, and a non-numeric element is a clean error.
+        check(!e.exec("INSERT INTO items (id,emb) VALUES (10, '[1,0]')").ok,
+              tag + "INSERT wrong-dim text literal rejected");
+        check(!e.exec("INSERT INTO items (id,emb) VALUES (11, ARRAY[1.0,2.0])").ok,
+              tag + "INSERT wrong-dim ARRAY rejected");
+        check(!e.exec("INSERT INTO items (id,emb) VALUES (12, ARRAY[1.0,NULL,2.0])").ok,
+              tag + "INSERT NULL element rejected");
+        check(!e.exec("INSERT INTO items (id,emb) VALUES (13, '[]')").ok,
+              tag + "INSERT empty vector rejected");
+        check(!e.exec("INSERT INTO items (id,emb) VALUES (14, '[a,b,c]')").ok,
+              tag + "INSERT non-numeric element rejected");
+        // DESCRIBE shows the declared dimension.
+        {
+            const ExecResult r = e.exec("DESCRIBE items");
+            bool found = false;
+            for (const auto& row : r.rows)
+                if (row.cells[0].second.s == "emb" && row.cells[1].second.s == "VECTOR(3)") found = true;
+            check(found, tag + "DESCRIBE shows VECTOR(3)");
+        }
+        // VECTOR[] (array of vectors) is rejected at parse.
+        check(!e.exec("CREATE TABLE bad (id INT, v VECTOR(2)[], PRIMARY KEY (id))").ok,
+              tag + "VECTOR[] rejected");
+        // A dimension outside 1..16000 is rejected.
+        check(!e.exec("CREATE TABLE bad2 (id INT, v VECTOR(0), PRIMARY KEY (id))").ok,
+              tag + "VECTOR(0) rejected");
     }
 
     // Durability: embeddings recover; k-NN still works after a restart.
@@ -87,13 +149,22 @@ int main() {
         lockstep::sim::SeededRandom rng(0x7EC70ull);
         lockstep::sim::DiskFaultConfig dc;
         lockstep::sim::SimDisk data(sched, clock, rng, dc), cat(sched, clock, rng, dc);
-        { SqlEngine e(sched, data, sched, cat); seed(e); }
+        { SqlEngine e(sched, data, sched, cat); seed(e); seed_vec(e); }
         {
             SqlEngine e(sched, data, sched, cat);
             e.recover(data.logical_len(), cat.logical_len());
             const ExecResult knn = e.exec(
                 "SELECT id, l2_distance(emb, ARRAY[1.0,0.0,0.0]) AS d FROM docs ORDER BY d LIMIT 2");
             check(ids(knn) == (std::vector<std::int64_t>{1, 3}), "k-NN after restart -> id 1, 3");
+            // K1.1: the VECTOR table recovers too — schema (dimension) + payload + render.
+            const ExecResult r = e.exec("SELECT emb FROM items WHERE id = 1");
+            check(r.ok && r.rows.size() == 1 && r.rows[0].cells[0].second.render() == "[1,0,0]",
+                  "VECTOR renders after restart");
+            check(!e.exec("INSERT INTO items (id,emb) VALUES (10, '[1,0]')").ok,
+                  "VECTOR dim enforced after restart");
+            const ExecResult vknn = e.exec(
+                "SELECT id, l2_distance(emb, '[1,0,0]') AS d FROM items ORDER BY d LIMIT 2");
+            check(ids(vknn) == (std::vector<std::int64_t>{1, 3}), "VECTOR k-NN after restart -> id 1, 3");
         }
     }
 

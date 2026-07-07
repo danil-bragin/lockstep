@@ -702,6 +702,7 @@ private:
         if (cur_.kind == Tok::LBracket) {
             advance();
             if (auto e = expect(Tok::RBracket, "']' to close an array type")) return e;
+            if (col.logical == 15) return make_err("VECTOR[] arrays are not supported");
             col.elem_type = col.type;
             col.elem_logical = col.logical;
             col.elem_scale = col.scale;
@@ -860,6 +861,27 @@ private:
                 if (auto e = expect(Tok::RParen, "')' after the length")) return e;
             }
             out = Type::Text;
+            return std::nullopt;
+        }
+        // K1: VECTOR(n) — a fixed-dimension embedding (pgvector-style). Logical 15 over physical
+        // TEXT; the stored payload is the generic ARRAY codec with REAL elements, the dimension
+        // lives in max_len (0 == unconstrained) and is enforced at coerce.
+        if (is_kw("vector")) {
+            advance();
+            out = Type::Text;
+            col.logical = 15;
+            col.elem_type = Type::Text;
+            col.elem_logical = 14;
+            col.elem_scale = 0;
+            if (cur_.kind == Tok::LParen) {
+                advance();
+                Datum n;
+                if (auto e = expect_literal(n)) return e;
+                if (n.type != Type::Int || n.i < 1 || n.i > 16000)
+                    return make_err("VECTOR(n) dimension must be 1..16000");
+                col.max_len = static_cast<std::uint32_t>(n.i);
+                if (auto e = expect(Tok::RParen, "')' after the VECTOR dimension")) return e;
+            }
             return std::nullopt;
         }
         if (is_kw("float") || is_kw("double") || is_kw("real")) {

@@ -2034,6 +2034,8 @@ private:
             case 1: return "numeric";
             case 2: return "date";
             case 3: return "timestamp";
+            case 14: return "double precision";  // F14
+            case 15: return "vector";            // K1
             default: return c.type == Type::Text ? "text" : "integer";
         }
     }
@@ -2305,6 +2307,8 @@ private:
         return r;
     }
     static std::string describe_type(const Column& c) {
+        if (c.logical == 15)  // K1: VECTOR(n) — show the declared dimension
+            return c.max_len != 0 ? "VECTOR(" + std::to_string(c.max_len) + ")" : "VECTOR";
         if (c.logical != 0) {
             std::string base = logical_name(c.logical);
             if ((c.logical == 1 || c.logical == 6) && c.scale) base += "(s=" + std::to_string(c.scale) + ")";
@@ -2939,6 +2943,56 @@ private:
             out.logical = 4;
             return std::nullopt;
         }
+        // K1: a VECTOR(n) column (logical 15, physical TEXT; the payload is the ARRAY codec with
+        // REAL elements). Accept an ARRAY[...] / VECTOR Datum, a '{...}' array text, or pgvector's
+        // '[x,y,z]' text form. Every element must be numeric and non-NULL; a declared dimension
+        // (col.max_len != 0) is enforced. The stored payload is canonical (every element a REAL).
+        if (col.type == Type::Text && col.logical == 15) {
+            std::vector<Datum> elems;
+            if (in.type == Type::Text && (in.logical == 7 || in.logical == 15)) {
+                elems = Datum::decode_array(in.s);
+            } else if (in.type == Type::Text && in.logical == 0) {
+                if (auto e = parse_vector_literal(in.s, elems)) return e;
+            } else {
+                return std::string("type mismatch for column '") + col.name + "': expected VECTOR";
+            }
+            if (elems.empty()) {
+                return std::string("VECTOR column '") + col.name + "' cannot hold an empty vector";
+            }
+            if (col.max_len != 0 && elems.size() != col.max_len) {
+                return std::string("VECTOR dimension mismatch for column '") + col.name +
+                       "': expected " + std::to_string(col.max_len) + ", got " +
+                       std::to_string(elems.size());
+            }
+            std::vector<Datum> coerced;
+            coerced.reserve(elems.size());
+            for (const Datum& e : elems) {
+                if (e.is_null) {
+                    return std::string("VECTOR column '") + col.name + "' cannot hold a NULL element";
+                }
+                double d = 0.0;
+                if (e.is_real()) {
+                    d = e.real_value();
+                } else if (e.type == Type::Int && e.logical == 0) {
+                    d = static_cast<double>(e.i);
+                } else if (e.type == Type::Text && e.logical == 0) {
+                    const char* first = e.s.data();
+                    const char* last = first + e.s.size();
+                    const auto res = std::from_chars(first, last, d);
+                    if (res.ec != std::errc{} || res.ptr != last) {
+                        return std::string("invalid VECTOR element '") + e.s + "' for column '" +
+                               col.name + "'";
+                    }
+                } else {
+                    return std::string("VECTOR column '") + col.name +
+                           "' requires numeric elements";
+                }
+                coerced.push_back(Datum::make_real(d));
+            }
+            out = Datum::make_text(Datum::encode_array(/*elem_logical=*/14, /*elem_scale=*/0, coerced));
+            out.logical = 15;
+            return std::nullopt;
+        }
         // F12: an ARRAY column (logical 7, physical TEXT). Accept an already-built array Datum (from
         // an ARRAY[...] expression) or a '{...}' text literal; re-encode each element coerced to the
         // column's element type so the stored payload is canonical.
@@ -3116,6 +3170,48 @@ private:
         return std::nullopt;
     }
 
+    // K1: parse a pgvector-style '[1,2,3]' (or '{1,2,3}') vector text literal into REAL Datums.
+    // Every element must be a plain numeric token (locale-free from_chars); no NULLs, no nesting.
+    static std::optional<std::string> parse_vector_literal(const std::string& in,
+                                                           std::vector<Datum>& out) {
+        std::size_t p = 0;
+        while (p < in.size() && (in[p] == ' ' || in[p] == '\t')) ++p;
+        if (p >= in.size() || (in[p] != '[' && in[p] != '{')) {
+            return std::string("vector literal must start with '[' or '{'");
+        }
+        const char close = in[p] == '[' ? ']' : '}';
+        ++p;
+        std::string cur;
+        bool closed = false;
+        auto flush = [&]() -> bool {
+            std::size_t a = 0, b = cur.size();
+            while (a < b && (cur[a] == ' ' || cur[a] == '\t')) ++a;
+            while (b > a && (cur[b - 1] == ' ' || cur[b - 1] == '\t')) --b;
+            const std::string tok = cur.substr(a, b - a);
+            cur.clear();
+            if (tok.empty()) return false;
+            double d = 0.0;
+            const auto res = std::from_chars(tok.data(), tok.data() + tok.size(), d);
+            if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size()) return false;
+            out.push_back(Datum::make_real(d));
+            return true;
+        };
+        for (; p < in.size(); ++p) {
+            if (in[p] == close) { closed = true; ++p; break; }
+            if (in[p] == ',') {
+                if (!flush()) return std::string("invalid vector element in '") + in + "'";
+                continue;
+            }
+            cur.push_back(in[p]);
+        }
+        if (!closed) return std::string("vector literal missing closing '") + close + "'";
+        // The final element (empty only for the '[]' empty-vector form, rejected by the caller).
+        std::size_t a = 0;
+        while (a < cur.size() && (cur[a] == ' ' || cur[a] == '\t')) ++a;
+        if (a < cur.size() && !flush()) return std::string("invalid vector element in '") + in + "'";
+        return std::nullopt;
+    }
+
     static const char* logical_name(std::uint8_t lg) {
         switch (lg) {
             case 1: return "DECIMAL";
@@ -3127,6 +3223,8 @@ private:
             case 8: return "TIME";
             case 9: return "ENUM";
             case 10: return "INTERVAL";
+            case 14: return "REAL";    // F14
+            case 15: return "VECTOR";  // K1
             default: return "INT";
         }
     }
@@ -8383,16 +8481,24 @@ private:
                 }
             return std::nullopt;
         }
-        // K1 (vector search): distance / similarity over two equal-length numeric vectors (REAL[] or
-        // INT[]). Returns a REAL. `ORDER BY l2_distance(embedding, ARRAY[...]) LIMIT k` is brute-force
-        // k-NN. L2_DISTANCE = Euclidean; INNER_PRODUCT / DOT_PRODUCT = dot; COSINE_DISTANCE =
-        // 1 - cosine similarity (a zero-magnitude vector yields distance 1, i.e. no similarity).
+        // K1 (vector search): distance / similarity over two equal-length numeric vectors (VECTOR,
+        // REAL[] or INT[]; a plain '[x,y,z]' text literal is parsed as a vector). Returns a REAL.
+        // `ORDER BY l2_distance(embedding, ARRAY[...]) LIMIT k` is brute-force k-NN. L2_DISTANCE =
+        // Euclidean; INNER_PRODUCT / DOT_PRODUCT = dot; COSINE_DISTANCE = 1 - cosine similarity (a
+        // zero-magnitude vector yields distance 1, i.e. no similarity).
         if (f == "L2_DISTANCE" || f == "EUCLIDEAN_DISTANCE" || f == "COSINE_DISTANCE" ||
             f == "INNER_PRODUCT" || f == "DOT_PRODUCT") {
             if (!need(2)) return f + " takes (vector, vector)";
             if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); out.logical = 14; return std::nullopt; }
-            if (!is_array(a[0]) || !is_array(a[1])) return f + " requires two ARRAY (vector) arguments";
-            const std::vector<Datum> u = Datum::decode_array(a[0].s), v = Datum::decode_array(a[1].s);
+            const auto vec_operand = [](const Datum& d, std::vector<Datum>& elems) -> bool {
+                if (d.type != Type::Text) return false;
+                if (d.logical == 7 || d.logical == 15) { elems = Datum::decode_array(d.s); return true; }
+                if (d.logical == 0) return !parse_vector_literal(d.s, elems).has_value();
+                return false;
+            };
+            std::vector<Datum> u, v;
+            if (!vec_operand(a[0], u) || !vec_operand(a[1], v))
+                return f + " requires two vector arguments (VECTOR, ARRAY, or a '[x,y,z]' literal)";
             if (u.size() != v.size()) return f + " requires vectors of equal length";
             const auto dbl = [](const Datum& d) { return d.is_real() ? d.real_value() : static_cast<double>(d.i); };
             double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;

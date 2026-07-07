@@ -371,6 +371,7 @@ struct Datum {
         }
         if (type == Type::Text && logical == 7) return render_array(s);  // F12: ARRAY
         if (type == Type::Text && logical == 14) return render_double(decode_double(s));  // F14: REAL
+        if (type == Type::Text && logical == 15) return render_vector(s);  // K1: VECTOR(n)
         if (type == Type::Text && logical >= 5) {  // F9e: INT128 / DECIMAL128 (16-byte payload in s)
             if (logical == 5) return render_i128(decode_i128(s));
             if (logical == 6) return render_decimal128(decode_i128(s), scale);
@@ -455,6 +456,18 @@ struct Datum {
             out += elems[k].render();
         }
         out.push_back('}');
+        return out;
+    }
+    // K1: VECTOR(n) (logical=15) — the payload is the ARRAY codec with REAL elements; the text
+    // form is pgvector's '[x,y,z]' (square brackets, comma-separated, no spaces).
+    static std::string render_vector(const std::string& s) {
+        const std::vector<Datum> elems = decode_array(s);
+        std::string out = "[";
+        for (std::size_t k = 0; k < elems.size(); ++k) {
+            if (k != 0) out.push_back(',');
+            out += elems[k].render();
+        }
+        out.push_back(']');
         return out;
     }
     // F13: TIME (logical=8) — seconds since midnight (0..86399) -> "HH:MM:SS".
