@@ -46,12 +46,12 @@ publishable novelty ("deterministic ANN"); (c) columnar SoA float blocks are alr
 ideal SIMD distance layout.
 
 **Steps.**
-- [ ] K1.1 `vector(n)` type (float32, dim-checked) — next logical type id; literals, casts, send/recv on PG wire (binary format matches pgvector's).
-- [ ] K1.2 Distance ops `<->` / `<#>` / `<=>` with SIMD kernels; exact scan (row + columnar).
-- [ ] K1.3 `USING ivfflat` (seeded k-means, `probes` knob) — ships first.
+- [x] K1.1 `vector(n)` type (dim-checked, logical 15 over the ARRAY codec with REAL elements; pgvector `'[x,y,z]'` text form). *Remaining: pgvector BINARY format on the PG wire (text works today).*
+- [x] K1.2 Distance ops `<->` / `<#>` / `<=>` (+ `l2_distance`/`cosine_distance`/`inner_product` fns); exact scan row + columnar; ORDER BY-expression k-NN idiom. *Remaining: SIMD kernels (scalar loops today).*
+- [x] K1.3 `USING ivfflat` (deterministic k-means — PK-ordered seeding, no rng; `lists`/`probes` knobs; entries carry the payload so probes skip row fetches).
 - [ ] K1.4 `USING hnsw` — seeded levels, WAL-logged, deterministic build; replica index-hash equality check.
 - [ ] K1.5 Recall/latency bench vs pgvector @1M×768d; honest report.
-- [ ] K1.6 Gate: index==scan differential (J-series discipline) + recall bounds vs exact oracle.
+- [x] K1.6 Gate: index==scan differential (probes=lists must EQUAL brute force — in sql_vector_test) *; recall bounds vs exact oracle at scale pending K1.5.*
 
 **Deps:** W3 arena (index build memory). **GTM hook:** "pgvector, but HA and reproducible."
 
