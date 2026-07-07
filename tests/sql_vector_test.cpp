@@ -134,6 +134,47 @@ int main() {
                 if (row.cells[0].second.s == "emb" && row.cells[1].second.s == "VECTOR(3)") found = true;
             check(found, tag + "DESCRIBE shows VECTOR(3)");
         }
+        // --- K1.2: pgvector distance operators <-> / <#> / <=> + ORDER BY expression ---
+        // Operator spelling == function spelling (same kernel).
+        {
+            const double d = d0(e.exec("SELECT emb <-> '[1,0,0]' AS d FROM items WHERE id = 3"));
+            check(d > 0.1414 && d < 0.1415, tag + "<-> == l2_distance");
+        }
+        check(d0(e.exec("SELECT emb <=> '[1,0,0]' AS d FROM items WHERE id = 2")) == 1.0,
+              tag + "<=> == cosine_distance");
+        // <#> is pgvector's NEGATIVE inner product.
+        check(d0(e.exec("SELECT emb <#> '[1,1,1]' AS d FROM items WHERE id = 3")) == -1.0,
+              tag + "<#> == -inner_product");
+        // The pgvector k-NN idiom: ORDER BY a distance EXPRESSION (not projected) + LIMIT.
+        {
+            const ExecResult knn = e.exec(
+                "SELECT id FROM items ORDER BY emb <-> '[1,0,0]' LIMIT 2");
+            check(ids(knn) == (std::vector<std::int64_t>{1, 3}), tag + "ORDER BY <-> LIMIT k");
+        }
+        // DESC + PK tie-break (id 2 and 4 are both at sqrt(2); the PK breaks the tie).
+        {
+            const ExecResult r = e.exec(
+                "SELECT id FROM items ORDER BY emb <-> '[1,0,0]' DESC LIMIT 1");
+            check(ids(r) == (std::vector<std::int64_t>{2}), tag + "ORDER BY <-> DESC");
+        }
+        // SELECT * + ORDER BY expression: the hidden sort cell is stripped from the output.
+        {
+            const ExecResult r = e.exec("SELECT * FROM items ORDER BY emb <-> '[1,0,0]' LIMIT 1");
+            check(r.ok && r.rows.size() == 1 && r.rows[0].cells.size() == 2 &&
+                      r.rows[0].cells[0].second.i == 1,
+                  tag + "SELECT * ORDER BY <-> strips the hidden cell");
+        }
+        // A distance operator in WHERE (J1 expression operand).
+        {
+            const ExecResult r = e.exec(
+                "SELECT id FROM items WHERE emb <-> '[1,0,0]' < 0.2 ORDER BY id");
+            check(ids(r) == (std::vector<std::int64_t>{1, 3}), tag + "WHERE <-> < 0.2");
+        }
+        // '<=' is still '<=' (the <=> lexer change must not break it).
+        {
+            const ExecResult r = e.exec("SELECT id FROM items WHERE id <= 2 ORDER BY id");
+            check(ids(r) == (std::vector<std::int64_t>{1, 2}), tag + "<= untouched");
+        }
         // VECTOR[] (array of vectors) is rejected at parse.
         check(!e.exec("CREATE TABLE bad (id INT, v VECTOR(2)[], PRIMARY KEY (id))").ok,
               tag + "VECTOR[] rejected");

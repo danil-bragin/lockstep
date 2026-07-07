@@ -7270,6 +7270,18 @@ private:
                 if (it.kind == SelectItemKind::Window)
                     return ExecResult::failure("UNNEST cannot be combined with window functions");
 
+        // K1.2: ORDER BY <scalar-expr> (`ORDER BY emb <-> '[1,0,0]' LIMIT k`). Each expression
+        // key is evaluated per SOURCE row into a HIDDEN output cell (label "\x01ob<i>" — the
+        // control byte cannot collide with a user alias); the sort reads the hidden label, and
+        // the cells are stripped after LIMIT. DISTINCT/UNNEST would change the row set between
+        // projection and sort, so the combination is rejected (PostgreSQL's DISTINCT rule).
+        bool has_expr_ob = false;
+        for (const OrderKey& k : sel.order_by) has_expr_ob = has_expr_ob || k.expr != nullptr;
+        if (has_expr_ob && (sel.distinct || unnest_idx >= 0)) {
+            return ExecResult::failure(
+                "ORDER BY expression cannot be combined with DISTINCT or UNNEST");
+        }
+
         ExecResult r;
         for (std::size_t ri = 0; ri < rows.size(); ++ri) {
             const auto& row = rows[ri];
@@ -7283,12 +7295,24 @@ private:
                 d = row[*idx];
                 return std::nullopt;
             };
+            // K1.2: append the hidden ORDER BY-expression cells to one built output row.
+            auto append_ob_cells = [&](ResultRow& out) -> std::optional<std::string> {
+                if (!has_expr_ob) return std::nullopt;
+                for (std::size_t ki = 0; ki < sel.order_by.size(); ++ki) {
+                    if (!sel.order_by[ki].expr) continue;
+                    Datum d;
+                    if (auto e = eval_expr(*sel.order_by[ki].expr, *t, row, d)) return e;
+                    out.cells.emplace_back(ob_label(ki), d);
+                }
+                return std::nullopt;
+            };
             if (sel.star) {
                 ResultRow out;
                 for (std::size_t i = 0; i < t->columns.size(); ++i) {
                     if (t->columns[i].dropped) continue;  // E1: hidden
                     out.cells.emplace_back(t->columns[i].name, row[i]);
                 }
+                if (auto e = append_ob_cells(out)) return ExecResult::failure(*e);
                 r.rows.push_back(std::move(out));
             } else if (unnest_idx < 0) {
                 ResultRow out;
@@ -7297,6 +7321,7 @@ private:
                     if (auto e = eval_item(a, d)) return ExecResult::failure(*e);
                     out.cells.emplace_back(sel.items[a].label, d);
                 }
+                if (auto e = append_ob_cells(out)) return ExecResult::failure(*e);
                 r.rows.push_back(std::move(out));
             } else {
                 // Decode the UNNEST array for this row, then emit one output row per element.
@@ -7329,8 +7354,20 @@ private:
             }
         }
         apply_limit(sel, r.rows);
+        strip_ob_cells(r.rows);  // K1.2: drop the hidden ORDER BY-expression cells
         r.affected = r.rows.size();
         return r;
+    }
+
+    // K1.2: the hidden output-cell label for ORDER BY-expression key <i>. The leading control
+    // byte cannot appear in a user identifier/alias, so no collision is possible.
+    [[nodiscard]] static std::string ob_label(std::size_t ki) {
+        return std::string("\x01ob") + std::to_string(ki);
+    }
+    static void strip_ob_cells(std::vector<ResultRow>& rows) {
+        for (ResultRow& rr : rows)
+            while (!rr.cells.empty() && rr.cells.back().first.rfind("\x01ob", 0) == 0)
+                rr.cells.pop_back();
     }
 
     // The grouped/aggregated execution path. `rows` is the post-WHERE row set (full
@@ -8487,7 +8524,8 @@ private:
         // Euclidean; INNER_PRODUCT / DOT_PRODUCT = dot; COSINE_DISTANCE = 1 - cosine similarity (a
         // zero-magnitude vector yields distance 1, i.e. no similarity).
         if (f == "L2_DISTANCE" || f == "EUCLIDEAN_DISTANCE" || f == "COSINE_DISTANCE" ||
-            f == "INNER_PRODUCT" || f == "DOT_PRODUCT") {
+            f == "INNER_PRODUCT" || f == "DOT_PRODUCT" ||
+            f == "<->" || f == "<#>" || f == "<=>") {  // K1.2: pgvector operator spellings
             if (!need(2)) return f + " takes (vector, vector)";
             if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); out.logical = 14; return std::nullopt; }
             const auto vec_operand = [](const Datum& d, std::vector<Datum>& elems) -> bool {
@@ -8508,11 +8546,12 @@ private:
                 dot += x * y; sq += (x - y) * (x - y); nu += x * x; nv += y * y;
             }
             double r = 0.0;
-            if (f == "L2_DISTANCE" || f == "EUCLIDEAN_DISTANCE") r = std::sqrt(sq);
-            else if (f == "COSINE_DISTANCE") {
+            if (f == "L2_DISTANCE" || f == "EUCLIDEAN_DISTANCE" || f == "<->") r = std::sqrt(sq);
+            else if (f == "COSINE_DISTANCE" || f == "<=>") {
                 const double denom = std::sqrt(nu) * std::sqrt(nv);
                 r = (denom == 0.0) ? 1.0 : 1.0 - dot / denom;
-            } else r = dot;  // INNER_PRODUCT / DOT_PRODUCT
+            } else if (f == "<#>") r = -dot;  // K1.2: pgvector's NEGATIVE inner product
+            else r = dot;  // INNER_PRODUCT / DOT_PRODUCT
             out = Datum::make_real(r);
             return std::nullopt;
         }
@@ -9574,6 +9613,9 @@ private:
         std::vector<std::string> keys;
         keys.reserve(sel.order_by.size());
         for (const OrderKey& k : sel.order_by) {
+            if (k.expr) {  // K1.2: only the single-table scalar SELECT path evaluates these
+                return std::string("ORDER BY expression is not supported in a JOIN SELECT");
+            }
             const std::string spelling =
                 k.qualifier.empty() ? k.column : k.qualifier + "." + k.column;
             // Accept either the bare column label or the qualified spelling, matching
@@ -9944,6 +9986,9 @@ private:
             mark(gc);
         }
         for (const OrderKey& k : sel.order_by) {
+            // K1.2: an ORDER BY expression may touch any column (like a J1 expr operand) —
+            // decode them all rather than walking the Expr tree.
+            if (k.expr) return std::vector<bool>(t.columns.size(), true);
             mark(k.column);
         }
         // WHERE + HAVING predicate leaves (column operands + column rhs).
@@ -10561,6 +10606,7 @@ private:
         bool all_asc = true, all_desc = true;
         for (std::size_t i = 0; i < sel.order_by.size(); ++i) {
             const OrderKey& k = sel.order_by[i];
+            if (k.expr) return 0;  // K1.2: an expression key never matches an index order
             if (k.position != 0 || !k.qualifier.empty() || k.nulls != NullsOrder::Default) return 0;
             if (k.column != t.columns[ix.columns[base + i]].name) return 0;
             if (k.descending) all_asc = false; else all_desc = false;
@@ -11824,6 +11870,7 @@ private:
         // bare column name matches the output). For a non-aggregate SELECT the cells
         // are labelled by column name, so a table column is found by its name.
         for (const OrderKey& k : sel.order_by) {
+            if (k.expr) continue;  // K1.2: expression key — sorted via its hidden cell
             if (k.position == 0 && !has_label(rows, k.column) && !t.column_index(k.column)) {
                 return std::string("unknown ORDER BY column '" + k.column + "'");
             }
@@ -11832,9 +11879,14 @@ private:
         const std::string pk_label = t.pk().name;
         std::stable_sort(rows.begin(), rows.end(),
                          [&](const ResultRow& x, const ResultRow& y) {
-                             for (const OrderKey& k : sel.order_by) {
+                             for (std::size_t ki = 0; ki < sel.order_by.size(); ++ki) {
+                                 const OrderKey& k = sel.order_by[ki];
                                  int dir = 0;
-                                 if (order_key_less(x, y, k, dir)) return true;
+                                 if (k.expr) {  // K1.2: read the hidden expression cell
+                                     if (order_key_less_label(x, y, ob_label(ki), k, dir)) return true;
+                                 } else if (order_key_less(x, y, k, dir)) {
+                                     return true;
+                                 }
                                  if (dir != 0) return false;
                              }
                              // Tie-break by PK (ascending) for a TOTAL order.
@@ -11853,6 +11905,9 @@ private:
             return std::nullopt;
         }
         for (const OrderKey& k : sel.order_by) {
+            if (k.expr) {  // K1.2: only the single-table scalar SELECT path evaluates these
+                return std::string("ORDER BY expression is not supported in this context");
+            }
             if (k.position == 0 && !has_label(rows, k.column) && !has_agg_label(sel, k.column)) {
                 return std::string("ORDER BY '" + k.column +
                                    "' must reference a grouped column or an aggregate "
@@ -11929,6 +11984,9 @@ private:
         std::vector<std::string> keys;
         keys.reserve(sel.order_by.size());
         for (const OrderKey& k : sel.order_by) {
+            if (k.expr) {  // K1.2: only the single-table scalar SELECT path evaluates these
+                return std::string("ORDER BY expression is not supported in this context");
+            }
             const std::string spelling =
                 k.qualifier.empty() ? k.column : k.qualifier + "." + k.column;
             if (has_label(rows, spelling) || has_agg_label(sel, spelling)) {

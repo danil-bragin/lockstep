@@ -311,6 +311,10 @@ struct OrderKey {
     bool descending = false;  // ASC default
     NullsOrder nulls = NullsOrder::Default;  // G3: NULLS FIRST | LAST override
     int position = 0;          // G4: ORDER BY <n> — the 1-based output column (0 == by name)
+    // K1.2: ORDER BY <scalar-expr> (e.g. `ORDER BY emb <-> '[1,0,0]'`, the pgvector k-NN idiom).
+    // Non-null == an expression key: the single-table SELECT path evaluates it per source row
+    // into a hidden output cell, sorts on it, then strips the cell. Other paths reject it.
+    std::shared_ptr<Expr> expr;
 };
 
 // One SELECT-list item: either a plain column or an aggregate expression. A v1

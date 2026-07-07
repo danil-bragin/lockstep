@@ -117,6 +117,9 @@ enum class Tok : std::uint8_t {
     Contains, // @>   (JSON containment)
     PathArrow,    // #>   (JSON get by path -> JSON)
     PathArrowText,// #>>  (JSON get by path -> text)
+    DistL2,   // <->  (K1.2: L2 distance, pgvector)
+    DistIp,   // <#>  (K1.2: NEGATIVE inner product, pgvector)
+    DistCos,  // <=>  (K1.2: cosine distance, pgvector)
     End,      // end of input
     Bad,      // a lexing error (unterminated string / stray byte)
 };
@@ -184,10 +187,22 @@ public:
                 ++i_;
                 if (i_ < src_.size() && src_[i_] == '=') {
                     ++i_;
-                    t.kind = Tok::Le;  // <=
+                    // K1.2: '<=>' (pgvector cosine distance) — only when '>' follows the '='.
+                    if (i_ < src_.size() && src_[i_] == '>') {
+                        ++i_;
+                        t.kind = Tok::DistCos;
+                    } else {
+                        t.kind = Tok::Le;  // <=
+                    }
                 } else if (i_ < src_.size() && src_[i_] == '>') {
                     ++i_;
                     t.kind = Tok::Ne;  // <> (SQL not-equal)
+                } else if (i_ + 1 < src_.size() && src_[i_] == '-' && src_[i_ + 1] == '>') {
+                    i_ += 2;
+                    t.kind = Tok::DistL2;  // <-> (K1.2; `a < -5` is untouched — no trailing '>')
+                } else if (i_ + 1 < src_.size() && src_[i_] == '#' && src_[i_ + 1] == '>') {
+                    i_ += 2;
+                    t.kind = Tok::DistIp;  // <#> (K1.2)
                 } else {
                     t.kind = Tok::Lt;  // <
                 }
@@ -2126,7 +2141,25 @@ private:
         return e;
     }
     [[nodiscard]] std::optional<ParseError> parse_scalar_expr(std::shared_ptr<Expr>& out) {
-        return parse_expr_add(out);
+        if (auto e = parse_expr_add(out)) return e;
+        // K1.2: pgvector distance operators `a <-> b` / `a <#> b` / `a <=> b`, lowest scalar
+        // precedence (they bind looser than +/-, like generic PostgreSQL operators). Each lowers
+        // to a Func node the engine's distance kernel evaluates ("<#>" is the NEGATIVE inner
+        // product, pgvector's convention).
+        for (;;) {
+            if (cur_.kind != Tok::DistL2 && cur_.kind != Tok::DistIp && cur_.kind != Tok::DistCos)
+                break;
+            const Tok op = cur_.kind;
+            advance();
+            std::shared_ptr<Expr> r;
+            if (auto e = parse_expr_add(r)) return e;
+            auto n = mk_expr(ExprKind::Func);
+            n->func = op == Tok::DistL2 ? "<->" : (op == Tok::DistIp ? "<#>" : "<=>");
+            n->args.push_back(out);
+            n->args.push_back(r);
+            out = n;
+        }
+        return std::nullopt;
     }
     [[nodiscard]] std::optional<ParseError> parse_expr_add(std::shared_ptr<Expr>& out) {
         if (auto e = parse_expr_mul(out)) return e;
@@ -2741,9 +2774,17 @@ private:
                     }
                     key.position = static_cast<int>(cur_.int_val);
                     advance();
-                } else if (auto e = expect_qualified_column("a column name or position in ORDER BY",
-                                                            key.qualifier, key.column)) {
-                    return e;
+                } else {
+                    // K1.2: a full scalar expression (`ORDER BY emb <-> '[1,0,0]'`). A bare
+                    // (optionally qualified) column keeps the classic column-key path.
+                    std::shared_ptr<Expr> ex;
+                    if (auto e = parse_scalar_expr(ex)) return e;
+                    if (ex->kind == ExprKind::Col) {
+                        key.qualifier = ex->qualifier;
+                        key.column = ex->column;
+                    } else {
+                        key.expr = ex;
+                    }
                 }
                 if (is_kw("asc")) {
                     advance();
