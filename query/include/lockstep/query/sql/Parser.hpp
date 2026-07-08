@@ -1519,6 +1519,16 @@ private:
                 std::string col;
                 if (auto e = expect_ident("an indexed column name", col)) return ParseResult{*e};
                 st.create_index.columns.push_back(col);
+                // K1.3c: an optional pgvector OPERATOR CLASS after the column name
+                // (`(emb vector_cosine_ops)`). Only the three vector opclasses are known.
+                if (cur_.kind == Tok::Ident) {
+                    const std::string oc = lower(cur_.text);
+                    if (oc == "vector_l2_ops") st.create_index.vec_op = 0;
+                    else if (oc == "vector_cosine_ops") st.create_index.vec_op = 1;
+                    else if (oc == "vector_ip_ops") st.create_index.vec_op = 2;
+                    else return err("unknown operator class '" + cur_.text + "'");
+                    advance();
+                }
                 if (cur_.kind == Tok::Comma) { advance(); continue; }
                 break;
             }

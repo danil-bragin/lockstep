@@ -85,6 +85,8 @@ struct CreateIndexStmt {
     bool ivfflat = false;
     std::uint32_t lists = 0;   // WITH (lists = N) — centroid count (0 == default)
     std::uint32_t probes = 0;  // WITH (probes = M) — lists searched per query (0 == default)
+    // K1.3c: operator class — 0 = vector_l2_ops (default), 1 = vector_cosine_ops, 2 = vector_ip_ops.
+    std::uint8_t vec_op = 0;
 };
 
 // DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).

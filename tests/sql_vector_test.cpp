@@ -52,6 +52,16 @@ void seed_ann(SqlEngine& e) {
            "(6,'[10,10]'), (7,'[11,10]'), (8,'[10,11]'), (9,'[11,11]'), (10,'[10.5,10.5]')");
     e.exec("CREATE INDEX ann_ivf ON ann (emb) USING IVFFLAT WITH (lists = 2, probes = 1)");
 }
+// K1.3c: two DIRECTION clusters (along +x and along +y) with mixed magnitudes — the cosine
+// opclass buckets by direction, which plain L2 clustering would scatter by magnitude.
+void seed_annc(SqlEngine& e) {
+    e.exec("CREATE TABLE annc (id INT, emb VECTOR(2) NOT NULL, PRIMARY KEY (id))");
+    e.exec("INSERT INTO annc (id,emb) VALUES "
+           "(1,'[1,0]'), (2,'[5,0.1]'), (3,'[20,1]'), (4,'[3,0.05]'), (5,'[9,0.4]'), "
+           "(6,'[0,1]'), (7,'[0.1,7]'), (8,'[1,30]'), (9,'[0.05,2]'), (10,'[0.3,11]')");
+    e.exec("CREATE INDEX annc_cos ON annc (emb vector_cosine_ops) USING IVFFLAT "
+           "WITH (lists = 2, probes = 1)");
+}
 }  // namespace
 
 int main() {
@@ -241,6 +251,68 @@ int main() {
                 "SELECT id FROM ann WHERE id <= 5 ORDER BY emb <-> '[0,0]' LIMIT 2");
             check(ids(r) == (std::vector<std::int64_t>{1, 5}), tag + "WHERE + <-> exact fallback");
         }
+        // K1.3d: EXPLAIN shows the ANN path (same matcher as the executor — the plan is honest).
+        {
+            const ExecResult r = e.exec("EXPLAIN SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 3");
+            bool has = false;
+            for (const auto& row : r.rows)
+                if (row.cells[0].second.s.find("Ivfflat Scan") != std::string::npos) has = true;
+            check(r.ok && has, tag + "EXPLAIN shows Ivfflat Scan");
+        }
+        // ...and a non-matching shape (WHERE present) plans as a plain scan, not ANN.
+        {
+            const ExecResult r = e.exec(
+                "EXPLAIN SELECT id FROM ann WHERE id <= 5 ORDER BY emb <-> '[0,0]' LIMIT 3");
+            bool has = false;
+            for (const auto& row : r.rows)
+                if (row.cells[0].second.s.find("Ivfflat Scan") != std::string::npos) has = true;
+            check(r.ok && !has, tag + "EXPLAIN: WHERE shape is not ANN");
+        }
+        // K1.3b: SET ivfflat.probes overrides the index default (ann_ivf2 has probes=2) for
+        // the session; 0 restores each index's own default.
+        e.exec("SET ivfflat.probes = 1");
+        {
+            const ExecResult r = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 10");
+            check(r.ok && r.rows.size() == 5, tag + "SET ivfflat.probes=1 probes one list");
+        }
+        e.exec("SET ivfflat.probes = 0");
+        {
+            const ExecResult r = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 10");
+            check(r.ok && r.rows.size() == 10, tag + "SET ivfflat.probes=0 restores the default");
+        }
+
+        // --- K1.3c: cosine / inner-product operator classes ---
+        seed_annc(e);
+        if (columnar) e.flush_columnar("annc");
+        // probes=1 towards +x finds the whole +x DIRECTION cluster regardless of magnitude,
+        // and the ordering matches the exact scan (shared kernel, identical FP accumulation).
+        {
+            const ExecResult a = e.exec("SELECT id FROM annc ORDER BY emb <=> '[1,0]' LIMIT 5");
+            const ExecResult b = e.exec(
+                "SELECT id, cosine_distance(emb,'[1,0]') AS d FROM annc ORDER BY d LIMIT 5");
+            check(a.ok && b.ok && ids(a) == ids(b) && a.rows.size() == 5,
+                  tag + "cosine ANN == exact top-5");
+        }
+        // The L2 operator does NOT use the cosine index (opclass mismatch -> exact fallback).
+        {
+            const ExecResult r = e.exec("SELECT id FROM annc ORDER BY emb <-> '[1,0]' LIMIT 1");
+            check(ids(r) == (std::vector<std::int64_t>{1}), tag + "<-> on a cosine index falls back");
+        }
+        // IP opclass: <#> ASC == max inner product; probes = lists == exact (differential gate).
+        check(e.exec("CREATE INDEX annc_ip ON annc (emb vector_ip_ops) USING IVFFLAT "
+                     "WITH (lists = 2, probes = 2)").ok,
+              tag + "CREATE IP IVFFLAT");
+        {
+            const ExecResult a = e.exec("SELECT id FROM annc ORDER BY emb <#> '[1,0]' LIMIT 3");
+            check(a.ok && ids(a) == (std::vector<std::int64_t>{3, 5, 2}),
+                  tag + "IP ANN (probes=lists) top-3 by dot");
+        }
+        // Opclass teeth: an opclass without IVFFLAT and an unknown opclass are clean errors.
+        check(!e.exec("CREATE INDEX bad_oc ON annc (emb vector_cosine_ops)").ok,
+              tag + "opclass without IVFFLAT rejected");
+        check(!e.exec("CREATE INDEX bad_oc2 ON annc (emb vector_bogus_ops) USING IVFFLAT").ok,
+              tag + "unknown opclass rejected");
+
         // Teeth: IVFFLAT demands a dimensioned VECTOR(n) column and rejects UNIQUE.
         check(!e.exec("CREATE INDEX bad_ivf ON ann (id) USING IVFFLAT").ok,
               tag + "IVFFLAT on non-VECTOR rejected");
@@ -258,7 +330,7 @@ int main() {
         lockstep::sim::SeededRandom rng(0x7EC70ull);
         lockstep::sim::DiskFaultConfig dc;
         lockstep::sim::SimDisk data(sched, clock, rng, dc), cat(sched, clock, rng, dc);
-        { SqlEngine e(sched, data, sched, cat); seed(e); seed_vec(e); seed_ann(e); }
+        { SqlEngine e(sched, data, sched, cat); seed(e); seed_vec(e); seed_ann(e); seed_annc(e); }
         {
             SqlEngine e(sched, data, sched, cat);
             e.recover(data.logical_len(), cat.logical_len());
@@ -282,6 +354,12 @@ int main() {
             const ExecResult aknn2 = e.exec("SELECT id FROM ann ORDER BY emb <-> '[0,0]' LIMIT 2");
             check(ids(aknn2) == (std::vector<std::int64_t>{1, 11}),
                   "ivfflat INSERT after restart uses recovered centroids");
+            // K1.3c: the opclass (vec_op) + its direction-space centroids recover too.
+            const ExecResult cknn2 = e.exec("SELECT id FROM annc ORDER BY emb <=> '[1,0]' LIMIT 5");
+            const ExecResult cref = e.exec(
+                "SELECT id, cosine_distance(emb,'[1,0]') AS d FROM annc ORDER BY d LIMIT 5");
+            check(cknn2.ok && cref.ok && ids(cknn2) == ids(cref) && cknn2.rows.size() == 5,
+                  "cosine ivfflat after restart == exact");
         }
     }
 

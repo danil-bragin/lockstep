@@ -966,6 +966,7 @@ public:
             cat_put_u32(o, ix.lists);
             cat_put_u32(o, ix.probes);
             cat_put_s(o, ix.centroids);
+            o.push_back(static_cast<char>(ix.vec_op));  // K1.3c: operator class
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
         for (const std::string& chk : t.checks) {
@@ -1047,6 +1048,7 @@ public:
             ix.lists = cat_get_u32(s, p);
             ix.probes = cat_get_u32(s, p);
             ix.centroids = cat_get_s(s, p);
+            ix.vec_op = static_cast<std::uint8_t>(s[p++]);  // K1.3c: operator class
             t.indexes.push_back(std::move(ix));
         }
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
@@ -1814,8 +1816,9 @@ private:
 
     // W3.1: SET <name> = <value>. Known session parameters take effect; unknown ones are
     // accepted as a no-op (PostgreSQL-compatible: clients SET client_encoding / datestyle /
-    // etc. which the engine need not model). The only knob acted on today is
-    // lockstep.max_query_memory (bytes; 0 = unlimited).
+    // etc. which the engine need not model). Knobs acted on today:
+    // lockstep.max_query_memory (bytes; 0 = unlimited) and ivfflat.probes (K1.3; pgvector's
+    // query-time recall knob — 0 restores each index's own default).
     ExecResult exec_set_param(const std::string& name, const std::string& value) {
         if (name == "lockstep.max_query_memory") {
             std::size_t bytes = 0;
@@ -1831,6 +1834,21 @@ private:
                     "SET lockstep.max_query_memory expects a non-negative integer (bytes)");
             }
             set_max_query_memory(bytes);
+        }
+        if (name == "ivfflat.probes") {  // K1.3: session override of the per-index probes default
+            std::uint64_t n = 0;
+            for (const char c : value) {
+                if (c < '0' || c > '9') {
+                    return ExecResult::failure(
+                        "SET ivfflat.probes expects an integer in 0..32768 (0 = index default)");
+                }
+                n = n * 10 + static_cast<std::uint64_t>(c - '0');
+            }
+            if (value.empty() || n > 32768) {
+                return ExecResult::failure(
+                    "SET ivfflat.probes expects an integer in 0..32768 (0 = index default)");
+            }
+            ivfflat_probes_ = static_cast<std::uint32_t>(n);
         }
         // Unknown parameter → accepted no-op (client-compat). Return an empty OK result.
         return ExecResult{};
@@ -2437,6 +2455,10 @@ private:
                 ix.hash = false;
                 ix.lists = ci.lists != 0 ? ci.lists : 100;   // pgvector's default lists
                 ix.probes = ci.probes != 0 ? ci.probes : 1;  // pgvector's default probes
+                ix.vec_op = ci.vec_op;                       // K1.3c: operator class
+            }
+            if (!ci.ivfflat && ci.vec_op != 0) {  // K1.3c: opclasses only mean something here
+                return ExecResult::failure("a vector operator class requires USING IVFFLAT");
             }
         }
         t->indexes.push_back(ix);
@@ -2476,7 +2498,8 @@ private:
             std::vector<std::vector<double>> vecs;
             vecs.reserve(all_rows.size());
             for (const auto& row : all_rows)
-                if (!row[vcol].is_null) vecs.push_back(ivf_payload_doubles(row[vcol].s));
+                if (!row[vcol].is_null)
+                    vecs.push_back(ivf_assign_vec(ix.vec_op, ivf_payload_doubles(row[vcol].s)));
             // Effective list count: never more lists than vectors (each seed needs a vector).
             const std::size_t k = std::max<std::size_t>(
                 1, std::min<std::size_t>(ix.lists, vecs.empty() ? 1 : vecs.size()));
@@ -2487,7 +2510,8 @@ private:
             persist_schema(ci.table);
             for (const auto& row : all_rows) {
                 if (row[vcol].is_null) continue;
-                const std::size_t list = ivf_nearest(cents, ivf_payload_doubles(row[vcol].s));
+                const std::size_t list =
+                    ivf_nearest(cents, ivf_assign_vec(ix.vec_op, ivf_payload_doubles(row[vcol].s)));
                 commit_writes({{encode_index_entry(table_id, live,
                                                    Datum::make_int(static_cast<std::int64_t>(list)),
                                                    row[t->pk_index]),
@@ -3333,6 +3357,21 @@ private:
             for (std::size_t d = 0; d < dim; ++d, off += 8)
                 cents[c][d] = Datum::decode_double(s.substr(off, 8));
     }
+    // K1.3c: normalize to a unit vector for the cosine/IP opclasses (direction space). A
+    // zero-magnitude vector stays zero (it lands in whichever list is nearest — deterministic).
+    static std::vector<double> ivf_normalize(std::vector<double> v) {
+        double n2 = 0.0;
+        for (const double x : v) n2 += x * x;
+        const double n = std::sqrt(n2);
+        if (n != 0.0)
+            for (double& x : v) x /= n;
+        return v;
+    }
+    // The vector used for CLUSTERING/ASSIGNMENT under an opclass (raw for L2, direction for
+    // cosine/IP). Candidate RANKING always uses the opclass's exact distance over raw payloads.
+    static std::vector<double> ivf_assign_vec(std::uint8_t vec_op, std::vector<double> v) {
+        return vec_op == 0 ? v : ivf_normalize(std::move(v));
+    }
     // Nearest centroid by squared L2; a tie breaks to the LOWEST index (deterministic).
     static std::size_t ivf_nearest(const std::vector<std::vector<double>>& cents,
                                    const std::vector<double>& v) {
@@ -3551,7 +3590,8 @@ private:
                 std::vector<std::vector<double>> cents;
                 ivf_decode_centroids(ix.centroids, dim, cents);
                 if (cents.empty()) continue;  // defensive: unbuilt index
-                const std::size_t list = ivf_nearest(cents, ivf_payload_doubles(v.s));
+                const std::size_t list =
+                    ivf_nearest(cents, ivf_assign_vec(ix.vec_op, ivf_payload_doubles(v.s)));
                 out.emplace_back(
                     encode_index_entry(t.id, ix, Datum::make_int(static_cast<std::int64_t>(list)),
                                        row[t.pk_index]),
@@ -6728,7 +6768,7 @@ private:
     // the EXPLAIN source. `actual` (from a PlanStats run) annotates the node under ANALYZE.
     struct PlanNode {
         enum class Kind {
-            SeqScan, PkPointGet, PkRangeScan, IndexScan,  // access paths (leaves)
+            SeqScan, PkPointGet, PkRangeScan, IndexScan, IvfflatScan,  // access paths (leaves)
             Filter, Project, HashAggregate, Having, Distinct, Sort, Limit,  // unary
             HashJoin, NestedLoopJoin  // binary
         };
@@ -6745,6 +6785,7 @@ private:
             case PlanNode::Kind::PkPointGet: return "PK Point Get";
             case PlanNode::Kind::PkRangeScan: return "PK Range Scan";
             case PlanNode::Kind::IndexScan: return "Index Scan";
+            case PlanNode::Kind::IvfflatScan: return "Ivfflat Scan";  // K1.3d: approximate k-NN
             case PlanNode::Kind::Filter: return "Filter";
             case PlanNode::Kind::Project: return "Project";
             case PlanNode::Kind::HashAggregate: return "HashAggregate";
@@ -6770,6 +6811,29 @@ private:
     // Build the physical plan tree for a single-table SELECT (uses the shared access-path
     // chooser, so EXPLAIN's plan == the executed plan).
     PlanNode build_plan_single(const SelectStmt& sel, const Table& t) {
+        // K1.3d: the IVFFLAT ANN path — SAME matcher the executor uses, so the plan is honest.
+        // The matcher guarantees no WHERE/GROUP BY/DISTINCT and exactly ORDER BY <dist> LIMIT k;
+        // the index provides the order, so the tree is just Limit over the probe scan.
+        if (const IvfMatch m = ivfflat_match(t, sel); m.ix != nullptr) {
+            const std::uint32_t probes = ivfflat_probes_ != 0 ? ivfflat_probes_ : m.ix->probes;
+            static const char* kOpNames[] = {"vector_l2_ops", "vector_cosine_ops", "vector_ip_ops"};
+            PlanNode scan;
+            scan.kind = PlanNode::Kind::IvfflatScan;
+            scan.detail = "using " + m.ix->name + " on " + t.name + " (" +
+                          kOpNames[m.want_op <= 2 ? m.want_op : 0] + ", lists=" +
+                          std::to_string(m.ix->lists) + ", probes=" + std::to_string(probes) + ")";
+            const std::int64_t want = std::max<std::int64_t>(0, sel.limit) +
+                                      std::max<std::int64_t>(0, sel.offset);
+            const std::int64_t scan_est =
+                std::min<std::int64_t>(want, static_cast<std::int64_t>(t.row_count));
+            scan.est = scan_est;
+            PlanNode lim = wrap(PlanNode::Kind::Limit,
+                                std::to_string(sel.limit) +
+                                    (sel.offset > 0 ? " offset " + std::to_string(sel.offset) : ""),
+                                std::move(scan));
+            lim.est = std::min<std::int64_t>(std::max<std::int64_t>(0, sel.limit), scan_est);
+            return lim;
+        }
         const AccessPath ap = choose_access_path(sel, t);
         PlanNode node;
         switch (ap.kind) {
@@ -6871,6 +6935,7 @@ private:
             case PlanNode::Kind::PkPointGet:
             case PlanNode::Kind::PkRangeScan:
             case PlanNode::Kind::IndexScan:
+            case PlanNode::Kind::IvfflatScan:  // K1.3d: index entries examined across the probes
                 n.actual = static_cast<std::int64_t>(st.scanned);
                 break;
             case PlanNode::Kind::Filter:
@@ -10868,24 +10933,40 @@ private:
     // Returns nullopt when the shape doesn't match (exact fallback); a malformed query vector
     // is a clean failure. With probes >= lists the probed set is EVERY entry, so the result is
     // EXACTLY the brute-force scan's — the differential gate in sql_vector_test relies on it.
-    [[nodiscard]] std::optional<ExecResult> ivfflat_try_knn(const Table& t, const SelectStmt& sel) {
+    // K1.3d: the ANN shape matcher, shared by the executor (ivfflat_try_knn) AND the EXPLAIN
+    // plan builder (build_plan_single) so what EXPLAIN shows is exactly what runs.
+    struct IvfMatch {
+        const Index* ix = nullptr;   // nullptr = the query is NOT the ANN shape
+        const Expr* vecside = nullptr;  // the constant query-vector expression
+        std::uint8_t want_op = 0;       // 0 L2 / 1 cosine / 2 inner-product
+        std::string op_name;            // the ORDER BY spelling (for errors/plan text)
+    };
+    [[nodiscard]] IvfMatch ivfflat_match(const Table& t, const SelectStmt& sel) const {
         if (sel.has_aggregates || !sel.group_by.empty() || sel.distinct || sel.filter.present() ||
             sel.having.present() || !sel.has_limit || sel.order_by.size() != 1 || gs_mode_) {
-            return std::nullopt;
+            return {};
         }
         const OrderKey& okey = sel.order_by[0];
-        if (!okey.expr || okey.descending || okey.nulls != NullsOrder::Default) return std::nullopt;
+        if (!okey.expr || okey.descending || okey.nulls != NullsOrder::Default) return {};
         for (const SelectItem& it : sel.items) {
-            if (it.kind == SelectItemKind::Window) return std::nullopt;
+            if (it.kind == SelectItemKind::Window) return {};
             if (it.kind == SelectItemKind::Expr && it.expr && it.expr->kind == ExprKind::Func &&
                 it.expr->func == "UNNEST") {
-                return std::nullopt;
+                return {};
             }
         }
         const Expr& e = *okey.expr;
-        if (e.kind != ExprKind::Func || e.args.size() != 2) return std::nullopt;
-        if (e.func != "<->" && e.func != "L2_DISTANCE" && e.func != "EUCLIDEAN_DISTANCE") {
-            return std::nullopt;  // the lists are k-means-built for L2 (v1: L2 only)
+        if (e.kind != ExprKind::Func || e.args.size() != 2) return {};
+        // K1.3c: the ORDER BY operator selects the required index OPERATOR CLASS.
+        std::uint8_t want_op = 0;
+        if (e.func == "<->" || e.func == "L2_DISTANCE" || e.func == "EUCLIDEAN_DISTANCE") {
+            want_op = 0;  // vector_l2_ops
+        } else if (e.func == "<=>" || e.func == "COSINE_DISTANCE") {
+            want_op = 1;  // vector_cosine_ops
+        } else if (e.func == "<#>") {
+            want_op = 2;  // vector_ip_ops (ASC over the NEGATIVE inner product = max dot)
+        } else {
+            return {};
         }
         const Expr* colside = nullptr;
         const Expr* vecside = nullptr;
@@ -10898,18 +10979,26 @@ private:
                 break;
             }
         }
-        if (colside == nullptr) return std::nullopt;
-        if (!colside->qualifier.empty() && colside->qualifier != t.name) return std::nullopt;
+        if (colside == nullptr) return {};
+        if (!colside->qualifier.empty() && colside->qualifier != t.name) return {};
         const auto cidx = t.column_index(colside->column);
-        if (!cidx) return std::nullopt;
-        const Index* ix = nullptr;
+        if (!cidx) return {};
         for (const Index& cand : t.indexes) {
-            if (cand.ivfflat && !cand.columns.empty() && cand.columns[0] == *cidx) {
-                ix = &cand;
-                break;
+            if (cand.ivfflat && !cand.columns.empty() && cand.columns[0] == *cidx &&
+                cand.vec_op == want_op && !cand.centroids.empty()) {
+                return IvfMatch{&cand, vecside, want_op, e.func};
             }
         }
-        if (ix == nullptr || ix->centroids.empty()) return std::nullopt;
+        return {};
+    }
+
+    [[nodiscard]] std::optional<ExecResult> ivfflat_try_knn(const Table& t, const SelectStmt& sel) {
+        const IvfMatch m = ivfflat_match(t, sel);
+        if (m.ix == nullptr) return std::nullopt;
+        const Index* ix = m.ix;
+        const Expr* vecside = m.vecside;
+        const std::uint8_t want_op = m.want_op;
+        const std::string& fname = m.op_name;
 
         // Evaluate the CONSTANT query vector (no column refs — any row works as context).
         Datum qd;
@@ -10935,24 +11024,28 @@ private:
         ivf_decode_centroids(ix->centroids, dim, cents);
         if (cents.empty()) return std::nullopt;
         if (qv.size() != dim) {
-            return ExecResult::failure(e.func + " requires vectors of equal length");
+            return ExecResult::failure(fname + " requires vectors of equal length");
         }
 
-        // Rank the lists by centroid distance; probe the nearest `probes` of them.
+        // Rank the lists by centroid distance in ASSIGNMENT space (raw for L2, direction for
+        // cosine/IP — the same space the entries were bucketed in); probe the nearest `probes`.
+        const std::vector<double> qav = ivf_assign_vec(want_op, qv);
         std::vector<std::pair<double, std::size_t>> ranked;
         ranked.reserve(cents.size());
         for (std::size_t c = 0; c < cents.size(); ++c) {
             double d2 = 0.0;
             for (std::size_t d = 0; d < dim; ++d) {
-                const double x = cents[c][d] - qv[d];
+                const double x = cents[c][d] - qav[d];
                 d2 += x * x;
             }
             ranked.emplace_back(d2, c);
         }
         std::stable_sort(ranked.begin(), ranked.end(),
                          [](const auto& a, const auto& b) { return a.first < b.first; });
+        // K1.3: `SET ivfflat.probes = n` overrides the index's own default for this session.
+        const std::uint32_t probes = ivfflat_probes_ != 0 ? ivfflat_probes_ : ix->probes;
         const std::size_t nprobe =
-            std::min<std::size_t>(std::max<std::uint32_t>(1, ix->probes), ranked.size());
+            std::min<std::size_t>(std::max<std::uint32_t>(1, probes), ranked.size());
 
         // Gather candidates from the probed lists (exact distance from the entry payload).
         struct Cand {
@@ -10973,14 +11066,27 @@ private:
             for (const storage::KeyValue& ikv : kvs) {
                 if (is_tombstone(ikv.second)) continue;
                 ++scanned;
+                // EXACT opclass distance over the RAW payload — the SAME accumulation order as
+                // the scalar distance kernel (dot/sq/nu/nv per element), so the value is
+                // IEEE-identical to the exact path's and the probes=lists gate holds per opclass.
                 const std::vector<double> v = ivf_payload_doubles(ikv.second);
-                double d2 = 0.0;
+                double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
                 for (std::size_t d = 0; d < dim && d < v.size(); ++d) {
-                    const double x = v[d] - qv[d];
-                    d2 += x * x;
+                    const double x = v[d], y = qv[d];
+                    dot += x * y;
+                    sq += (x - y) * (x - y);
+                    nu += x * x;
+                    nv += y * y;
                 }
                 Cand c;
-                c.dist = std::sqrt(d2);
+                if (want_op == 0) {
+                    c.dist = std::sqrt(sq);
+                } else if (want_op == 1) {
+                    const double denom = std::sqrt(nu) * std::sqrt(nv);
+                    c.dist = (denom == 0.0) ? 1.0 : 1.0 - dot / denom;
+                } else {
+                    c.dist = -dot;
+                }
                 c.pk = decode_index_entry_pk(t, ix->id, ikv.first);
                 c.pk_bytes = encode_pk(c.pk);
                 cands.push_back(std::move(c));
@@ -12613,6 +12719,10 @@ private:
     std::size_t max_query_mem_ = 0;      // per-statement cap in bytes (0 = unlimited)
     std::size_t query_mem_used_ = 0;     // bytes charged so far in the current top-level statement
     int stmt_depth_ = 0;                 // >0 while inside a top-level exec() (reset guard)
+
+    // K1.3: SET ivfflat.probes — session override of each IVFFLAT index's own probes default
+    // (0 = no override). pgvector's query-time recall knob.
+    std::uint32_t ivfflat_probes_ = 0;
 
     // W9.2: parse cache (sql text -> parsed AST). Always valid (parsing is catalog-independent).
     static constexpr std::size_t kParseCacheCap = 1024;

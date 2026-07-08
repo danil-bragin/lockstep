@@ -171,6 +171,10 @@ struct Index {
     std::uint32_t lists = 0;   // effective centroid count (the WITH (lists=N) knob, clamped)
     std::uint32_t probes = 1;  // lists searched per k-NN query (WITH (probes=M))
     std::string centroids;     // [dim:be32][k:be32] then k*dim little-endian 8-byte doubles
+    // K1.3c: operator class — 0 = vector_l2_ops (default), 1 = vector_cosine_ops,
+    // 2 = vector_ip_ops. Cosine/IP cluster + assign in NORMALIZED (direction) space; the
+    // query path ranks candidates by the opclass's EXACT distance over the raw payloads.
+    std::uint8_t vec_op = 0;
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).
