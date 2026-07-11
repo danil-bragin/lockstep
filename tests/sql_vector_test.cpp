@@ -52,6 +52,14 @@ void seed_ann(SqlEngine& e) {
            "(6,'[10,10]'), (7,'[11,10]'), (8,'[10,11]'), (9,'[11,11]'), (10,'[10.5,10.5]')");
     e.exec("CREATE INDEX ann_ivf ON ann (emb) USING IVFFLAT WITH (lists = 2, probes = 1)");
 }
+// K1.4: the same two spatial clusters, indexed by the deterministic HNSW graph.
+void seed_hnsw(SqlEngine& e) {
+    e.exec("CREATE TABLE annh (id INT, emb VECTOR(2) NOT NULL, PRIMARY KEY (id))");
+    e.exec("INSERT INTO annh (id,emb) VALUES "
+           "(1,'[0,0]'), (2,'[1,0]'), (3,'[0,1]'), (4,'[1,1]'), (5,'[0.5,0.5]'), "
+           "(6,'[10,10]'), (7,'[11,10]'), (8,'[10,11]'), (9,'[11,11]'), (10,'[10.5,10.5]')");
+    e.exec("CREATE INDEX annh_ix ON annh (emb) USING HNSW WITH (m = 4, ef_construction = 32)");
+}
 // K1.3c: two DIRECTION clusters (along +x and along +y) with mixed magnitudes — the cosine
 // opclass buckets by direction, which plain L2 clustering would scatter by magnitude.
 void seed_annc(SqlEngine& e) {
@@ -313,6 +321,83 @@ int main() {
         check(!e.exec("CREATE INDEX bad_oc2 ON annc (emb vector_bogus_ops) USING IVFFLAT").ok,
               tag + "unknown opclass rejected");
 
+        // --- K1.4: deterministic HNSW graph index ---
+        seed_hnsw(e);
+        if (columnar) e.flush_columnar("annh");
+        // ef_search (default 40) >= N explores the whole connected graph => EXACT top-k.
+        {
+            const ExecResult r = e.exec("SELECT id FROM annh ORDER BY emb <-> '[0,0]' LIMIT 3");
+            check(ids(r) == (std::vector<std::int64_t>{1, 5, 2}), tag + "hnsw k-NN cluster A");
+        }
+        {
+            const ExecResult a = e.exec("SELECT id FROM annh ORDER BY emb <-> '[5,5]' LIMIT 10");
+            const ExecResult b = e.exec(
+                "SELECT id, l2_distance(emb,'[5,5]') AS d FROM annh ORDER BY d LIMIT 10");
+            check(a.ok && b.ok && ids(a) == ids(b) && a.rows.size() == 10,
+                  tag + "hnsw ef>=N == exact scan (differential gate)");
+        }
+        // EXPLAIN shows the graph path.
+        {
+            const ExecResult r = e.exec("EXPLAIN SELECT id FROM annh ORDER BY emb <-> '[0,0]' LIMIT 3");
+            bool has = false;
+            for (const auto& row : r.rows)
+                if (row.cells[0].second.s.find("Hnsw Scan") != std::string::npos) has = true;
+            check(r.ok && has, tag + "EXPLAIN shows Hnsw Scan");
+        }
+        // Maintenance: INSERT links live; DELETE zombies (excluded, still traversable);
+        // UPDATE re-links under the same PK (same deterministic level).
+        e.exec("INSERT INTO annh (id,emb) VALUES (11, '[0.1,0.1]')");
+        {
+            const ExecResult r = e.exec("SELECT id FROM annh ORDER BY emb <-> '[0,0]' LIMIT 2");
+            check(ids(r) == (std::vector<std::int64_t>{1, 11}), tag + "hnsw INSERT maintained");
+        }
+        e.exec("DELETE FROM annh WHERE id = 11");
+        {
+            const ExecResult r = e.exec("SELECT id FROM annh ORDER BY emb <-> '[0,0]' LIMIT 2");
+            check(ids(r) == (std::vector<std::int64_t>{1, 5}), tag + "hnsw DELETE zombied");
+        }
+        {   // the zombie stays out of a full-graph result too
+            const ExecResult r = e.exec("SELECT id FROM annh ORDER BY emb <-> '[0,0]' LIMIT 20");
+            check(r.ok && r.rows.size() == 10, tag + "hnsw zombie excluded from results");
+        }
+        e.exec("UPDATE annh SET emb = '[10,10.1]' WHERE id = 1");
+        {
+            const ExecResult r = e.exec("SELECT id FROM annh ORDER BY emb <-> '[10,10]' LIMIT 2");
+            check(ids(r) == (std::vector<std::int64_t>{6, 1}), tag + "hnsw UPDATE re-linked");
+        }
+        e.exec("UPDATE annh SET emb = '[0,0]' WHERE id = 1");  // restore
+        // SET hnsw.ef_search widens the beam; results stay exact-equal here.
+        e.exec("SET hnsw.ef_search = 100");
+        {
+            const ExecResult a = e.exec("SELECT id FROM annh ORDER BY emb <-> '[5,5]' LIMIT 10");
+            const ExecResult b = e.exec(
+                "SELECT id, l2_distance(emb,'[5,5]') AS d FROM annh ORDER BY d LIMIT 10");
+            check(a.ok && b.ok && ids(a) == ids(b), tag + "hnsw ef_search=100 == exact");
+        }
+        e.exec("SET hnsw.ef_search = 0");  // restore the default
+        // A cosine-opclass HNSW graph over the direction clusters (annc from K1.3c).
+        check(e.exec("CREATE INDEX annc_hnsw ON annc (emb vector_cosine_ops) USING HNSW "
+                     "WITH (m = 4)").ok,
+              tag + "CREATE cosine HNSW");
+        {
+            // Two cosine indexes exist (ivfflat annc_cos + hnsw annc_hnsw); the matcher takes
+            // the FIRST in CREATE order — annc_cos — so drop it to exercise the graph.
+            (void)e.exec("DROP INDEX annc_cos ON annc");
+            const ExecResult a = e.exec("SELECT id FROM annc ORDER BY emb <=> '[1,0]' LIMIT 5");
+            const ExecResult b = e.exec(
+                "SELECT id, cosine_distance(emb,'[1,0]') AS d FROM annc ORDER BY d LIMIT 5");
+            check(a.ok && b.ok && ids(a) == ids(b) && a.rows.size() == 5,
+                  tag + "cosine HNSW == exact top-5");
+        }
+        // HNSW teeth.
+        check(!e.exec("CREATE INDEX bad_h1 ON annh (id) USING HNSW").ok,
+              tag + "HNSW on non-VECTOR rejected");
+        check(!e.exec("CREATE UNIQUE INDEX bad_h2 ON annh (emb) USING HNSW").ok,
+              tag + "UNIQUE HNSW rejected");
+        e.exec("CREATE TABLE annhu (id INT, emb VECTOR, PRIMARY KEY (id))");
+        check(!e.exec("CREATE INDEX bad_h3 ON annhu (emb) USING HNSW").ok,
+              tag + "undimensioned VECTOR HNSW rejected");
+
         // Teeth: IVFFLAT demands a dimensioned VECTOR(n) column and rejects UNIQUE.
         check(!e.exec("CREATE INDEX bad_ivf ON ann (id) USING IVFFLAT").ok,
               tag + "IVFFLAT on non-VECTOR rejected");
@@ -330,7 +415,7 @@ int main() {
         lockstep::sim::SeededRandom rng(0x7EC70ull);
         lockstep::sim::DiskFaultConfig dc;
         lockstep::sim::SimDisk data(sched, clock, rng, dc), cat(sched, clock, rng, dc);
-        { SqlEngine e(sched, data, sched, cat); seed(e); seed_vec(e); seed_ann(e); seed_annc(e); }
+        { SqlEngine e(sched, data, sched, cat); seed(e); seed_vec(e); seed_ann(e); seed_annc(e); seed_hnsw(e); }
         {
             SqlEngine e(sched, data, sched, cat);
             e.recover(data.logical_len(), cat.logical_len());
@@ -360,6 +445,14 @@ int main() {
                 "SELECT id, cosine_distance(emb,'[1,0]') AS d FROM annc ORDER BY d LIMIT 5");
             check(cknn2.ok && cref.ok && ids(cknn2) == ids(cref) && cknn2.rows.size() == 5,
                   "cosine ivfflat after restart == exact");
+            // K1.4: the HNSW graph (KV records + entry point + knobs) recovers — k-NN is
+            // exact again, and a fresh INSERT links into the RECOVERED graph.
+            const ExecResult h1 = e.exec("SELECT id FROM annh ORDER BY emb <-> '[0,0]' LIMIT 3");
+            check(ids(h1) == (std::vector<std::int64_t>{1, 5, 2}), "hnsw k-NN after restart");
+            e.exec("INSERT INTO annh (id,emb) VALUES (11, '[0.1,0.1]')");
+            const ExecResult h2 = e.exec("SELECT id FROM annh ORDER BY emb <-> '[0,0]' LIMIT 2");
+            check(ids(h2) == (std::vector<std::int64_t>{1, 11}),
+                  "hnsw INSERT after restart links into the recovered graph");
         }
     }
 

@@ -87,6 +87,10 @@ struct CreateIndexStmt {
     std::uint32_t probes = 0;  // WITH (probes = M) — lists searched per query (0 == default)
     // K1.3c: operator class — 0 = vector_l2_ops (default), 1 = vector_cosine_ops, 2 = vector_ip_ops.
     std::uint8_t vec_op = 0;
+    // K1.4: USING HNSW (graph-based approximate k-NN) + its WITH (...) knobs.
+    bool hnsw = false;
+    std::uint32_t hnsw_m = 0;    // WITH (m = N) — max out-degree per layer (0 == default 16)
+    std::uint32_t hnsw_efc = 0;  // WITH (ef_construction = N) — build beam width (0 == default 64)
 };
 
 // DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).

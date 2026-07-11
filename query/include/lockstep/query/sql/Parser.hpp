@@ -1537,30 +1537,34 @@ private:
                 return ParseResult{*e};
             }
         }
-        if (is_kw("using")) {  // I7: USING HASH | BTREE ; J3: USING GIN ; K1.3: USING IVFFLAT
+        if (is_kw("using")) {  // I7: HASH | BTREE ; J3: GIN ; K1.3: IVFFLAT ; K1.4: HNSW
             advance();
             if (is_kw("hash")) { advance(); st.create_index.hash = true; }
             else if (is_kw("btree")) { advance(); }
             else if (is_kw("gin")) { advance(); st.create_index.gin = true; }
             else if (is_kw("ivfflat")) { advance(); st.create_index.ivfflat = true; }
-            else return err("USING expects HASH, BTREE, GIN, or IVFFLAT");
+            else if (is_kw("hnsw")) { advance(); st.create_index.hnsw = true; }
+            else return err("USING expects HASH, BTREE, GIN, IVFFLAT, or HNSW");
         }
-        // K1.3: WITH (lists = N [, probes = M]) — the IVFFLAT build/search knobs (pgvector shape).
-        if (st.create_index.ivfflat && is_kw("with")) {
+        // K1.3/K1.4: WITH (knob = N, ...) — the vector-index build/search knobs (pgvector shape):
+        // IVFFLAT takes lists/probes; HNSW takes m/ef_construction.
+        if ((st.create_index.ivfflat || st.create_index.hnsw) && is_kw("with")) {
             advance();
             if (auto e = expect(Tok::LParen, "'(' after WITH")) return ParseResult{*e};
             for (;;) {
                 std::string knob;
-                if (auto e = expect_ident("an IVFFLAT option (lists | probes)", knob)) return ParseResult{*e};
+                if (auto e = expect_ident("a vector-index option", knob)) return ParseResult{*e};
                 if (auto e = expect(Tok::Eq, "'=' after the option name")) return ParseResult{*e};
                 if (cur_.kind != Tok::IntLit || cur_.int_val < 1 || cur_.int_val > 32768)
-                    return err("the IVFFLAT option value must be an integer in 1..32768");
+                    return err("the vector-index option value must be an integer in 1..32768");
                 const auto v = static_cast<std::uint32_t>(cur_.int_val);
                 advance();
                 const std::string lk = lower(knob);
-                if (lk == "lists") st.create_index.lists = v;
-                else if (lk == "probes") st.create_index.probes = v;
-                else return err("unknown IVFFLAT option '" + knob + "' (expected lists or probes)");
+                if (st.create_index.ivfflat && lk == "lists") st.create_index.lists = v;
+                else if (st.create_index.ivfflat && lk == "probes") st.create_index.probes = v;
+                else if (st.create_index.hnsw && lk == "m") st.create_index.hnsw_m = v;
+                else if (st.create_index.hnsw && lk == "ef_construction") st.create_index.hnsw_efc = v;
+                else return err("unknown option '" + knob + "' (IVFFLAT: lists, probes; HNSW: m, ef_construction)");
                 if (cur_.kind == Tok::Comma) { advance(); continue; }
                 break;
             }

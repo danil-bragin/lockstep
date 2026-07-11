@@ -781,6 +781,7 @@ private:
         o += ")";
         if (ix.gin) o += " USING GIN";
         else if (ix.ivfflat) o += " USING IVFFLAT";  // K1.3 (WITH knobs are rebuild-time defaults)
+        else if (ix.hnsw) o += " USING HNSW";        // K1.4
         else if (ix.hash) o += " USING HASH";
         if (!ix.partial_src.empty()) o += " WHERE " + ix.partial_src;
         o += ";";
@@ -967,6 +968,9 @@ public:
             cat_put_u32(o, ix.probes);
             cat_put_s(o, ix.centroids);
             o.push_back(static_cast<char>(ix.vec_op));  // K1.3c: operator class
+            o.push_back(ix.hnsw ? 1 : 0);               // K1.4: HNSW (graph k-NN)
+            cat_put_u32(o, ix.hnsw_m);
+            cat_put_u32(o, ix.hnsw_efc);
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
         for (const std::string& chk : t.checks) {
@@ -1049,6 +1053,9 @@ public:
             ix.probes = cat_get_u32(s, p);
             ix.centroids = cat_get_s(s, p);
             ix.vec_op = static_cast<std::uint8_t>(s[p++]);  // K1.3c: operator class
+            ix.hnsw = s[p++] != 0;                          // K1.4: HNSW (graph k-NN)
+            ix.hnsw_m = cat_get_u32(s, p);
+            ix.hnsw_efc = cat_get_u32(s, p);
             t.indexes.push_back(std::move(ix));
         }
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
@@ -1850,6 +1857,21 @@ private:
             }
             ivfflat_probes_ = static_cast<std::uint32_t>(n);
         }
+        if (name == "hnsw.ef_search") {  // K1.4: HNSW search beam width (pgvector's knob)
+            std::uint64_t n = 0;
+            for (const char c : value) {
+                if (c < '0' || c > '9') {
+                    return ExecResult::failure(
+                        "SET hnsw.ef_search expects an integer in 0..32768 (0 = default 40)");
+                }
+                n = n * 10 + static_cast<std::uint64_t>(c - '0');
+            }
+            if (value.empty() || n > 32768) {
+                return ExecResult::failure(
+                    "SET hnsw.ef_search expects an integer in 0..32768 (0 = default 40)");
+            }
+            hnsw_ef_search_ = n == 0 ? 40 : static_cast<std::uint32_t>(n);
+        }
         // Unknown parameter → accepted no-op (client-compat). Return an empty OK result.
         return ExecResult{};
     }
@@ -2457,13 +2479,76 @@ private:
                 ix.probes = ci.probes != 0 ? ci.probes : 1;  // pgvector's default probes
                 ix.vec_op = ci.vec_op;                       // K1.3c: operator class
             }
-            if (!ci.ivfflat && ci.vec_op != 0) {  // K1.3c: opclasses only mean something here
-                return ExecResult::failure("a vector operator class requires USING IVFFLAT");
+            if (!ci.ivfflat && !ci.hnsw && ci.vec_op != 0) {  // K1.3c/K1.4
+                return ExecResult::failure(
+                    "a vector operator class requires USING IVFFLAT or USING HNSW");
+            }
+            if (ci.hnsw) {  // K1.4: HNSW — one dimensioned VECTOR(n) column, non-unique
+                if (ix.columns.size() != 1) {
+                    return ExecResult::failure("USING HNSW indexes exactly one VECTOR column");
+                }
+                const Column& vc = t->columns[ix.columns[0]];
+                if (vc.logical != 15 || vc.max_len == 0) {
+                    return ExecResult::failure(
+                        "USING HNSW requires a dimensioned VECTOR(n) column (got '" +
+                        ci.column + "')");
+                }
+                if (ci.unique) return ExecResult::failure("an HNSW index cannot be UNIQUE");
+                if (!ci.partial_src.empty()) {
+                    return ExecResult::failure("an HNSW index cannot be partial");
+                }
+                if (t->composite_pk()) {
+                    return ExecResult::failure(
+                        "an HNSW index is not supported on a composite-PK table");
+                }
+                ix.hnsw = true;
+                ix.hash = false;
+                ix.hnsw_m = ci.hnsw_m != 0 ? ci.hnsw_m : 16;      // pgvector's default m
+                ix.hnsw_efc = ci.hnsw_efc != 0 ? ci.hnsw_efc : 64;  // default ef_construction
+                ix.vec_op = ci.vec_op;
             }
         }
         t->indexes.push_back(ix);
         persist_schema(ci.table);  // C7: the new index is part of the durable schema
         const std::uint32_t table_id = t->id;
+
+        // K1.4: HNSW build — insert every live row's node in PK (scan) order, one atomic
+        // commit per node (each insert's greedy search reads the graph the prior commits
+        // built). Deterministic: same rows, same order => byte-identical graph on replicas.
+        if (ix.hnsw) {
+            std::vector<std::vector<Datum>> all_rows;
+            if (t->columnar) {
+                SelectStmt full;
+                full.table = t->name;
+                full.level = Level::StrictSerializable;
+                std::vector<bool> all(t->columns.size(), true);
+                if (auto e = columnar_build_rows(*t, full, all, all_rows)) {
+                    t->indexes.pop_back();
+                    persist_schema(ci.table);
+                    return ExecResult::failure(*e);
+                }
+            } else {
+                std::vector<storage::KeyValue> kvs;
+                {
+                    Query<Strict> q;
+                    q.scan(table_prefix(table_id), table_prefix_end(table_id));
+                    collect(db_.run(q), kvs);
+                }
+                for (const storage::KeyValue& kv : kvs) {
+                    if (is_tombstone(kv.second)) continue;
+                    all_rows.push_back(decode_row(*t, kv.first, kv.second));
+                }
+            }
+            const std::size_t vcol = ix.columns[0];
+            const Index& live = t->indexes.back();
+            for (const auto& row : all_rows) {
+                if (row[vcol].is_null) continue;
+                std::vector<std::pair<Key, Value>> writes;
+                hnsw_insert(*t, live, encode_pk(row[t->pk_index]), row[vcol].s, writes);
+                commit_writes(writes);
+            }
+            return ExecResult{};
+        }
 
         // K1.3: IVFFLAT build — enumerate every live row FIRST (the k-means needs the full
         // vector set), compute the FROZEN centroids (deterministic k-means over the PK-ordered
@@ -3579,10 +3664,336 @@ private:
         return out;
     }
 
+    // ===================== K1.4: HNSW (graph) approximate k-NN =====================
+    // Deterministic HNSW over one VECTOR(n) column. KV records under the index prefix:
+    //   'v' ++ pk            -> [flags u8 (1 = zombie)][top_level u8][vector payload]
+    //   'n' ++ level u8 ++ pk -> repeated [be32 len][neighbor pk bytes]   (out-edges)
+    //   'e'                  -> [top_level u8][entry-point pk bytes]
+    // A node's LEVEL is a pure integer-geometric function of its PK bytes (repeated
+    // splitmix64, success p = 1/m per level — no rng, and no libm ln() whose bits vary
+    // across libc builds), and every heap/selection tie breaks on (real_cmp(dist), pk
+    // bytes) — so replicas applying the same op sequence build a BYTE-IDENTICAL graph.
+    // All maintenance writes ride the SAME atomic batch as the row write; reads during
+    // maintenance overlay the in-flight batch so a multi-row INSERT links within itself.
+    [[nodiscard]] static Key hnsw_vec_key(std::uint32_t tid, std::uint32_t iid,
+                                          const std::string& pk) {
+        return index_prefix(tid, iid) + "v" + pk;
+    }
+    [[nodiscard]] static Key hnsw_adj_key(std::uint32_t tid, std::uint32_t iid, std::uint8_t lvl,
+                                          const std::string& pk) {
+        Key k = index_prefix(tid, iid);
+        k += "n";
+        k.push_back(static_cast<char>(lvl));
+        k += pk;
+        return k;
+    }
+    [[nodiscard]] static Key hnsw_entry_key(std::uint32_t tid, std::uint32_t iid) {
+        return index_prefix(tid, iid) + "e";
+    }
+    [[nodiscard]] static std::uint64_t hnsw_mix64(std::uint64_t x) {  // splitmix64 finalizer
+        x += 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    }
+    // Geometric level with success probability 1/m per step (P(level >= l) = m^-l, the
+    // HNSW distribution) — pure integer arithmetic over an FNV-1a hash of the PK bytes.
+    [[nodiscard]] static std::uint32_t hnsw_level_for(const std::string& pk, std::uint32_t m) {
+        std::uint64_t h = 0xcbf29ce484222325ull;
+        for (const char c : pk) {
+            h ^= static_cast<unsigned char>(c);
+            h *= 0x100000001b3ull;
+        }
+        std::uint32_t lvl = 0;
+        while (lvl < 30) {
+            h = hnsw_mix64(h);
+            if (h % m != 0) break;
+            ++lvl;
+        }
+        return lvl;
+    }
+    [[nodiscard]] static std::string hnsw_encode_list(const std::vector<std::string>& l) {
+        std::string o;
+        for (const std::string& s : l) {
+            Datum::put_be32_(o, static_cast<std::uint32_t>(s.size()));
+            o += s;
+        }
+        return o;
+    }
+    [[nodiscard]] static std::vector<std::string> hnsw_decode_list(const std::string& s) {
+        std::vector<std::string> out;
+        std::size_t p = 0;
+        while (p + 4 <= s.size()) {
+            const std::uint32_t len = Datum::get_be32_(s, p);
+            p += 4;
+            if (p + len > s.size()) break;
+            out.push_back(s.substr(p, len));
+            p += len;
+        }
+        return out;
+    }
+    // Opclass distance (same per-element accumulation order as the scalar kernel, u = the
+    // STORED vector, v = the query — the candidate values are IEEE-identical to the exact
+    // path's, so the large-ef == exact-scan gate holds).
+    [[nodiscard]] static double hnsw_dist(std::uint8_t op, const std::vector<double>& u,
+                                          const std::vector<double>& v) {
+        double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
+        const std::size_t n = std::min(u.size(), v.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            const double x = u[i], y = v[i];
+            dot += x * y;
+            sq += (x - y) * (x - y);
+            nu += x * x;
+            nv += y * y;
+        }
+        if (op == 0) return std::sqrt(sq);
+        if (op == 1) {
+            const double denom = std::sqrt(nu) * std::sqrt(nv);
+            return denom == 0.0 ? 1.0 : 1.0 - dot / denom;
+        }
+        return -dot;
+    }
+    // Total deterministic order over (distance, pk bytes) — real_cmp keeps NaN total.
+    struct HnswOrd {
+        bool operator()(const std::pair<double, std::string>& a,
+                        const std::pair<double, std::string>& b) const {
+            const int c = Datum::real_cmp(a.first, b.first);
+            if (c != 0) return c < 0;
+            return a.second < b.second;
+        }
+    };
+    // Read context: overlays the in-flight write batch (write path) and routes reads at
+    // the statement's level (query path). Vectors are cached per operation (immutable
+    // within one op — the only rewrite, the op's own node, happens before any search).
+    struct HnswIO {
+        const Table* t = nullptr;
+        const Index* ix = nullptr;
+        std::vector<std::pair<Key, Value>>* batch = nullptr;  // overlay + write sink
+        const SelectStmt* sel = nullptr;                      // non-null => leveled reads
+        std::string err;                                      // first read error (query path)
+        std::unordered_map<std::string, std::vector<double>> vec_cache;
+        std::size_t visited = 0;  // nodes examined (EXPLAIN ANALYZE "scanned")
+    };
+    [[nodiscard]] std::optional<Value> hnsw_get(HnswIO& io, const Key& k) {
+        if (io.batch != nullptr) {
+            for (auto it = io.batch->rbegin(); it != io.batch->rend(); ++it) {
+                if (it->first == k) {
+                    if (is_tombstone(it->second)) return std::nullopt;
+                    return it->second;
+                }
+            }
+        }
+        std::vector<storage::KeyValue> kvs;
+        if (io.sel != nullptr) {
+            if (auto e = run_index_scan_at_level(*io.sel, k, key_successor(k), kvs)) {
+                if (io.err.empty()) io.err = *e;
+                return std::nullopt;
+            }
+        } else {
+            Query<Strict> q;
+            q.scan(k, key_successor(k));
+            collect(db_.run(q), kvs);
+        }
+        for (const storage::KeyValue& kv : kvs)
+            if (kv.first == k && !is_tombstone(kv.second)) return kv.second;
+        return std::nullopt;
+    }
+    struct HnswNode {
+        bool deleted = false;
+        std::uint8_t top = 0;
+    };
+    [[nodiscard]] bool hnsw_node(HnswIO& io, const std::string& pk, HnswNode& n,
+                                 const std::vector<double>** vec) {
+        const auto v = hnsw_get(io, hnsw_vec_key(io.t->id, io.ix->id, pk));
+        if (!v || v->size() < 2) return false;
+        n.deleted = (*v)[0] != 0;
+        n.top = static_cast<std::uint8_t>((*v)[1]);
+        if (vec != nullptr) {
+            auto it = io.vec_cache.find(pk);
+            if (it == io.vec_cache.end())
+                it = io.vec_cache.emplace(pk, ivf_payload_doubles(v->substr(2))).first;
+            *vec = &it->second;
+        }
+        return true;
+    }
+    [[nodiscard]] std::vector<std::string> hnsw_neighbors(HnswIO& io, std::uint8_t lvl,
+                                                          const std::string& pk) {
+        const auto v = hnsw_get(io, hnsw_adj_key(io.t->id, io.ix->id, lvl, pk));
+        return v ? hnsw_decode_list(*v) : std::vector<std::string>{};
+    }
+    // Best-first beam search within ONE layer (the classic HNSW SEARCH-LAYER), ef-wide.
+    // Returns the ef best (distance, pk) pairs ascending. Deterministic: ordered sets with
+    // the (real_cmp, pk-bytes) comparator; zombies participate (connectivity) — the CALLER
+    // filters them from results.
+    [[nodiscard]] std::vector<std::pair<double, std::string>> hnsw_search_layer(
+        HnswIO& io, const std::vector<double>& q, const std::vector<std::string>& eps,
+        std::size_t ef, std::uint8_t lvl) {
+        std::set<std::pair<double, std::string>, HnswOrd> cand, best;
+        std::set<std::string> visited;
+        for (const std::string& ep : eps) {
+            if (!visited.insert(ep).second) continue;
+            HnswNode n;
+            const std::vector<double>* v = nullptr;
+            if (!hnsw_node(io, ep, n, &v)) continue;
+            ++io.visited;
+            const double d = hnsw_dist(io.ix->vec_op, *v, q);
+            cand.emplace(d, ep);
+            best.emplace(d, ep);
+        }
+        while (!cand.empty() && io.err.empty()) {
+            const std::pair<double, std::string> c = *cand.begin();
+            cand.erase(cand.begin());
+            if (best.size() >= ef && HnswOrd{}(*std::prev(best.end()), c)) break;
+            for (const std::string& nb : hnsw_neighbors(io, lvl, c.second)) {
+                if (!visited.insert(nb).second) continue;
+                HnswNode n;
+                const std::vector<double>* v = nullptr;
+                if (!hnsw_node(io, nb, n, &v)) continue;
+                ++io.visited;
+                const double d = hnsw_dist(io.ix->vec_op, *v, q);
+                const std::pair<double, std::string> e{d, nb};
+                if (best.size() < ef || HnswOrd{}(e, *std::prev(best.end()))) {
+                    cand.insert(e);
+                    best.insert(e);
+                    if (best.size() > ef) best.erase(std::prev(best.end()));
+                }
+            }
+        }
+        return {best.begin(), best.end()};
+    }
+    // INSERT (or UPDATE — same PK => same level) one node: write the vector record first
+    // (searches below then see the fresh value through the batch overlay), greedy-descend
+    // from the entry, link the m nearest per level bidirectionally, trim an overflowing
+    // neighbor to its own m-max (2m at level 0) nearest.
+    void hnsw_insert(const Table& t, const Index& ix, const std::string& pk,
+                     const std::string& payload, std::vector<std::pair<Key, Value>>& out) {
+        HnswIO io;
+        io.t = &t;
+        io.ix = &ix;
+        io.batch = &out;
+        const std::uint32_t m = std::max<std::uint32_t>(2, ix.hnsw_m);
+        const std::uint32_t lnew = hnsw_level_for(pk, m);
+        std::string vrec;
+        vrec.push_back(0);
+        vrec.push_back(static_cast<char>(lnew));
+        vrec += payload;
+        out.emplace_back(hnsw_vec_key(t.id, ix.id, pk), vrec);
+        const std::vector<double> q = ivf_payload_doubles(payload);
+        io.vec_cache[pk] = q;
+        const auto entry = hnsw_get(io, hnsw_entry_key(t.id, ix.id));
+        std::vector<std::string> eps;
+        std::uint8_t etop = 0;
+        if (entry && !entry->empty()) {
+            etop = static_cast<std::uint8_t>((*entry)[0]);
+            const std::string epk = entry->substr(1);
+            if (epk == pk) {
+                // Re-inserting the ENTRY node itself (UPDATE): seed from its OLD out-edges
+                // (still unwritten at this point — the overlay only holds the vector record).
+                for (int lc = etop; lc >= 0 && eps.empty(); --lc)
+                    eps = hnsw_neighbors(io, static_cast<std::uint8_t>(lc), pk);
+            } else {
+                eps = {epk};
+            }
+        }
+        if (eps.empty()) {
+            // First node ever (or the sole node re-inserted): it IS the graph.
+            for (std::uint32_t l = 0; l <= lnew; ++l)
+                out.emplace_back(hnsw_adj_key(t.id, ix.id, static_cast<std::uint8_t>(l), pk),
+                                 std::string{});
+            std::string erec;
+            erec.push_back(static_cast<char>(lnew));
+            erec += pk;
+            out.emplace_back(hnsw_entry_key(t.id, ix.id), erec);
+            return;
+        }
+        for (int lc = etop; lc > static_cast<int>(lnew); --lc) {
+            const auto w = hnsw_search_layer(io, q, eps, 1, static_cast<std::uint8_t>(lc));
+            if (!w.empty()) eps = {w.front().second};
+        }
+        for (int lc = std::min<int>(etop, static_cast<int>(lnew)); lc >= 0; --lc) {
+            const std::uint8_t L = static_cast<std::uint8_t>(lc);
+            const auto w =
+                hnsw_search_layer(io, q, eps, std::max<std::uint32_t>(ix.hnsw_efc, m), L);
+            std::vector<std::string> own;
+            for (const auto& [d, nb] : w) {
+                (void)d;
+                if (nb == pk) continue;  // the UPDATE case can find itself
+                own.push_back(nb);
+                if (own.size() >= m) break;
+            }
+            out.emplace_back(hnsw_adj_key(t.id, ix.id, L, pk), hnsw_encode_list(own));
+            const std::size_t mmax = L == 0 ? 2 * static_cast<std::size_t>(m) : m;
+            for (const std::string& nb : own) {
+                std::vector<std::string> lst = hnsw_neighbors(io, L, nb);
+                bool dup = false;
+                for (const std::string& x : lst)
+                    if (x == pk) { dup = true; break; }
+                if (!dup) lst.push_back(pk);
+                if (lst.size() > mmax) {
+                    HnswNode nn;
+                    const std::vector<double>* nv = nullptr;
+                    if (hnsw_node(io, nb, nn, &nv)) {
+                        std::set<std::pair<double, std::string>, HnswOrd> scored;
+                        for (const std::string& x : lst) {
+                            HnswNode xn;
+                            const std::vector<double>* xv = nullptr;
+                            if (!hnsw_node(io, x, xn, &xv)) continue;
+                            scored.emplace(hnsw_dist(ix.vec_op, *xv, *nv), x);
+                        }
+                        lst.clear();
+                        for (const auto& [d2, x] : scored) {
+                            (void)d2;
+                            lst.push_back(x);
+                            if (lst.size() >= mmax) break;
+                        }
+                    }
+                }
+                out.emplace_back(hnsw_adj_key(t.id, ix.id, L, nb), hnsw_encode_list(lst));
+            }
+            eps.clear();
+            for (const auto& [d, nbp] : w) {
+                (void)d;
+                eps.push_back(nbp);
+            }
+            if (eps.empty()) eps = {entry->substr(1)};
+        }
+        if (lnew > etop) {
+            for (std::uint32_t l = etop + 1; l <= lnew; ++l)
+                out.emplace_back(hnsw_adj_key(t.id, ix.id, static_cast<std::uint8_t>(l), pk),
+                                 std::string{});
+            std::string erec;
+            erec.push_back(static_cast<char>(lnew));
+            erec += pk;
+            out.emplace_back(hnsw_entry_key(t.id, ix.id), erec);
+        }
+    }
+    // DELETE: zombie the node (flags = 1). Excluded from results, still traversable — the
+    // standard HNSW deletion story (a rebuild/REINDEX compacts later).
+    void hnsw_mark_deleted(const Table& t, const Index& ix, const std::string& pk,
+                           std::vector<std::pair<Key, Value>>& out) {
+        HnswIO io;
+        io.t = &t;
+        io.ix = &ix;
+        io.batch = &out;
+        const auto v = hnsw_get(io, hnsw_vec_key(t.id, ix.id, pk));
+        if (!v || v->size() < 2) return;
+        std::string nv = *v;
+        nv[0] = 1;
+        out.emplace_back(hnsw_vec_key(t.id, ix.id, pk), nv);
+    }
+    // =================== end K1.4 HNSW core ===================
+
     void index_writes_for_row(const Table& t, const std::vector<Datum>& row, bool tombstone,
                               std::vector<std::pair<Key, Value>>& out) {
         for (const Index& ix : t.indexes) {
             if (!row_matches_partial(t, ix, row)) continue;  // I5: outside the partial set
+            if (ix.hnsw) {  // K1.4: graph maintenance rides the SAME atomic batch as the row
+                const Datum& v = row[ix.columns[0]];
+                const std::string pk = encode_pk(row[t.pk_index]);
+                if (tombstone) hnsw_mark_deleted(t, ix, pk, out);
+                else if (!v.is_null) hnsw_insert(t, ix, pk, v.s, out);
+                continue;
+            }
             if (ix.ivfflat) {  // K1.3: one entry in the nearest-centroid list; value = the payload
                 const Datum& v = row[ix.columns[0]];
                 if (v.is_null) continue;  // a NULL vector gets no entry (like a NULL column)
@@ -6768,7 +7179,7 @@ private:
     // the EXPLAIN source. `actual` (from a PlanStats run) annotates the node under ANALYZE.
     struct PlanNode {
         enum class Kind {
-            SeqScan, PkPointGet, PkRangeScan, IndexScan, IvfflatScan,  // access paths (leaves)
+            SeqScan, PkPointGet, PkRangeScan, IndexScan, IvfflatScan, HnswScan,  // access (leaves)
             Filter, Project, HashAggregate, Having, Distinct, Sort, Limit,  // unary
             HashJoin, NestedLoopJoin  // binary
         };
@@ -6786,6 +7197,7 @@ private:
             case PlanNode::Kind::PkRangeScan: return "PK Range Scan";
             case PlanNode::Kind::IndexScan: return "Index Scan";
             case PlanNode::Kind::IvfflatScan: return "Ivfflat Scan";  // K1.3d: approximate k-NN
+            case PlanNode::Kind::HnswScan: return "Hnsw Scan";        // K1.4: graph k-NN
             case PlanNode::Kind::Filter: return "Filter";
             case PlanNode::Kind::Project: return "Project";
             case PlanNode::Kind::HashAggregate: return "HashAggregate";
@@ -6815,13 +7227,21 @@ private:
         // The matcher guarantees no WHERE/GROUP BY/DISTINCT and exactly ORDER BY <dist> LIMIT k;
         // the index provides the order, so the tree is just Limit over the probe scan.
         if (const IvfMatch m = ivfflat_match(t, sel); m.ix != nullptr) {
-            const std::uint32_t probes = ivfflat_probes_ != 0 ? ivfflat_probes_ : m.ix->probes;
             static const char* kOpNames[] = {"vector_l2_ops", "vector_cosine_ops", "vector_ip_ops"};
             PlanNode scan;
+            if (m.ix->hnsw) {  // K1.4
+                scan.kind = PlanNode::Kind::HnswScan;
+                scan.detail = "using " + m.ix->name + " on " + t.name + " (" +
+                              kOpNames[m.want_op <= 2 ? m.want_op : 0] + ", m=" +
+                              std::to_string(m.ix->hnsw_m) + ", ef_search=" +
+                              std::to_string(hnsw_ef_search_) + ")";
+            } else {
+            const std::uint32_t probes = ivfflat_probes_ != 0 ? ivfflat_probes_ : m.ix->probes;
             scan.kind = PlanNode::Kind::IvfflatScan;
             scan.detail = "using " + m.ix->name + " on " + t.name + " (" +
                           kOpNames[m.want_op <= 2 ? m.want_op : 0] + ", lists=" +
                           std::to_string(m.ix->lists) + ", probes=" + std::to_string(probes) + ")";
+            }
             const std::int64_t want = std::max<std::int64_t>(0, sel.limit) +
                                       std::max<std::int64_t>(0, sel.offset);
             const std::int64_t scan_est =
@@ -6936,6 +7356,7 @@ private:
             case PlanNode::Kind::PkRangeScan:
             case PlanNode::Kind::IndexScan:
             case PlanNode::Kind::IvfflatScan:  // K1.3d: index entries examined across the probes
+            case PlanNode::Kind::HnswScan:     // K1.4: graph nodes examined during the search
                 n.actual = static_cast<std::int64_t>(st.scanned);
                 break;
             case PlanNode::Kind::Filter:
@@ -10517,7 +10938,7 @@ private:
             const Index* ix = t.index_for_column(*col);
             // a SINGLE-column index on the leading column (a composite is the I1 prefix path instead).
             if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col || ix->gin ||
-                ix->ivfflat || !query_implies_partial(sel, t, *ix))
+                ix->ivfflat || ix->hnsw || !query_implies_partial(sel, t, *ix))
                 continue;
             bool dup = false;
             for (const IndexPlan& p : eqs) if (p.index->column == *col) { dup = true; break; }
@@ -10704,8 +11125,9 @@ private:
             // query doesn't imply is skipped (a full index on the same column can still serve).
             const Index* ix = nullptr;
             for (const Index& cand : t.indexes)
-                if (!cand.columns.empty() && cand.columns[0] == *col && !cand.gin && !cand.ivfflat &&
-                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }  // J3 GIN / K1.3 IVFFLAT excluded
+                if (!cand.columns.empty() && cand.columns[0] == *col && !cand.gin &&
+                    !cand.ivfflat && !cand.hnsw &&
+                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }  // GIN/IVFFLAT/HNSW excluded
             if (ix == nullptr) {
                 continue;
             }
@@ -10798,8 +11220,8 @@ private:
                 continue;
             }
             const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr || ix->hash || ix->gin || ix->ivfflat ||
-                !query_implies_partial(sel, t, *ix)) {  // I7 hash; J3 GIN; K1.3 IVFFLAT; I5 partial
+            if (ix == nullptr || ix->hash || ix->gin || ix->ivfflat || ix->hnsw ||
+                !query_implies_partial(sel, t, *ix)) {  // I7 hash; J3 GIN; K1.3/K1.4 vector; I5 partial
                 continue;
             }
             // Find a matching `col <= hi` conjunct on the SAME column.
@@ -10984,8 +11406,8 @@ private:
         const auto cidx = t.column_index(colside->column);
         if (!cidx) return {};
         for (const Index& cand : t.indexes) {
-            if (cand.ivfflat && !cand.columns.empty() && cand.columns[0] == *cidx &&
-                cand.vec_op == want_op && !cand.centroids.empty()) {
+            if ((cand.ivfflat || cand.hnsw) && !cand.columns.empty() && cand.columns[0] == *cidx &&
+                cand.vec_op == want_op && (cand.hnsw || !cand.centroids.empty())) {
                 return IvfMatch{&cand, vecside, want_op, e.func};
             }
         }
@@ -11021,12 +11443,56 @@ private:
         }
         std::size_t dim = 0;
         std::vector<std::vector<double>> cents;
-        ivf_decode_centroids(ix->centroids, dim, cents);
-        if (cents.empty()) return std::nullopt;
+        if (ix->ivfflat) {
+            ivf_decode_centroids(ix->centroids, dim, cents);
+            if (cents.empty()) return std::nullopt;
+        } else {
+            dim = t.columns[ix->columns[0]].max_len;  // K1.4: HNSW — dim from the column
+        }
         if (qv.size() != dim) {
             return ExecResult::failure(fname + " requires vectors of equal length");
         }
 
+        struct Cand {
+            double dist = 0.0;
+            Key pk_bytes;
+            Datum pk;
+        };
+        std::vector<Cand> cands;
+        std::size_t scanned = 0;
+        const std::size_t want = static_cast<std::size_t>(
+            std::max<std::int64_t>(0, sel.limit) + std::max<std::int64_t>(0, sel.offset));
+
+        if (ix->hnsw) {
+            // K1.4: greedy-descend from the entry point to level 0, then one ef-wide beam
+            // search there (ef = max(hnsw.ef_search, k)). Zombies steer but are filtered.
+            HnswIO io;
+            io.t = &t;
+            io.ix = ix;
+            io.sel = &sel;  // leveled reads — AT SNAPSHOT sees the graph as of that Seq
+            const auto entry = hnsw_get(io, hnsw_entry_key(t.id, ix->id));
+            if (entry && !entry->empty()) {
+                const std::uint8_t etop = static_cast<std::uint8_t>((*entry)[0]);
+                std::vector<std::string> eps{entry->substr(1)};
+                for (int lc = etop; lc >= 1; --lc) {
+                    const auto w = hnsw_search_layer(io, qv, eps, 1, static_cast<std::uint8_t>(lc));
+                    if (!w.empty()) eps = {w.front().second};
+                }
+                const std::size_t ef = std::max<std::size_t>(want, hnsw_ef_search_);
+                const auto w0 = hnsw_search_layer(io, qv, eps, ef, 0);
+                if (!io.err.empty()) return ExecResult::failure(io.err);
+                for (const auto& [d, pkb] : w0) {
+                    HnswNode n;
+                    if (!hnsw_node(io, pkb, n, nullptr) || n.deleted) continue;  // zombie
+                    Cand c;
+                    c.dist = d;
+                    c.pk_bytes = pkb;
+                    c.pk = decode_pk(t, table_prefix(t.id) + pkb);
+                    cands.push_back(std::move(c));
+                }
+                scanned = io.visited;
+            }
+        } else {
         // Rank the lists by centroid distance in ASSIGNMENT space (raw for L2, direction for
         // cosine/IP — the same space the entries were bucketed in); probe the nearest `probes`.
         const std::vector<double> qav = ivf_assign_vec(want_op, qv);
@@ -11048,13 +11514,6 @@ private:
             std::min<std::size_t>(std::max<std::uint32_t>(1, probes), ranked.size());
 
         // Gather candidates from the probed lists (exact distance from the entry payload).
-        struct Cand {
-            double dist = 0.0;
-            Key pk_bytes;
-            Datum pk;
-        };
-        std::vector<Cand> cands;
-        std::size_t scanned = 0;
         for (std::size_t p = 0; p < nprobe; ++p) {
             Key lo = index_prefix(t.id, ix->id);
             put_index_col(lo, Datum::make_int(static_cast<std::int64_t>(ranked[p].second)));
@@ -11092,6 +11551,7 @@ private:
                 cands.push_back(std::move(c));
             }
         }
+        }  // end IVFFLAT probe branch
         // Total deterministic order — (distance, PK bytes) — matching the exact path's
         // ORDER BY distance with its PK tie-break (real_cmp keeps NaN total).
         std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
@@ -11099,8 +11559,6 @@ private:
             if (c != 0) return c < 0;
             return a.pk_bytes < b.pk_bytes;
         });
-        const std::size_t want = static_cast<std::size_t>(
-            std::max<std::int64_t>(0, sel.limit) + std::max<std::int64_t>(0, sel.offset));
         if (cands.size() > want) cands.resize(want);
 
         // Fetch + project the winners in distance order (already final — no sort needed).
@@ -11271,7 +11729,7 @@ private:
                                   std::size_t pk_index) {
         // J2/J3: an expression index covers no stored column; a GIN entry holds a single ARRAY
         // element, not the array — neither can serve a covering (index-only) read.
-        if (!ix.expr_src.empty() || ix.gin || ix.ivfflat) return false;  // K1.3: list-bucketed
+        if (!ix.expr_src.empty() || ix.gin || ix.ivfflat || ix.hnsw) return false;  // K1.3/K1.4
         for (std::size_t c = 0; c < need.size(); ++c) {
             if (!need[c] || c == pk_index) continue;
             bool in_ix = false;
@@ -12723,6 +13181,8 @@ private:
     // K1.3: SET ivfflat.probes — session override of each IVFFLAT index's own probes default
     // (0 = no override). pgvector's query-time recall knob.
     std::uint32_t ivfflat_probes_ = 0;
+    // K1.4: SET hnsw.ef_search — the HNSW level-0 beam width (pgvector default 40).
+    std::uint32_t hnsw_ef_search_ = 40;
 
     // W9.2: parse cache (sql text -> parsed AST). Always valid (parsing is catalog-independent).
     static constexpr std::size_t kParseCacheCap = 1024;

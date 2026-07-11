@@ -175,6 +175,18 @@ struct Index {
     // 2 = vector_ip_ops. Cosine/IP cluster + assign in NORMALIZED (direction) space; the
     // query path ranks candidates by the opclass's EXACT distance over the raw payloads.
     std::uint8_t vec_op = 0;
+    // K1.4: HNSW (graph) approximate k-NN over ONE VECTOR(n) column. The graph lives in the
+    // index KV namespace: per-node vector+flags record ('v'), per-(level,node) adjacency
+    // ('n'), and the mutable entry-point record ('e') — all written in the SAME atomic batch
+    // as the row write. DETERMINISTIC: a node's level is a pure integer-geometric function
+    // of its PK bytes (repeated splitmix64, p = 1/m per level — NO rng, NO libm), and every
+    // heap/selection tie breaks on (distance via real_cmp, pk bytes), so replicas applying
+    // the same op sequence build a byte-identical graph. DELETE zombies the node (flags=1:
+    // excluded from results, still traversable); UPDATE rewrites the vector + out-edges
+    // (same PK => same level), stale in-edges stay (distances are always computed fresh).
+    bool hnsw = false;
+    std::uint32_t hnsw_m = 16;    // max out-degree per layer (level 0 allows 2m)
+    std::uint32_t hnsw_efc = 64;  // ef_construction — build-time beam width
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).
