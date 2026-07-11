@@ -173,3 +173,9 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 - [x] **SET ivfflat.probes = n** — session override of the per-index probes default (0 restores); pgvector's recall knob.
 - [x] **honest EXPLAIN** — same ivfflat_match as the executor: `Limit -> Ivfflat Scan: using <ix> (opclass, lists=N, probes=M)`; ANALYZE actual = entries examined.
 - [x] **micro-bench (K1.5-lite, host -O2)**: 20k×32d, k=10, lists=100, probes=4 → **7.3x** vs brute-force (7.3 ms/query vs 53.5), recall@10 = **0.958**, build 260 ms. Full 1M×768d vs real pgvector still open.
+
+## K1.4 deterministic HNSW (2026-07-11)
+
+- [x] **USING HNSW WITH (m, ef_construction)** — levels = integer-geometric hash of PK bytes (no rng, no libm → bit-stable across replicas); graph in index-KV ('v' vector+flags, 'n' per-level adjacency, 'e' entry); maintenance in the SAME atomic batch, overlay reads (multi-row INSERT links within itself); DELETE = zombie (traversable, excluded); UPDATE = same-level relink; `SET hnsw.ef_search`; honest EXPLAIN `Hnsw Scan`; AT SNAPSHOT works; ef>=N == exact gate (L2 + cosine) row+columnar+durable.
+- **HONEST BENCH (host -O2, 5k×32d, k=10)**: build 261 s (~52 ms/insert), query 84 ms (0.1x vs brute 12.4 ms), recall@10 0.826 — **correct + replica-attestable but NOT yet fast**: each graph hop = a point KV get through the full Query machinery (~130 µs × ~640 visited nodes). ivfflat reads probe lists as RANGE scans → 0.84 ms/query, 14.7x, recall 0.958 at the same scale. **Recommendation today: ivfflat.** HNSW win needs storage batch-get / cheap point-read path (ties into the ~17k ops/s single-thread coroutine ceiling) — future work.
+- [ ] open: batch/cached graph reads (or inline neighbor vectors + reverse-edge maintenance) · REINDEX/vacuum to compact zombies · replica graph-hash attestation demo over the keyspace-hash machinery.

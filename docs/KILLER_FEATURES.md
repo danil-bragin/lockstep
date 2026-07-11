@@ -49,7 +49,7 @@ ideal SIMD distance layout.
 - [x] K1.1 `vector(n)` type (dim-checked, logical 15 over the ARRAY codec with REAL elements; pgvector `'[x,y,z]'` text form). *Remaining: pgvector BINARY format on the PG wire (text works today).*
 - [x] K1.2 Distance ops `<->` / `<#>` / `<=>` (+ `l2_distance`/`cosine_distance`/`inner_product` fns); exact scan row + columnar; ORDER BY-expression k-NN idiom. *Remaining: SIMD kernels (scalar loops today).*
 - [x] K1.3 `USING ivfflat` (deterministic k-means — PK-ordered seeding, no rng; `lists`/`probes` knobs; entries carry the payload so probes skip row fetches).
-- [ ] K1.4 `USING hnsw` — seeded levels, WAL-logged, deterministic build; replica index-hash equality check.
+- [x] K1.4 `USING hnsw` — deterministic build (integer-geometric hash-of-PK levels, no rng/libm; byte-identical replica graphs, attestable via keyspace-hash). *Honest caveat: correct but point-get-bound (~130 µs/hop) — ivfflat is the fast path today; batch-get optimization pending.*
 - [ ] K1.5 Recall/latency bench vs pgvector @1M×768d; honest report.
 - [x] K1.6 Gate: index==scan differential (probes=lists must EQUAL brute force — in sql_vector_test) *; recall bounds vs exact oracle at scale pending K1.5.*
 
