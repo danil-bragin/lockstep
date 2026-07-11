@@ -2606,11 +2606,15 @@ private:
             const std::size_t k = std::max<std::size_t>(
                 1, std::min<std::size_t>(ix.lists, vecs.empty() ? 1 : vecs.size()));
             // K1 perf: k-means over a DETERMINISTIC SAMPLE (every stride-th vector in PK
-            // order, ~50 per list — pgvector's sampling rule) instead of every vector:
+            // order, ~200 per list — 4x pgvector's rule: its 50/list bent centroids on overlapping clusters (v3 recall plateau 0.85)) instead of every vector:
             // the build was dominated by the full-set Lloyd iterations. stride == 1 (all
             // vectors) whenever the table is small, so existing behavior/centroids are
             // unchanged there. The ASSIGNMENT pass still covers every vector exactly.
-            const std::size_t stride = std::max<std::size_t>(1, vecs.size() / (50 * k));
+            // Sampling is reserved for HUGE sets (> 1000 vectors/list): on overlapping
+            // clusters a sampled k-means bends centroids and costs recall (v3 sweep:
+            // 1.0 -> 0.85-0.90 plateau) — quality wins by default at normal sizes.
+            const std::size_t stride =
+                vecs.size() > 1000 * k ? std::max<std::size_t>(1, vecs.size() / (400 * k)) : 1;
             std::vector<std::vector<double>> cents;
             if (stride == 1) {
                 cents = ivf_kmeans(vecs, k, dim);
@@ -11892,17 +11896,19 @@ private:
             float qnf = 0.0F;
             for (const float x : qf) qnf += x * x;
             qnf = std::sqrt(qnf);
-            struct P {
-                float s;
-                std::uint32_t list, idx;
-            };
-            std::vector<P> pr;
+            // K1 perf (SoA prune): scores land in ONE flat float array; (list, count)
+            // pairs recover each score's position — no 12-byte per-candidate records.
+            std::vector<float> ps;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> plists;
+            plists.reserve(nprobe);
             for (std::size_t p = 0; p < nprobe; ++p) {
                 const std::size_t list = ranked[p].second;
                 if (list >= cache->list_pks.size()) continue;
                 const float* f = cache->list_f32[list].data();
                 const std::size_t n2 = cache->list_pks[list].size();
-                pr.reserve(pr.size() + n2);
+                ps.reserve(ps.size() + n2);
+                plists.emplace_back(static_cast<std::uint32_t>(list),
+                                    static_cast<std::uint32_t>(n2));
                 for (std::size_t i = 0; i < n2; ++i, f += dim) {
                     float s;
                     if (want_op == 0) {
@@ -11933,20 +11939,27 @@ private:
                             s = -dotf;
                         }
                     }
-                    pr.push_back(P{s, static_cast<std::uint32_t>(list),
-                                   static_cast<std::uint32_t>(i)});
+                    ps.push_back(s);
                 }
             }
-            scanned += pr.size();
-            // The want-th smallest f32 prune score (the window pivot).
+            scanned += ps.size();
+            // The want-th smallest f32 prune score (the window pivot) via a RUNNING
+            // bounded max-heap — no second scores copy, no nth_element pass.
             float kth = std::numeric_limits<float>::infinity();
-            if (want > 0 && pr.size() > want) {
-                std::vector<float> ss;
-                ss.reserve(pr.size());
-                for (const P& p2 : pr) ss.push_back(p2.s);
-                std::nth_element(ss.begin(), ss.begin() + static_cast<std::ptrdiff_t>(want - 1),
-                                 ss.end());
-                kth = ss[want - 1];
+            if (want > 0 && ps.size() > want) {
+                std::vector<float> heap;
+                heap.reserve(want);
+                for (const float s : ps) {
+                    if (heap.size() < want) {
+                        heap.push_back(s);
+                        std::push_heap(heap.begin(), heap.end());
+                    } else if (s < heap.front()) {
+                        std::pop_heap(heap.begin(), heap.end());
+                        heap.back() = s;
+                        std::push_heap(heap.begin(), heap.end());
+                    }
+                }
+                kth = heap.front();
             }
             // ---- Phase 2: EXACT double re-rank of the window. The margins over-cover
             // the worst-case f32 error, so the window provably contains the true
@@ -11955,37 +11968,42 @@ private:
             // absolute floor); cosine distance lies in [0,2] with absolute error
             // <= ~1e-6 (margin 1e-4); inner-product error scales with |u||v| (margin
             // 1e-4 * (|u|*|q| + 1)). Any candidate outside its margin cannot beat the
-            // true k-th, so dropping it cannot change the exact top-k.
-            cands.reserve(pr.size());
-            for (const P& p2 : pr) {
-                bool in_window = true;
-                if (kth != std::numeric_limits<float>::infinity()) {
-                    if (want_op == 0) {
-                        in_window = p2.s <= kth * (1.0F + 6.1e-5F) + 1e-30F;
-                    } else if (want_op == 1) {
-                        in_window = p2.s <= kth + 1e-4F;
-                    } else {
-                        in_window =
-                            p2.s <= kth + 1e-4F * (cache->list_norm[p2.list][p2.idx] * qnf + 1.0F);
+            // true k-th, so dropping it cannot change the exact top-k. Scores are read
+            // back POSITIONALLY from the flat array (SoA — no per-candidate records).
+            std::size_t pos = 0;
+            for (const auto& [list32, cnt] : plists) {
+                const std::size_t list = list32;
+                const double* base = cache->list_vecs[list].data();
+                for (std::uint32_t i = 0; i < cnt; ++i) {
+                    const float s = ps[pos++];
+                    bool in_window = true;
+                    if (kth != std::numeric_limits<float>::infinity()) {
+                        if (want_op == 0) {
+                            in_window = s <= kth * (1.0F + 6.1e-5F) + 1e-30F;
+                        } else if (want_op == 1) {
+                            in_window = s <= kth + 1e-4F;
+                        } else {
+                            in_window =
+                                s <= kth + 1e-4F * (cache->list_norm[list][i] * qnf + 1.0F);
+                        }
                     }
+                    if (!in_window) continue;
+                    const double* fp = base + static_cast<std::size_t>(i) * dim;
+                    const auto gx = [fp](std::size_t k) { return fp[k]; };
+                    Cand c;
+                    if (want_op == 0) {
+                        c.dist = std::sqrt(vec_sq4(dim, qv, gx));
+                    } else if (want_op == 1) {
+                        double dot = 0.0, nu = 0.0;
+                        vec_dot_nu4(dim, qv, gx, dot, nu);
+                        const double denom = std::sqrt(nu) * std::sqrt(qnv);
+                        c.dist = denom == 0.0 ? 1.0 : 1.0 - dot / denom;
+                    } else {
+                        c.dist = -vec_dot4(dim, qv, gx);
+                    }
+                    c.pk_bytes = cache->list_pks[list][i];
+                    cands.push_back(std::move(c));
                 }
-                if (!in_window) continue;
-                const double* fp =
-                    cache->list_vecs[p2.list].data() + static_cast<std::size_t>(p2.idx) * dim;
-                const auto gx = [fp](std::size_t k) { return fp[k]; };
-                Cand c;
-                if (want_op == 0) {
-                    c.dist = std::sqrt(vec_sq4(dim, qv, gx));
-                } else if (want_op == 1) {
-                    double dot = 0.0, nu = 0.0;
-                    vec_dot_nu4(dim, qv, gx, dot, nu);
-                    const double denom = std::sqrt(nu) * std::sqrt(qnv);
-                    c.dist = denom == 0.0 ? 1.0 : 1.0 - dot / denom;
-                } else {
-                    c.dist = -vec_dot4(dim, qv, gx);
-                }
-                c.pk_bytes = cache->list_pks[p2.list][p2.idx];
-                cands.push_back(std::move(c));
             }
         }
         for (std::size_t p = 0; cache == nullptr && p < nprobe; ++p) {
