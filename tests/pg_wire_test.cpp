@@ -336,6 +336,147 @@ int main() {
         check(bp.closed(), "W3.5: oversized frame closes the connection (no unbounded buffering)");
     }
 
+    // (K1) VECTOR over the wire: the vector type OID, pg_type discovery, and pgvector's
+    // BINARY parameter format through the extended protocol.
+    {
+        (void)session.feed(sp(query(
+            "CREATE TABLE docs (id INT, emb VECTOR(3) NOT NULL, PRIMARY KEY (id))")));
+        (void)session.feed(sp(query("INSERT INTO docs (id,emb) VALUES (1, '[1,0,0]')")));
+        // RowDescription advertises the vector OID; DataRow carries the pgvector text form.
+        {
+            const auto ms = parse_backend(session.feed(sp(query("SELECT emb FROM docs WHERE id = 1"))));
+            bool oid_ok = false;
+            for (const Msg& m : ms)
+                if (m.type == 'T') {
+                    std::size_t p = 2;
+                    (void)cstring(m.body, p);
+                    oid_ok = (pw::pg_get_i32(m.body.data() + p + 6) == pw::kPgVectorOid);
+                }
+            check(oid_ok, "K1: VECTOR column advertises the vector OID (16388)");
+            bool val_ok = false;
+            for (const Msg& m : ms)
+                if (m.type == 'D') {
+                    std::size_t p = 2;
+                    const std::int32_t vl = pw::pg_get_i32(m.body.data() + p);
+                    p += 4;
+                    val_ok = vl > 0 && std::string(reinterpret_cast<const char*>(m.body.data() + p),
+                                                   static_cast<std::size_t>(vl)) == "[1,0,0]";
+                }
+            check(val_ok, "K1: VECTOR DataRow is pgvector text '[1,0,0]'");
+        }
+        // pg_type discovery — the query the pgvector client adapters run at registration.
+        {
+            const auto ms = parse_backend(
+                session.feed(sp(query("SELECT oid FROM pg_type WHERE typname = 'vector'"))));
+            bool ok = false;
+            for (const Msg& m : ms)
+                if (m.type == 'D') {
+                    std::size_t p = 2;
+                    const std::int32_t vl = pw::pg_get_i32(m.body.data() + p);
+                    p += 4;
+                    ok = vl > 0 && std::string(reinterpret_cast<const char*>(m.body.data() + p),
+                                               static_cast<std::size_t>(vl)) == "16388";
+                }
+            check(ok, "K1: pg_type discovery returns the vector OID");
+        }
+        // Extended protocol with a BINARY vector parameter (pgvector's binary format:
+        // uint16 dim, uint16 unused, dim x float4 big-endian) declared via the Parse OID.
+        {
+            std::vector<std::byte> ext;
+            {
+                std::vector<std::byte> p;
+                pw::pg_put_str(p, "");
+                pw::pg_put_str(p, "INSERT INTO docs (id, emb) VALUES ($1, $2)");
+                pw::pg_put_i16(p, 2);   // two declared param types
+                pw::pg_put_i32(p, 20);  // $1 int8
+                pw::pg_put_i32(p, pw::kPgVectorOid);  // $2 vector
+                ext.push_back(static_cast<std::byte>('P'));
+                pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+                ext.insert(ext.end(), p.begin(), p.end());
+            }
+            {
+                std::vector<std::byte> p;
+                pw::pg_put_str(p, "");
+                pw::pg_put_str(p, "");
+                pw::pg_put_i16(p, 2);  // per-param format codes
+                pw::pg_put_i16(p, 1);  // $1 binary
+                pw::pg_put_i16(p, 1);  // $2 binary
+                pw::pg_put_i16(p, 2);  // two parameters
+                pw::pg_put_i32(p, 8);  // $1: int8 binary = 8 bytes
+                for (int i = 7; i >= 0; --i)
+                    p.push_back(static_cast<std::byte>((static_cast<std::uint64_t>(2) >> (8 * i)) & 0xFF));
+                pw::pg_put_i32(p, 4 + 3 * 4);  // $2: vector binary
+                pw::pg_put_i16(p, 3);          // dim
+                pw::pg_put_i16(p, 0);          // unused
+                const float fv[3] = {0.0F, 1.0F, 0.0F};
+                for (const float f : fv) {
+                    std::uint32_t bits = 0;
+                    std::memcpy(&bits, &f, sizeof(bits));
+                    for (int i = 3; i >= 0; --i)
+                        p.push_back(static_cast<std::byte>((bits >> (8 * i)) & 0xFF));
+                }
+                pw::pg_put_i16(p, 0);  // result format codes
+                ext.push_back(static_cast<std::byte>('B'));
+                pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+                ext.insert(ext.end(), p.begin(), p.end());
+            }
+            {
+                std::vector<std::byte> p;
+                pw::pg_put_str(p, "");
+                pw::pg_put_i32(p, 0);
+                ext.push_back(static_cast<std::byte>('E'));
+                pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+                ext.insert(ext.end(), p.begin(), p.end());
+            }
+            ext.push_back(static_cast<std::byte>('S'));
+            pw::pg_put_i32(ext, 4);
+            const auto ms = parse_backend(session.feed(sp(ext)));
+            check(has_type(ms, '2') && !has_type(ms, 'E'),
+                  "K1: binary int8 + binary vector params bind clean");
+            // The row landed with the decoded vector.
+            const auto sel = parse_backend(session.feed(sp(query("SELECT emb FROM docs WHERE id = 2"))));
+            bool ok = false;
+            for (const Msg& m : sel)
+                if (m.type == 'D') {
+                    std::size_t p = 2;
+                    const std::int32_t vl = pw::pg_get_i32(m.body.data() + p);
+                    p += 4;
+                    ok = vl > 0 && std::string(reinterpret_cast<const char*>(m.body.data() + p),
+                                               static_cast<std::size_t>(vl)) == "[0,1,0]";
+                }
+            check(ok, "K1: binary vector param round-trips as '[0,1,0]'");
+        }
+        // A binary RESULT-format request is a clean error (text-only results today).
+        {
+            std::vector<std::byte> ext;
+            {
+                std::vector<std::byte> p;
+                pw::pg_put_str(p, "");
+                pw::pg_put_str(p, "SELECT id FROM docs");
+                pw::pg_put_i16(p, 0);
+                ext.push_back(static_cast<std::byte>('P'));
+                pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+                ext.insert(ext.end(), p.begin(), p.end());
+            }
+            {
+                std::vector<std::byte> p;
+                pw::pg_put_str(p, "");
+                pw::pg_put_str(p, "");
+                pw::pg_put_i16(p, 0);  // no param formats
+                pw::pg_put_i16(p, 0);  // no params
+                pw::pg_put_i16(p, 1);  // one result format code...
+                pw::pg_put_i16(p, 1);  // ...binary -> rejected
+                ext.push_back(static_cast<std::byte>('B'));
+                pw::pg_put_i32(ext, static_cast<std::int32_t>(p.size() + 4));
+                ext.insert(ext.end(), p.begin(), p.end());
+            }
+            ext.push_back(static_cast<std::byte>('S'));
+            pw::pg_put_i32(ext, 4);
+            const auto ms = parse_backend(session.feed(sp(ext)));
+            check(has_type(ms, 'E'), "K1: binary result-format request -> clean ErrorResponse");
+        }
+    }
+
     if (g_fail) { std::printf("pg_wire_test: FAILED\n"); return 1; }
     std::printf("pg_wire_test: OK (handshake + simple query + EXTENDED protocol (bound $1) + "
                 "per-type OIDs + cleartext-password auth)\n");

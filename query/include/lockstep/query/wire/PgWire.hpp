@@ -19,6 +19,7 @@
 // EXTENDED protocol (Parse/Bind/Execute prepared statements) is a follow-on too.
 #include <cstddef>
 #include <cstdint>
+#include <cstring>  // K1: memcpy for the binary float4/float8 parameter decode
 #include <functional>
 #include <map>
 #include <optional>
@@ -62,18 +63,102 @@ inline void pg_put_bytes(std::vector<std::byte>& b, const std::string& s) {
 
 // The `text` type OID (25) — the fallback when a column's type is unknown.
 inline constexpr std::int32_t kPgTextOid = 25;
+// K1: the `vector` type OID. pgvector's OID is per-database (extension-assigned); ours is
+// FIXED at a value in the extension range, and pg_catalog.pg_type advertises it — a client
+// doing `SELECT oid FROM pg_type WHERE typname = 'vector'` (psycopg register_vector, the
+// pgvector client adapters) discovers it exactly like on real PostgreSQL.
+inline constexpr std::int32_t kPgVectorOid = 16388;
 
 // Map a Lockstep Datum's type to the closest PostgreSQL type OID. Values are still sent
 // in TEXT format; the OID tells a type-aware client how to PARSE that text (int vs string
 // vs date vs numeric), so a driver returns a native int/Decimal/date instead of a string.
 [[nodiscard]] inline std::int32_t pg_oid_for_datum(const sql::Datum& d) {
-    if (d.type == sql::Type::Text) return kPgTextOid;  // text / varchar / char / enum label
+    if (d.type == sql::Type::Text) {
+        switch (d.logical) {           // TEXT-physical logical subtypes
+            case 4: return 2950;       // uuid
+            case 11: return 114;       // json
+            case 14: return 701;       // float8 (REAL renders as PG float8 text)
+            case 15: return kPgVectorOid;  // K1: vector — text form '[x,y,z]' matches pgvector
+            default: return kPgTextOid;    // text / varchar / char / enum label / arrays
+        }
+    }
     switch (d.logical) {                                // Int base, logical subtype (F9b/F13)
         case 1: return 1700;  // numeric  (DECIMAL)
         case 2: return 1082;  // date
         case 3: return 1114;  // timestamp
         case 8: return 1083;  // time
         default: return 20;   // int8 (Lockstep ints are 64-bit)
+    }
+}
+
+// K1: decode ONE binary-format Bind parameter into its TEXT form by its DECLARED
+// Parse-time type OID (network byte order per PG v3). Returns nullopt for an OID we do
+// not know how to decode — the caller errors clean instead of splicing garbage bytes.
+// The vector shape is pgvector's binary format: uint16 dim, uint16 unused, dim x float4.
+[[nodiscard]] inline std::optional<std::string> pg_decode_binary_param(std::int32_t oid,
+                                                                       const std::byte* p,
+                                                                       std::size_t len) {
+    const auto u16 = [&](std::size_t off) {
+        return (static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(p[off])) << 8) |
+               static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(p[off + 1]));
+    };
+    const auto u32 = [&](std::size_t off) {
+        std::uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v = (v << 8) | std::to_integer<std::uint8_t>(p[off + static_cast<std::size_t>(i)]);
+        return v;
+    };
+    const auto u64 = [&](std::size_t off) {
+        std::uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) v = (v << 8) | std::to_integer<std::uint8_t>(p[off + static_cast<std::size_t>(i)]);
+        return v;
+    };
+    const auto f32 = [&](std::size_t off) {
+        const std::uint32_t bits = u32(off);
+        float f = 0.0F;
+        std::memcpy(&f, &bits, sizeof(f));
+        return f;
+    };
+    switch (oid) {
+        case 16:  // bool
+            return len == 1 ? std::optional<std::string>(std::to_integer<std::uint8_t>(p[0]) != 0 ? "TRUE" : "FALSE")
+                            : std::nullopt;
+        case 21:  // int2
+            return len == 2 ? std::optional<std::string>(std::to_string(static_cast<std::int16_t>(u16(0))))
+                            : std::nullopt;
+        case 23:  // int4
+            return len == 4 ? std::optional<std::string>(std::to_string(static_cast<std::int32_t>(u32(0))))
+                            : std::nullopt;
+        case 20:  // int8
+            return len == 8 ? std::optional<std::string>(std::to_string(static_cast<std::int64_t>(u64(0))))
+                            : std::nullopt;
+        case 700:  // float4
+            return len == 4 ? std::optional<std::string>(sql::Datum::render_double(static_cast<double>(f32(0))))
+                            : std::nullopt;
+        case 701: {  // float8
+            if (len != 8) return std::nullopt;
+            const std::uint64_t bits = u64(0);
+            double d = 0.0;
+            std::memcpy(&d, &bits, sizeof(d));
+            return sql::Datum::render_double(d);
+        }
+        case kPgVectorOid: {  // K1: pgvector binary — [dim u16][unused u16][dim x float4 BE]
+            if (len < 4) return std::nullopt;
+            const std::uint16_t dim = u16(0);
+            if (len != 4 + static_cast<std::size_t>(dim) * 4) return std::nullopt;
+            std::string s = "[";
+            for (std::uint16_t i = 0; i < dim; ++i) {
+                if (i != 0) s += ",";
+                s += sql::Datum::render_double(static_cast<double>(f32(4 + static_cast<std::size_t>(i) * 4)));
+            }
+            s += "]";
+            return s;
+        }
+        case 0:     // unspecified — PG treats the bytes as the text form
+        case 25:    // text
+        case 1043:  // varchar
+            return std::string(reinterpret_cast<const char*>(p), len);
+        default:
+            return std::nullopt;
     }
 }
 // The (column name, type OID) list for a result — from the first row's cells (the OID is
@@ -489,23 +574,51 @@ private:
         return s;
     }
 
-    // Parse 'P': name\0 query\0 int16 nparamtypes int32[]... — store the prepared statement.
+    // Parse 'P': name\0 query\0 int16 nparamtypes int32[]... — store the prepared statement
+    // AND its declared parameter-type OIDs (K1: needed to decode a BINARY-format Bind param).
     void handle_parse(std::vector<std::byte>& out, const std::byte* p, std::size_t plen) {
         std::size_t pos = 0;
         const std::string name = read_cstring(p, plen, pos);
         const std::string query = read_cstring(p, plen, pos);
-        stmts_[name] = query;  // param types ignored: we substitute textually
+        stmts_[name] = query;
+        std::vector<std::int32_t> types;
+        if (pos + 2 <= plen) {
+            const std::int16_t n = pg_get_i16(p + pos);
+            pos += 2;
+            for (std::int16_t k = 0; k < n && pos + 4 <= plen; ++k) {
+                types.push_back(pg_get_i32(p + pos));
+                pos += 4;
+            }
+        }
+        stmt_types_[name] = std::move(types);
         pg_parse_complete(out);
     }
 
     // Bind 'B': portal\0 stmt\0 [fmt codes] [params] [result fmts] — substitute -> a portal.
+    // K1: parameter format codes are HONORED — a binary param is decoded by its Parse-time
+    // type OID (int2/4/8, float4/8, bool, text, pgvector's vector shape); an undecodable
+    // binary param and a binary RESULT-format request are clean errors (never garbage).
     void handle_bind(std::vector<std::byte>& out, const std::byte* p, std::size_t plen) {
         std::size_t pos = 0;
         const std::string portal = read_cstring(p, plen, pos);
         const std::string stmt = read_cstring(p, plen, pos);
         if (pos + 2 > plen) return;
         const std::int16_t nfmt = pg_get_i16(p + pos);
-        pos += 2 + static_cast<std::size_t>(nfmt < 0 ? 0 : nfmt) * 2;  // skip format codes
+        pos += 2;
+        std::vector<std::int16_t> fmts;
+        for (std::int16_t k = 0; k < nfmt && pos + 2 <= plen; ++k) {
+            fmts.push_back(pg_get_i16(p + pos));
+            pos += 2;
+        }
+        const auto fmt_for = [&](std::size_t k) -> std::int16_t {
+            if (fmts.empty()) return 0;                       // all-text default
+            return fmts.size() == 1 ? fmts[0] : (k < fmts.size() ? fmts[k] : 0);
+        };
+        const auto tit = stmt_types_.find(stmt);
+        const auto oid_for = [&](std::size_t k) -> std::int32_t {
+            if (tit == stmt_types_.end() || k >= tit->second.size()) return 0;  // unspecified
+            return tit->second[k];
+        };
         if (pos + 2 > plen) return;
         const std::int16_t nparams = pg_get_i16(p + pos);
         pos += 2;
@@ -515,10 +628,35 @@ private:
             pos += 4;
             if (vlen < 0) {
                 lits.push_back(pg_param_literal("", true));
+                continue;
+            }
+            const std::byte* vp = p + pos;
+            pos += static_cast<std::size_t>(vlen);
+            if (fmt_for(static_cast<std::size_t>(k)) == 1) {  // binary parameter
+                const auto txt = pg_decode_binary_param(oid_for(static_cast<std::size_t>(k)), vp,
+                                                        static_cast<std::size_t>(vlen));
+                if (!txt) {
+                    pg_error_response_code(out, "0A000",
+                                           "binary parameter format is not supported for this type");
+                    return;
+                }
+                lits.push_back(pg_param_literal(*txt, false));
             } else {
-                std::string v(reinterpret_cast<const char*>(p + pos), static_cast<std::size_t>(vlen));
-                pos += static_cast<std::size_t>(vlen);
-                lits.push_back(pg_param_literal(v, false));
+                lits.push_back(pg_param_literal(
+                    std::string(reinterpret_cast<const char*>(vp), static_cast<std::size_t>(vlen)),
+                    false));
+            }
+        }
+        // Result-format codes: only TEXT results are produced; reject a binary request clean.
+        if (pos + 2 <= plen) {
+            const std::int16_t nres = pg_get_i16(p + pos);
+            pos += 2;
+            for (std::int16_t k = 0; k < nres && pos + 2 <= plen; ++k) {
+                if (pg_get_i16(p + pos) == 1) {
+                    pg_error_response_code(out, "0A000", "binary result format is not supported");
+                    return;
+                }
+                pos += 2;
             }
         }
         const auto it = stmts_.find(stmt);
@@ -576,7 +714,8 @@ private:
             const char what = std::to_integer<char>(p[0]);
             std::size_t pos = 1;
             const std::string name = read_cstring(p, plen, pos);
-            if (what == 'S') stmts_.erase(name); else portals_.erase(name);
+            if (what == 'S') { stmts_.erase(name); stmt_types_.erase(name); }
+            else portals_.erase(name);
         }
         pg_close_complete(out);
     }
@@ -633,6 +772,8 @@ private:
     bool closed_ = false;
     std::map<std::string, std::string> stmts_;  // prepared statements: name -> query
     std::map<std::string, Portal> portals_;     // bound portals: name -> {sql, cached}
+    // K1: Parse-time declared parameter-type OIDs (decode key for binary-format Bind params).
+    std::map<std::string, std::vector<std::int32_t>> stmt_types_;
     // W3.4 PG CancelRequest: the server assigns this session a (pid, secret) that is sent to
     // the client in BackendKeyData; the client opens a SEPARATE connection and sends a
     // CancelRequest carrying them, which the server matches to this session's cancel flag.

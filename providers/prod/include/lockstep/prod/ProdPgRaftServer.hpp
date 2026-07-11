@@ -141,6 +141,8 @@ private:
         // EXTENDED protocol (prepared statements): name -> SQL, portal -> bound query.
         std::map<std::string, std::string> stmts;
         std::map<std::string, Portal> portals;
+        // K1: Parse-time declared param-type OIDs (decode key for binary-format Bind params).
+        std::map<std::string, std::vector<std::int32_t>> stmt_types;
     };
 
     static void set_nonblock(int fd) {
@@ -497,7 +499,18 @@ private:
         std::size_t pos = 0;
         const std::string name = rd_cstr(p, plen, pos);
         const std::string query = rd_cstr(p, plen, pos);
-        c.stmts[name] = query;  // param types ignored — we substitute $N textually
+        c.stmts[name] = query;
+        // K1: capture the declared param-type OIDs (the binary-Bind decode key).
+        std::vector<std::int32_t> types;
+        if (pos + 2 <= plen) {
+            const std::int16_t n = pgw::pg_get_i16(p + pos);
+            pos += 2;
+            for (std::int16_t k = 0; k < n && pos + 4 <= plen; ++k) {
+                types.push_back(pgw::pg_get_i32(p + pos));
+                pos += 4;
+            }
+        }
+        c.stmt_types[name] = std::move(types);
         pgw::pg_parse_complete(out);
     }
 
@@ -505,10 +518,26 @@ private:
         std::size_t pos = 0;
         const std::string portal = rd_cstr(p, plen, pos);
         const std::string stmt = rd_cstr(p, plen, pos);
+        // K1: parameter format codes are HONORED (binary decoded by the Parse-time OID);
+        // a binary RESULT-format request is a clean error (only text results are produced).
+        std::vector<std::int16_t> fmts;
         if (pos + 2 <= plen) {
             const std::int16_t nfmt = pgw::pg_get_i16(p + pos);
-            pos += 2 + static_cast<std::size_t>(nfmt < 0 ? 0 : nfmt) * 2;  // skip format codes
+            pos += 2;
+            for (std::int16_t k = 0; k < nfmt && pos + 2 <= plen; ++k) {
+                fmts.push_back(pgw::pg_get_i16(p + pos));
+                pos += 2;
+            }
         }
+        const auto fmt_for = [&](std::size_t k) -> std::int16_t {
+            if (fmts.empty()) return 0;
+            return fmts.size() == 1 ? fmts[0] : (k < fmts.size() ? fmts[k] : 0);
+        };
+        const auto tit = c.stmt_types.find(stmt);
+        const auto oid_for = [&](std::size_t k) -> std::int32_t {
+            if (tit == c.stmt_types.end() || k >= tit->second.size()) return 0;
+            return tit->second[k];
+        };
         std::vector<std::string> lits;
         if (pos + 2 <= plen) {
             const std::int16_t nparams = pgw::pg_get_i16(p + pos);
@@ -518,11 +547,35 @@ private:
                 pos += 4;
                 if (vlen < 0) {
                     lits.push_back(pgw::pg_param_literal("", true));
-                } else {
-                    std::string v(reinterpret_cast<const char*>(p + pos), static_cast<std::size_t>(vlen));
-                    pos += static_cast<std::size_t>(vlen);
-                    lits.push_back(pgw::pg_param_literal(v, false));
+                    continue;
                 }
+                const std::byte* vp = p + pos;
+                pos += static_cast<std::size_t>(vlen);
+                if (fmt_for(static_cast<std::size_t>(k)) == 1) {
+                    const auto txt = pgw::pg_decode_binary_param(
+                        oid_for(static_cast<std::size_t>(k)), vp, static_cast<std::size_t>(vlen));
+                    if (!txt) {
+                        pgw::pg_error_response_code(
+                            out, "0A000", "binary parameter format is not supported for this type");
+                        return;
+                    }
+                    lits.push_back(pgw::pg_param_literal(*txt, false));
+                } else {
+                    lits.push_back(pgw::pg_param_literal(
+                        std::string(reinterpret_cast<const char*>(vp), static_cast<std::size_t>(vlen)),
+                        false));
+                }
+            }
+        }
+        if (pos + 2 <= plen) {  // result-format codes: reject binary clean
+            const std::int16_t nres = pgw::pg_get_i16(p + pos);
+            pos += 2;
+            for (std::int16_t k = 0; k < nres && pos + 2 <= plen; ++k) {
+                if (pgw::pg_get_i16(p + pos) == 1) {
+                    pgw::pg_error_response_code(out, "0A000", "binary result format is not supported");
+                    return;
+                }
+                pos += 2;
             }
         }
         const auto it = c.stmts.find(stmt);

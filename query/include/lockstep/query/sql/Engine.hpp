@@ -2111,7 +2111,9 @@ private:
                lower_name == "pg_catalog.pg_namespace" ||
                lower_name == "pg_namespace" ||
                lower_name == "pg_catalog.pg_class" ||
-               lower_name == "pg_class";
+               lower_name == "pg_class" ||
+               lower_name == "pg_catalog.pg_type" ||  // K1: vector-OID discovery
+               lower_name == "pg_type";
     }
 
     // W9: build the (columns, rows) of a synthesised system relation from the live catalog.
@@ -2177,6 +2179,20 @@ private:
             for (const auto& [qn, v] : catalog_.all_views()) {
                 (void)v;
                 rows.push_back({Datum::make_text(split_schema(qn).second), Datum::make_text("v")});
+            }
+        } else if (lower_name == "pg_catalog.pg_type" || lower_name == "pg_type") {
+            // K1: the type OIDs the PG wire shim advertises — enough for client-side type
+            // discovery, notably `SELECT oid FROM pg_type WHERE typname = 'vector'` (the
+            // pgvector adapters' registration query). OIDs match PgWire.hpp's mapping.
+            cols = {{"oid", Type::Int}, {"typname", Type::Text}};
+            const std::pair<std::int64_t, const char*> kTypes[] = {
+                {16, "bool"},     {20, "int8"},      {21, "int2"},      {23, "int4"},
+                {25, "text"},     {114, "json"},     {700, "float4"},   {701, "float8"},
+                {1043, "varchar"}, {1082, "date"},   {1083, "time"},    {1114, "timestamp"},
+                {1700, "numeric"}, {2950, "uuid"},   {16388, "vector"},
+            };
+            for (const auto& [oid, nm] : kTypes) {
+                rows.push_back({Datum::make_int(oid), Datum::make_text(nm)});
             }
         } else if (lower_name == "information_schema.table_constraints") {
             cols = {{"constraint_catalog", Type::Text}, {"constraint_schema", Type::Text},
