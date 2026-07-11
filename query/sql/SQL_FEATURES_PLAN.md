@@ -212,3 +212,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] storage::Engine::scan_visit (sync, zero-materialisation, vlog-declines) + WalEngine build_scan_merged extraction; IVFFLAT probe scores inside the visit at Strict level. **No wall-clock win (~22ms unchanged)** — skipped layers (Task/Promise/out-vector/Query) were cheap; profile floor = merge itself (SSTableReader::scan_into copies key+value per entry, ~4µs/entry).
 - [ ] NEXT RUNG: streaming SSTable cursor (iterator scan_into) plugged into build_scan_merged — kills the per-entry acc copies; then revisit vs pgvector 0.67ms.
+
+## K1 perf rung 5 (2026-07-11) — SSTable scan seek
+
+- [x] scan_into seeks the sparse index (lookup-style back-up, break past hi) — was O(table) per range scan on flushed data. ivfflat @100k×64 host 21.7→16 ms; benefits EVERY narrow range read (index lookups, GIN, columnar families, PK ranges). Output byte-identical.
+- [ ] remaining probe floor: accepted-entry key+value copies in acc/run + merge — streaming per-source cursors into build_scan_merged if further cuts needed; vs pgvector 0.67 ms the honest gap is now ~65x host-measured.
