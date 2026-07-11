@@ -11755,6 +11755,10 @@ private:
             return ExecResult::failure(fname + " requires vectors of equal length");
         }
 
+        // The Strict-level LIVE path may use the synchronous storage seams (probe cache,
+        // scan_visit point-gets); every other level reads through the leveled pipeline.
+        const bool live_strict =
+            sel.level == Level::StrictSerializable && sel.snapshot_version == kNoSeq;
         // K1 perf: a candidate is (distance, pk BYTES) only — the pk Datum is decoded for
         // the k+offset WINNERS after the cut, not for every scored entry.
         struct Cand {
@@ -11840,8 +11844,6 @@ private:
         // the SAME doubles the payloads decode to and is erased by any index maintenance,
         // so the scored values are bit-identical to the scan path's. Built lazily here
         // (one scan_visit pass over the index) when absent.
-        const bool live_strict =
-            sel.level == Level::StrictSerializable && sel.snapshot_version == kNoSeq;
         const IvfProbeCache* cache = nullptr;
         if (live_strict) {
             const std::uint64_t ck = ivf_cache_key(t.id, ix->id);
@@ -12028,20 +12030,41 @@ private:
         }
 
         // Fetch + project the winners in distance order (already final — no sort needed).
-        // The pk Datum is decoded HERE, for the <= k+offset winners only.
+        // The pk Datum is decoded HERE, for the <= k+offset winners only. K1 perf: on the
+        // Strict-level live path the row point-get goes through the synchronous scan_visit
+        // seam (a one-key range) instead of the full Query pipeline — the k winner fetches
+        // were the dominant remaining per-query cost; values and MVCC semantics identical
+        // (same snapshot Seq a Query<Strict> resolves to, tombstones filtered inside).
         ExecResult r;
         for (const Cand& c : cands) {
             const Key rkey = table_prefix(t.id) + c.pk_bytes;
             std::vector<Datum> row;
+            bool have = false;
             if (t.columnar) {
                 auto rr = read_columnar_row(t, decode_pk(t, rkey));
-                if (!rr) continue;  // entry with no live row (defensive)
-                row = std::move(*rr);
+                if (rr) {
+                    row = std::move(*rr);
+                    have = true;
+                }
             } else {
-                const ReadResult rv = point_get_at_level(sel, rkey);
-                if (!rv.has_value() || is_tombstone(*rv)) continue;
-                row = decode_row(t, rkey, *rv);
+                bool visited = false;
+                if (live_strict) {
+                    visited = db_.engine().scan_visit(
+                        storage::Range{rkey, key_successor(rkey), /*hi_unbounded=*/false},
+                        db_.live_snap_seq(), [&](const Key&, const Value& v2) {
+                            row = decode_row(t, rkey, v2);
+                            have = true;
+                        });
+                }
+                if (!visited) {
+                    const ReadResult rv = point_get_at_level(sel, rkey);
+                    if (rv.has_value() && !is_tombstone(*rv)) {
+                        row = decode_row(t, rkey, *rv);
+                        have = true;
+                    }
+                }
             }
+            if (!have) continue;  // entry with no live row (defensive)
             ResultRow out;
             if (sel.star) {
                 for (std::size_t i = 0; i < t.columns.size(); ++i) {
