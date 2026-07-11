@@ -217,3 +217,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] scan_into seeks the sparse index (lookup-style back-up, break past hi) — was O(table) per range scan on flushed data. ivfflat @100k×64 host 21.7→16 ms; benefits EVERY narrow range read (index lookups, GIN, columnar families, PK ranges). Output byte-identical.
 - [ ] remaining probe floor: accepted-entry key+value copies in acc/run + merge — streaming per-source cursors into build_scan_merged if further cuts needed; vs pgvector 0.67 ms the honest gap is now ~65x host-measured.
+
+## K1 perf rung 6 (2026-07-11, a5352bd) — streaming zero-copy scan_visit
+
+- [x] scan_visit = streaming k-way cursor merge (memtable iter + SSTableReader block cursors, offer-identical winner rule, pointer-buffer then callbacks, vlog falls back pre-callback). ivfflat @100k×64 host 16→10.6 ms. **Day total indexed: 4267→10.6 (~400x)**; vs pgvector 0.67 ms ≈ 16x (host-vs-docker rough).
+- [ ] next: clean profile of the 10.6 ms residual (last sample mixed the brute phase) — suspects: per-candidate pk_bytes substr alloc + push_back · ivf byte-assembly (LE memcpy fast path) · std::function indirection · per-list overhead · then the 4-accumulator kernel (both paths together) if the math surfaces.
