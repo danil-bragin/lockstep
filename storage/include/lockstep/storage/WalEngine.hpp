@@ -754,6 +754,54 @@ public:
             }
             merged.insert(it, std::pair<Key, Best>{k, Best{s, std::move(v), tomb, vl, true}});
         };
+        // Fold ONE source's key-ASCENDING run into `merged` by a linear 2-way MERGE. The
+        // per-item `offer` above degrades to O(N^2) the moment a source INTERLEAVES with
+        // what is already merged: after the first memtable flush a scan merges the (post-
+        // flush) memtable run with each SSTable's run, every offer lands mid-vector, and
+        // each vector::insert shifts the tail — a k-NN bench profile put 92% of samples in
+        // that insert, and the cost cliff appears exactly at the flush watermark. The merge
+        // is O(merged + run) with the SAME winner rule as `offer` (equal key -> the
+        // INCOMING, later-offered source wins on seq >=), so the resulting content and
+        // order are byte-identical. A non-ascending or duplicate-key run (no source
+        // produces one today) falls back to per-item `offer` — fail-safe, not fail-wrong.
+        auto fold_run = [&](std::vector<std::pair<Key, Best>>&& run) {
+            for (std::size_t i = 0; i + 1 < run.size(); ++i) {
+                if (!(run[i].first < run[i + 1].first)) {  // defensive: keep offer semantics
+                    for (auto& e : run)
+                        offer(e.first, e.second.seq, std::move(e.second.value),
+                              e.second.tombstone, e.second.vlog);
+                    return;
+                }
+            }
+            if (run.empty()) {
+                return;
+            }
+            if (merged.empty() || merged.back().first < run.front().first) {
+                for (auto& e : run) merged.push_back(std::move(e));  // pure append
+                return;
+            }
+            std::vector<std::pair<Key, Best>> next;
+            next.reserve(merged.size() + run.size());
+            std::size_t a = 0, b = 0;
+            while (a < merged.size() && b < run.size()) {
+                if (merged[a].first < run[b].first) {
+                    next.push_back(std::move(merged[a++]));
+                } else if (run[b].first < merged[a].first) {
+                    next.push_back(std::move(run[b++]));
+                } else {  // same key: offer's tiebreak — the incoming run wins on seq >=
+                    if (run[b].second.seq >= merged[a].second.seq) {
+                        next.push_back(std::move(run[b]));
+                    } else {
+                        next.push_back(std::move(merged[a]));
+                    }
+                    ++a;
+                    ++b;
+                }
+            }
+            while (a < merged.size()) next.push_back(std::move(merged[a++]));
+            while (b < run.size()) next.push_back(std::move(run[b++]));
+            merged = std::move(next);
+        };
 
         // SEEK to range.lo by binary search instead of walking the WHOLE memtable: keys()
         // is sorted, so a scan whose range is a small slice (a columnar column family, a
@@ -774,10 +822,16 @@ public:
             std::vector<std::pair<Key, SSTableReader::ScanCand>> acc;
             const Key hi = range.hi_unbounded ? Key{} : range.hi;
             sst->scan_into(range.lo, hi, at, range.hi_unbounded, acc);
+            // One SSTable = one key-ascending run: fold it with a LINEAR merge (the
+            // per-item offer degrades to O(N^2) once runs interleave — see fold_run).
+            std::vector<std::pair<Key, Best>> run;
+            run.reserve(acc.size());
             for (auto& c : acc) {
-                offer(c.first, c.second.seq, std::move(c.second.value), c.second.tombstone,
-                      c.second.vlog);
+                run.emplace_back(std::move(c.first),
+                                 Best{c.second.seq, std::move(c.second.value),
+                                      c.second.tombstone, c.second.vlog, true});
             }
+            fold_run(std::move(run));
         }
 
         // Materialise the surviving live values (deref vlog pointers). We DON'T hold
