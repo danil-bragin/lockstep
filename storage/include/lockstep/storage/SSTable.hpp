@@ -456,8 +456,34 @@ public:
     };
     void scan_into(const Key& lo, const Key& hi, Seq at, bool hi_unbounded,
                    std::vector<std::pair<Key, ScanCand>>& acc) const {
-        for (const std::vector<SstEntry>& blk : blocks_) {
-            for (const SstEntry& e : blk) {
+        // K1 perf: SEEK to the range via the sparse index instead of walking EVERY block
+        // (this loop used to be O(table) per scan — a probed-list scan over a flushed
+        // 100k-row table filtered ~13x more entries than it accepted). Blocks and the
+        // entries within each block are key-ascending, so:
+        //   * start at the LAST block whose first_key <= lo, backing up over pure-spill
+        //     predecessors exactly like lookup() (a key's version run can begin
+        //     mid-block after a smaller key);
+        //   * stop at the first block whose first_key is past hi, and break out of a
+        //     block once its entries pass hi.
+        // The accepted (entry, order) sequence is IDENTICAL to the full walk's.
+        std::size_t b0 = 0;
+        if (!lo.empty()) {
+            const int blk = seek_block(lo);
+            if (blk >= 0) {
+                b0 = static_cast<std::size_t>(blk);
+                while (b0 > 0 && index_[b0 - 1].first_key == lo) {
+                    --b0;
+                }
+                if (b0 > 0 && index_[b0 - 1].first_key < lo) {
+                    --b0;  // lo's first versions may start mid-block in this predecessor
+                }
+            }
+        }
+        for (std::size_t b = b0; b < blocks_.size(); ++b) {
+            if (!hi_unbounded && !(index_[b].first_key < hi)) {
+                break;  // this block (and every later one) starts at or past hi
+            }
+            for (const SstEntry& e : blocks_[b]) {
                 if (e.seq > at) {
                     continue;
                 }
@@ -465,7 +491,7 @@ public:
                     continue;
                 }
                 if (!hi_unbounded && !(e.key < hi)) {
-                    continue;
+                    break;  // entries are key-ascending — the rest of the block is past hi
                 }
                 acc.emplace_back(e.key, ScanCand{e.seq, e.value, e.tombstone, e.vlog});
             }
