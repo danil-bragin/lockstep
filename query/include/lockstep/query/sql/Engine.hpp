@@ -2610,6 +2610,7 @@ private:
             live.lists = static_cast<std::uint32_t>(k);
             live.centroids = ivf_encode_centroids(dim, cents);
             persist_schema(ci.table);
+            ivf_probe_cache_.erase(ivf_cache_key(table_id, live.id));  // K1 perf: fresh build
             for (const auto& row : all_rows) {
                 if (row[vcol].is_null) continue;
                 const std::size_t list =
@@ -2755,6 +2756,7 @@ private:
         }
         const Index ix = *ixp;  // copy before mutating the vector
         const std::uint32_t table_id = t->id;
+        ivf_probe_cache_.erase(ivf_cache_key(table_id, ix.id));  // K1 perf: derived cache
         // Tombstone every index entry (the scan path ignores tombstones, so this fully
         // retires the index's key range).
         std::vector<storage::KeyValue> kvs;
@@ -4145,6 +4147,9 @@ private:
                               std::vector<std::pair<Key, Value>>& out) {
         for (const Index& ix : t.indexes) {
             if (!row_matches_partial(t, ix, row)) continue;  // I5: outside the partial set
+            if (ix.ivfflat) {  // K1 perf: any maintenance invalidates the probe cache
+                ivf_probe_cache_.erase(ivf_cache_key(t.id, ix.id));
+            }
             if (ix.hnsw) {  // K1.4: graph maintenance rides the SAME atomic batch as the row
                 const Datum& v = row[ix.columns[0]];
                 const std::string pk = encode_pk(row[t.pk_index]);
@@ -11742,16 +11747,68 @@ private:
                 c.pk_bytes = ekey.size() > pk_off ? ekey.substr(pk_off) : Key{};
                 cands.push_back(std::move(c));
             };
+        // K1 perf (memory-bound fix): the Strict-level live probe scores from the
+        // CONTIGUOUS per-list cache — dense double blocks stream sequentially instead of
+        // reading ~600-byte payload strings scattered across the heap. The cache holds
+        // the SAME doubles the payloads decode to and is erased by any index maintenance,
+        // so the scored values are bit-identical to the scan path's. Built lazily here
+        // (one scan_visit pass over the index) when absent.
+        const bool live_strict =
+            sel.level == Level::StrictSerializable && sel.snapshot_version == kNoSeq;
+        const IvfProbeCache* cache = nullptr;
+        if (live_strict) {
+            const std::uint64_t ck = ivf_cache_key(t.id, ix->id);
+            auto cit = ivf_probe_cache_.find(ck);
+            if (cit == ivf_probe_cache_.end()) {
+                IvfProbeCache fresh;
+                fresh.dim = dim;
+                fresh.list_vecs.resize(ix->lists);
+                fresh.list_pks.resize(ix->lists);
+                bool ok = true;
+                std::vector<double> tmp;
+                for (std::uint32_t l = 0; l < ix->lists && ok; ++l) {
+                    Key llo = index_prefix(t.id, ix->id);
+                    put_index_col(llo, Datum::make_int(static_cast<std::int64_t>(l)));
+                    ok = db_.engine().scan_visit(
+                        storage::Range{llo, key_successor(llo), /*hi_unbounded=*/false},
+                        db_.live_snap_seq(), [&](const Key& k2, const Value& val) {
+                            if (!ivf_doubles_fast(val, tmp)) tmp = ivf_payload_doubles(val);
+                            tmp.resize(dim, 0.0);  // defensive; coerced payloads match dim
+                            auto& flat = fresh.list_vecs[l];
+                            flat.insert(flat.end(), tmp.begin(), tmp.end());
+                            fresh.list_pks[l].push_back(
+                                k2.size() > pk_off ? k2.substr(pk_off) : Key{});
+                        });
+                }
+                if (ok) cit = ivf_probe_cache_.emplace(ck, std::move(fresh)).first;
+            }
+            if (cit != ivf_probe_cache_.end() && cit->second.dim == dim) {
+                cache = &cit->second;
+            }
+        }
         for (std::size_t p = 0; p < nprobe; ++p) {
+            const std::size_t list = ranked[p].second;
+            if (cache != nullptr && list < cache->list_pks.size()) {
+                const std::vector<double>& flat = cache->list_vecs[list];
+                const std::vector<Key>& pks = cache->list_pks[list];
+                const double* fp = flat.data();
+                for (std::size_t i = 0; i < pks.size(); ++i, fp += dim) {
+                    ++scanned;
+                    Cand c;
+                    double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
+                    vec_accum4(dim, qv, [fp](std::size_t k) { return fp[k]; }, dot, sq, nu, nv);
+                    c.dist = vec_finish(want_op, dot, sq, nu, nv);
+                    c.pk_bytes = pks[i];
+                    cands.push_back(std::move(c));
+                }
+                continue;
+            }
             Key lo = index_prefix(t.id, ix->id);
-            put_index_col(lo, Datum::make_int(static_cast<std::int64_t>(ranked[p].second)));
+            put_index_col(lo, Datum::make_int(static_cast<std::int64_t>(list)));
             const Key hi = key_successor(lo);
-            // K1 perf: a Strict-level probe VISITS the list's entries synchronously inside
-            // storage (scan_visit) — no Task/Promise crossing, no output-vector copy of
-            // thousands of 8*dim-byte payloads. live_snap_seq() is exactly the snapshot a
-            // Query<Strict> scan resolves to. Any other level (or an engine that cannot
-            // visit) takes the regular leveled scan; entries and scores are identical.
-            if (sel.level == Level::StrictSerializable &&
+            // Strict-level fallback without a cache: visit synchronously inside storage;
+            // any other level takes the regular leveled scan. Entries + scores identical.
+            if (live_strict &&
                 db_.engine().scan_visit(storage::Range{lo, hi, /*hi_unbounded=*/false},
                                         db_.live_snap_seq(), score_entry)) {
                 continue;
@@ -13412,6 +13469,24 @@ private:
     // query vector of a k-NN would otherwise be strtod-parsed on EVERY row). Pure cache —
     // same text always yields the same doubles; bounded at 64 entries.
     std::unordered_map<std::string, std::vector<double>> vec_lit_cache_;
+    // K1 perf (the memory-bound fix): a CONTIGUOUS probe cache per IVFFLAT index — each
+    // list's live vectors as one dense double block + the parallel pk-byte suffixes. The
+    // probe then streams sequential memory instead of ~600-byte payload strings scattered
+    // across the heap (the profiled floor). DERIVED data: contents are a deterministic
+    // function of the live index (rebuilt via scan_visit), node-local, never replicated,
+    // and the scored doubles are the SAME doubles — results stay bit-identical. Any
+    // maintenance write to the index (insert/update/delete/truncate paths all go through
+    // index_writes_for_row) erases the entry; DROP/CREATE INDEX erase it too. Only the
+    // Strict-level live path consults it — AT SNAPSHOT reads the index as of its Seq.
+    struct IvfProbeCache {
+        std::size_t dim = 0;
+        std::vector<std::vector<double>> list_vecs;  // per list: n*dim flattened doubles
+        std::vector<std::vector<Key>> list_pks;      // per list: n pk-byte suffixes
+    };
+    std::map<std::uint64_t, IvfProbeCache> ivf_probe_cache_;  // key: table_id<<32 | index_id
+    static std::uint64_t ivf_cache_key(std::uint32_t tid, std::uint32_t iid) {
+        return (static_cast<std::uint64_t>(tid) << 32) | iid;
+    }
 
     // W9.2: parse cache (sql text -> parsed AST). Always valid (parsing is catalog-independent).
     static constexpr std::size_t kParseCacheCap = 1024;
