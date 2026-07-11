@@ -152,6 +152,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>  // K1 perf: std::endian for the LE payload fast path
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -3430,6 +3431,31 @@ private:
         const std::uint8_t el = static_cast<unsigned char>(s[0]);
         const std::uint32_t n = Datum::get_be32_(s, 2);
         out.reserve(n);
+        // All-REAL fixed-stride fast path (13 bytes/element; LE memcpy — same value).
+        if (el == 14 && s.size() == 6 + static_cast<std::size_t>(n) * 13) {
+            const char* p = s.data() + 6;
+            bool ok = true;
+            for (std::uint32_t k = 0; k < n; ++k, p += 13) {
+                if (static_cast<unsigned char>(p[0]) != 2 || p[1] != 0 || p[2] != 0 ||
+                    p[3] != 0 || static_cast<unsigned char>(p[4]) != 8) {
+                    ok = false;
+                    break;
+                }
+                double d = 0.0;
+                if constexpr (std::endian::native == std::endian::little) {
+                    std::memcpy(&d, p + 5, sizeof(d));
+                } else {
+                    std::uint64_t bits = 0;
+                    for (int b = 0; b < 8; ++b)
+                        bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(p[5 + b]))
+                                << (8 * b);
+                    std::memcpy(&d, &bits, sizeof(d));
+                }
+                out.push_back(d);
+            }
+            if (ok) return true;
+            out.clear();
+        }
         std::size_t off = 6;
         for (std::uint32_t k = 0; k < n; ++k) {
             if (off >= s.size()) return false;
@@ -3464,26 +3490,33 @@ private:
     // order and the dot/sq/nu/nv accumulation are the kernel's — bit-identical distance.
     // Returns false (caller falls back to the generic path) on any other payload shape
     // or a dimension mismatch.
+    // An all-REAL payload has a FIXED 13-byte element stride ([tag 1][len be32 = 8][8 LE
+    // payload bytes]) — one up-front size check replaces the per-element bounds checks,
+    // and on a little-endian host the stored LE bit pattern memcpys straight into the
+    // double (identical value; the portable byte-assembly stays for big-endian).
     static bool ivf_score_fast(const std::string& s, const std::vector<double>& q,
                                std::uint8_t op, double& dist) {
         if (s.size() < 6 || static_cast<unsigned char>(s[0]) != 14) return false;
         const std::uint32_t n = Datum::get_be32_(s, 2);
         if (n != q.size()) return false;
-        std::size_t off = 6;
+        if (s.size() != 6 + static_cast<std::size_t>(n) * 13) return false;  // not all-REAL
+        const char* p = s.data() + 6;
         double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
-        for (std::uint32_t k = 0; k < n; ++k) {
-            if (off + 13 > s.size() || static_cast<unsigned char>(s[off]) != 2 ||
-                Datum::get_be32_(s, off + 1) != 8) {
+        for (std::uint32_t k = 0; k < n; ++k, p += 13) {
+            if (static_cast<unsigned char>(p[0]) != 2 || p[1] != 0 || p[2] != 0 || p[3] != 0 ||
+                static_cast<unsigned char>(p[4]) != 8) {
                 return false;
             }
-            off += 5;
-            std::uint64_t bits = 0;
-            for (int b = 0; b < 8; ++b)
-                bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(s[off + static_cast<std::size_t>(b)]))
-                        << (8 * b);
-            off += 8;
             double x = 0.0;
-            std::memcpy(&x, &bits, sizeof(x));
+            if constexpr (std::endian::native == std::endian::little) {
+                std::memcpy(&x, p + 5, sizeof(x));
+            } else {
+                std::uint64_t bits = 0;
+                for (int b = 0; b < 8; ++b)
+                    bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(p[5 + b]))
+                            << (8 * b);
+                std::memcpy(&x, &bits, sizeof(x));
+            }
             const double y = q[k];
             dot += x * y;
             sq += (x - y) * (x - y);
