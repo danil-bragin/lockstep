@@ -254,3 +254,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] winner point-gets via scan_visit (kept: less work, no Query dependency in ANN tail) — NO wall-clock change (~1.1-1.3ms @probes=10): point-get path was already cheap. Residual = f32 prune stream (~1.3MB/query) + per-candidate bookkeeping — same physics as pgvector; remaining ~1.4x raw = our P-records/window copies/exec pipeline vs bare tuple pointers.
 - Raw-parity options if ever needed: flat SoA prune arrays (drop P-structs) · top-want running threshold in prune (skip cold pushes) · probes-downtuning (our recall reserve is huge). The RECALL claim (only system on the board at ≥0.95) stands regardless — bench/compare/vector/REPORT.md.
+
+## K2 BM25 full-text v1 (2026-07-12)
+
+- [x] **K2.1-K2.3 core**: deterministic tokenizer (ASCII, no locale/ICU/stemmer) · USING BM25 posting index ('t'+term+pk → tf,dl denormalised; 'S' → corpus stats, overlay read-modify-write in the row batch; backfill == live path) · top-k `ORDER BY bm25_score(col,'q') DESC LIMIT k` (classic k1=1.2/b=0.75, scan_visit per term, (score DESC, pk) total order) · MATCHES(col,'q') per-row predicate · planner exclusions · K2.6 differential gate = independent reference BM25 in sql_bm25_test (queries × maintenance × columnar × restart).
+- [ ] open (K2): projected bm25_score (needs stmt-scoped df/stats memo) · @@ operator sugar · stemmer/language packs (deterministic pinned tables) · K2.4 RRF hybrid helper over CTEs (vectors + BM25 — the flagship demo) · K2.5 relevance parity vs Elasticsearch (BEIR subset) · AT SNAPSHOT reads (leveled posting scans) · phrase/prefix queries.
