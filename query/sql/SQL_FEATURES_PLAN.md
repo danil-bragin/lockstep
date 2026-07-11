@@ -229,3 +229,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 - [x] rung 8 (c003e6b): ONE shared 4-lane kernel (vec_accum4/vec_finish, fixed lanes+combine, bit-deterministic per host) in exact+probe+HNSW — flat (~11.2-11.6 ms @100k×64).
 - **Diagnosis: memory-bound** — ~5000 scattered ~600B double payloads (~3MB irregular reads/query) vs pgvector's contiguous float4 pages. Compute levers exhausted.
 - [ ] **NEXT (the parity move): per-list contiguous float32 probe cache + exact double re-rank of the top window** — prune in f32 over dense blocks (~1/2 bytes, prefetch-friendly), final ordering bit-exact via the shared kernel on the re-rank window. Cache = derived data (rebuildable, non-replicated layout, deterministic content).
+
+## K1 perf rung 9 (2026-07-11, 215d23a) — contiguous probe cache: 6.6x, gap 3.5x
+
+- [x] per-list dense-double probe cache (derived, lazy scan_visit build, maintenance-erased, Strict-live only) — bit-identical via shared kernel. **@100k×64: host 11.3→1.7 ms; docker vs pgvector 2.36 vs 0.67 ms = 3.5x gap** (was 226x at dawn). Our recall 1.0 vs pg 0.105 at equal probes on this dataset — equal-recall claim needs dataset v2.
+- [ ] remaining to parity/beyond: f32 prune blocks + exact double re-rank window (≈2x bytes) · residual profile (~1.7ms: kernel+cands+partial_sort+fetch) · dataset v2 for the honest recall-vs-latency curve · pgvector build 0.4s vs our 4.3s (k-means backfill commits row-by-row — batchable).
