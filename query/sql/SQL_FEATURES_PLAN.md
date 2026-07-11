@@ -186,3 +186,10 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 - [x] **parse_double_strict** — libc++ 18 (Docker/TSan toolchain) lacks FP from_chars; whole F14/K1 layer didn't compile there (CI green = libstdc++ only). Shared helper: from_chars if available else strtod_l("C"), from_chars-grammar-tightened. Docker-Linux libc++ Release now builds + tests green.
 - **SIMD kernels: deliberately SKIPPED** — manual/auto FP vectorization changes accumulation order → distance values differ per platform lane-width → breaks cross-replica byte-identity + kernel-identity gates. Determinism > throughput; revisit only as a fixed-width (always-4-lane) portable kernel applied to BOTH exact and index paths at once.
 - [ ] open: binary RESULT format (text-only today) · K1.5 bench vs real pgvector · HNSW batch-get perf · REINDEX.
+
+## K1.5 bench harness vs real pgvector (2026-07-11) — PRELIMINARY, found a scaling cliff
+
+- [x] harness `bench/compare/vector/` (run_vector.sh + lockstep_vector.cpp + REPORT.md): identical deterministic data both sides, cpu-pinned, Docker pgvector:pg16.
+- **FINDING (blocks a quotable report): Lockstep k-NN does not scale past ~50k rows** — brute ms/query 12.5k→311, 25k→774, 50k→1553 (≈linear), 100k→26242 (**17x cliff**; suspect row-materialization memory blow-up → swap, NOT the distance kernel). pgvector at 100k×64: brute 55 ms, ivfflat 1.77 ms, build 1.9 s — the target to close.
+- recall comparison invalid on the current dataset (100 tight clusters → tie-dominated top-k; our 1.0 = determinism artifact, pgvector 0.09 = tie-shuffle + k-means degeneracy). Need separated points.
+- [ ] next: profile-first the 50k→100k cliff · dataset v2 (separated points) · rerun · publish.
