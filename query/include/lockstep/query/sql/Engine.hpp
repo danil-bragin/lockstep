@@ -3459,6 +3459,47 @@ private:
         }
         return true;
     }
+    // K1 perf: score ONE all-REAL ARRAY-codec payload against the query WITHOUT
+    // materialising a doubles vector (the probe runs this per candidate). The element
+    // order and the dot/sq/nu/nv accumulation are the kernel's — bit-identical distance.
+    // Returns false (caller falls back to the generic path) on any other payload shape
+    // or a dimension mismatch.
+    static bool ivf_score_fast(const std::string& s, const std::vector<double>& q,
+                               std::uint8_t op, double& dist) {
+        if (s.size() < 6 || static_cast<unsigned char>(s[0]) != 14) return false;
+        const std::uint32_t n = Datum::get_be32_(s, 2);
+        if (n != q.size()) return false;
+        std::size_t off = 6;
+        double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
+        for (std::uint32_t k = 0; k < n; ++k) {
+            if (off + 13 > s.size() || static_cast<unsigned char>(s[off]) != 2 ||
+                Datum::get_be32_(s, off + 1) != 8) {
+                return false;
+            }
+            off += 5;
+            std::uint64_t bits = 0;
+            for (int b = 0; b < 8; ++b)
+                bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(s[off + static_cast<std::size_t>(b)]))
+                        << (8 * b);
+            off += 8;
+            double x = 0.0;
+            std::memcpy(&x, &bits, sizeof(x));
+            const double y = q[k];
+            dot += x * y;
+            sq += (x - y) * (x - y);
+            nu += x * x;
+            nv += y * y;
+        }
+        if (op == 0) {
+            dist = std::sqrt(sq);
+        } else if (op == 1) {
+            const double denom = std::sqrt(nu) * std::sqrt(nv);
+            dist = denom == 0.0 ? 1.0 : 1.0 - dot / denom;
+        } else {
+            dist = -dot;
+        }
+        return true;
+    }
     // Decode a VECTOR payload (the ARRAY codec with REAL elements) into raw doubles.
     static std::vector<double> ivf_payload_doubles(const std::string& payload) {
         std::vector<double> v;
@@ -11560,10 +11601,11 @@ private:
             return ExecResult::failure(fname + " requires vectors of equal length");
         }
 
+        // K1 perf: a candidate is (distance, pk BYTES) only — the pk Datum is decoded for
+        // the k+offset WINNERS after the cut, not for every scored entry.
         struct Cand {
             double dist = 0.0;
             Key pk_bytes;
-            Datum pk;
         };
         std::vector<Cand> cands;
         std::size_t scanned = 0;
@@ -11591,11 +11633,7 @@ private:
                 for (const auto& [d, pkb] : w0) {
                     HnswNode n;
                     if (!hnsw_node(io, pkb, n, nullptr) || n.deleted) continue;  // zombie
-                    Cand c;
-                    c.dist = d;
-                    c.pk_bytes = pkb;
-                    c.pk = decode_pk(t, table_prefix(t.id) + pkb);
-                    cands.push_back(std::move(c));
+                    cands.push_back(Cand{d, pkb});
                 }
                 scanned = io.visited;
             }
@@ -11629,55 +11667,71 @@ private:
             if (auto err = run_index_scan_at_level(sel, lo, hi, kvs)) {
                 return ExecResult::failure(*err);
             }
+            // The entry key is prefix ++ put_index_col(INT list) [9 bytes] ++ encode_pk(pk):
+            // the pk BYTES are the raw suffix — no Datum decode + re-encode per candidate.
+            const std::size_t pk_off = index_prefix(t.id, ix->id).size() + 9;
             for (const storage::KeyValue& ikv : kvs) {
                 if (is_tombstone(ikv.second)) continue;
                 ++scanned;
-                // EXACT opclass distance over the RAW payload — the SAME accumulation order as
-                // the scalar distance kernel (dot/sq/nu/nv per element), so the value is
-                // IEEE-identical to the exact path's and the probes=lists gate holds per opclass.
-                const std::vector<double> v = ivf_payload_doubles(ikv.second);
-                double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
-                for (std::size_t d = 0; d < dim && d < v.size(); ++d) {
-                    const double x = v[d], y = qv[d];
-                    dot += x * y;
-                    sq += (x - y) * (x - y);
-                    nu += x * x;
-                    nv += y * y;
-                }
                 Cand c;
-                if (want_op == 0) {
-                    c.dist = std::sqrt(sq);
-                } else if (want_op == 1) {
-                    const double denom = std::sqrt(nu) * std::sqrt(nv);
-                    c.dist = (denom == 0.0) ? 1.0 : 1.0 - dot / denom;
-                } else {
-                    c.dist = -dot;
+                // EXACT opclass distance over the RAW payload — the SAME accumulation order
+                // as the scalar distance kernel, so the value is IEEE-identical to the exact
+                // path's and the probes=lists gate holds per opclass. Fused fast path; the
+                // generic decode covers any other payload shape.
+                if (!ivf_score_fast(ikv.second, qv, want_op, c.dist)) {
+                    const std::vector<double> v = ivf_payload_doubles(ikv.second);
+                    double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
+                    for (std::size_t d = 0; d < dim && d < v.size(); ++d) {
+                        const double x = v[d], y = qv[d];
+                        dot += x * y;
+                        sq += (x - y) * (x - y);
+                        nu += x * x;
+                        nv += y * y;
+                    }
+                    if (want_op == 0) {
+                        c.dist = std::sqrt(sq);
+                    } else if (want_op == 1) {
+                        const double denom = std::sqrt(nu) * std::sqrt(nv);
+                        c.dist = (denom == 0.0) ? 1.0 : 1.0 - dot / denom;
+                    } else {
+                        c.dist = -dot;
+                    }
                 }
-                c.pk = decode_index_entry_pk(t, ix->id, ikv.first);
-                c.pk_bytes = encode_pk(c.pk);
+                c.pk_bytes = ikv.first.size() > pk_off ? ikv.first.substr(pk_off) : Key{};
                 cands.push_back(std::move(c));
             }
         }
         }  // end IVFFLAT probe branch
         // Total deterministic order — (distance, PK bytes) — matching the exact path's
-        // ORDER BY distance with its PK tie-break (real_cmp keeps NaN total).
-        std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        // ORDER BY distance with its PK tie-break (real_cmp keeps NaN total). The
+        // comparator is TOTAL, so a partial sort of the k+offset winners selects and
+        // orders exactly the same rows a full stable sort would (K1 perf: no full sort
+        // of thousands of candidates for a LIMIT-k query).
+        const auto cand_less = [](const Cand& a, const Cand& b) {
             const int c = Datum::real_cmp(a.dist, b.dist);
             if (c != 0) return c < 0;
             return a.pk_bytes < b.pk_bytes;
-        });
-        if (cands.size() > want) cands.resize(want);
+        };
+        if (cands.size() > want) {
+            std::partial_sort(cands.begin(),
+                              cands.begin() + static_cast<std::ptrdiff_t>(want), cands.end(),
+                              cand_less);
+            cands.resize(want);
+        } else {
+            std::sort(cands.begin(), cands.end(), cand_less);
+        }
 
         // Fetch + project the winners in distance order (already final — no sort needed).
+        // The pk Datum is decoded HERE, for the <= k+offset winners only.
         ExecResult r;
         for (const Cand& c : cands) {
+            const Key rkey = table_prefix(t.id) + c.pk_bytes;
             std::vector<Datum> row;
             if (t.columnar) {
-                auto rr = read_columnar_row(t, c.pk);
+                auto rr = read_columnar_row(t, decode_pk(t, rkey));
                 if (!rr) continue;  // entry with no live row (defensive)
                 row = std::move(*rr);
             } else {
-                const Key rkey = encode_key(t, c.pk);
                 const ReadResult rv = point_get_at_level(sel, rkey);
                 if (!rv.has_value() || is_tombstone(*rv)) continue;
                 row = decode_row(t, rkey, *rv);
