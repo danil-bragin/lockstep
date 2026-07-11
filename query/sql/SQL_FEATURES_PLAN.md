@@ -249,3 +249,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] sampled k-means (deterministic PK-stride, ~50/list — pgvector's rule; stride=1 on small tables → unchanged) + chunked 4096-entry backfill commits. Build @100k×64: 4.3→2.1 s (pgvector 0.4 — rest = full assignment pass + enumeration). Query side-effect: 1.16→0.96 ms (better-balanced lists). Gates hold.
 - K1 perf status vs pgvector @100k×64: **query 0.96 vs 0.69 ms raw (1.4x); at recall≥0.95 we are ALONE on the board (his max 0.63-0.71)**; build 2.1 vs 0.4 s (5x).
+
+## K1 perf rung 13 (2026-07-12, cb08188) — winner-fetch seam, hypothesis refuted
+
+- [x] winner point-gets via scan_visit (kept: less work, no Query dependency in ANN tail) — NO wall-clock change (~1.1-1.3ms @probes=10): point-get path was already cheap. Residual = f32 prune stream (~1.3MB/query) + per-candidate bookkeeping — same physics as pgvector; remaining ~1.4x raw = our P-records/window copies/exec pipeline vs bare tuple pointers.
+- Raw-parity options if ever needed: flat SoA prune arrays (drop P-structs) · top-want running threshold in prune (skip cold pushes) · probes-downtuning (our recall reserve is huge). The RECALL claim (only system on the board at ≥0.95) stands regardless — bench/compare/vector/REPORT.md.
