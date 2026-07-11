@@ -11823,6 +11823,8 @@ private:
                 IvfProbeCache fresh;
                 fresh.dim = dim;
                 fresh.list_vecs.resize(ix->lists);
+                fresh.list_f32.resize(ix->lists);
+                fresh.list_norm.resize(ix->lists);
                 fresh.list_pks.resize(ix->lists);
                 bool ok = true;
                 std::vector<double> tmp;
@@ -11836,6 +11838,10 @@ private:
                             tmp.resize(dim, 0.0);  // defensive; coerced payloads match dim
                             auto& flat = fresh.list_vecs[l];
                             flat.insert(flat.end(), tmp.begin(), tmp.end());
+                            auto& f32 = fresh.list_f32[l];
+                            for (const double d2 : tmp) f32.push_back(static_cast<float>(d2));
+                            fresh.list_norm[l].push_back(
+                                static_cast<float>(std::sqrt(vec_nv4(tmp))));
                             fresh.list_pks[l].push_back(
                                 k2.size() > pk_off ? k2.substr(pk_off) : Key{});
                         });
@@ -11847,34 +11853,114 @@ private:
             }
         }
         const double qnv = want_op == 1 ? vec_nv4(qv) : 0.0;  // cosine: query norm, once
-        for (std::size_t p = 0; p < nprobe; ++p) {
-            const std::size_t list = ranked[p].second;
-            if (cache != nullptr && list < cache->list_pks.size()) {
-                const std::vector<double>& flat = cache->list_vecs[list];
-                const std::vector<Key>& pks = cache->list_pks[list];
-                const double* fp = flat.data();
-                // Op-specialised scoring (bit-equal sums — see vec_sq4 et al.); the
-                // query norm for cosine is accumulated once per query, not per row.
-                cands.reserve(cands.size() + pks.size());
-                for (std::size_t i = 0; i < pks.size(); ++i, fp += dim) {
-                    ++scanned;
-                    Cand c;
-                    const auto gx = [fp](std::size_t k) { return fp[k]; };
+        if (cache != nullptr) {
+            // ---- Phase 1 (K1 perf): FLOAT32 prune over every probed list — half the
+            // bytes, twice the lanes. Prune scores are approximate and only ever used to
+            // pick a provably sufficient WINDOW (below); the RESULT comes from the exact
+            // double re-rank, so it is identical to the pure-double path no matter how
+            // the f32 rounding falls (and thus across platforms/binaries too).
+            const std::vector<float> qf(qv.begin(), qv.end());
+            float qnf = 0.0F;
+            for (const float x : qf) qnf += x * x;
+            qnf = std::sqrt(qnf);
+            struct P {
+                float s;
+                std::uint32_t list, idx;
+            };
+            std::vector<P> pr;
+            for (std::size_t p = 0; p < nprobe; ++p) {
+                const std::size_t list = ranked[p].second;
+                if (list >= cache->list_pks.size()) continue;
+                const float* f = cache->list_f32[list].data();
+                const std::size_t n2 = cache->list_pks[list].size();
+                pr.reserve(pr.size() + n2);
+                for (std::size_t i = 0; i < n2; ++i, f += dim) {
+                    float s;
                     if (want_op == 0) {
-                        c.dist = std::sqrt(vec_sq4(dim, qv, gx));
-                    } else if (want_op == 1) {
-                        double dot = 0.0, nu = 0.0;
-                        vec_dot_nu4(dim, qv, gx, dot, nu);
-                        const double denom = std::sqrt(nu) * std::sqrt(qnv);
-                        c.dist = denom == 0.0 ? 1.0 : 1.0 - dot / denom;
+                        float l0 = 0, l1 = 0, l2 = 0, l3 = 0;
+                        std::size_t k = 0;
+                        for (; k + 4 <= dim; k += 4) {
+                            const float a0 = f[k] - qf[k], a1 = f[k + 1] - qf[k + 1];
+                            const float a2 = f[k + 2] - qf[k + 2], a3 = f[k + 3] - qf[k + 3];
+                            l0 += a0 * a0; l1 += a1 * a1; l2 += a2 * a2; l3 += a3 * a3;
+                        }
+                        for (; k < dim; ++k) { const float a = f[k] - qf[k]; l0 += a * a; }
+                        s = (l0 + l1) + (l2 + l3);  // pruned as SQUARED L2 (monotone)
                     } else {
-                        c.dist = -vec_dot4(dim, qv, gx);
+                        float d0 = 0, d1 = 0, d2 = 0, d3 = 0, u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+                        std::size_t k = 0;
+                        for (; k + 4 <= dim; k += 4) {
+                            d0 += f[k] * qf[k]; d1 += f[k + 1] * qf[k + 1];
+                            d2 += f[k + 2] * qf[k + 2]; d3 += f[k + 3] * qf[k + 3];
+                            u0 += f[k] * f[k]; u1 += f[k + 1] * f[k + 1];
+                            u2 += f[k + 2] * f[k + 2]; u3 += f[k + 3] * f[k + 3];
+                        }
+                        for (; k < dim; ++k) { d0 += f[k] * qf[k]; u0 += f[k] * f[k]; }
+                        const float dotf = (d0 + d1) + (d2 + d3);
+                        if (want_op == 1) {
+                            const float denom = std::sqrt((u0 + u1) + (u2 + u3)) * qnf;
+                            s = denom == 0.0F ? 1.0F : 1.0F - dotf / denom;
+                        } else {
+                            s = -dotf;
+                        }
                     }
-                    c.pk_bytes = pks[i];
-                    cands.push_back(std::move(c));
+                    pr.push_back(P{s, static_cast<std::uint32_t>(list),
+                                   static_cast<std::uint32_t>(i)});
                 }
-                continue;
             }
+            scanned += pr.size();
+            // The want-th smallest f32 prune score (the window pivot).
+            float kth = std::numeric_limits<float>::infinity();
+            if (want > 0 && pr.size() > want) {
+                std::vector<float> ss;
+                ss.reserve(pr.size());
+                for (const P& p2 : pr) ss.push_back(p2.s);
+                std::nth_element(ss.begin(), ss.begin() + static_cast<std::ptrdiff_t>(want - 1),
+                                 ss.end());
+                kth = ss[want - 1];
+            }
+            // ---- Phase 2: EXACT double re-rank of the window. The margins over-cover
+            // the worst-case f32 error, so the window provably contains the true
+            // top-`want` set: L2 prunes non-negative squared sums (no cancellation —
+            // relative error <= ~(dim+4)*2^-24, margined at 2^-14 ~ 7x slack + an
+            // absolute floor); cosine distance lies in [0,2] with absolute error
+            // <= ~1e-6 (margin 1e-4); inner-product error scales with |u||v| (margin
+            // 1e-4 * (|u|*|q| + 1)). Any candidate outside its margin cannot beat the
+            // true k-th, so dropping it cannot change the exact top-k.
+            cands.reserve(pr.size());
+            for (const P& p2 : pr) {
+                bool in_window = true;
+                if (kth != std::numeric_limits<float>::infinity()) {
+                    if (want_op == 0) {
+                        in_window = p2.s <= kth * (1.0F + 6.1e-5F) + 1e-30F;
+                    } else if (want_op == 1) {
+                        in_window = p2.s <= kth + 1e-4F;
+                    } else {
+                        in_window =
+                            p2.s <= kth + 1e-4F * (cache->list_norm[p2.list][p2.idx] * qnf + 1.0F);
+                    }
+                }
+                if (!in_window) continue;
+                const double* fp =
+                    cache->list_vecs[p2.list].data() + static_cast<std::size_t>(p2.idx) * dim;
+                const auto gx = [fp](std::size_t k) { return fp[k]; };
+                Cand c;
+                if (want_op == 0) {
+                    c.dist = std::sqrt(vec_sq4(dim, qv, gx));
+                } else if (want_op == 1) {
+                    double dot = 0.0, nu = 0.0;
+                    vec_dot_nu4(dim, qv, gx, dot, nu);
+                    const double denom = std::sqrt(nu) * std::sqrt(qnv);
+                    c.dist = denom == 0.0 ? 1.0 : 1.0 - dot / denom;
+                } else {
+                    c.dist = -vec_dot4(dim, qv, gx);
+                }
+                c.pk_bytes = cache->list_pks[p2.list][p2.idx];
+                cands.push_back(std::move(c));
+            }
+        }
+        for (std::size_t p = 0; cache == nullptr && p < nprobe; ++p) {
+            const std::size_t list = ranked[p].second;
             Key lo = index_prefix(t.id, ix->id);
             put_index_col(lo, Datum::make_int(static_cast<std::int64_t>(list)));
             const Key hi = key_successor(lo);
@@ -13553,6 +13639,8 @@ private:
     struct IvfProbeCache {
         std::size_t dim = 0;
         std::vector<std::vector<double>> list_vecs;  // per list: n*dim flattened doubles
+        std::vector<std::vector<float>> list_f32;    // per list: n*dim floats (prune pass)
+        std::vector<std::vector<float>> list_norm;   // per list: n vector norms (dot margins)
         std::vector<std::vector<Key>> list_pks;      // per list: n pk-byte suffixes
     };
     std::map<std::uint64_t, IvfProbeCache> ivf_probe_cache_;  // key: table_id<<32 | index_id
