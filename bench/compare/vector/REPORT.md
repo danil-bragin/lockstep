@@ -124,3 +124,15 @@ sampling bent centroids on overlapping clusters and cost recall (1.0 -> 0.85) �
 chose quality by default and kept the honest 3.5 s build at this scale.
 
 **Verdict: faster AND correct — on dense embeddings Lockstep wins both axes.**
+
+---
+
+# Milvus: harness added, first run NOT publishable (2026-07-12)
+
+`milvus_v2.py` (Milvus Lite, same v3 data/queries/sweep). First run is uninterpretable
+and is NOT a comparison: nprobe has zero effect (recall constant 0.455, latency ~25 ms
+across nprobe 1..100; FLAT 30 ms) — Lite appears to ignore the IVF index (a known Lite
+limitation) and its FLAT-vs-search self-consistency needs its own investigation before
+any claim, in either direction. Next: run against a real milvusdb/milvus standalone
+server (gRPC, proper index build), verify nprobe takes effect, then publish the
+three-way curve. No verdict on Milvus yet — recorded to avoid quoting these numbers.
