@@ -3490,6 +3490,53 @@ private:
     // order and the dot/sq/nu/nv accumulation are the kernel's — bit-identical distance.
     // Returns false (caller falls back to the generic path) on any other payload shape
     // or a dimension mismatch.
+    // K1 perf: THE shared distance accumulator — FOUR independent partial sums per
+    // quantity break the serial dot/sq/nu/nv FP dependency chain (the dominant probe
+    // cost in the clean profile) and let the compiler vectorise the lanes. The lane
+    // count and the final combine order are FIXED ((l0+l1)+(l2+l3), tail element k into
+    // lane k&3) — no platform-width SIMD — so the value is bit-deterministic on every
+    // host. EVERY distance consumer (the exact scalar kernel, the ivfflat probe, HNSW)
+    // uses this one function, so index == scan equality holds by construction. NOTE:
+    // the association differs from the old sequential kernel, so absolute values can
+    // differ in low bits — cross-replica byte-identity is unaffected (one binary).
+    template <class GetX>
+    static void vec_accum4(std::size_t n, const std::vector<double>& q, GetX&& get_x,
+                           double& dot, double& sq, double& nu, double& nv) {
+        double d[4] = {0, 0, 0, 0}, s[4] = {0, 0, 0, 0}, a[4] = {0, 0, 0, 0},
+               b[4] = {0, 0, 0, 0};
+        std::size_t k = 0;
+        for (; k + 4 <= n; k += 4) {
+            for (std::size_t l = 0; l < 4; ++l) {
+                const double x = get_x(k + l), y = q[k + l];
+                d[l] += x * y;
+                s[l] += (x - y) * (x - y);
+                a[l] += x * x;
+                b[l] += y * y;
+            }
+        }
+        for (; k < n; ++k) {
+            const std::size_t l = k & 3;
+            const double x = get_x(k), y = q[k];
+            d[l] += x * y;
+            s[l] += (x - y) * (x - y);
+            a[l] += x * x;
+            b[l] += y * y;
+        }
+        dot = (d[0] + d[1]) + (d[2] + d[3]);
+        sq = (s[0] + s[1]) + (s[2] + s[3]);
+        nu = (a[0] + a[1]) + (a[2] + a[3]);
+        nv = (b[0] + b[1]) + (b[2] + b[3]);
+    }
+    // Finish a distance from the accumulated quantities (op: 0 L2, 1 cosine, 2 -dot).
+    static double vec_finish(std::uint8_t op, double dot, double sq, double nu, double nv) {
+        if (op == 0) return std::sqrt(sq);
+        if (op == 1) {
+            const double denom = std::sqrt(nu) * std::sqrt(nv);
+            return denom == 0.0 ? 1.0 : 1.0 - dot / denom;
+        }
+        return -dot;
+    }
+
     // An all-REAL payload has a FIXED 13-byte element stride ([tag 1][len be32 = 8][8 LE
     // payload bytes]) — one up-front size check replaces the per-element bounds checks,
     // and on a little-endian host the stored LE bit pattern memcpys straight into the
@@ -3500,37 +3547,33 @@ private:
         const std::uint32_t n = Datum::get_be32_(s, 2);
         if (n != q.size()) return false;
         if (s.size() != 6 + static_cast<std::size_t>(n) * 13) return false;  // not all-REAL
-        const char* p = s.data() + 6;
-        double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
-        for (std::uint32_t k = 0; k < n; ++k, p += 13) {
+        // Validate the element headers first (cheap byte compares), then accumulate over
+        // the fixed stride with no per-element branching.
+        const char* base = s.data() + 6;
+        for (std::uint32_t k = 0; k < n; ++k) {
+            const char* p = base + static_cast<std::size_t>(k) * 13;
             if (static_cast<unsigned char>(p[0]) != 2 || p[1] != 0 || p[2] != 0 || p[3] != 0 ||
                 static_cast<unsigned char>(p[4]) != 8) {
                 return false;
             }
+        }
+        const auto get_x = [base](std::size_t k) {
             double x = 0.0;
             if constexpr (std::endian::native == std::endian::little) {
-                std::memcpy(&x, p + 5, sizeof(x));
+                std::memcpy(&x, base + k * 13 + 5, sizeof(x));
             } else {
                 std::uint64_t bits = 0;
                 for (int b = 0; b < 8; ++b)
-                    bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(p[5 + b]))
+                    bits |= static_cast<std::uint64_t>(
+                                static_cast<unsigned char>(base[k * 13 + 5 + static_cast<std::size_t>(b)]))
                             << (8 * b);
                 std::memcpy(&x, &bits, sizeof(x));
             }
-            const double y = q[k];
-            dot += x * y;
-            sq += (x - y) * (x - y);
-            nu += x * x;
-            nv += y * y;
-        }
-        if (op == 0) {
-            dist = std::sqrt(sq);
-        } else if (op == 1) {
-            const double denom = std::sqrt(nu) * std::sqrt(nv);
-            dist = denom == 0.0 ? 1.0 : 1.0 - dot / denom;
-        } else {
-            dist = -dot;
-        }
+            return x;
+        };
+        double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
+        vec_accum4(n, q, get_x, dot, sq, nu, nv);
+        dist = vec_finish(op, dot, sq, nu, nv);
         return true;
     }
     // Decode a VECTOR payload (the ARRAY codec with REAL elements) into raw doubles.
@@ -3863,21 +3906,10 @@ private:
     // path's, so the large-ef == exact-scan gate holds).
     [[nodiscard]] static double hnsw_dist(std::uint8_t op, const std::vector<double>& u,
                                           const std::vector<double>& v) {
-        double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
+        double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;  // shared 4-lane kernel
         const std::size_t n = std::min(u.size(), v.size());
-        for (std::size_t i = 0; i < n; ++i) {
-            const double x = u[i], y = v[i];
-            dot += x * y;
-            sq += (x - y) * (x - y);
-            nu += x * x;
-            nv += y * y;
-        }
-        if (op == 0) return std::sqrt(sq);
-        if (op == 1) {
-            const double denom = std::sqrt(nu) * std::sqrt(nv);
-            return denom == 0.0 ? 1.0 : 1.0 - dot / denom;
-        }
-        return -dot;
+        vec_accum4(n, v, [&u](std::size_t k) { return u[k]; }, dot, sq, nu, nv);
+        return vec_finish(op, dot, sq, nu, nv);
     }
     // Total deterministic order over (distance, pk bytes) — real_cmp keeps NaN total.
     struct HnswOrd {
@@ -9377,11 +9409,8 @@ private:
                 return f + " requires two vector arguments (VECTOR, ARRAY, or a '[x,y,z]' literal)";
             if (u.size() != v.size()) return f + " requires vectors of equal length";
             if (u_null || v_null) return f + " does not accept NULL vector elements";
-            double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
-            for (std::size_t k = 0; k < u.size(); ++k) {
-                const double x = u[k], y = v[k];
-                dot += x * y; sq += (x - y) * (x - y); nu += x * x; nv += y * y;
-            }
+            double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;  // shared 4-lane kernel
+            vec_accum4(u.size(), v, [&u](std::size_t k) { return u[k]; }, dot, sq, nu, nv);
             double r = 0.0;
             if (f == "L2_DISTANCE" || f == "EUCLIDEAN_DISTANCE" || f == "<->") r = std::sqrt(sq);
             else if (f == "COSINE_DISTANCE" || f == "<=>") {
@@ -11705,22 +11734,10 @@ private:
                 Cand c;
                 if (!ivf_score_fast(payload, qv, want_op, c.dist)) {
                     const std::vector<double> v = ivf_payload_doubles(payload);
-                    double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
-                    for (std::size_t d = 0; d < dim && d < v.size(); ++d) {
-                        const double x = v[d], y = qv[d];
-                        dot += x * y;
-                        sq += (x - y) * (x - y);
-                        nu += x * x;
-                        nv += y * y;
-                    }
-                    if (want_op == 0) {
-                        c.dist = std::sqrt(sq);
-                    } else if (want_op == 1) {
-                        const double denom = std::sqrt(nu) * std::sqrt(nv);
-                        c.dist = (denom == 0.0) ? 1.0 : 1.0 - dot / denom;
-                    } else {
-                        c.dist = -dot;
-                    }
+                    const std::size_t vn = std::min(dim, v.size());
+                    double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;  // shared 4-lane kernel
+                    vec_accum4(vn, qv, [&v](std::size_t k) { return v[k]; }, dot, sq, nu, nv);
+                    c.dist = vec_finish(want_op, dot, sq, nu, nv);
                 }
                 c.pk_bytes = ekey.size() > pk_off ? ekey.substr(pk_off) : Key{};
                 cands.push_back(std::move(c));
