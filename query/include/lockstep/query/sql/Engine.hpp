@@ -3529,6 +3529,66 @@ private:
         nu = (a[0] + a[1]) + (a[2] + a[3]);
         nv = (b[0] + b[1]) + (b[2] + b[3]);
     }
+    // K1 perf: op-specialised accumulators for the HOT probe path — the SAME lane
+    // structure and combine order as vec_accum4, restricted to the quantities the op
+    // needs (L2 uses only sq — 3 flops/element instead of 12; cosine needs dot+nu with
+    // the query norm nv precomputed ONCE per query; IP needs dot). The lanes are
+    // independent variables in vec_accum4, so each restricted sum is BIT-EQUAL to the
+    // corresponding full-kernel sum — the exact path can keep the full kernel and
+    // index == scan equality still holds value-for-value.
+    template <class GetX>
+    static double vec_sq4(std::size_t n, const std::vector<double>& q, GetX&& get_x) {
+        double s[4] = {0, 0, 0, 0};
+        std::size_t k = 0;
+        for (; k + 4 <= n; k += 4)
+            for (std::size_t l = 0; l < 4; ++l) {
+                const double x = get_x(k + l), y = q[k + l];
+                s[l] += (x - y) * (x - y);
+            }
+        for (; k < n; ++k) {
+            const double x = get_x(k), y = q[k];
+            s[k & 3] += (x - y) * (x - y);
+        }
+        return (s[0] + s[1]) + (s[2] + s[3]);
+    }
+    template <class GetX>
+    static void vec_dot_nu4(std::size_t n, const std::vector<double>& q, GetX&& get_x,
+                            double& dot, double& nu) {
+        double d[4] = {0, 0, 0, 0}, a[4] = {0, 0, 0, 0};
+        std::size_t k = 0;
+        for (; k + 4 <= n; k += 4)
+            for (std::size_t l = 0; l < 4; ++l) {
+                const double x = get_x(k + l), y = q[k + l];
+                d[l] += x * y;
+                a[l] += x * x;
+            }
+        for (; k < n; ++k) {
+            const double x = get_x(k), y = q[k];
+            d[k & 3] += x * y;
+            a[k & 3] += x * x;
+        }
+        dot = (d[0] + d[1]) + (d[2] + d[3]);
+        nu = (a[0] + a[1]) + (a[2] + a[3]);
+    }
+    // The query's own norm accumulator (nv lanes of vec_accum4) — once per query.
+    static double vec_nv4(const std::vector<double>& q) {
+        double b[4] = {0, 0, 0, 0};
+        std::size_t k = 0;
+        for (; k + 4 <= q.size(); k += 4)
+            for (std::size_t l = 0; l < 4; ++l) b[l] += q[k + l] * q[k + l];
+        for (; k < q.size(); ++k) b[k & 3] += q[k] * q[k];
+        return (b[0] + b[1]) + (b[2] + b[3]);
+    }
+    template <class GetX>
+    static double vec_dot4(std::size_t n, const std::vector<double>& q, GetX&& get_x) {
+        double d[4] = {0, 0, 0, 0};
+        std::size_t k = 0;
+        for (; k + 4 <= n; k += 4)
+            for (std::size_t l = 0; l < 4; ++l) d[l] += get_x(k + l) * q[k + l];
+        for (; k < n; ++k) d[k & 3] += get_x(k) * q[k];
+        return (d[0] + d[1]) + (d[2] + d[3]);
+    }
+
     // Finish a distance from the accumulated quantities (op: 0 L2, 1 cosine, 2 -dot).
     static double vec_finish(std::uint8_t op, double dot, double sq, double nu, double nv) {
         if (op == 0) return std::sqrt(sq);
@@ -11786,18 +11846,30 @@ private:
                 cache = &cit->second;
             }
         }
+        const double qnv = want_op == 1 ? vec_nv4(qv) : 0.0;  // cosine: query norm, once
         for (std::size_t p = 0; p < nprobe; ++p) {
             const std::size_t list = ranked[p].second;
             if (cache != nullptr && list < cache->list_pks.size()) {
                 const std::vector<double>& flat = cache->list_vecs[list];
                 const std::vector<Key>& pks = cache->list_pks[list];
                 const double* fp = flat.data();
+                // Op-specialised scoring (bit-equal sums — see vec_sq4 et al.); the
+                // query norm for cosine is accumulated once per query, not per row.
+                cands.reserve(cands.size() + pks.size());
                 for (std::size_t i = 0; i < pks.size(); ++i, fp += dim) {
                     ++scanned;
                     Cand c;
-                    double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
-                    vec_accum4(dim, qv, [fp](std::size_t k) { return fp[k]; }, dot, sq, nu, nv);
-                    c.dist = vec_finish(want_op, dot, sq, nu, nv);
+                    const auto gx = [fp](std::size_t k) { return fp[k]; };
+                    if (want_op == 0) {
+                        c.dist = std::sqrt(vec_sq4(dim, qv, gx));
+                    } else if (want_op == 1) {
+                        double dot = 0.0, nu = 0.0;
+                        vec_dot_nu4(dim, qv, gx, dot, nu);
+                        const double denom = std::sqrt(nu) * std::sqrt(qnv);
+                        c.dist = denom == 0.0 ? 1.0 : 1.0 - dot / denom;
+                    } else {
+                        c.dist = -vec_dot4(dim, qv, gx);
+                    }
                     c.pk_bytes = pks[i];
                     cands.push_back(std::move(c));
                 }
