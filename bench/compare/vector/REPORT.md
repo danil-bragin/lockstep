@@ -136,3 +136,30 @@ limitation) and its FLAT-vs-search self-consistency needs its own investigation 
 any claim, in either direction. Next: run against a real milvusdb/milvus standalone
 server (gRPC, proper index build), verify nprobe takes effect, then publish the
 three-way curve. No verdict on Milvus yet — recorded to avoid quoting these numbers.
+
+---
+
+# Three-way: + Milvus standalone server (2026-07-12)
+
+Real milvusdb/milvus:v2.4.15 standalone (embedded etcd, server pinned cpu0, client
+cpu1, same v3 dataset/queries via gRPC). Numbers now interpretable:
+
+| system | k-NN latency | recall@10 (vs own exact) |
+|---|---|---|
+| **Lockstep** (probes=5, in-process) | **0.63 ms** | **1.000** |
+| Milvus IVF_FLAT (any nprobe 1..100) | 1.4-2.2 ms | 0.990 |
+| pgvector (best sub-ms point) | <= 0.98 ms | <= 0.22 |
+
+Honest bounds and open items:
+- Milvus's latency floor (~1.5-2 ms) is dominated by its gRPC + server scheduling —
+  the architectural tax of a SEPARATE service, which its users always pay; Lockstep
+  and pgvector are in-process with the data. His raw kernel is strong: FLAT full-scan
+  of 100k x 64d in 12 ms (vs our 150 ms brute — SIMD f32 done right).
+- Milvus recall plateaus at 0.990 and never reaches 1.000 at any nprobe up to
+  nlist — cause NOT isolated yet (nprobe applicability over MilvusClient was
+  inconclusive: latency does not scale with nprobe in either supported params form);
+  do not quote as an f32-correctness datapoint until nprobe is verified end to end.
+- Load: his bulk insert is excellent (100k in 0.6 s); build 1.5 s.
+
+Verdict so far: on this workload Lockstep holds the best (latency, recall) point of
+all three systems measured — with transactions, SQL, HA and reproducibility attached.

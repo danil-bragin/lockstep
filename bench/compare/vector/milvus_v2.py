@@ -6,6 +6,7 @@ import numpy as np
 from pymilvus import MilvusClient, DataType
 
 N, DIM, K, Q, NLIST = (int(x) for x in sys.argv[1:6])
+URI = sys.argv[6] if len(sys.argv) > 6 else "/tmp/milvus_bench.db"  # file = Lite, http = standalone server
 
 i = np.arange(N, dtype=np.int64)[:, None]
 d = np.arange(DIM, dtype=np.int64)[None, :]
@@ -13,7 +14,7 @@ X = ((((i % 1000) * 37 + d * 11) % 8) + ((i * 2654435761 + d * 40503) % 2000) / 
 j = np.arange(Q, dtype=np.int64)[:, None]
 QV = ((((((j * 37) % 1000) * 37 + d * 11) % 8) + ((j * 13 + d * 7) % 100) / 100.0)).astype(np.float32)
 
-client = MilvusClient("/tmp/milvus_bench.db")
+client = MilvusClient(URI)
 if client.has_collection("docs"):
     client.drop_collection("docs")
 schema = client.create_schema(auto_id=False)
@@ -60,7 +61,7 @@ print(f'{{"sys":"milvus","probes":0,"ms_each":{brute_ms:.2f},"recall":1.0}}')
 bt = build("IVF_FLAT", {"nlist": NLIST})
 print(f'{{"sys":"milvus","probes":-1,"ms_each":{bt:.0f},"recall":0}}  # ivf build ms', file=sys.stderr)
 for p in (1, 2, 5, 10, 20, 50, NLIST):
-    ann, ms = sweep("ivf", p, {"metric_type": "L2", "params": {"nprobe": p}})
+    ann, ms = sweep("ivf", p, {"nprobe": p})  # v2.4 MilvusClient: FLAT dict form applies
     hit = sum(len(ref[q] & ann[q]) for q in range(Q))
     tot = sum(len(ref[q]) for q in range(Q))
     print(f'{{"sys":"milvus","probes":{p},"ms_each":{ms:.2f},"recall":{hit/tot:.4f}}}')
