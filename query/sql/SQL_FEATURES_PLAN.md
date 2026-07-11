@@ -234,3 +234,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] per-list dense-double probe cache (derived, lazy scan_visit build, maintenance-erased, Strict-live only) — bit-identical via shared kernel. **@100k×64: host 11.3→1.7 ms; docker vs pgvector 2.36 vs 0.67 ms = 3.5x gap** (was 226x at dawn). Our recall 1.0 vs pg 0.105 at equal probes on this dataset — equal-recall claim needs dataset v2.
 - [ ] remaining to parity/beyond: f32 prune blocks + exact double re-rank window (≈2x bytes) · residual profile (~1.7ms: kernel+cands+partial_sort+fetch) · dataset v2 for the honest recall-vs-latency curve · pgvector build 0.4s vs our 4.3s (k-means backfill commits row-by-row — batchable).
+
+## K1 perf rung 10 (2026-07-11, fac46fc) — op-specialised probe kernels
+
+- [x] vec_sq4/vec_dot_nu4/vec_dot4 + per-query vec_nv4 (bit-equal restricted sums — lanes independent; exact path keeps full kernel). 1.7→1.62 ms — loop is LOAD-LATENCY bound now.
+- [ ] **NEXT SESSION: f32 prune blocks + exact double re-rank window** (halves bytes, doubles lanes). Window correctness: L2 sums non-negative → relative f32 error ≤ ~n·eps; window = all cands with f32sq ≤ kth_f32sq·(1+2^-18)+eps_abs; dot-ops margin scaled by stored f32 norms × query norm; re-rank window with the exact shared kernel → final top-k bit-exact, gates hold. Store f32 blocks alongside doubles in IvfProbeCache. · also: centroids into the cache (97 samples/query) · batch backfill commits (build 4.3s→) · dataset v2.
