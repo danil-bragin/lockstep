@@ -58,10 +58,43 @@
 #include <cmath>     // F14: isnan/isinf for REAL total order + render
 #include <cstring>   // F14: memcpy for the double <-> 8-byte bit codec
 
+#include <cstdlib>   // F14 fallback: strtod_l (libc++ lacks floating-point from_chars)
+#include <clocale>
+#if __has_include(<xlocale.h>)
+#include <xlocale.h>  // macOS: locale_t / strtod_l live here
+#endif
+
 #include <lockstep/query/Query.hpp>  // Key, Value (== txn opaque bytes)
 #include <lockstep/query/sql/Uint256.hpp>  // u256: the UINT256 (logical 13) backing type
 
 namespace lockstep::query::sql {
+
+// F14/K1: locale-INDEPENDENT strict double parse ([first,last) must be fully consumed).
+// libstdc++ (and new Apple libc++) provide floating-point std::from_chars; libc++ 18 (the
+// Docker/TSan toolchain) still deletes that overload, so fall back to strtod_l pinned to
+// an explicit "C" locale — deterministic regardless of the process locale. The fallback is
+// tightened to from_chars' grammar (no leading '+'/whitespace, no hex floats). NOTE: the
+// two paths can differ on out-of-range literals (strtod saturates to inf); replicas run
+// the SAME binary, so cross-replica determinism is unaffected.
+[[nodiscard]] inline bool parse_double_strict(const char* first, const char* last, double& out) {
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    const auto res = std::from_chars(first, last, out);
+    return res.ec == std::errc{} && res.ptr == last;
+#else
+    if (first == last) return false;
+    if (*first == '+' || *first == ' ' || *first == '\t') return false;
+    {
+        const char* q = first;
+        if (*q == '-') ++q;
+        if (last - q >= 2 && q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) return false;
+    }
+    static const locale_t kCLocale = ::newlocale(LC_ALL_MASK, "C", static_cast<locale_t>(nullptr));
+    const std::string tmp(first, last);  // strtod needs NUL termination
+    char* end = nullptr;
+    out = ::strtod_l(tmp.c_str(), &end, kCLocale);
+    return end == tmp.c_str() + tmp.size();
+#endif
+}
 
 // The two scalar column types v1 supports. (FLOAT/BLOB/NULL/multi-col PK = OUT.)
 enum class Type : std::uint8_t { Int = 0, Text = 1 };

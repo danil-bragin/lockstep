@@ -934,10 +934,7 @@ private:
         if (cur_.kind == Tok::FloatLit) {
             // F14: a floating-point literal -> a REAL Datum (double). Locale-free parse.
             double d = 0.0;
-            const char* first = cur_.text.data();
-            const char* last = first + cur_.text.size();
-            const auto res = std::from_chars(first, last, d);
-            if (res.ec != std::errc{} || res.ptr != last) {
+            if (!parse_double_strict(cur_.text.data(), cur_.text.data() + cur_.text.size(), d)) {
                 return make_err("malformed floating-point literal '" + cur_.text + "'");
             }
             out = Datum::make_real(d);
@@ -2325,10 +2322,7 @@ private:
         }
         if (cur_.kind == Tok::FloatLit) {  // F14: a REAL literal in an expression (e.g. x * 1.5)
             double d = 0.0;
-            const char* first = cur_.text.data();
-            const char* last = first + cur_.text.size();
-            const auto res = std::from_chars(first, last, d);
-            if (res.ec != std::errc{} || res.ptr != last) {
+            if (!parse_double_strict(cur_.text.data(), cur_.text.data() + cur_.text.size(), d)) {
                 return make_err("malformed floating-point literal '" + cur_.text + "'");
             }
             auto n = mk_expr(ExprKind::Lit);

@@ -3116,10 +3116,7 @@ private:
             } else if (in.type == Type::Int) {
                 d = static_cast<double>(in.i);
             } else if (in.type == Type::Text) {
-                const char* first = in.s.data();
-                const char* last = first + in.s.size();
-                const auto res = std::from_chars(first, last, d);
-                if (res.ec != std::errc{} || res.ptr != last) {
+                if (!parse_double_strict(in.s.data(), in.s.data() + in.s.size(), d)) {
                     return std::string("invalid REAL literal '") + in.s + "' for column '" + col.name + "'";
                 }
             } else {
@@ -3189,10 +3186,7 @@ private:
                 } else if (e.type == Type::Int && e.logical == 0) {
                     d = static_cast<double>(e.i);
                 } else if (e.type == Type::Text && e.logical == 0) {
-                    const char* first = e.s.data();
-                    const char* last = first + e.s.size();
-                    const auto res = std::from_chars(first, last, d);
-                    if (res.ec != std::errc{} || res.ptr != last) {
+                    if (!parse_double_strict(e.s.data(), e.s.data() + e.s.size(), d)) {
                         return std::string("invalid VECTOR element '") + e.s + "' for column '" +
                                col.name + "'";
                     }
@@ -3404,8 +3398,7 @@ private:
             cur.clear();
             if (tok.empty()) return false;
             double d = 0.0;
-            const auto res = std::from_chars(tok.data(), tok.data() + tok.size(), d);
-            if (res.ec != std::errc{} || res.ptr != tok.data() + tok.size()) return false;
+            if (!parse_double_strict(tok.data(), tok.data() + tok.size(), d)) return false;
             out.push_back(Datum::make_real(d));
             return true;
         };
