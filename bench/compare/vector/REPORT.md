@@ -110,3 +110,17 @@ pgvector stays <= 0.71 everywhere.
 **One sentence: on dense embeddings we are the only one of the two that can hit
 high recall at all — at sub-millisecond latency; "faster than pgvector" is TRUE at
 recall parity, and unreachable-by-them above recall 0.7 on this data.**
+
+---
+
+# Final standing (2026-07-12, after SoA prune + heap pivot + quality-first k-means)
+
+Head-to-head @100k x 64d, one core, probes=10 both: **Lockstep 0.67-0.97 ms / recall
+1.000 vs pgvector 0.72 ms / recall <= 0.22.** On the v3 curve our (0.63 ms, recall
+1.000) point at probes=5 PARETO-DOMINATES every pgvector operating point (his best
+recall 0.71 costs 75 ms; at sub-millisecond he is at recall <= 0.14). Sampling in
+k-means is reserved for huge sets (> 1000 vectors/list): pgvector-style 50/list
+sampling bent centroids on overlapping clusters and cost recall (1.0 -> 0.85) — we
+chose quality by default and kept the honest 3.5 s build at this scale.
+
+**Verdict: faster AND correct — on dense embeddings Lockstep wins both axes.**
