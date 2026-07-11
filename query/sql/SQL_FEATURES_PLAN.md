@@ -207,3 +207,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 ## K1 perf rung 3 (2026-07-11)
 
 - [x] fused probe scoring (ivf_score_fast off raw bytes) + winner-only pk decode (Cand = dist+pk-bytes, suffix substr) + partial_sort(k+offset). ivfflat @100k×64: host 41→21.7 ms, docker 156→62 ms — **gap to pgvector ~92x indexed / 11x brute** (morning: 226x/45x). Residual = per-list Query scan machinery (scan_into/offer/memcmp ≈ dominant in profile) — next seam is storage-side batch scan or probe-list layout.
+
+## K1 perf rung 4 (2026-07-11, 7b34192) — scan_visit seam, honest no-win
+
+- [x] storage::Engine::scan_visit (sync, zero-materialisation, vlog-declines) + WalEngine build_scan_merged extraction; IVFFLAT probe scores inside the visit at Strict level. **No wall-clock win (~22ms unchanged)** — skipped layers (Task/Promise/out-vector/Query) were cheap; profile floor = merge itself (SSTableReader::scan_into copies key+value per entry, ~4µs/entry).
+- [ ] NEXT RUNG: streaming SSTable cursor (iterator scan_into) plugged into build_scan_merged — kills the per-entry acc copies; then revisit vs pgvector 0.67ms.
