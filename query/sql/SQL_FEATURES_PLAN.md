@@ -198,3 +198,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] **storage scan_task O(N^2) post-flush cliff KILLED** (profile-first: 92% samples in vector::insert; SSTable runs now fold via linear 2-way merge, offer-identical winner rule). Brute k-NN 100k: 26242→415 ms host (63x); linear to 200k. Every flushed-table reader wins.
 - **K1.5 run 2 @100k×64 (docker, 1 cpu)**: brute 597 vs 13.2 ms (45x), ivfflat 156 vs 0.69 ms (226x), build 4.5 vs 0.4 s. Gap causes known: AST-interpreted distance + full-width row materialisation (brute); per-candidate Datum decode via ARRAY codec (probe). Next rungs: raw-double probe scoring · narrow materialisation for the k-NN shape · dataset v2 for recall.
+
+## K1 perf rungs 1-2 (2026-07-11, abea55e)
+
+- [x] raw-double scoring (ivf_doubles_fast byte-walk, no Datum per element) + const-query-vector memo (vec_lit_cache_) + narrow ORDER-BY-expr materialisation (expr_mark_cols). @100k×64 docker: brute 597→145 ms (4.1x), ivfflat 156→80 ms (2x). **Gap to pgvector: brute 11x, indexed 116x** (was 45x/226x). Bit-identical (bench differential gate holds).
+- [ ] next rungs: probe residual = Query range-scan machinery per list + candidate sort — batch the probed lists into one scan? · float4 payload storage option · dataset v2 recall · HNSW batch-get.
