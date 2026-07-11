@@ -713,17 +713,20 @@ public:
         return f;
     }
 
-    core::Task scan_task(Promise<std::vector<KeyValue>> p, Range range, Seq at) {
-        // Collect, per key, the NEWEST (seq, value, tombstone, vlog) with seq <= at,
-        // across the memtable and all SSTables, keeping the highest seq per key.
-        struct Best {
-            Seq seq = kNoSeq;
-            Value value;
-            bool tombstone = false;
-            bool vlog = false;
-            bool present = false;
-        };
-        std::vector<std::pair<Key, Best>> merged;  // sorted-by-Key (deterministic)
+    // Per-key winner of the scan merge (the NEWEST version with seq <= at).
+    struct ScanBest {
+        Seq seq = kNoSeq;
+        Value value;
+        bool tombstone = false;
+        bool vlog = false;
+        bool present = false;
+    };
+    // Build the merged (key-ascending, newest-wins) view of `range` at snapshot `at`
+    // across the memtable + every SSTable. Shared by the async scan_task (which then
+    // materialises + derefs vlog pointers) and the synchronous scan_visit seam.
+    void build_scan_merged(const Range& range, Seq at,
+                           std::vector<std::pair<Key, ScanBest>>& merged) {
+        using Best = ScanBest;
         // `v` is taken BY VALUE so the caller can std::move its (owned) value in and we
         // move it onward into `merged` — one fewer value copy per offered key vs taking a
         // const ref and copying into Best. (We must NOT hold a pointer into the memtable
@@ -833,6 +836,34 @@ public:
             }
             fold_run(std::move(run));
         }
+    }
+
+    // K1 perf seam (storage::Engine::scan_visit override): the synchronous, zero-output-
+    // materialisation visit. Skips the Task/Promise/Future crossing AND the caller-side
+    // output vector — the probe of a vector index reads thousands of entries per query
+    // and only needs (key suffix, value ref) each. Falls back (returns false) when the
+    // value log is active or any surviving entry is a vlog pointer (deref must await);
+    // no callback fires in that case, so the caller's regular scan cannot double-count.
+    [[nodiscard]] bool scan_visit(
+        const Range& range, Seq at,
+        const std::function<void(const Key&, const Value&)>& fn) override {
+        if (value_log_active()) return false;
+        std::vector<std::pair<Key, ScanBest>> merged;
+        build_scan_merged(range, at, merged);
+        for (const auto& e : merged) {
+            if (e.second.present && !e.second.tombstone && e.second.vlog) return false;
+        }
+        for (const auto& e : merged) {
+            if (!e.second.present || e.second.tombstone) continue;
+            fn(e.first, e.second.value);
+        }
+        return true;
+    }
+
+    core::Task scan_task(Promise<std::vector<KeyValue>> p, Range range, Seq at) {
+        using Best = ScanBest;
+        std::vector<std::pair<Key, Best>> merged;  // sorted-by-Key (deterministic)
+        build_scan_merged(range, at, merged);
 
         // Materialise the surviving live values (deref vlog pointers). We DON'T hold
         // a reference into `merged` across the await — copy the pointer bytes out

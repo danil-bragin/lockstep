@@ -40,6 +40,7 @@
 // keep that in mind.
 
 #include <cstdint>
+#include <functional>  // scan_visit's per-entry callback
 #include <optional>
 #include <string>
 #include <utility>
@@ -130,6 +131,20 @@ public:
     // Spans the memtable + every durable SSTable, merged newest-version-per-key
     // (storage-engine.md §1/§5 step 4).
     [[nodiscard]] virtual Future<std::vector<KeyValue>> scan(Range range, Snapshot snap) = 0;
+
+    // K1 perf seam: synchronously VISIT the live entries of `range` at snapshot `at` —
+    // the SAME key-ascending, newest-wins, tombstone-filtered sequence scan() returns,
+    // WITHOUT materialising an output vector or crossing a Task/Promise boundary. An
+    // engine that cannot serve the range synchronously returns false (the default; a
+    // WalEngine with the value log active must await derefs) and the caller falls back
+    // to scan(). The callback's references are valid ONLY for the duration of the call.
+    [[nodiscard]] virtual bool scan_visit(
+        const Range& range, Seq at, const std::function<void(const Key&, const Value&)>& fn) {
+        (void)range;
+        (void)at;
+        (void)fn;
+        return false;
+    }
 };
 
 }  // namespace lockstep::storage

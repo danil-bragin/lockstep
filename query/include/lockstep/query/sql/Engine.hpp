@@ -11659,27 +11659,19 @@ private:
             std::min<std::size_t>(std::max<std::uint32_t>(1, probes), ranked.size());
 
         // Gather candidates from the probed lists (exact distance from the entry payload).
-        for (std::size_t p = 0; p < nprobe; ++p) {
-            Key lo = index_prefix(t.id, ix->id);
-            put_index_col(lo, Datum::make_int(static_cast<std::int64_t>(ranked[p].second)));
-            const Key hi = key_successor(lo);
-            std::vector<storage::KeyValue> kvs;
-            if (auto err = run_index_scan_at_level(sel, lo, hi, kvs)) {
-                return ExecResult::failure(*err);
-            }
-            // The entry key is prefix ++ put_index_col(INT list) [9 bytes] ++ encode_pk(pk):
-            // the pk BYTES are the raw suffix — no Datum decode + re-encode per candidate.
-            const std::size_t pk_off = index_prefix(t.id, ix->id).size() + 9;
-            for (const storage::KeyValue& ikv : kvs) {
-                if (is_tombstone(ikv.second)) continue;
+        // The entry key is prefix ++ put_index_col(INT list) [9 bytes] ++ encode_pk(pk):
+        // the pk BYTES are the raw suffix — no Datum decode + re-encode per candidate.
+        const std::size_t pk_off = index_prefix(t.id, ix->id).size() + 9;
+        // EXACT opclass distance over the RAW payload — the SAME accumulation order as the
+        // scalar distance kernel, so the value is IEEE-identical to the exact path's and
+        // the probes=lists gate holds per opclass. Fused fast path; the generic decode
+        // covers any other payload shape.
+        const std::function<void(const Key&, const Value&)> score_entry =
+            [&](const Key& ekey, const Value& payload) {
                 ++scanned;
                 Cand c;
-                // EXACT opclass distance over the RAW payload — the SAME accumulation order
-                // as the scalar distance kernel, so the value is IEEE-identical to the exact
-                // path's and the probes=lists gate holds per opclass. Fused fast path; the
-                // generic decode covers any other payload shape.
-                if (!ivf_score_fast(ikv.second, qv, want_op, c.dist)) {
-                    const std::vector<double> v = ivf_payload_doubles(ikv.second);
+                if (!ivf_score_fast(payload, qv, want_op, c.dist)) {
+                    const std::vector<double> v = ivf_payload_doubles(payload);
                     double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
                     for (std::size_t d = 0; d < dim && d < v.size(); ++d) {
                         const double x = v[d], y = qv[d];
@@ -11697,8 +11689,30 @@ private:
                         c.dist = -dot;
                     }
                 }
-                c.pk_bytes = ikv.first.size() > pk_off ? ikv.first.substr(pk_off) : Key{};
+                c.pk_bytes = ekey.size() > pk_off ? ekey.substr(pk_off) : Key{};
                 cands.push_back(std::move(c));
+            };
+        for (std::size_t p = 0; p < nprobe; ++p) {
+            Key lo = index_prefix(t.id, ix->id);
+            put_index_col(lo, Datum::make_int(static_cast<std::int64_t>(ranked[p].second)));
+            const Key hi = key_successor(lo);
+            // K1 perf: a Strict-level probe VISITS the list's entries synchronously inside
+            // storage (scan_visit) — no Task/Promise crossing, no output-vector copy of
+            // thousands of 8*dim-byte payloads. live_snap_seq() is exactly the snapshot a
+            // Query<Strict> scan resolves to. Any other level (or an engine that cannot
+            // visit) takes the regular leveled scan; entries and scores are identical.
+            if (sel.level == Level::StrictSerializable &&
+                db_.engine().scan_visit(storage::Range{lo, hi, /*hi_unbounded=*/false},
+                                        db_.live_snap_seq(), score_entry)) {
+                continue;
+            }
+            std::vector<storage::KeyValue> kvs;
+            if (auto err = run_index_scan_at_level(sel, lo, hi, kvs)) {
+                return ExecResult::failure(*err);
+            }
+            for (const storage::KeyValue& ikv : kvs) {
+                if (is_tombstone(ikv.second)) continue;
+                score_entry(ikv.first, ikv.second);
             }
         }
         }  // end IVFFLAT probe branch
