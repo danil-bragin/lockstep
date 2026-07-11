@@ -239,3 +239,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] vec_sq4/vec_dot_nu4/vec_dot4 + per-query vec_nv4 (bit-equal restricted sums — lanes independent; exact path keeps full kernel). 1.7→1.62 ms — loop is LOAD-LATENCY bound now.
 - [ ] **NEXT SESSION: f32 prune blocks + exact double re-rank window** (halves bytes, doubles lanes). Window correctness: L2 sums non-negative → relative f32 error ≤ ~n·eps; window = all cands with f32sq ≤ kth_f32sq·(1+2^-18)+eps_abs; dot-ops margin scaled by stored f32 norms × query norm; re-rank window with the exact shared kernel → final top-k bit-exact, gates hold. Store f32 blocks alongside doubles in IvfProbeCache. · also: centroids into the cache (97 samples/query) · batch backfill commits (build 4.3s→) · dataset v2.
+
+## K1 perf rung 11 (2026-07-11) — f32 prune + provable exact re-rank window
+
+- [x] two-phase probe: f32 dense prune (squared-L2 monotone) → want-th pivot → margin window (L2 rel 2^-14 over non-negative sums · cosine abs 1e-4 · IP norm-scaled) → exact double re-rank via shared kernel. Result provably == pure-double path; platform-independent. **@100k×64: host 1.16 ms; docker 1.49 vs pgvector 0.69 = GAP 2.2x** at recall 1.000 vs 0.095.
+- [ ] remaining: batch backfill commits (build 4.3s vs 0.4s) · centroids into cache · dataset v2 → publish the recall-vs-latency curve (at equal recall we are likely already ahead — the honest claim needs v2) · residual ~1.1ms profile if pushing to parity on raw latency.
