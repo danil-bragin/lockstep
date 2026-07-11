@@ -244,3 +244,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] two-phase probe: f32 dense prune (squared-L2 monotone) → want-th pivot → margin window (L2 rel 2^-14 over non-negative sums · cosine abs 1e-4 · IP norm-scaled) → exact double re-rank via shared kernel. Result provably == pure-double path; platform-independent. **@100k×64: host 1.16 ms; docker 1.49 vs pgvector 0.69 = GAP 2.2x** at recall 1.000 vs 0.095.
 - [ ] remaining: batch backfill commits (build 4.3s vs 0.4s) · centroids into cache · dataset v2 → publish the recall-vs-latency curve (at equal recall we are likely already ahead — the honest claim needs v2) · residual ~1.1ms profile if pushing to parity on raw latency.
+
+## K1 perf rung 12 (2026-07-12, 838bcc1) — build side
+
+- [x] sampled k-means (deterministic PK-stride, ~50/list — pgvector's rule; stride=1 on small tables → unchanged) + chunked 4096-entry backfill commits. Build @100k×64: 4.3→2.1 s (pgvector 0.4 — rest = full assignment pass + enumeration). Query side-effect: 1.16→0.96 ms (better-balanced lists). Gates hold.
+- K1 perf status vs pgvector @100k×64: **query 0.96 vs 0.69 ms raw (1.4x); at recall≥0.95 we are ALONE on the board (his max 0.63-0.71)**; build 2.1 vs 0.4 s (5x).
