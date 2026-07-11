@@ -3419,12 +3419,55 @@ private:
     }
 
     // --- K1.3: IVFFLAT helpers (all pure + deterministic — no rng, no wall-clock). -----------
+    // K1 perf: walk an ARRAY-codec payload of REAL (and/or INT) elements STRAIGHT into
+    // doubles — no per-element Datum/string materialisation (the generic decode_array
+    // allocates a string per element; a probe scores thousands of candidates and the
+    // brute path runs this per row). Bit-identical values. Returns false on any other
+    // element shape (NULL / TEXT-ish) — the caller falls back to the generic decode.
+    static bool ivf_doubles_fast(const std::string& s, std::vector<double>& out) {
+        out.clear();
+        if (s.size() < 6) return false;
+        const std::uint8_t el = static_cast<unsigned char>(s[0]);
+        const std::uint32_t n = Datum::get_be32_(s, 2);
+        out.reserve(n);
+        std::size_t off = 6;
+        for (std::uint32_t k = 0; k < n; ++k) {
+            if (off >= s.size()) return false;
+            const std::uint8_t tag = static_cast<unsigned char>(s[off++]);
+            if (tag == 1) {  // INT element: 8-byte big-endian int64
+                if (off + 8 > s.size()) return false;
+                std::uint64_t bits = 0;
+                for (int b = 0; b < 8; ++b)
+                    bits = (bits << 8) | static_cast<unsigned char>(s[off++]);
+                out.push_back(static_cast<double>(static_cast<std::int64_t>(bits)));
+            } else if (tag == 2 && el == 14) {  // REAL element: [len be32][8 LE payload bytes]
+                if (off + 4 > s.size()) return false;
+                const std::uint32_t len = Datum::get_be32_(s, off);
+                off += 4;
+                if (len != 8 || off + 8 > s.size()) return false;
+                std::uint64_t bits = 0;
+                for (int b = 0; b < 8; ++b)
+                    bits |= static_cast<std::uint64_t>(static_cast<unsigned char>(s[off + static_cast<std::size_t>(b)]))
+                            << (8 * b);
+                off += 8;
+                double d = 0.0;
+                std::memcpy(&d, &bits, sizeof(d));
+                out.push_back(d);
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
     // Decode a VECTOR payload (the ARRAY codec with REAL elements) into raw doubles.
     static std::vector<double> ivf_payload_doubles(const std::string& payload) {
         std::vector<double> v;
+        if (ivf_doubles_fast(payload, v)) return v;
+        v.clear();
         const std::vector<Datum> elems = Datum::decode_array(payload);
         v.reserve(elems.size());
-        for (const Datum& d : elems) v.push_back(d.real_value());
+        for (const Datum& d : elems)
+            v.push_back(d.is_real() ? d.real_value() : static_cast<double>(d.i));
         return v;
     }
     // Centroid blob codec: [dim:be32][k:be32] then k*dim little-endian 8-byte doubles.
@@ -9219,21 +9262,50 @@ private:
             f == "<->" || f == "<#>" || f == "<=>") {  // K1.2: pgvector operator spellings
             if (!need(2)) return f + " takes (vector, vector)";
             if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Text); out.logical = 14; return std::nullopt; }
-            const auto vec_operand = [](const Datum& d, std::vector<Datum>& elems) -> bool {
+            // K1 perf: extract each operand STRAIGHT into doubles. An array/vector payload
+            // walks bytes (ivf_doubles_fast — no per-element Datum/string); a '[x,y,z]'
+            // TEXT literal (the constant query vector, otherwise re-parsed through strtod
+            // on EVERY row of a brute k-NN) is parsed once and memoised by content in
+            // vec_lit_cache_. Values and error surface are byte-identical to the Datum
+            // path: a NULL element is flagged (0.0 placeholder keeps the length exact)
+            // and reported AFTER the length check, exactly like the old per-element loop.
+            const auto load_vec = [this](const Datum& d, std::vector<double>& o, bool& null_el) -> bool {
+                null_el = false;
                 if (d.type != Type::Text) return false;
-                if (d.logical == 7 || d.logical == 15) { elems = Datum::decode_array(d.s); return true; }
-                if (d.logical == 0) return !parse_vector_literal(d.s, elems).has_value();
+                if (d.logical == 7 || d.logical == 15) {
+                    if (ivf_doubles_fast(d.s, o)) return true;
+                    const std::vector<Datum> elems = Datum::decode_array(d.s);
+                    o.clear();
+                    o.reserve(elems.size());
+                    for (const Datum& e2 : elems) {
+                        if (e2.is_null) { null_el = true; o.push_back(0.0); continue; }
+                        o.push_back(e2.is_real() ? e2.real_value() : static_cast<double>(e2.i));
+                    }
+                    return true;
+                }
+                if (d.logical == 0) {
+                    const auto it = vec_lit_cache_.find(d.s);
+                    if (it != vec_lit_cache_.end()) { o = it->second; return true; }
+                    std::vector<Datum> elems;
+                    if (parse_vector_literal(d.s, elems)) return false;
+                    o.clear();
+                    o.reserve(elems.size());
+                    for (const Datum& e2 : elems) o.push_back(e2.real_value());
+                    if (vec_lit_cache_.size() >= 64) vec_lit_cache_.clear();  // bound the memo
+                    vec_lit_cache_.emplace(d.s, o);
+                    return true;
+                }
                 return false;
             };
-            std::vector<Datum> u, v;
-            if (!vec_operand(a[0], u) || !vec_operand(a[1], v))
+            std::vector<double> u, v;
+            bool u_null = false, v_null = false;
+            if (!load_vec(a[0], u, u_null) || !load_vec(a[1], v, v_null))
                 return f + " requires two vector arguments (VECTOR, ARRAY, or a '[x,y,z]' literal)";
             if (u.size() != v.size()) return f + " requires vectors of equal length";
-            const auto dbl = [](const Datum& d) { return d.is_real() ? d.real_value() : static_cast<double>(d.i); };
+            if (u_null || v_null) return f + " does not accept NULL vector elements";
             double dot = 0.0, sq = 0.0, nu = 0.0, nv = 0.0;
             for (std::size_t k = 0; k < u.size(); ++k) {
-                if (u[k].is_null || v[k].is_null) return f + " does not accept NULL vector elements";
-                const double x = dbl(u[k]), y = dbl(v[k]);
+                const double x = u[k], y = v[k];
                 dot += x * y; sq += (x - y) * (x - y); nu += x * x; nv += y * y;
             }
             double r = 0.0;
@@ -10649,6 +10721,25 @@ private:
     // column the pipeline later reads is included, and the PK is always decodable from
     // the key. Conservative by construction (over-include is safe; under-include of a
     // read column is impossible because every read site is enumerated below).
+    // K1 perf: mark the columns a scalar expression references into `need`. Returns false
+    // when the reference set cannot be bounded (CASE — WHEN predicates are not walked here —
+    // or a column that does not resolve): the caller then decodes every column (fail-safe).
+    [[nodiscard]] static bool expr_mark_cols(const Expr& e, const Table& t,
+                                             std::vector<bool>& need) {
+        if (e.kind == ExprKind::Case) return false;
+        if (e.kind == ExprKind::Col) {
+            const auto idx = t.column_index(e.column);
+            if (!idx) return false;
+            need[*idx] = true;
+            return true;
+        }
+        if (e.left && !expr_mark_cols(*e.left, t, need)) return false;
+        if (e.right && !expr_mark_cols(*e.right, t, need)) return false;
+        for (const auto& a2 : e.args)
+            if (a2 && !expr_mark_cols(*a2, t, need)) return false;
+        return true;
+    }
+
     [[nodiscard]] static std::vector<bool> needed_columns(const Table& t,
                                                           const SelectStmt& sel) {
         std::vector<bool> need(t.columns.size(), false);
@@ -10677,9 +10768,16 @@ private:
             mark(gc);
         }
         for (const OrderKey& k : sel.order_by) {
-            // K1.2: an ORDER BY expression may touch any column (like a J1 expr operand) —
-            // decode them all rather than walking the Expr tree.
-            if (k.expr) return std::vector<bool>(t.columns.size(), true);
+            // K1.2/K1 perf: an ORDER BY expression marks exactly the columns it references
+            // (a k-NN over a wide table must not decode every column per row). A shape the
+            // walker cannot bound (CASE — its WHEN predicates are not walked, or an unknown
+            // column) falls back to decode-all, the previous behavior.
+            if (k.expr) {
+                if (!expr_mark_cols(*k.expr, t, need)) {
+                    return std::vector<bool>(t.columns.size(), true);
+                }
+                continue;
+            }
             mark(k.column);
         }
         // WHERE + HAVING predicate leaves (column operands + column rhs).
@@ -13192,6 +13290,10 @@ private:
     std::uint32_t ivfflat_probes_ = 0;
     // K1.4: SET hnsw.ef_search — the HNSW level-0 beam width (pgvector default 40).
     std::uint32_t hnsw_ef_search_ = 40;
+    // K1 perf: content-keyed memo of parsed '[x,y,z]' vector text literals (the constant
+    // query vector of a k-NN would otherwise be strtod-parsed on EVERY row). Pure cache —
+    // same text always yields the same doubles; bounded at 64 entries.
+    std::unordered_map<std::string, std::vector<double>> vec_lit_cache_;
 
     // W9.2: parse cache (sql text -> parsed AST). Always valid (parsing is catalog-independent).
     static constexpr std::size_t kParseCacheCap = 1024;
