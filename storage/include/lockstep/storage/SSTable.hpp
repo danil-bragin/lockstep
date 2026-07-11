@@ -498,6 +498,23 @@ public:
         }
     }
 
+    // K1 perf: zero-copy cursor surface over the DECODED blocks (key-asc across blocks,
+    // key-asc/seq-asc within one) — the streaming scan merge iterates entries by
+    // REFERENCE instead of materialising (key, value) copies per accepted entry.
+    [[nodiscard]] std::size_t block_count() const noexcept { return blocks_.size(); }
+    [[nodiscard]] const std::vector<SstEntry>& block(std::size_t b) const { return blocks_[b]; }
+    // The block where a scan for keys >= lo starts — the same lookup()-style seek +
+    // spill back-up scan_into uses (an empty lo starts at block 0).
+    [[nodiscard]] std::size_t scan_start_block(const Key& lo) const {
+        if (lo.empty() || blocks_.empty()) return 0;
+        const int blk = seek_block(lo);
+        if (blk < 0) return 0;
+        std::size_t b0 = static_cast<std::size_t>(blk);
+        while (b0 > 0 && index_[b0 - 1].first_key == lo) --b0;
+        if (b0 > 0 && index_[b0 - 1].first_key < lo) --b0;
+        return b0;
+    }
+
     // Append EVERY decoded entry of this table (key-asc/seq-asc) into `out` — the
     // compaction merge input (C3.4). Pure, synchronous over the cached blocks.
     void collect_entries(std::vector<SstEntry>& out) const {

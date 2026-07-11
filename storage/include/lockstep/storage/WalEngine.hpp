@@ -838,25 +838,127 @@ public:
         }
     }
 
-    // K1 perf seam (storage::Engine::scan_visit override): the synchronous, zero-output-
-    // materialisation visit. Skips the Task/Promise/Future crossing AND the caller-side
-    // output vector — the probe of a vector index reads thousands of entries per query
-    // and only needs (key suffix, value ref) each. Falls back (returns false) when the
-    // value log is active or any surviving entry is a vlog pointer (deref must await);
-    // no callback fires in that case, so the caller's regular scan cannot double-count.
+    // K1 perf seam (storage::Engine::scan_visit override): the synchronous, ZERO-COPY
+    // visit. A streaming k-way merge walks the memtable range and each SSTable's decoded
+    // blocks BY REFERENCE — per surviving entry it records one (key*, value*) pointer
+    // pair (16 bytes) instead of copying the key + value strings the materialising scan
+    // pays per entry. The winner rule is offer()'s exactly: per source the newest
+    // version <= at; across sources the highest seq, a seq tie going to the LATER
+    // source (memtable first, then sstables in order — so an incoming equal-seq source
+    // replaces, matching `s >= held`). Callbacks fire only after the whole merge, so a
+    // vlog fallback (value log active, or a surviving vlog pointer that must await a
+    // deref) returns false BEFORE any callback — the caller's regular scan cannot
+    // double-count. References stay valid across the loop: no co_await, no mutation.
     [[nodiscard]] bool scan_visit(
         const Range& range, Seq at,
         const std::function<void(const Key&, const Value&)>& fn) override {
         if (value_log_active()) return false;
-        std::vector<std::pair<Key, ScanBest>> merged;
-        build_scan_merged(range, at, merged);
-        for (const auto& e : merged) {
-            if (e.second.present && !e.second.tombstone && e.second.vlog) return false;
+        // --- source cursors: 0 = memtable, 1..S = sstables (offer order) --------------
+        struct Cur {
+            bool live = false;
+            const Key* key = nullptr;
+            const Value* value = nullptr;
+            Seq seq = kNoSeq;
+            bool tombstone = false;
+            bool vlog = false;
+        };
+        const std::map<Key, Memtable::Versions>& mk = mem_.entries();
+        auto mit = mk.lower_bound(range.lo);
+        Cur mcur;
+        const auto in_hi = [&](const Key& k) {
+            return range.hi_unbounded || k < range.hi;
+        };
+        const auto advance_mem = [&]() {
+            mcur.live = false;
+            for (; mit != mk.end() && in_hi(mit->first); ++mit) {
+                const Memtable::Version* best = nullptr;
+                for (const Memtable::Version& v : mit->second) {
+                    if (v.seq <= at) best = &v;  // seq-ascending ⇒ later is newer
+                    else break;
+                }
+                if (best == nullptr) continue;  // no visible version — not offered
+                mcur = Cur{true, &mit->first, &best->value, best->seq, best->tombstone,
+                           best->vlog};
+                ++mit;
+                return;
+            }
+        };
+        struct SstCur {
+            const SSTableReader* sst = nullptr;
+            std::size_t b = 0, i = 0;
+            Cur cur;
+        };
+        std::vector<SstCur> scs;
+        scs.reserve(sstables_.size());
+        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+            scs.push_back(SstCur{sst.get(), sst->scan_start_block(range.lo), 0, {}});
         }
-        for (const auto& e : merged) {
-            if (!e.second.present || e.second.tombstone) continue;
-            fn(e.first, e.second.value);
+        const auto advance_sst = [&](SstCur& sc) {
+            sc.cur.live = false;
+            while (sc.b < sc.sst->block_count()) {
+                const std::vector<SstEntry>& blk = sc.sst->block(sc.b);
+                if (sc.i >= blk.size()) {
+                    ++sc.b;
+                    sc.i = 0;
+                    continue;
+                }
+                const SstEntry& e = blk[sc.i];
+                if (e.key < range.lo) {
+                    ++sc.i;
+                    continue;
+                }
+                if (!in_hi(e.key)) return;  // key-ascending — the rest is past hi
+                // Gather this key's version run (seq-ascending; it may span blocks):
+                // the per-source best is the LAST version with seq <= at.
+                const Key& k = e.key;
+                const SstEntry* best = nullptr;
+                while (sc.b < sc.sst->block_count()) {
+                    const std::vector<SstEntry>& blk2 = sc.sst->block(sc.b);
+                    if (sc.i >= blk2.size()) {
+                        ++sc.b;
+                        sc.i = 0;
+                        continue;
+                    }
+                    const SstEntry& e2 = blk2[sc.i];
+                    if (!(e2.key == k)) break;
+                    if (e2.seq <= at) best = &e2;
+                    ++sc.i;
+                }
+                if (best == nullptr) continue;  // whole run newer than the snapshot
+                sc.cur = Cur{true, &best->key, &best->value, best->seq, best->tombstone,
+                             best->vlog};
+                return;
+            }
+        };
+        advance_mem();
+        for (SstCur& sc : scs) advance_sst(sc);
+        // --- k-way merge into a POINTER buffer (callbacks only after a clean pass) ----
+        std::vector<std::pair<const Key*, const Value*>> out;
+        for (;;) {
+            const Key* min_key = mcur.live ? mcur.key : nullptr;
+            for (const SstCur& sc : scs) {
+                if (sc.cur.live && (min_key == nullptr || *sc.cur.key < *min_key)) {
+                    min_key = sc.cur.key;
+                }
+            }
+            if (min_key == nullptr) break;
+            // Winner among sources holding min_key: highest seq; seq tie -> later source.
+            Cur win;
+            if (mcur.live && *mcur.key == *min_key) win = mcur;
+            for (const SstCur& sc : scs) {
+                if (sc.cur.live && *sc.cur.key == *min_key &&
+                    (!win.live || sc.cur.seq >= win.seq)) {
+                    win = sc.cur;
+                }
+            }
+            if (win.vlog && !win.tombstone) return false;  // must await a deref — fall back
+            if (!win.tombstone) out.emplace_back(win.key, win.value);
+            if (mcur.live && *mcur.key == *min_key) advance_mem();
+            for (SstCur& sc : scs) {
+                if (sc.cur.live && *sc.cur.key == *min_key) advance_sst(sc);
+            }
         }
+        for (const auto& [k, v] : out) fn(*k, *v);
         return true;
     }
 
