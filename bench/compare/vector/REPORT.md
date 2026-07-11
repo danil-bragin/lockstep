@@ -1,11 +1,33 @@
-# K1.5 — vector k-NN vs pgvector (PRELIMINARY, 2026-07-11)
+# K1.5 — vector k-NN vs pgvector (2026-07-11, post scan-fix)
 
 Harness: `run_vector.sh [N] [DIM] [K] [QUERIES] [LISTS] [PROBES]` — identical deterministic
 data (shared integer formula), both systems pinned to one CPU, Docker. Lockstep embedded
 (`lockstep_vector.cpp`, libc++ Release); pgvector = `pgvector/pgvector:pg16`, fsync off,
 EXPLAIN ANALYZE min-of-3. Recall@k = each system's index result vs its OWN brute force.
 
-## First run: N=100k, dim=64, k=10, q=20, lists=200, probes=10 (cpu-pinned, one core)
+## Run 2 (after the scan_task O(N^2) fix, 4e68dc3): N=100k, dim=64, k=10, lists=200, probes=10
+
+| metric | Lockstep | pgvector | gap |
+|---|---|---|---|
+| brute-force k-NN (ms/query) | 597 | 13.2 | 45x |
+| ivfflat build (ms) | 4 532 | 395 | 11x |
+| ivfflat k-NN (ms/query) | 156 | 0.69 | 226x |
+| recall@10 (vs own brute) | 1.000* | 0.140* | — |
+
+*Recall still tie-dominated on this dataset (see below) — not comparable yet.
+
+**The 17x scaling cliff the first run exposed is FIXED** (storage scan_task now folds
+SSTable runs with a linear merge; brute k-NN scales 2.06x per row-doubling to 200k).
+The remaining honest gap is architectural, and each cause is known:
+- brute: our path materialises full-width rows and evaluates the distance through the
+  AST interpreter per row; pgvector runs a C float4 loop over tuples.
+- indexed: our probe decodes each candidate payload into Datums through the generic
+  ARRAY codec (~5k candidates here) plus Query-machinery overhead per range scan;
+  pgvector reads float4 arrays straight off index pages.
+Next rungs: raw-double candidate scoring in the probe (skip the Datum decode), narrow
+row materialisation for the k-NN shape, then revisit.
+
+## Run 1 (BEFORE the fix — kept for the record): N=100k, dim=64, k=10, q=20, lists=200, probes=10 (cpu-pinned, one core)
 
 | metric | Lockstep | pgvector |
 |---|---|---|

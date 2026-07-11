@@ -193,3 +193,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 - **FINDING (blocks a quotable report): Lockstep k-NN does not scale past ~50k rows** — brute ms/query 12.5k→311, 25k→774, 50k→1553 (≈linear), 100k→26242 (**17x cliff**; suspect row-materialization memory blow-up → swap, NOT the distance kernel). pgvector at 100k×64: brute 55 ms, ivfflat 1.77 ms, build 1.9 s — the target to close.
 - recall comparison invalid on the current dataset (100 tight clusters → tie-dominated top-k; our 1.0 = determinism artifact, pgvector 0.09 = tie-shuffle + k-means degeneracy). Need separated points.
 - [ ] next: profile-first the 50k→100k cliff · dataset v2 (separated points) · rerun · publish.
+
+## scan cliff fixed (2026-07-11, 4e68dc3) + K1.5 run 2
+
+- [x] **storage scan_task O(N^2) post-flush cliff KILLED** (profile-first: 92% samples in vector::insert; SSTable runs now fold via linear 2-way merge, offer-identical winner rule). Brute k-NN 100k: 26242→415 ms host (63x); linear to 200k. Every flushed-table reader wins.
+- **K1.5 run 2 @100k×64 (docker, 1 cpu)**: brute 597 vs 13.2 ms (45x), ivfflat 156 vs 0.69 ms (226x), build 4.5 vs 0.4 s. Gap causes known: AST-interpreted distance + full-width row materialisation (brute); per-candidate Datum decode via ARRAY codec (probe). Next rungs: raw-double probe scoring · narrow materialisation for the k-NN shape · dataset v2 for recall.
