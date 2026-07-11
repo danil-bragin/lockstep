@@ -203,3 +203,7 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] raw-double scoring (ivf_doubles_fast byte-walk, no Datum per element) + const-query-vector memo (vec_lit_cache_) + narrow ORDER-BY-expr materialisation (expr_mark_cols). @100k×64 docker: brute 597→145 ms (4.1x), ivfflat 156→80 ms (2x). **Gap to pgvector: brute 11x, indexed 116x** (was 45x/226x). Bit-identical (bench differential gate holds).
 - [ ] next rungs: probe residual = Query range-scan machinery per list + candidate sort — batch the probed lists into one scan? · float4 payload storage option · dataset v2 recall · HNSW batch-get.
+
+## K1 perf rung 3 (2026-07-11)
+
+- [x] fused probe scoring (ivf_score_fast off raw bytes) + winner-only pk decode (Cand = dist+pk-bytes, suffix substr) + partial_sort(k+offset). ivfflat @100k×64: host 41→21.7 ms, docker 156→62 ms — **gap to pgvector ~92x indexed / 11x brute** (morning: 226x/45x). Residual = per-list Query scan machinery (scan_into/offer/memcmp ≈ dominant in profile) — next seam is storage-side batch scan or probe-list layout.
