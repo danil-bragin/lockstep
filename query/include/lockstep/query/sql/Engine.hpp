@@ -2605,21 +2605,48 @@ private:
             // Effective list count: never more lists than vectors (each seed needs a vector).
             const std::size_t k = std::max<std::size_t>(
                 1, std::min<std::size_t>(ix.lists, vecs.empty() ? 1 : vecs.size()));
-            const std::vector<std::vector<double>> cents = ivf_kmeans(vecs, k, dim);
+            // K1 perf: k-means over a DETERMINISTIC SAMPLE (every stride-th vector in PK
+            // order, ~50 per list — pgvector's sampling rule) instead of every vector:
+            // the build was dominated by the full-set Lloyd iterations. stride == 1 (all
+            // vectors) whenever the table is small, so existing behavior/centroids are
+            // unchanged there. The ASSIGNMENT pass still covers every vector exactly.
+            const std::size_t stride = std::max<std::size_t>(1, vecs.size() / (50 * k));
+            std::vector<std::vector<double>> cents;
+            if (stride == 1) {
+                cents = ivf_kmeans(vecs, k, dim);
+            } else {
+                std::vector<std::vector<double>> sample;
+                sample.reserve(vecs.size() / stride + 1);
+                for (std::size_t i = 0; i < vecs.size(); i += stride) sample.push_back(vecs[i]);
+                cents = ivf_kmeans(sample, std::min<std::size_t>(k, sample.size()), dim);
+                while (cents.size() < k) cents.push_back(std::vector<double>(dim, 0.0));
+            }
             Index& live = t->indexes.back();
             live.lists = static_cast<std::uint32_t>(k);
             live.centroids = ivf_encode_centroids(dim, cents);
             persist_schema(ci.table);
             ivf_probe_cache_.erase(ivf_cache_key(table_id, live.id));  // K1 perf: fresh build
+            // K1 perf: backfill in CHUNKED batches — one commit per row made the build
+            // ~10x slower than pgvector's (each commit pays the full write pipeline).
+            // Content and order are identical; the crash-mid-backfill window is the same
+            // as per-row commits (the catalog entry precedes the backfill either way).
+            std::vector<std::pair<Key, Value>> writes;
+            constexpr std::size_t kBackfillChunk = 4096;
+            writes.reserve(kBackfillChunk);
             for (const auto& row : all_rows) {
                 if (row[vcol].is_null) continue;
                 const std::size_t list =
                     ivf_nearest(cents, ivf_assign_vec(ix.vec_op, ivf_payload_doubles(row[vcol].s)));
-                commit_writes({{encode_index_entry(table_id, live,
-                                                   Datum::make_int(static_cast<std::int64_t>(list)),
-                                                   row[t->pk_index]),
-                                row[vcol].s}});
+                writes.emplace_back(encode_index_entry(table_id, live,
+                                                       Datum::make_int(static_cast<std::int64_t>(list)),
+                                                       row[t->pk_index]),
+                                    row[vcol].s);
+                if (writes.size() >= kBackfillChunk) {
+                    commit_writes(writes);
+                    writes.clear();
+                }
             }
+            if (!writes.empty()) commit_writes(writes);
             return ExecResult{};
         }
 
