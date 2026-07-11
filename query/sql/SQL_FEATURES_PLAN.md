@@ -222,3 +222,10 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] scan_visit = streaming k-way cursor merge (memtable iter + SSTableReader block cursors, offer-identical winner rule, pointer-buffer then callbacks, vlog falls back pre-callback). ivfflat @100k×64 host 16→10.6 ms. **Day total indexed: 4267→10.6 (~400x)**; vs pgvector 0.67 ms ≈ 16x (host-vs-docker rough).
 - [ ] next: clean profile of the 10.6 ms residual (last sample mixed the brute phase) — suspects: per-candidate pk_bytes substr alloc + push_back · ivf byte-assembly (LE memcpy fast path) · std::function indirection · per-list overhead · then the 4-accumulator kernel (both paths together) if the math surfaces.
+
+## K1 perf rungs 7-8 (2026-07-11) — verdict: probe is MEMORY-BOUND
+
+- [x] rung 7 (1dc5d5b): fixed-stride LE memcpy scorer/decoder — flat.
+- [x] rung 8 (c003e6b): ONE shared 4-lane kernel (vec_accum4/vec_finish, fixed lanes+combine, bit-deterministic per host) in exact+probe+HNSW — flat (~11.2-11.6 ms @100k×64).
+- **Diagnosis: memory-bound** — ~5000 scattered ~600B double payloads (~3MB irregular reads/query) vs pgvector's contiguous float4 pages. Compute levers exhausted.
+- [ ] **NEXT (the parity move): per-list contiguous float32 probe cache + exact double re-rank of the top window** — prune in f32 over dense blocks (~1/2 bytes, prefetch-friendly), final ordering bit-exact via the shared kernel on the re-rank window. Cache = derived data (rebuildable, non-replicated layout, deterministic content).
