@@ -1541,7 +1541,8 @@ private:
             else if (is_kw("gin")) { advance(); st.create_index.gin = true; }
             else if (is_kw("ivfflat")) { advance(); st.create_index.ivfflat = true; }
             else if (is_kw("hnsw")) { advance(); st.create_index.hnsw = true; }
-            else return err("USING expects HASH, BTREE, GIN, IVFFLAT, or HNSW");
+            else if (is_kw("bm25")) { advance(); st.create_index.bm25 = true; }  // K2
+            else return err("USING expects HASH, BTREE, GIN, IVFFLAT, HNSW, or BM25");
         }
         // K1.3/K1.4: WITH (knob = N, ...) — the vector-index build/search knobs (pgvector shape):
         // IVFFLAT takes lists/probes; HNSW takes m/ef_construction.

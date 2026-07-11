@@ -783,6 +783,7 @@ private:
         if (ix.gin) o += " USING GIN";
         else if (ix.ivfflat) o += " USING IVFFLAT";  // K1.3 (WITH knobs are rebuild-time defaults)
         else if (ix.hnsw) o += " USING HNSW";        // K1.4
+        else if (ix.bm25) o += " USING BM25";        // K2
         else if (ix.hash) o += " USING HASH";
         if (!ix.partial_src.empty()) o += " WHERE " + ix.partial_src;
         o += ";";
@@ -972,6 +973,7 @@ public:
             o.push_back(ix.hnsw ? 1 : 0);               // K1.4: HNSW (graph k-NN)
             cat_put_u32(o, ix.hnsw_m);
             cat_put_u32(o, ix.hnsw_efc);
+            o.push_back(ix.bm25 ? 1 : 0);  // K2: BM25 full-text
         }
         cat_put_u32(o, static_cast<std::uint32_t>(t.checks.size()));  // F5
         for (const std::string& chk : t.checks) {
@@ -1057,6 +1059,7 @@ public:
             ix.hnsw = s[p++] != 0;                          // K1.4: HNSW (graph k-NN)
             ix.hnsw_m = cat_get_u32(s, p);
             ix.hnsw_efc = cat_get_u32(s, p);
+            ix.bm25 = s[p++] != 0;  // K2: BM25 full-text
             t.indexes.push_back(std::move(ix));
         }
         const std::uint32_t ncheck = cat_get_u32(s, p);  // F5
@@ -2500,6 +2503,26 @@ private:
                 return ExecResult::failure(
                     "a vector operator class requires USING IVFFLAT or USING HNSW");
             }
+            if (ci.bm25) {  // K2: BM25 — one TEXT column, non-unique, non-partial
+                if (ix.columns.size() != 1) {
+                    return ExecResult::failure("USING BM25 indexes exactly one TEXT column");
+                }
+                const Column& tc = t->columns[ix.columns[0]];
+                if (tc.type != Type::Text || tc.logical != 0) {
+                    return ExecResult::failure("USING BM25 requires a plain TEXT column (got '" +
+                                               ci.column + "')");
+                }
+                if (ci.unique) return ExecResult::failure("a BM25 index cannot be UNIQUE");
+                if (!ci.partial_src.empty()) {
+                    return ExecResult::failure("a BM25 index cannot be partial");
+                }
+                if (t->composite_pk()) {
+                    return ExecResult::failure(
+                        "a BM25 index is not supported on a composite-PK table");
+                }
+                ix.bm25 = true;
+                ix.hash = false;
+            }
             if (ci.hnsw) {  // K1.4: HNSW — one dimensioned VECTOR(n) column, non-unique
                 if (ix.columns.size() != 1) {
                     return ExecResult::failure("USING HNSW indexes exactly one VECTOR column");
@@ -2528,6 +2551,45 @@ private:
         t->indexes.push_back(ix);
         persist_schema(ci.table);  // C7: the new index is part of the durable schema
         const std::uint32_t table_id = t->id;
+
+        // K2: BM25 backfill — chunked batches through the SAME maintenance path (postings
+        // + running stats), so a backfilled index is byte-identical to one maintained live.
+        if (ix.bm25) {
+            std::vector<std::vector<Datum>> all_rows;
+            if (t->columnar) {
+                SelectStmt full;
+                full.table = t->name;
+                full.level = Level::StrictSerializable;
+                std::vector<bool> all(t->columns.size(), true);
+                if (auto e = columnar_build_rows(*t, full, all, all_rows)) {
+                    t->indexes.pop_back();
+                    persist_schema(ci.table);
+                    return ExecResult::failure(*e);
+                }
+            } else {
+                std::vector<storage::KeyValue> kvs;
+                {
+                    Query<Strict> q;
+                    q.scan(table_prefix(table_id), table_prefix_end(table_id));
+                    collect(db_.run(q), kvs);
+                }
+                for (const storage::KeyValue& kv : kvs) {
+                    if (is_tombstone(kv.second)) continue;
+                    all_rows.push_back(decode_row(*t, kv.first, kv.second));
+                }
+            }
+            const Index& live = t->indexes.back();
+            std::vector<std::pair<Key, Value>> writes;
+            for (const auto& row : all_rows) {
+                bm25_maintain(*t, live, row, /*tombstone=*/false, writes);
+                if (writes.size() >= 4096) {
+                    commit_writes(writes);
+                    writes.clear();
+                }
+            }
+            if (!writes.empty()) commit_writes(writes);
+            return ExecResult{};
+        }
 
         // K1.4: HNSW build — insert every live row's node in PK (scan) order, one atomic
         // commit per node (each insert's greedy search reads the graph the prior commits
@@ -3926,6 +3988,124 @@ private:
         return out;
     }
 
+    // ===================== K2: BM25 full-text search =====================
+    // Deterministic tokenizer: ASCII lowercase, alphanumeric runs, length >= 2. No
+    // locale, no ICU, no stemmer (v1) — the SAME bytes tokenize identically on every
+    // replica and platform. Returns (term -> tf); `dl` = the doc length (token count).
+    static std::map<std::string, std::uint32_t> bm25_tokens(const std::string& text,
+                                                            std::uint32_t& dl) {
+        std::map<std::string, std::uint32_t> tf;
+        dl = 0;
+        std::string cur;
+        const auto flush = [&]() {
+            if (cur.size() >= 2) {
+                ++tf[cur];
+                ++dl;
+            }
+            cur.clear();
+        };
+        for (const char ch : text) {
+            const unsigned char u = static_cast<unsigned char>(ch);
+            if ((u >= 'a' && u <= 'z') || (u >= '0' && u <= '9')) {
+                cur.push_back(ch);
+            } else if (u >= 'A' && u <= 'Z') {
+                cur.push_back(static_cast<char>(u + 32));
+            } else {
+                flush();
+            }
+        }
+        flush();
+        return tf;
+    }
+    // Posting: 't' ++ put_index_col(term) ++ pk -> [tf be32][dl be32] (dl denormalised —
+    // scoring needs no second lookup; an UPDATE rewrites the doc's postings anyway).
+    // Stats: 'S' -> [nDocs be32][totalLen be64], read-modify-written in the row's batch.
+    [[nodiscard]] static Key bm25_term_key(std::uint32_t tid, std::uint32_t iid,
+                                           const std::string& term, const Key& pk) {
+        Key k = index_prefix(tid, iid);
+        k += "t";
+        put_index_col(k, Datum::make_text(term));
+        k += pk;
+        return k;
+    }
+    [[nodiscard]] static Key bm25_term_prefix(std::uint32_t tid, std::uint32_t iid,
+                                              const std::string& term) {
+        Key k = index_prefix(tid, iid);
+        k += "t";
+        put_index_col(k, Datum::make_text(term));
+        return k;
+    }
+    [[nodiscard]] static Key bm25_stats_key(std::uint32_t tid, std::uint32_t iid) {
+        return index_prefix(tid, iid) + "S";
+    }
+    static std::string bm25_posting(std::uint32_t tf, std::uint32_t dl) {
+        std::string v;
+        Datum::put_be32_(v, tf);
+        Datum::put_be32_(v, dl);
+        return v;
+    }
+    static std::string bm25_stats_enc(std::uint32_t ndocs, std::uint64_t total_len) {
+        std::string v;
+        Datum::put_be32_(v, ndocs);
+        Datum::put_be32_(v, static_cast<std::uint32_t>(total_len >> 32));
+        Datum::put_be32_(v, static_cast<std::uint32_t>(total_len & 0xFFFFFFFFULL));
+        return v;
+    }
+    static void bm25_stats_dec(const std::string& v, std::uint32_t& ndocs,
+                               std::uint64_t& total_len) {
+        ndocs = v.size() >= 12 ? Datum::get_be32_(v, 0) : 0;
+        total_len = v.size() >= 12
+                        ? ((static_cast<std::uint64_t>(Datum::get_be32_(v, 4)) << 32) |
+                           Datum::get_be32_(v, 8))
+                        : 0;
+    }
+    // Read one small KV through the in-flight batch overlay, then storage (Strict).
+    [[nodiscard]] std::optional<Value> bm25_get(
+        const Key& k, const std::vector<std::pair<Key, Value>>& out) {
+        for (auto it = out.rbegin(); it != out.rend(); ++it) {
+            if (it->first == k) {
+                if (is_tombstone(it->second)) return std::nullopt;
+                return it->second;
+            }
+        }
+        std::vector<storage::KeyValue> kvs;
+        Query<Strict> q;
+        q.scan(k, key_successor(k));
+        collect(db_.run(q), kvs);
+        for (const storage::KeyValue& kv : kvs)
+            if (kv.first == k && !is_tombstone(kv.second)) return kv.second;
+        return std::nullopt;
+    }
+    // Maintenance: (un)index one row's TEXT value — postings + corpus stats in the SAME
+    // atomic batch as the row write; the stats read goes through the batch overlay so a
+    // multi-row INSERT accumulates correctly within one statement.
+    void bm25_maintain(const Table& t, const Index& ix, const std::vector<Datum>& row,
+                       bool tombstone, std::vector<std::pair<Key, Value>>& out) {
+        const Datum& v = row[ix.columns[0]];
+        if (v.is_null) return;  // a NULL indexes nothing (like every other index kind)
+        std::uint32_t dl = 0;
+        const std::map<std::string, std::uint32_t> tf = bm25_tokens(v.s, dl);
+        const Key pk = encode_pk(row[t.pk_index]);
+        for (const auto& [term, cnt] : tf) {
+            out.emplace_back(bm25_term_key(t.id, ix.id, term, pk),
+                             tombstone ? tombstone_marker() : bm25_posting(cnt, dl));
+        }
+        std::uint32_t nd = 0;
+        std::uint64_t tl = 0;
+        if (const auto sv = bm25_get(bm25_stats_key(t.id, ix.id), out)) {
+            bm25_stats_dec(*sv, nd, tl);
+        }
+        if (tombstone) {
+            if (nd > 0) --nd;
+            tl = tl >= dl ? tl - dl : 0;
+        } else {
+            ++nd;
+            tl += dl;
+        }
+        out.emplace_back(bm25_stats_key(t.id, ix.id), bm25_stats_enc(nd, tl));
+    }
+    // =================== end K2 BM25 core ===================
+
     // ===================== K1.4: HNSW (graph) approximate k-NN =====================
     // Deterministic HNSW over one VECTOR(n) column. KV records under the index prefix:
     //   'v' ++ pk            -> [flags u8 (1 = zombie)][top_level u8][vector payload]
@@ -4240,6 +4420,10 @@ private:
             if (!row_matches_partial(t, ix, row)) continue;  // I5: outside the partial set
             if (ix.ivfflat) {  // K1 perf: any maintenance invalidates the probe cache
                 ivf_probe_cache_.erase(ivf_cache_key(t.id, ix.id));
+            }
+            if (ix.bm25) {  // K2: postings + stats ride the SAME atomic batch as the row
+                bm25_maintain(t, ix, row, tombstone, out);
+                continue;
             }
             if (ix.hnsw) {  // K1.4: graph maintenance rides the SAME atomic batch as the row
                 const Datum& v = row[ix.columns[0]];
@@ -8002,6 +8186,11 @@ private:
         if (auto ann = ivfflat_try_knn(*t, sel)) {
             return std::move(*ann);
         }
+        // K2: BM25 top-k — `ORDER BY bm25_score(col, 'query') DESC LIMIT k` over a
+        // BM25-indexed TEXT column (nullopt = generic path / clean BM25_SCORE error).
+        if (auto fts = bm25_try_topk(*t, sel)) {
+            return std::move(*fts);
+        }
 
         // (1) READ — pick the storage read (PK fast path vs full scan), run at the
         // call-site-visible D5 level. The fast path is taken only when the WHERE is
@@ -9453,6 +9642,31 @@ private:
                     break;
                 }
             return std::nullopt;
+        }
+        // K2: MATCHES(text_col, 'query') — 1 iff EVERY query term occurs in the text
+        // (deterministic tokenizer; needs no index, evaluable per row anywhere in SQL).
+        if (f == "MATCHES") {
+            if (!need(2)) return "MATCHES takes (text, 'query')";
+            if (a[0].is_null || a[1].is_null) { out = Datum::make_null(Type::Int); return std::nullopt; }
+            if (a[0].type != Type::Text || a[1].type != Type::Text)
+                return "MATCHES requires TEXT arguments";
+            std::uint32_t dl = 0;
+            const auto doc = bm25_tokens(a[0].s, dl);
+            const auto q2 = bm25_tokens(a[1].s, dl);
+            std::int64_t all = 1;
+            for (const auto& [term, cnt] : q2) {
+                (void)cnt;
+                if (doc.find(term) == doc.end()) { all = 0; break; }
+            }
+            out = Datum::make_int(all);
+            return std::nullopt;
+        }
+        // K2: BM25_SCORE is served by the index-backed top-k path (ORDER BY
+        // bm25_score(col,'q') DESC LIMIT k). Projecting the score per row would need
+        // per-row corpus scans — a clean error until the projected form ships.
+        if (f == "BM25_SCORE") {
+            return "BM25_SCORE is supported in ORDER BY bm25_score(col, 'query') DESC LIMIT k "
+                   "over a BM25-indexed column (projecting the score is not supported yet)";
         }
         // K1 (vector search): distance / similarity over two equal-length numeric vectors (VECTOR,
         // REAL[] or INT[]; a plain '[x,y,z]' text literal is parsed as a vector). Returns a REAL.
@@ -11244,7 +11458,7 @@ private:
             const Index* ix = t.index_for_column(*col);
             // a SINGLE-column index on the leading column (a composite is the I1 prefix path instead).
             if (ix == nullptr || ix->columns.size() != 1 || ix->columns[0] != *col || ix->gin ||
-                ix->ivfflat || ix->hnsw || !query_implies_partial(sel, t, *ix))
+                ix->ivfflat || ix->hnsw || ix->bm25 || !query_implies_partial(sel, t, *ix))
                 continue;
             bool dup = false;
             for (const IndexPlan& p : eqs) if (p.index->column == *col) { dup = true; break; }
@@ -11432,8 +11646,8 @@ private:
             const Index* ix = nullptr;
             for (const Index& cand : t.indexes)
                 if (!cand.columns.empty() && cand.columns[0] == *col && !cand.gin &&
-                    !cand.ivfflat && !cand.hnsw &&
-                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }  // GIN/IVFFLAT/HNSW excluded
+                    !cand.ivfflat && !cand.hnsw && !cand.bm25 &&
+                    query_implies_partial(sel, t, cand)) { ix = &cand; break; }  // special kinds excluded
             if (ix == nullptr) {
                 continue;
             }
@@ -11526,8 +11740,8 @@ private:
                 continue;
             }
             const Index* ix = t.index_for_column(*col);
-            if (ix == nullptr || ix->hash || ix->gin || ix->ivfflat || ix->hnsw ||
-                !query_implies_partial(sel, t, *ix)) {  // I7 hash; J3 GIN; K1.3/K1.4 vector; I5 partial
+            if (ix == nullptr || ix->hash || ix->gin || ix->ivfflat || ix->hnsw || ix->bm25 ||
+                !query_implies_partial(sel, t, *ix)) {  // hash/GIN/vector/BM25; I5 partial
                 continue;
             }
             // Find a matching `col <= hi` conjunct on the SAME column.
@@ -11718,6 +11932,166 @@ private:
             }
         }
         return {};
+    }
+
+    // K2: the BM25 top-k path — `SELECT ... ORDER BY bm25_score(col, 'query') DESC LIMIT k`
+    // (no WHERE/GROUP BY/DISTINCT/aggregates) over a BM25-indexed TEXT column at the
+    // Strict live level. Scores the classic BM25 (k1=1.2, b=0.75) from the postings:
+    // one scan_visit per DISTINCT query term, df = the posting count, idf =
+    // ln(1 + (N-df+0.5)/(df+0.5)), accumulated per doc; ranked by (score DESC, pk ASC) —
+    // total and deterministic. Every non-matching shape returns nullopt (generic path).
+    [[nodiscard]] std::optional<ExecResult> bm25_try_topk(const Table& t, const SelectStmt& sel) {
+        if (sel.has_aggregates || !sel.group_by.empty() || sel.distinct || sel.filter.present() ||
+            sel.having.present() || !sel.has_limit || sel.order_by.size() != 1 || gs_mode_) {
+            return std::nullopt;
+        }
+        if (sel.level != Level::StrictSerializable || sel.snapshot_version != kNoSeq) {
+            return std::nullopt;
+        }
+        const OrderKey& okey = sel.order_by[0];
+        if (!okey.expr || !okey.descending || okey.nulls != NullsOrder::Default) return std::nullopt;
+        const Expr& e = *okey.expr;
+        if (e.kind != ExprKind::Func || e.func != "BM25_SCORE" || e.args.size() != 2) {
+            return std::nullopt;
+        }
+        const Expr* colside = e.args[0] && e.args[0]->kind == ExprKind::Col ? e.args[0].get() : nullptr;
+        const Expr* qside = e.args[1].get();
+        if (colside == nullptr || qside == nullptr || expr_has_col(*qside)) return std::nullopt;
+        if (!colside->qualifier.empty() && colside->qualifier != t.name) return std::nullopt;
+        const auto cidx = t.column_index(colside->column);
+        if (!cidx) return std::nullopt;
+        const Index* ix = nullptr;
+        for (const Index& cand : t.indexes) {
+            if (cand.bm25 && !cand.columns.empty() && cand.columns[0] == *cidx) {
+                ix = &cand;
+                break;
+            }
+        }
+        if (ix == nullptr) return std::nullopt;
+        for (const SelectItem& it : sel.items) {  // no window/UNNEST/score projection
+            if (it.kind == SelectItemKind::Window) return std::nullopt;
+            if (it.kind == SelectItemKind::Expr && it.expr) {
+                if (it.expr->kind == ExprKind::Func &&
+                    (it.expr->func == "UNNEST" || it.expr->func == "BM25_SCORE")) {
+                    return std::nullopt;
+                }
+            }
+        }
+        Datum qd;
+        const std::vector<Datum> dummy(t.columns.size());
+        if (eval_expr(*qside, t, dummy, qd)) return std::nullopt;
+        if (qd.is_null || qd.type != Type::Text) return std::nullopt;
+        std::uint32_t qdl = 0;
+        const std::map<std::string, std::uint32_t> qterms = bm25_tokens(qd.s, qdl);
+
+        std::uint32_t ndocs = 0;
+        std::uint64_t total_len = 0;
+        static const std::vector<std::pair<Key, Value>> kNoBatch;
+        if (const auto sv = bm25_get(bm25_stats_key(t.id, ix->id), kNoBatch)) {
+            bm25_stats_dec(*sv, ndocs, total_len);
+        }
+        ExecResult r;
+        if (ndocs == 0 || qterms.empty()) {  // empty corpus/query -> empty result
+            r.affected = 0;
+            return r;
+        }
+        const double avgdl = static_cast<double>(total_len) / ndocs;
+        constexpr double kK1 = 1.2, kB = 0.75;
+        std::map<Key, double> score;  // pk bytes -> accumulated score (deterministic order)
+        std::size_t scanned = 0;
+        for (const auto& [term, qcnt] : qterms) {
+            (void)qcnt;  // classic BM25 ignores query-side tf for short queries
+            const Key pfx = bm25_term_prefix(t.id, ix->id, term);
+            std::vector<std::pair<Key, std::pair<std::uint32_t, std::uint32_t>>> posts;
+            const bool visited = db_.engine().scan_visit(
+                storage::Range{pfx, key_successor(pfx), /*hi_unbounded=*/false},
+                db_.live_snap_seq(), [&](const Key& k2, const Value& v2) {
+                    if (v2.size() < 8 || k2.size() <= pfx.size()) return;
+                    posts.emplace_back(k2.substr(pfx.size()),
+                                       std::make_pair(Datum::get_be32_(v2, 0),
+                                                      Datum::get_be32_(v2, 4)));
+                });
+            if (!visited) return std::nullopt;  // vlog-active engine: no BM25 fast path
+            scanned += posts.size();
+            if (posts.empty()) continue;
+            const double df = static_cast<double>(posts.size());
+            const double idf = std::log(1.0 + (ndocs - df + 0.5) / (df + 0.5));
+            for (const auto& [pk, p2] : posts) {
+                const double tf = p2.first, dl2 = p2.second;
+                score[pk] += idf * (tf * (kK1 + 1.0)) /
+                             (tf + kK1 * (1.0 - kB + kB * dl2 / avgdl));
+            }
+        }
+        struct Hit2 {
+            double s;
+            Key pk;
+        };
+        std::vector<Hit2> hits;
+        hits.reserve(score.size());
+        for (const auto& [pk, sc] : score) hits.push_back(Hit2{sc, pk});
+        const auto better = [](const Hit2& a, const Hit2& b) {
+            const int c = Datum::real_cmp(a.s, b.s);
+            if (c != 0) return c > 0;  // higher score first
+            return a.pk < b.pk;        // pk tie-break, total + deterministic
+        };
+        const std::size_t want = static_cast<std::size_t>(
+            std::max<std::int64_t>(0, sel.limit) + std::max<std::int64_t>(0, sel.offset));
+        if (hits.size() > want) {
+            std::partial_sort(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(want),
+                              hits.end(), better);
+            hits.resize(want);
+        } else {
+            std::sort(hits.begin(), hits.end(), better);
+        }
+        for (const Hit2& h : hits) {
+            const Key rkey = table_prefix(t.id) + h.pk;
+            std::vector<Datum> row;
+            bool have = false;
+            if (t.columnar) {
+                auto rr = read_columnar_row(t, decode_pk(t, rkey));
+                if (rr) {
+                    row = std::move(*rr);
+                    have = true;
+                }
+            } else {
+                (void)db_.engine().scan_visit(
+                    storage::Range{rkey, key_successor(rkey), /*hi_unbounded=*/false},
+                    db_.live_snap_seq(), [&](const Key&, const Value& v2) {
+                        row = decode_row(t, rkey, v2);
+                        have = true;
+                    });
+            }
+            if (!have) continue;
+            ResultRow out;
+            if (sel.star) {
+                for (std::size_t i = 0; i < t.columns.size(); ++i) {
+                    if (t.columns[i].dropped) continue;
+                    out.cells.emplace_back(t.columns[i].name, row[i]);
+                }
+            } else {
+                for (const SelectItem& item : sel.items) {
+                    Datum d2;
+                    if (item.kind == SelectItemKind::Expr) {
+                        if (auto err = eval_expr(*item.expr, t, row, d2)) {
+                            return ExecResult::failure(*err);
+                        }
+                    } else {
+                        const auto idx2 = t.column_index(item.column);
+                        if (!idx2) return ExecResult::failure("unknown column '" + item.column + "'");
+                        d2 = row[*idx2];
+                    }
+                    out.cells.emplace_back(item.label, d2);
+                }
+            }
+            r.rows.push_back(std::move(out));
+        }
+        if (plan_stats_ != nullptr) {
+            plan_stats_->scanned = scanned;
+            plan_stats_->after_filter = r.rows.size();
+        }
+        apply_limit(sel, r.rows);
+        r.affected = r.rows.size();
+        return r;
     }
 
     [[nodiscard]] std::optional<ExecResult> ivfflat_try_knn(const Table& t, const SelectStmt& sel) {
@@ -12237,7 +12611,7 @@ private:
                                   std::size_t pk_index) {
         // J2/J3: an expression index covers no stored column; a GIN entry holds a single ARRAY
         // element, not the array — neither can serve a covering (index-only) read.
-        if (!ix.expr_src.empty() || ix.gin || ix.ivfflat || ix.hnsw) return false;  // K1.3/K1.4
+        if (!ix.expr_src.empty() || ix.gin || ix.ivfflat || ix.hnsw || ix.bm25) return false;
         for (std::size_t c = 0; c < need.size(); ++c) {
             if (!need[c] || c == pk_index) continue;
             bool in_ix = false;

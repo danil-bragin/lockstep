@@ -220,6 +220,14 @@ struct Index {
     bool hnsw = false;
     std::uint32_t hnsw_m = 16;    // max out-degree per layer (level 0 allows 2m)
     std::uint32_t hnsw_efc = 64;  // ef_construction — build-time beam width
+    // K2: BM25 full-text index over ONE TEXT column. Postings live in the index KV
+    // namespace: 't' ++ term ++ pk -> [tf be32][dl be32] (doc length DENORMALISED into
+    // every posting so scoring needs no second lookup; an UPDATE rewrites the doc's
+    // postings anyway), and 'S' -> [nDocs be32][totalLen be64] (the corpus stats BM25's
+    // IDF/avgdl need), maintained read-modify-write inside the SAME atomic batch as the
+    // row write. The tokenizer is DETERMINISTIC by construction: ASCII lowercase,
+    // alphanumeric runs, length >= 2 — no locale, no ICU, no stemmer (v1).
+    bool bm25 = false;
 };
 
 // A table schema: an ordered column list + the PK column index (single-column PK).

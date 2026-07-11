@@ -91,6 +91,7 @@ struct CreateIndexStmt {
     bool hnsw = false;
     std::uint32_t hnsw_m = 0;    // WITH (m = N) — max out-degree per layer (0 == default 16)
     std::uint32_t hnsw_efc = 0;  // WITH (ef_construction = N) — build beam width (0 == default 64)
+    bool bm25 = false;           // K2: USING BM25 — full-text posting index over one TEXT column
 };
 
 // DROP INDEX <name> ON <table> — remove a secondary index (+ its KV entries).
