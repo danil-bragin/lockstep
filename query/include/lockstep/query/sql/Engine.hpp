@@ -8562,6 +8562,23 @@ private:
     }
 
     ExecResult exec_select(const SelectStmt& sel) {
+        // K11: FROM-less projection — evaluate each expression against no table, one row.
+        if (sel.fromless) {
+            static const Table kNoTable{};
+            const std::vector<Datum> no_row;
+            ExecResult r;
+            ResultRow row;
+            for (const SelectItem& it : sel.items) {
+                Datum d;
+                if (auto er = eval_expr(*it.expr, kNoTable, no_row, d)) {
+                    return ExecResult::failure(*er);
+                }
+                row.cells.emplace_back(it.label, std::move(d));
+            }
+            r.rows.push_back(std::move(row));
+            r.affected = 1;
+            return r;
+        }
         // D4 WITH common table expressions + D3 FROM-subqueries (derived tables). Materialize each
         // CTE (in order — a later CTE may read an earlier one) and each derived-table subquery into
         // an ephemeral table named by the CTE / the derived alias, run the main query (a copy with
@@ -9761,6 +9778,14 @@ private:
         // compatible string so a driver's `PostgreSQL <major>` parse succeeds.
         if (f == "VERSION") {
             out = Datum::make_text("PostgreSQL 16.0 (Lockstep 0.1.0)");
+            return std::nullopt;
+        }
+        // K11: the CURRENT step on the statement-version line — the SAME unit AS OF SEQ /
+        // AT SNAPSHOT read at. Lets a client capture "now" and audit it later exactly
+        // (SELECT CURRENT_VERSION() -> n; ... later ... SELECT ... AS OF SEQ n). This is
+        // NOT the CHANGES _seq line (storage ops) — the two are documented separately.
+        if (f == "CURRENT_VERSION" && need(0)) {
+            out = Datum::make_int(static_cast<std::int64_t>(db_.tip()));
             return std::nullopt;
         }
         if (f == "CURRENT_DATABASE" || f == "CURRENT_CATALOG") {

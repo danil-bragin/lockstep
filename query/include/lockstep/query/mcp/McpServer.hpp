@@ -37,7 +37,25 @@ using sql::json::JVal;
 
 class McpSession {
 public:
-    explicit McpSession(sql::SqlEngine& engine) : eng_(&engine) {}
+    // K11.4: per-agent isolation. A non-empty agent name pins the session to its OWN
+    // schema (CREATE SCHEMA agent_<name> + search_path) — every tool then reads and
+    // writes that agent's memory only; agents cannot see each other's stores. The
+    // name is [A-Za-z0-9_]+ (validated); "" = the shared default schema.
+    explicit McpSession(sql::SqlEngine& engine, std::string agent = {})
+        : eng_(&engine), agent_(std::move(agent)) {
+        if (!agent_.empty()) {
+            bool ok = true;
+            for (const char c : agent_) {
+                if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_') ok = false;
+            }
+            if (ok) {
+                (void)eng_->exec("CREATE SCHEMA IF NOT EXISTS agent_" + agent_);
+                (void)eng_->exec("SET search_path TO agent_" + agent_);
+            } else {
+                agent_.clear();  // invalid name: fall back to the shared schema
+            }
+        }
+    }
 
     // One inbound line -> one outbound line ("" for notifications / no response).
     [[nodiscard]] std::string handle_line(const std::string& line) {
@@ -191,6 +209,11 @@ private:
         }
         static const JVal kEmpty = [] { JVal v; v.kind = JVal::Obj; return v; }();
         const JVal& a = (args != nullptr && args->kind == JVal::Obj) ? *args : kEmpty;
+        // The engine's search_path is ENGINE-global session state: with several agent
+        // sessions on one engine, re-pin this agent's schema before every tool call.
+        if (!agent_.empty()) {
+            (void)eng_->exec("SET search_path TO agent_" + agent_);
+        }
         if (name->text == "query") return result_line(id, tool_query(a));
         if (name->text == "schema") return result_line(id, tool_schema());
         if (name->text == "remember") return result_line(id, tool_remember(a));
@@ -376,6 +399,7 @@ private:
     }
 
     sql::SqlEngine* eng_;
+    std::string agent_;
     std::size_t mem_dim_ = 0;  // embedding dim once provisioned (0 = text-only store)
 };
 

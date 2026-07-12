@@ -110,6 +110,45 @@ int main() {
               "isError\":true"),
           "wrong embedding dim -> clean tool error");
 
+    // (7) K11.4 per-agent isolation: two agents on ONE engine see disjoint memory.
+    {
+        SqlEngine iso;
+        mcp::McpSession alice(iso, "alice");
+        mcp::McpSession bob(iso, "bob");
+        check(!has(call(alice, 20, "remember", R"({"content":"alice private fact"})"),
+                   "isError\":true"),
+              "alice remembers");
+        check(!has(call(bob, 21, "remember", R"({"content":"bob private fact"})"),
+                   "isError\":true"),
+              "bob remembers");
+        const std::string ar = call(alice, 22, "recall", R"({"query":"private fact"})");
+        check(has(ar, "alice private") && !has(ar, "bob private"),
+              "alice recalls only her memory");
+        const std::string br = call(bob, 23, "recall", R"({"query":"private fact"})");
+        check(has(br, "bob private") && !has(br, "alice private"),
+              "bob recalls only his memory");
+    }
+
+    // (8) CURRENT_VERSION(): capture "now" on the SAME line AS OF reads — the audit loop.
+    {
+        SqlEngine v;
+        mcp::McpSession vs(v, "");
+        (void)call(vs, 30, "remember", R"({"content":"step one"})");
+        const std::string now = call(vs, 31, "query", R"js({"sql":"SELECT CURRENT_VERSION()"})js");
+        check(!has(now, "isError\":true"), "CURRENT_VERSION() runs");
+        // Extract the number out of ...\"CURRENT_VERSION()\":\"N\"...
+        const std::size_t at = now.rfind(":\\\"");
+        std::string n;
+        for (std::size_t i = at + 3; i < now.size() && isdigit(static_cast<unsigned char>(now[i])); ++i)
+            n += now[i];
+        check(!n.empty(), "version extracted");
+        (void)call(vs, 32, "remember", R"({"content":"step two"})");
+        const std::string audit = call(
+            vs, 33, "history",
+            R"({"sql":"SELECT COUNT(*) FROM agent_memory WHERE id > 0","seq":)" + n + "}");
+        check(has(audit, "\\\"1\\\""), "audit at the captured version sees exactly step one");
+    }
+
     if (g_fail != 0) { std::printf("mcp_server_test: FAILURES\n"); return 1; }
     std::printf("mcp_server_test: ALL PASS\n");
     return 0;

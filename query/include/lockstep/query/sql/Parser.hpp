@@ -2873,6 +2873,20 @@ private:
                 break;
             }
         }
+        // K11: FROM-less SELECT (SELECT CURRENT_VERSION(), SELECT 1+1, SELECT version())
+        // — a pure expression projection evaluated against no table, one output row.
+        // Only Expr items qualify (a bare column with no table is meaningless).
+        if (!is_kw("from")) {
+            bool exprs_only = !sel.items.empty() && sel.columns.empty() && !sel.star;
+            for (const SelectItem& it : sel.items) {
+                if (it.kind != SelectItemKind::Expr) exprs_only = false;
+            }
+            if (exprs_only && cur_.kind == Tok::End) {
+                sel.table.clear();
+                sel.fromless = true;
+                return std::nullopt;
+            }
+        }
         if (auto e = expect_kw("from")) {
             return e;
         }

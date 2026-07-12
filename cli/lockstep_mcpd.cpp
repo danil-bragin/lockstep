@@ -18,8 +18,10 @@ namespace prod = lockstep::prod;
 
 int main(int argc, char** argv) {
     std::string data_dir = ".";
+    std::string agent;  // K11.4: pin this server process to one agent's schema
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--data-dir") == 0) data_dir = argv[i + 1];
+        if (std::strcmp(argv[i], "--agent") == 0) agent = argv[i + 1];
     }
     core::Scheduler d_sched;
     core::Scheduler c_sched;
@@ -29,7 +31,7 @@ int main(int argc, char** argv) {
     engine.recover(d_disk.logical_len(), c_disk.logical_len());
     engine.set_trace_enabled(false);  // prod posture
 
-    lockstep::query::mcp::McpSession session(engine);
+    lockstep::query::mcp::McpSession session(engine, agent);
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;

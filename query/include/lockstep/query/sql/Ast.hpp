@@ -466,6 +466,7 @@ struct SelectStmt {
     // read). Snapshot/Bounded carry a parameter.
     Level level = Level::StrictSerializable;
     Seq snapshot_version = kNoSeq;  // AT SNAPSHOT <version>
+    bool fromless = false;          // K11: SELECT <exprs> with no FROM (one row)
     Seq max_lag = 0;                // AT BOUNDED <max_lag>
     SessionId session = 0;          // AT RYW <session>
 
