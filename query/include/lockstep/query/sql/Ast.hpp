@@ -584,6 +584,7 @@ enum class StmtKind : std::uint8_t {
 // processed, making resume exactly-once BY CONSTRUCTION, no protocol).
 struct ChangesStmt {
     std::string table;
+    std::int64_t shard = -1;  // -1 = local feed; >=0 = one shard's feed (a "partition")
     std::int64_t since = 0;
     std::int64_t limit = -1;  // -1 = all
 };

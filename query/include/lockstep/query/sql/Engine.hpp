@@ -4024,6 +4024,11 @@ private:
         done.set_value(true);
     }
     ExecResult exec_changes(const ChangesStmt& cs) {
+        if (cs.shard >= 0) {
+            return ExecResult::failure(
+                "CHANGES ... SHARD is a distributed-coordinator statement (a single "
+                "engine has exactly one feed — drop the SHARD clause)");
+        }
         const Table* t = catalog_.find(cs.table);
         if (t == nullptr) return ExecResult::failure("unknown table '" + cs.table + "'");
         auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());

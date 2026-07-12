@@ -67,6 +67,9 @@ public:
     // coordinator). Lets a benchmark measure the SAME query both ways and quantify the shuffle win.
     void set_pushdown_enabled(bool on) { pushdown_enabled_ = on; }
 
+    // K4.2: shard count — one changefeed cursor per shard (the partition set).
+    [[nodiscard]] std::size_t shard_count() const noexcept { return shards_.size(); }
+
     ExecResult exec(const std::string& sql) {
         ParseResult pr = parse_sql(sql);
         if (!pr.ok()) {
@@ -110,11 +113,45 @@ public:
                 return shards_.front()->exec(sql);
             case StmtKind::Analyze:  // I6: recompute stats on every shard
                 return broadcast(sql);
+            case StmtKind::Changes:  // K4.2: per-shard changefeeds (partition-shaped)
+                return exec_changes_dist(st.changes);
+            case StmtKind::CreateQueue:  // K3 queues are single-engine v1 — a clean
+            case StmtKind::DropQueue:    // refusal beats a silently-wrong route (a
+            case StmtKind::Send:         // RECEIVE must see ONE queue, not a slice).
+            case StmtKind::Receive:
+            case StmtKind::Ack:
+                return ExecResult::failure(
+                    "queues are not distributed yet — run them on a single engine");
         }
         return ExecResult::failure("distributed: unsupported statement");
     }
 
 private:
+    // K4.2: a sharded cluster has M independent Seq lines, so a changefeed cursor is
+    // PER SHARD — exactly Kafka's per-partition offsets (a global cross-shard order
+    // does not exist here, same as it does not exist across Kafka partitions; one
+    // shard's feed IS still totally ordered, which is already stronger than a Kafka
+    // partition, where cross-topic order is absent too). The consumer runs one
+    // `CHANGES t SHARD i SINCE cursor_i` loop per shard; shards scale horizontally
+    // and the feeds scale WITH them.
+    ExecResult exec_changes_dist(const ChangesStmt& cs) {
+        if (cs.shard < 0) {
+            return ExecResult::failure(
+                "CHANGES on a sharded cluster needs SHARD <i> (0.." +
+                std::to_string(shards_.size() - 1) +
+                "): seqs are per-shard cursors, like Kafka partition offsets — run one "
+                "cursor per shard");
+        }
+        if (static_cast<std::size_t>(cs.shard) >= shards_.size()) {
+            return ExecResult::failure("SHARD " + std::to_string(cs.shard) +
+                                       " out of range (cluster has " +
+                                       std::to_string(shards_.size()) + " shards)");
+        }
+        std::string sql = "CHANGES " + cs.table + " SINCE " + std::to_string(cs.since);
+        if (cs.limit >= 0) sql += " LIMIT " + std::to_string(cs.limit);
+        return shards_[static_cast<std::size_t>(cs.shard)]->exec(sql);
+    }
+
     [[nodiscard]] std::size_t shard_of(const Datum& key) const {
         std::uint64_t h = 1469598103934665603ULL;
         if (key.type == Type::Int) {

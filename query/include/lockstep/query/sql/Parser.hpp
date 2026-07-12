@@ -450,6 +450,13 @@ public:
             st.kind = StmtKind::Changes;
             if (auto e = expect_table_name("a table name after CHANGES", st.changes.table))
                 return ParseResult{*e};
+            if (is_kw("shard")) {  // K4.2: one shard's feed — the Kafka-partition shape
+                advance();
+                if (cur_.kind != Tok::IntLit || cur_.int_val < 0)
+                    return err("SHARD expects a non-negative shard index");
+                st.changes.shard = cur_.int_val;
+                advance();
+            }
             if (auto e = expect_kw("since")) return ParseResult{*e};
             if (cur_.kind != Tok::IntLit || cur_.int_val < 0)
                 return err("SINCE expects a non-negative Seq");

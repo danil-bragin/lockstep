@@ -12,6 +12,7 @@
 #include <lockstep/core/Scheduler.hpp>
 #include <lockstep/sim/SeededRandom.hpp>
 #include <lockstep/sim/SimDisk.hpp>
+#include <lockstep/query/sql/DistributedSql.hpp>
 #include <lockstep/query/sql/Engine.hpp>
 
 using namespace lockstep::query::sql;
@@ -22,7 +23,7 @@ void check(bool ok, const std::string& what) {
     if (!ok) { std::printf("FAIL: %s\n", what.c_str()); g_fail = 1; }
 }
 // Apply one CHANGES result to a shadow (pk -> rendered non-pk cols); returns last _seq.
-std::int64_t apply(const ExecResult& r, std::map<std::int64_t, std::string>& shadow) {
+std::int64_t apply_feed(const ExecResult& r, std::map<std::int64_t, std::string>& shadow) {
     std::int64_t last = 0;
     for (const auto& row : r.rows) {
         last = row.cells[0].second.i;
@@ -63,7 +64,7 @@ int main() {
     std::map<std::int64_t, std::string> shadow;
     const ExecResult all = e.exec("CHANGES t SINCE 0");
     check(all.ok && !all.rows.empty(), "CHANGES t SINCE 0 returns ops");
-    const std::int64_t last = apply(all, shadow);
+    const std::int64_t last = apply_feed(all, shadow);
     check(shadow == table_image(e), "replayed changefeed == live table");
     check(last > 0, "last _seq is a usable cursor");
 
@@ -77,9 +78,9 @@ int main() {
     {
         std::map<std::int64_t, std::string> s2;
         const ExecResult first = e.exec("CHANGES t SINCE 0 LIMIT 3");
-        const std::int64_t cur = apply(first, s2);
+        const std::int64_t cur = apply_feed(first, s2);
         const ExecResult rest = e.exec("CHANGES t SINCE " + std::to_string(cur));
-        apply(rest, s2);
+        apply_feed(rest, s2);
         check(s2 == shadow, "split cursor consumption == single pass (exactly-once resume)");
     }
 
@@ -88,7 +89,7 @@ int main() {
     e.exec("DELETE FROM t WHERE id = 3");
     const ExecResult tail = e.exec("CHANGES t SINCE " + std::to_string(last));
     check(tail.ok && tail.rows.size() == 2, "tail has exactly the two new ops");
-    apply(tail, shadow);
+    apply_feed(tail, shadow);
     check(shadow == table_image(e), "shadow tracks the table incrementally");
 
     // (5) Filtering: another table's writes never leak into this feed.
@@ -133,7 +134,59 @@ int main() {
         }
     }
 
-    // (8) Teeth: unknown table; LIMIT respected.
+    // (8) K4.2 per-shard feeds — the Kafka-partition shape. M shards = M independent
+    // Seq lines; one cursor per shard. THE GATE: the union of all per-shard replays
+    // == the whole distributed table, each shard's feed internally Seq-ordered, and a
+    // per-shard split cursor resumes exactly-once — while cross-shard requires SHARD
+    // (a global cross-shard seq does not exist, same as across Kafka partitions).
+    {
+        constexpr std::size_t kShards = 4;
+        std::vector<SqlEngine> shards(kShards);
+        std::vector<EngineSqlShard> wraps;
+        wraps.reserve(kShards);
+        for (SqlEngine& s : shards) wraps.emplace_back(&s);
+        std::vector<ISqlShard*> ptrs;
+        for (EngineSqlShard& w : wraps) ptrs.push_back(&w);
+        DistributedSql dist(ptrs);
+        dist.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
+        for (int i = 0; i < 40; ++i)
+            dist.exec("INSERT INTO t (id,name,score) VALUES (" + std::to_string(i) + ",'u" +
+                      std::to_string(i) + "'," + std::to_string(i * 3) + ")");
+        dist.exec("DELETE FROM t WHERE id = 7");
+        dist.exec("UPDATE t SET score = 999 WHERE id = 11");
+
+        std::map<std::int64_t, std::string> uni;
+        bool per_shard_ok = true;
+        for (std::size_t sh = 0; sh < dist.shard_count(); ++sh) {
+            // Split consumption per shard: LIMIT 4 then resume from the cursor.
+            std::map<std::int64_t, std::string> a, b;
+            const ExecResult full =
+                dist.exec("CHANGES t SHARD " + std::to_string(sh) + " SINCE 0");
+            per_shard_ok = per_shard_ok && full.ok;
+            apply_feed(full, a);
+            const ExecResult head =
+                dist.exec("CHANGES t SHARD " + std::to_string(sh) + " SINCE 0 LIMIT 4");
+            const std::int64_t cur = apply_feed(head, b);
+            apply_feed(dist.exec("CHANGES t SHARD " + std::to_string(sh) + " SINCE " +
+                                 std::to_string(cur)),
+                       b);
+            per_shard_ok = per_shard_ok && a == b;
+            for (const auto& [k, v] : a) uni[k] = v;
+        }
+        check(per_shard_ok, "each shard feed replays + resumes exactly-once");
+        std::map<std::int64_t, std::string> want;
+        const ExecResult sel = dist.exec("SELECT id, name, score FROM t ORDER BY id");
+        for (const auto& row : sel.rows)
+            want[row.cells[0].second.i] =
+                row.cells[1].second.render() + "|" + row.cells[2].second.render() + "|";
+        check(uni == want && want.size() == 39,
+              "union of per-shard replays == whole distributed table");
+        check(!dist.exec("CHANGES t SINCE 0").ok, "cross-shard CHANGES demands SHARD");
+        check(!dist.exec("CHANGES t SHARD 4 SINCE 0").ok, "shard index out of range rejected");
+    }
+    check(!e.exec("CHANGES t SHARD 0 SINCE 0").ok, "SHARD on a single engine rejected");
+
+    // (9) Teeth: unknown table; LIMIT respected.
     check(!e.exec("CHANGES nosuch SINCE 0").ok, "unknown table rejected");
     check(e.exec("CHANGES t SINCE 0 LIMIT 2").rows.size() == 2, "LIMIT respected");
 

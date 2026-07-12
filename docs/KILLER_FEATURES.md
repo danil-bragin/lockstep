@@ -116,9 +116,17 @@ compacted-past cursor gets a clean refusal, never a silent gap. Gates: replay-fr
 live table, split-cursor == single pass, restart byte-stable, cross-table filtering,
 compaction-horizon tooth (storage_pitr_test §9). Throughput (release, one core):
 full drain 4.7M ops/s; cold chunked cursor 860k ops/s; LIVE TAIL (ingest+consume
-interleaved, 800k rows) 2.37M ops/s delivered. Open: CREATE CHANGEFEED (named cursors,
-server-side), push sinks over the PG wire (NOTIFY-shaped), per-shard feeds (M shards →
-M independent Seq lines, Kafka-partition-shaped scaling), fault-storm teeth.
+interleaved, 800k rows) 2.37M ops/s delivered. **K4.2 SHIPPED:** per-shard feeds — `CHANGES t SHARD <i> SINCE <s>` on the distributed
+coordinator routes to shard i's own Seq line: M shards = M independent, internally
+totally-ordered feeds = Kafka's partition model exactly (no cross-shard order, same as
+no cross-partition order; one cursor per shard). Cross-shard `CHANGES` without SHARD
+gets a clean teaching error. Scaling (thread-per-shard, engines share nothing,
+TSan-clean; release, laptop): aggregate ingest+deliver 128k → 199k → 394k → 605k ops/s
+at 1/2/4/8 shards (~linear to the physical perf cores, honest efficiency-core rolloff
+at 8). Gate: union of per-shard replays == the whole distributed table + per-shard
+exactly-once resume (sql_cdc_test §8). Open: CREATE CHANGEFEED (named server-side
+cursors), push sinks over the PG wire (NOTIFY-shaped), CHANGES over the wire-shard
+transport + prod replicated shards, fault-storm teeth, Kafka head-to-head harness.
 
 ### K5 — Incrementally-maintained materialized views *(L)* — TIER: BET *(TECH_PLAN K3)*
 

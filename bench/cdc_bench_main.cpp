@@ -3,17 +3,74 @@
 //   (a) full-feed drain      CHANGES t SINCE 0            (cold cursor, whole log)
 //   (b) chunked consumption  CHANGES t SINCE c LIMIT 4096 (the real consumer loop)
 // Reported number = ops/s DELIVERED to the consumer, decoded into full row images.
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <lockstep/query/sql/Engine.hpp>
 
 using namespace lockstep::query::sql;
 using Clock = std::chrono::steady_clock;
 
+// --dist M: the SCALING shape — M shards, thread-per-shard (each shard is its own
+// engine + Seq line, the prod Phase-9 topology), each thread ingests its slice and
+// TAILS its own feed (cursor loop) concurrently. Reported: AGGREGATE ingest and
+// delivered ops/s vs M — the per-partition-scaling claim vs Kafka.
+static int run_dist(std::size_t m, std::size_t n_per_shard) {
+    std::atomic<bool> bad{false};
+    std::atomic<std::uint64_t> delivered{0};
+    std::vector<std::thread> ts;
+    const auto t0 = Clock::now();
+    for (std::size_t sh = 0; sh < m; ++sh) {
+        ts.emplace_back([&] {
+            // The engine lives ENTIRELY on its shard thread (built, used, destroyed
+            // here) — the prod thread-per-shard shape; engines share nothing.
+            SqlEngine e;
+            e.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
+            std::int64_t cur = 0;
+            std::size_t seen = 0;
+            for (std::size_t i = 0; i < n_per_shard; ++i) {
+                const std::string v = std::to_string(i);
+                e.exec("INSERT INTO t (id,name,score) VALUES (" + v + ",'u" + v + "'," +
+                       std::to_string((i * 7) % 1000) + ")");
+                if ((i + 1) % 2048 == 0 || i + 1 == n_per_shard) {
+                    for (;;) {
+                        ExecResult c = e.exec("CHANGES t SINCE " + std::to_string(cur) +
+                                              " LIMIT 4096");
+                        if (!c.ok) { bad = true; return; }
+                        if (c.rows.empty()) break;
+                        seen += c.rows.size();
+                        cur = c.rows.back().cells[0].second.i;
+                    }
+                }
+            }
+            if (seen != n_per_shard) bad = true;
+            delivered += seen;
+        });
+    }
+    for (std::thread& t : ts) t.join();
+    const double ms = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                          Clock::now() - t0).count()) / 1000.0;
+    if (bad || delivered != m * n_per_shard) { std::printf("BAD dist run\n"); return 1; }
+    const double total = static_cast<double>(m * n_per_shard);
+    std::printf("shards=%zu rows/shard=%zu total=%.0f  wall=%.0fms  "
+                "aggregate ingest+deliver=%.0f ops/s\n",
+                m, n_per_shard, total, ms, total / ms * 1000);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 2 && std::strcmp(argv[1], "--dist") == 0) {
+        const std::size_t m = static_cast<std::size_t>(std::atoll(argv[2]));
+        const std::size_t nps =
+            argc > 3 ? static_cast<std::size_t>(std::atoll(argv[3])) : 100000;
+        return run_dist(m == 0 ? 1 : m, nps);
+    }
     const std::size_t n = argc > 1 ? static_cast<std::size_t>(std::atoll(argv[1])) : 200000;
     SqlEngine e;
     e.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
