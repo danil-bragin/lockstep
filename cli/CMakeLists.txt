@@ -58,6 +58,21 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
   # the reactor's ONE shared ProdClock + ProdRandom + ProdDisk + ProdNetwork), spawns
   # the UNCHANGED wire::Server's serve coroutine, and runs the reactor's BOUNDED loop
   # (absolute now()-deadline wall guard). epoll/sockets are LINUX-ONLY -> built ONLY
+  # --- lockstep_mcpd — K11: the agent-memory MCP server (stdio JSON-RPC over SqlEngine).
+  # Portable (ProdDisk is plain POSIX file I/O — no epoll): built on every host.
+  if(TARGET lockstep_providers_prod)
+    add_executable(lockstep_mcpd lockstep_mcpd.cpp)
+    target_link_libraries(lockstep_mcpd
+      PRIVATE
+        lockstep_warnings
+        lockstep_sanitizers
+        lockstep_query
+        lockstep_txn
+        lockstep_storage
+        lockstep_runtime
+        lockstep_providers_prod)
+  endif()
+
   # on Linux (if(UNIX AND NOT APPLE)) so the macOS host stays green (target absent).
   # NOT in the providers/ lint-exempt zone: forbidden-lint scans it (no raw syscall
   # here — only the provider surfaces). Links the query lib (wire::Server) + the prod

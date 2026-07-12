@@ -266,9 +266,24 @@ exactly — an auditability story for agent incidents) and **branchable memory**
 agent's memory for an experiment, throw it away).
 
 **Steps.**
-- [ ] K11.1 Built-in MCP server in lockstepd (prod boundary): tools = query/schema-introspect/subscribe; RBAC-scoped tokens per agent.
-- [ ] K11.2 Hybrid-recall recipe: one documented SQL pattern (K1 vector + K2 BM25 + RRF + recency decay via Seq) shipped as a view template.
-- [ ] K11.3 Session/episodic schema recipe + `AS OF` audit queries ("agent's world at step N").
+- [x] K11.1 SHIPPED: `lockstep_mcpd` — the agent-memory MCP server (stdio JSON-RPC 2.0,
+      newline-delimited; register the binary in any MCP client). Tools: `query`,
+      `schema`, `remember` (auto-provisions the memory store: TEXT + VECTOR(dim) +
+      IVFFLAT + BM25 on first use), `recall` (RRF-fused hybrid when an embedding is
+      given, BM25 otherwise — DETERMINISTIC ranking, replayable in incident review),
+      `history` (SELECT at statement-version n = "the agent's world at step N",
+      exact). Durable over ProdDisk WALs; a restart recovers the store byte-identically
+      (verified end-to-end over stdio). Gate: mcp_server_test — handshake, recall ==
+      the documented SQL recipe, AS-OF step audit, protocol/tool teeth. FOUND ALONG THE
+      WAY: `AS OF SEQ` counts committed WRITE STATEMENTS while `CHANGES _seq` counts
+      storage ops — two version lines; documented in the tool, unification = open item.
+      Remaining from the original K11.1 scope: RBAC-scoped per-agent tokens.
+- [x] K11.2 Hybrid-recall recipe (shipped INSIDE the recall tool; the SQL it runs):
+      `SELECT id, kind, content FROM agent_memory ORDER BY rrf_score(embedding, '[q]',
+      content, 'query text') DESC LIMIT k` — recency re-weighting composes by fusing
+      with `ORDER BY id DESC` ranks client-side; view template + leg weights = open.
+- [x] K11.3 Episodic audit (shipped as the `history` tool): any SELECT + `AS OF SEQ n`
+      where n = committed-statement step; each `remember` is exactly one step.
 - [ ] K11.4 Per-agent isolation: cheap namespaces (schema-per-agent exists via `qualify`) + K7 branch-per-experiment.
 - [ ] K11.5 Bench vs mem0/agentmemory on the public agent-memory benchmark; honest report.
 
