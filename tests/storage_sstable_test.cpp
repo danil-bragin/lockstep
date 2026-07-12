@@ -678,9 +678,52 @@ void test_adopt_equals_parse() {
     CHECK(pm.covered == am.covered, "missing-key answer identical");
 }
 
+// K4.16: size-classed tiering — sustained ingest must keep the live table count
+// LOG-bounded (not linear in flushes), and every key must stay readable through
+// the cascade of same-bucket merges.
+void test_size_classed_tiering() {
+    using namespace lockstep::storage;
+    lockstep::core::Scheduler sched;
+    lockstep::core::SimClock clock(sched);
+    lockstep::sim::SeededRandom rng(0x516ull);
+    lockstep::sim::DiskFaultConfig dc;
+    lockstep::sim::SimDisk wal(sched, clock, rng, dc), man(sched, clock, rng, dc);
+    VecDiskFactory fac(sched, clock, rng, dc);
+    WalEngine e(sched, wal, man, fac, /*flush_threshold=*/8);
+    e.set_compaction_trigger(2);
+    constexpr int kKeys = 400;  // ~50 flushes -> without classing, huge rewrite churn
+    sched.spawn([](WalEngine& w) -> lockstep::core::Task {
+        for (int i = 0; i < kKeys; ++i) {
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "k%06d", i);
+            (void)co_await w.put(buf, "v" + std::to_string(i));
+        }
+        (void)co_await w.sync();
+        co_return;
+    }(e));
+    sched.run();
+    // Table count must be log-ish, not ~50 (unmerged) and not 1 (merge-everything).
+    CHECK(e.sstable_count() >= 2 && e.sstable_count() <= 16,
+          "size-classed tiering: live table count log-bounded (got %zu)", e.sstable_count());
+    // Every key readable through the merged cascade.
+    int missing = 0;
+    sched.spawn([&missing](WalEngine& w) -> lockstep::core::Task {
+        for (int i = 0; i < kKeys; ++i) {
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "k%06d", i);
+            const auto v = co_await w.get(buf, lockstep::storage::Snapshot{w.last_seq()});
+            if (!v.has_value() || *v != "v" + std::to_string(i)) ++missing;
+        }
+        co_return;
+    }(e));
+    sched.run();
+    CHECK(missing == 0, "all %d keys readable after cascaded merges (missing %d)", kKeys, missing);
+}
+
 int main() {
     std::fprintf(stderr, "=== storage_sstable_test (flush + SSTable + manifest + scan) ===\n");
     test_adopt_equals_parse();
+    test_size_classed_tiering();
     test_differential_with_flush();
     test_metamorphic_flush();
     test_crash_during_flush();

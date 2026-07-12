@@ -1469,24 +1469,41 @@ private:
             return lo != nullptr && hi != nullptr && lo->rfind("!t", 0) == 0 &&
                    hi->rfind("!t", 0) == 0;
         };
-        std::size_t giant = sstables_.size();  // index of the excluded table (or none)
+        // SIZE-CLASSED TIERING (K4.16, replaces the giant-exclusion rule): tables are
+        // bucketed by floor(log2(entry_count)); a merge happens ONLY within the
+        // smallest bucket that holds >= compaction_trigger_ tables, producing one
+        // table in (roughly) the next bucket up. Every entry therefore takes part in
+        // O(log N) merges over its lifetime — amortized O(N log N) total rewrite
+        // (true STCS), where merge-everything was O(N^2) and the giant rule only a
+        // 2-class approximation. The live table count is bounded by ~trigger x
+        // log(N/flush_threshold); point reads stay cheap via per-table blooms.
+        // Deterministic: bucket of a table is a pure function of its entry count;
+        // the smallest qualifying bucket is chosen; ties cannot arise.
+        const auto bucket_of = [](std::size_t n) {
+            std::size_t b = 0;
+            while (n > 1) { n >>= 1; ++b; }
+            return b;
+        };
+        std::size_t chosen_bucket = SIZE_MAX;
         {
-            std::size_t total = 0, imax = 0, nmax = 0;
-            for (std::size_t i = 0; i < sstables_.size(); ++i) {
-                if (is_topic_segment(*sstables_[i])) continue;
-                const std::size_t n = sstables_[i]->entry_count();
-                total += n;
-                if (n > nmax) { nmax = n; imax = i; }
+            std::map<std::size_t, std::size_t> bucket_counts;
+            for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+                if (is_topic_segment(*sst)) continue;
+                ++bucket_counts[bucket_of(sst->entry_count())];
             }
-            if (nmax > total - nmax && sstables_.size() > 2) {
-                giant = imax;
+            for (const auto& [b, cnt] : bucket_counts) {  // std::map: smallest first
+                if (cnt >= compaction_trigger_) { chosen_bucket = b; break; }
             }
+        }
+        if (chosen_bucket == SIZE_MAX) {
+            co_return;  // no size class is crowded — nothing worth rewriting yet
         }
         std::vector<std::vector<SstEntry>> runs;
         std::vector<std::uint64_t> input_ids;
         Seq covered_max = kNoSeq;
         for (std::size_t i = 0; i < sstables_.size(); ++i) {
-            if (i == giant || is_topic_segment(*sstables_[i])) {
+            if (is_topic_segment(*sstables_[i]) ||
+                bucket_of(sstables_[i]->entry_count()) != chosen_bucket) {
                 continue;
             }
             const std::unique_ptr<SSTableReader>& sst = sstables_[i];
