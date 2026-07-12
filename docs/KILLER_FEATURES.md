@@ -133,9 +133,19 @@ from-0 cursor, retained engine replays all 40 ops contiguously (storage_pitr_tes
 And CHANGES t SHARD i runs unchanged over the WIRE shard transport (statement routes to
 the remote engine): union of per-shard wire feeds == the whole distributed table
 (sql_distributed_wire_test) — the prod consumer topology, one wire cursor per shard.
-Open: CREATE CHANGEFEED (named server-side cursors, auto-advance retain), push sinks
-over the PG wire (NOTIFY-shaped), prod replicated shards, fault-storm teeth, Kafka
-head-to-head harness.
+**K4.4 SHIPPED:** named changefeeds — `CREATE CHANGEFEED cf FOR t` / `FETCH cf [LIMIT
+n]` / `ACK CHANGEFEED cf AT <seq>` / `DROP CHANGEFEED cf`. The cursor registry is a
+hidden row table written through the ordinary SQL path (the K3-queue trick), so cursors
+are durable, replicated, and restart-surviving like user data. FETCH never advances;
+ACK does (monotone-only) — a crash between them refetches the same batch: exactly-once
+EFFECT with zero consumer-group machinery. Every ACK/DROP recomputes min(acked) across
+feeds and hands compaction the retention horizon automatically — disk pays exactly for
+the slowest consumer's lag (Kafka: guessed retention.ms + a separate offsets topic +
+group coordinators; here: one table and one min()). Named feeds are per-shard (the
+coordinator refuses, cursors ARE partition offsets). Gates: fetch/ack loop, crash-safe
+refetch, backwards-ACK tooth, two-feed min() horizon + DROP recompute, restart cursor
+survival (sql_cdc_test §11-12). Open: push sinks over the PG wire (NOTIFY-shaped), prod
+replicated shards, fault-storm teeth, Kafka head-to-head harness.
 
 ### K5 — Incrementally-maintained materialized views *(L)* — TIER: BET *(TECH_PLAN K3)*
 

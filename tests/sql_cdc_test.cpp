@@ -183,6 +183,8 @@ int main() {
               "union of per-shard replays == whole distributed table");
         check(!dist.exec("CHANGES t SINCE 0").ok, "cross-shard CHANGES demands SHARD");
         check(!dist.exec("CHANGES t SHARD 4 SINCE 0").ok, "shard index out of range rejected");
+        check(!dist.exec("CREATE CHANGEFEED cf FOR t").ok,
+              "named feeds are per-shard (coordinator refuses)");
     }
     check(!e.exec("CHANGES t SHARD 0 SINCE 0").ok, "SHARD on a single engine rejected");
 
@@ -193,6 +195,68 @@ int main() {
     // (10) Teeth: unknown table; LIMIT respected.
     check(!e.exec("CHANGES nosuch SINCE 0").ok, "unknown table rejected");
     check(e.exec("CHANGES t SINCE 0 LIMIT 2").rows.size() == 2, "LIMIT respected");
+
+    // (11) K4.4 named changefeeds: server-side durable cursors + auto-retention.
+    {
+        SqlEngine d;
+        d.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
+        d.exec("INSERT INTO t (id,name,score) VALUES (1,'a',10), (2,'b',20), (3,'c',30)");
+        check(d.exec("CREATE CHANGEFEED cf FOR t").ok, "CREATE CHANGEFEED");
+        check(!d.exec("CREATE CHANGEFEED cf FOR t").ok, "duplicate feed rejected");
+        check(!d.exec("CREATE CHANGEFEED nope FOR missing").ok, "feed on unknown table rejected");
+
+        const ExecResult f1 = d.exec("FETCH cf");
+        const ExecResult direct = d.exec("CHANGES t SINCE 0");
+        check(f1.ok && f1.rows.size() == direct.rows.size() && f1.rows.size() == 3,
+              "FETCH == CHANGES SINCE 0 (fresh cursor)");
+        const ExecResult f2 = d.exec("FETCH cf");
+        check(f2.ok && f2.rows.size() == 3, "FETCH does NOT advance (crash-safe refetch)");
+
+        const std::int64_t last = f1.rows.back().cells[0].second.i;
+        check(d.exec("ACK CHANGEFEED cf AT " + std::to_string(last)).ok, "ACK advances");
+        check(d.exec("FETCH cf").rows.empty(), "post-ACK FETCH is empty");
+        check(!d.exec("ACK CHANGEFEED cf AT 1").ok, "cursor never moves backwards");
+        d.exec("INSERT INTO t (id,name,score) VALUES (4,'d',40)");
+        const ExecResult f3 = d.exec("FETCH cf");
+        check(f3.ok && f3.rows.size() == 1 && f3.rows[0].cells[2].second.i == 4,
+              "FETCH returns only the new tail");
+
+        // Auto-retention: the slowest feed's cursor + 1 becomes the horizon.
+        check(d.exec("CREATE CHANGEFEED cf2 FOR t").ok, "second feed");
+        d.exec("ACK CHANGEFEED cf2 AT 2");
+        check(d.cdc_retain_seq() == 3, "horizon = min(acked)+1 (slow feed cf2 at 2)");
+        check(d.exec("DROP CHANGEFEED cf2").ok, "DROP CHANGEFEED");
+        check(d.cdc_retain_seq() == last + 1, "horizon recomputed after DROP (cf's ack)");
+        check(!d.exec("FETCH cf2").ok, "dropped feed gone");
+        check(!d.exec("FETCH ghost").ok && !d.exec("ACK CHANGEFEED ghost AT 5").ok,
+              "unknown feed teeth");
+    }
+
+    // (12) Named cursor survives a restart (the registry is an ordinary durable table).
+    {
+        lockstep::core::Scheduler sched;
+        lockstep::core::SimClock clock(sched);
+        lockstep::sim::SeededRandom rng(0x4Dull);
+        lockstep::sim::DiskFaultConfig dc;
+        lockstep::sim::SimDisk data(sched, clock, rng, dc), cat(sched, clock, rng, dc);
+        std::int64_t acked_at = 0;
+        {
+            SqlEngine d(sched, data, sched, cat);
+            d.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
+            d.exec("INSERT INTO t (id,name,score) VALUES (1,'a',10), (2,'b',20)");
+            d.exec("CREATE CHANGEFEED cf FOR t");
+            const ExecResult f = d.exec("FETCH cf");
+            acked_at = f.rows[0].cells[0].second.i;  // ack only the FIRST op
+            d.exec("ACK CHANGEFEED cf AT " + std::to_string(acked_at));
+        }
+        {
+            SqlEngine d(sched, data, sched, cat);
+            d.recover(data.logical_len(), cat.logical_len());
+            const ExecResult f = d.exec("FETCH cf");
+            check(f.ok && f.rows.size() == 1 && f.rows[0].cells[0].second.i > acked_at,
+                  "cursor position survives restart (exactly the unacked tail)");
+        }
+    }
 
     if (g_fail != 0) { std::printf("sql_cdc_test: FAILURES\n"); return 1; }
     std::printf("sql_cdc_test: ALL PASS\n");

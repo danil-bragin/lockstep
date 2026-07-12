@@ -1211,6 +1211,14 @@ public:
                 return exec_drop_view(st.drop_view);
             case StmtKind::Changes:
                 return exec_changes(st.changes);
+            case StmtKind::CreateChangefeed:
+                return exec_create_changefeed(st.changes);
+            case StmtKind::DropChangefeed:
+                return exec_drop_changefeed(st.changes);
+            case StmtKind::Fetch:
+                return exec_fetch(st.changes);
+            case StmtKind::AckFeed:
+                return exec_ack_feed(st.changes);
             case StmtKind::CreateQueue:
                 return exec_create_queue(st.queue);
             case StmtKind::DropQueue:
@@ -4100,6 +4108,117 @@ private:
         r.affected = r.rows.size();
         return r;
     }
+    // K4.4: named server-side changefeed cursors. The registry is a HIDDEN ROW TABLE
+    // (__cf: name PK, tbl, acked) written through the ordinary SQL write path — so
+    // cursors are durable, replicated, and deterministic exactly like user data (the
+    // K3-queue trick). Consumer loop: FETCH cf [LIMIT n] returns the ops AFTER the
+    // acked cursor WITHOUT advancing it; the consumer applies them idempotently, then
+    // ACK CHANGEFEED cf AT <last _seq> advances. A crash between the two refetches the
+    // same batch — exactly-once EFFECT with no consumer-group machinery. Every ACK
+    // recomputes min(acked) over all feeds and hands compaction the retention horizon
+    // (SET cdc.retain_seq automated): disk pays for the actual slowest consumer's lag.
+    static constexpr const char* kCfRegistry = "__cf";
+    ExecResult cf_registry_ensure() {
+        if (catalog_.find(kCfRegistry) != nullptr) return ExecResult{};
+        const bool saved = columnar_default_;
+        columnar_default_ = false;
+        ExecResult r = exec(std::string("CREATE TABLE ") + kCfRegistry +
+                            " (name TEXT, tbl TEXT NOT NULL, acked INT DEFAULT 0, "
+                            "PRIMARY KEY (name))");
+        columnar_default_ = saved;
+        return r;
+    }
+    // Look up a feed row; returns false (with a failure in `r`) when absent.
+    bool cf_lookup(const std::string& feed, std::string& tbl, std::int64_t& acked,
+                   ExecResult& r) {
+        if (catalog_.find(kCfRegistry) != nullptr) {
+            const ExecResult q = exec(std::string("SELECT tbl, acked FROM ") + kCfRegistry +
+                                      " WHERE name = '" + feed + "'");
+            if (q.ok && q.rows.size() == 1) {
+                tbl = q.rows[0].cells[0].second.s;
+                acked = q.rows[0].cells[1].second.i;
+                return true;
+            }
+        }
+        r = ExecResult::failure("unknown changefeed '" + feed + "'");
+        return false;
+    }
+    ExecResult exec_create_changefeed(const ChangesStmt& cs) {
+        for (const char c : cs.feed) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+                return ExecResult::failure("changefeed name must be [A-Za-z0-9_]+");
+            }
+        }
+        const Table* t = catalog_.find(cs.table);
+        if (t == nullptr) return ExecResult::failure("unknown table '" + cs.table + "'");
+        if (ExecResult r = cf_registry_ensure(); !r.ok) return r;
+        std::string tbl;
+        std::int64_t acked = 0;
+        ExecResult miss;
+        if (cf_lookup(cs.feed, tbl, acked, miss)) {
+            return ExecResult::failure("changefeed '" + cs.feed + "' already exists");
+        }
+        return exec(std::string("INSERT INTO ") + kCfRegistry + " (name, tbl) VALUES ('" +
+                    cs.feed + "', '" + cs.table + "')");
+    }
+    ExecResult exec_drop_changefeed(const ChangesStmt& cs) {
+        std::string tbl;
+        std::int64_t acked = 0;
+        ExecResult r;
+        if (!cf_lookup(cs.feed, tbl, acked, r)) return r;
+        r = exec(std::string("DELETE FROM ") + kCfRegistry + " WHERE name = '" + cs.feed + "'");
+        if (r.ok) cf_refresh_retention();
+        return r;
+    }
+    ExecResult exec_fetch(const ChangesStmt& cs) {
+        std::string tbl;
+        std::int64_t acked = 0;
+        ExecResult r;
+        if (!cf_lookup(cs.feed, tbl, acked, r)) return r;
+        ChangesStmt run;
+        run.table = tbl;
+        run.since = acked;
+        run.limit = cs.limit;
+        return exec_changes(run);
+    }
+    ExecResult exec_ack_feed(const ChangesStmt& cs) {
+        if (in_txn_) return ExecResult::failure("ACK CHANGEFEED inside a transaction is not supported");
+        std::string tbl;
+        std::int64_t acked = 0;
+        ExecResult r;
+        if (!cf_lookup(cs.feed, tbl, acked, r)) return r;
+        if (cs.at < acked) {
+            return ExecResult::failure("changefeed cursor only advances (acked=" +
+                                       std::to_string(acked) + ", AT " +
+                                       std::to_string(cs.at) + ")");
+        }
+        r = exec(std::string("UPDATE ") + kCfRegistry + " SET acked = " +
+                 std::to_string(cs.at) + " WHERE name = '" + cs.feed + "'");
+        if (r.ok) cf_refresh_retention();
+        return r;
+    }
+    // Auto-retention: the slowest acked cursor across ALL named feeds becomes the
+    // compaction retention horizon (min(acked)+1 must stay consumable). No feeds ⇒
+    // knob released to 0 (manual SET cdc.retain_seq still available).
+    void cf_refresh_retention() {
+        auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());
+        if (we == nullptr || catalog_.find(kCfRegistry) == nullptr) return;
+        const ExecResult q = exec(std::string("SELECT MIN(acked) FROM ") + kCfRegistry);
+        if (!q.ok || q.rows.size() != 1 || q.rows[0].cells[0].second.is_null) {
+            we->set_cdc_retain_from(0);
+            return;
+        }
+        we->set_cdc_retain_from(static_cast<storage::Seq>(q.rows[0].cells[0].second.i) + 1);
+    }
+
+public:
+    // Test/admin visibility: the current auto/manual CDC retention horizon (0 = off).
+    [[nodiscard]] std::int64_t cdc_retain_seq() {
+        auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());
+        return we == nullptr ? 0 : static_cast<std::int64_t>(we->cdc_retain_from());
+    }
+
+private:
     // =================== end K4 CDC ===================
 
     // ===================== K3: SQL queues (exactly-once messaging) =====================

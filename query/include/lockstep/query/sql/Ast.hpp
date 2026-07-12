@@ -572,6 +572,10 @@ enum class StmtKind : std::uint8_t {
     Receive = 29,              // K3: RECEIVE q [BATCH n] [VISIBILITY v] [DLQ]
     Ack = 30,                  // K3: ACK q, <mid>
     Changes = 31,              // K4: CHANGES t SINCE <seq> [LIMIT n] — the CDC pull feed
+    CreateChangefeed = 32,     // K4.4: CREATE CHANGEFEED cf FOR t — named server-side cursor
+    DropChangefeed = 33,       // K4.4: DROP CHANGEFEED cf
+    Fetch = 34,                // K4.4: FETCH cf [LIMIT n] — next batch after the acked cursor
+    AckFeed = 35,              // K4.4: ACK CHANGEFEED cf AT <seq> — advance + auto-retention
 };
 
 // K3: one queue statement. Visibility is measured in Seq UNITS (logical time): a
@@ -584,9 +588,11 @@ enum class StmtKind : std::uint8_t {
 // processed, making resume exactly-once BY CONSTRUCTION, no protocol).
 struct ChangesStmt {
     std::string table;
+    std::string feed;         // K4.4: the changefeed name (Create/Drop/Fetch/AckFeed)
     std::int64_t shard = -1;  // -1 = local feed; >=0 = one shard's feed (a "partition")
     std::int64_t since = 0;
     std::int64_t limit = -1;  // -1 = all
+    std::int64_t at = -1;     // K4.4: ACK CHANGEFEED ... AT <seq>
 };
 
 struct QueueStmt {

@@ -115,6 +115,13 @@ public:
                 return broadcast(sql);
             case StmtKind::Changes:  // K4.2: per-shard changefeeds (partition-shaped)
                 return exec_changes_dist(st.changes);
+            case StmtKind::CreateChangefeed:  // K4.4: cursors are per-shard state — a
+            case StmtKind::DropChangefeed:    // named feed lives ON the shard engine
+            case StmtKind::Fetch:             // (one cursor per Seq line); manage it
+            case StmtKind::AckFeed:           // there, not through the coordinator.
+                return ExecResult::failure(
+                    "named changefeeds are per-shard — create/fetch/ack them on the "
+                    "shard engine (one cursor per shard, like partition offsets)");
             case StmtKind::CreateQueue:  // K3 queues are single-engine v1 — a clean
             case StmtKind::DropQueue:    // refusal beats a silently-wrong route (a
             case StmtKind::Send:         // RECEIVE must see ONE queue, not a slice).

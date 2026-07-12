@@ -470,6 +470,20 @@ public:
                 advance();
             }
             r = ParseResult{std::move(st)};
+        } else if (kw == "fetch") {  // K4.4: FETCH cf [LIMIT n]
+            advance();
+            Statement st;
+            st.kind = StmtKind::Fetch;
+            if (auto e = expect_ident("a changefeed name after FETCH", st.changes.feed))
+                return ParseResult{*e};
+            if (is_kw("limit")) {
+                advance();
+                if (cur_.kind != Tok::IntLit || cur_.int_val < 1)
+                    return err("LIMIT expects a positive integer");
+                st.changes.limit = cur_.int_val;
+                advance();
+            }
+            r = ParseResult{std::move(st)};
         } else if (kw == "send") {  // K3: SEND q, <payload>
             advance();
             Statement st;
@@ -506,8 +520,21 @@ public:
                 }
             }
             r = ParseResult{std::move(st)};
-        } else if (kw == "ack") {  // K3: ACK q, <mid>
+        } else if (kw == "ack") {  // K3: ACK q, <mid> | K4.4: ACK CHANGEFEED cf AT s
             advance();
+            if (is_kw("changefeed")) {
+                advance();
+                Statement st;
+                st.kind = StmtKind::AckFeed;
+                if (auto e = expect_ident("a changefeed name", st.changes.feed))
+                    return ParseResult{*e};
+                if (auto e = expect_kw("at")) return ParseResult{*e};
+                if (cur_.kind != Tok::IntLit || cur_.int_val < 0)
+                    return err("ACK CHANGEFEED expects AT <non-negative seq>");
+                st.changes.at = cur_.int_val;
+                advance();
+                r = ParseResult{std::move(st)};
+            } else {
             Statement st;
             st.kind = StmtKind::Ack;
             if (auto e = expect_ident("a queue name after ACK", st.queue.queue))
@@ -522,6 +549,7 @@ public:
             }
             st.queue.mid = st.queue.mids.front();
             r = ParseResult{std::move(st)};
+            }
         } else if (kw == "insert") {
             r = parse_insert();
         } else if (kw == "update") {
@@ -1250,6 +1278,17 @@ private:
                 return ParseResult{*e};
             return ParseResult{std::move(st)};
         }
+        if (is_kw("changefeed")) {  // K4.4: CREATE CHANGEFEED cf FOR t
+            advance();
+            Statement st;
+            st.kind = StmtKind::CreateChangefeed;
+            if (auto e = expect_ident("a changefeed name", st.changes.feed))
+                return ParseResult{*e};
+            if (auto e = expect_kw("for")) return ParseResult{*e};
+            if (auto e = expect_table_name("a table name after FOR", st.changes.table))
+                return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
         if (is_kw("materialized")) {  // CREATE MATERIALIZED VIEW name AS SELECT ...
             advance();  // MATERIALIZED
             if (auto e = expect_kw("view")) return ParseResult{*e};
@@ -1678,6 +1717,14 @@ private:
             Statement st;
             st.kind = StmtKind::DropQueue;
             if (auto e = expect_ident("a queue name after DROP QUEUE", st.queue.queue))
+                return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
+        if (is_kw("changefeed")) {  // K4.4: DROP CHANGEFEED cf
+            advance();
+            Statement st;
+            st.kind = StmtKind::DropChangefeed;
+            if (auto e = expect_ident("a changefeed name", st.changes.feed))
                 return ParseResult{*e};
             return ParseResult{std::move(st)};
         }
