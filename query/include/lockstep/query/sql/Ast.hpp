@@ -67,6 +67,7 @@ struct CreateStmt {
     std::shared_ptr<SelectStmt> as_select;  // E3: CREATE TABLE t AS SELECT ... (populate from a query)
     bool materialized = false;              // CREATE MATERIALIZED VIEW — a table + a refreshable source
     std::string source_sql;                 // the raw SELECT text stored for REFRESH MATERIALIZED VIEW
+    bool incremental = false;               // K5: IVM — maintained from the CDC delta feed on read
 };
 
 // CREATE INDEX <name> ON <table> (<col>) — a single-column SECONDARY INDEX. The

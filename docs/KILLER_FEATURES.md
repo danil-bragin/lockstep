@@ -173,6 +173,23 @@ Materialize/pg_ivm demand; deterministic total order → *exact* deltas, no
 eventual-consistency caveats; pairs with columnar for always-fresh dashboards. Steps as in
 TECH_PLAN (single-table aggregates → differential replay gate → delta-joins → REFRESH).
 
+**K5.1 SHIPPED:** `CREATE INCREMENTAL MATERIALIZED VIEW mv AS SELECT g..., COUNT(*),
+SUM(x)... FROM t [WHERE p] GROUP BY g...` — maintained LAZILY from the K4 CDC op-log:
+a read pulls the base table's committed ops past the view's durable cursor, folds
+per-group deltas (old row image = MVCC read at the cursor snapshot; new = the feed's
+final image), and applies changed rows + the cursor advance in ONE commit batch —
+crash-safe by construction (partial apply impossible; re-derivation idempotent).
+Compaction past the cursor = honest full-REFRESH fallback, never silently wrong.
+v1 shape: single row-mode table, INT/TEXT group columns, COUNT(*) required (detects
+group death) + any number of SUM(col); AVG/MIN/MAX/DISTINCT/HAVING/joins are clean
+teaching errors (AVG: project SUM and COUNT(*), divide in a view; MIN/MAX need a
+heap under deletes). REFRESH on an incremental view re-bases the cursor. Gate:
+incremental == full recompute, byte-for-byte, sampled through a 220-round seeded
+storm (inserts/updates/deletes, txn commits AND rollbacks, group birth+death,
+filter-boundary rows), across a restart, and after REFRESH (sql_ivm_test, 146th).
+Open: delta-joins, SUM over REAL, per-write eager mode, K6 composition (LISTEN on
+the view's table = push-on-change dashboards — the pieces now exist).
+
 ### K6 — Realtime live queries (subscriptions) *(M after K4/K5)* — TIER: FAST-FOLLOW
 
 **Market signal.** Supabase Realtime / LISTEN-NOTIFY / Zero/Electric client-side sync —

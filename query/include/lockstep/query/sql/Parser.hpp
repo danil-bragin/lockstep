@@ -1344,7 +1344,13 @@ private:
         if (is_kw("materialized")) {  // CREATE MATERIALIZED VIEW name AS SELECT ...
             advance();  // MATERIALIZED
             if (auto e = expect_kw("view")) return ParseResult{*e};
-            return parse_create_matview();
+            return parse_create_matview(/*incremental=*/false);
+        }
+        if (is_kw("incremental")) {  // K5: CREATE INCREMENTAL MATERIALIZED VIEW (pg_ivm shape)
+            advance();
+            if (auto e = expect_kw("materialized")) return ParseResult{*e};
+            if (auto e = expect_kw("view")) return ParseResult{*e};
+            return parse_create_matview(/*incremental=*/true);
         }
         if (is_kw("unique")) {  // E5: CREATE UNIQUE INDEX
             advance();  // UNIQUE
@@ -1620,10 +1626,11 @@ private:
 
     // CREATE MATERIALIZED VIEW name AS SELECT ... — materialize the query into a table AND
     // store the raw SELECT text so REFRESH MATERIALIZED VIEW can recompute it.
-    ParseResult parse_create_matview() {
+    ParseResult parse_create_matview(bool incremental) {
         Statement st;
         st.kind = StmtKind::Create;
         st.create.materialized = true;
+        st.create.incremental = incremental;
         if (is_kw("if")) {  // IF NOT EXISTS
             advance();
             if (auto e = expect_kw("not")) return ParseResult{*e};

@@ -451,6 +451,18 @@ public:
             if (is_tombstone(kv.second)) continue;
             matviews_[kv.first.substr(1)] = kv.second;
         }
+        // K5: rebuild the incremental-matview registry (sources tagged "IVM|"); the
+        // cursor lives in the durable __ivm table and needs no rebuild.
+        ivm_defs_.clear();
+        for (const auto& [qn, src] : matviews_) {
+            if (src.rfind(kIvmTag, 0) != 0) continue;
+            ParseResult pr = parse_sql(src.substr(std::string(kIvmTag).size()));
+            if (!pr.ok() || pr.stmt().kind != StmtKind::Select) continue;
+            IvmDef def;
+            if (ivm_validate(pr.stmt().select, def) == std::nullopt) {
+                ivm_defs_[qn] = std::move(def);
+            }
+        }
     }
 
     // True iff the catalog store is disk-backed (4-arg ctor) — the caller then persists the
@@ -1199,6 +1211,18 @@ public:
             case StmtKind::Delete:
                 return exec_delete(st.del);
             case StmtKind::Select: {
+                // K5: any incremental matview referenced by this SELECT catches up first.
+                if (!ivm_defs_.empty()) {
+                    if (!st.select.table.empty()) {
+                        const std::string qn = catalog_.qualify(st.select.table);
+                        if (ivm_defs_.count(qn) != 0) ivm_catch_up(qn);
+                    }
+                    for (const JoinEntry& je : st.select.from) {
+                        if (je.subquery) continue;
+                        const std::string qn = catalog_.qualify(je.table);
+                        if (ivm_defs_.count(qn) != 0) ivm_catch_up(qn);
+                    }
+                }
                 ExecResult r = exec_select(st.select);
                 // W3.1: charge the returned result set against the per-statement budget
                 // (bounds a runaway result before it is handed back / serialized to the
@@ -1795,6 +1819,37 @@ private:
     // the table (with a HIDDEN auto-increment PK so the model's PK requirement is met without polluting
     // SELECT *), and INSERT every result row.
     ExecResult exec_create_as_select(const CreateStmt& c) {
+        IvmDef def;
+        if (c.incremental) {  // K5: validate the maintainable shape BEFORE materializing
+            if (auto e = ivm_validate(*c.as_select, def)) return ExecResult::failure(*e);
+            // EXPLICIT typed schema (materialize_select infers from rows and cannot
+            // represent an empty view — a fresh base table is the normal case here).
+            const Table* base = catalog_.find(def.base);
+            std::vector<std::pair<std::string, Type>> cols;
+            for (const SelectItem& it : c.as_select->items) {
+                if (it.kind == SelectItemKind::Column) {
+                    const auto ci = base->column_index(it.column);
+                    cols.emplace_back(it.label, base->columns[*ci].type);
+                } else {
+                    cols.emplace_back(it.label, Type::Int);  // COUNT(*) / SUM(int)
+                }
+            }
+            const ExecResult init = exec_select(*c.as_select);
+            if (!init.ok) return init;
+            std::vector<std::vector<Datum>> rows;
+            for (const ResultRow& r : init.rows) {
+                std::vector<Datum> row;
+                for (const auto& cell : r.cells) row.push_back(cell.second);
+                rows.push_back(std::move(row));
+            }
+            if (auto e = materialize_typed(c.table, cols, rows)) return ExecResult::failure(*e);
+            const std::string qn = catalog_.qualify(c.table);
+            matviews_[qn] = std::string(kIvmTag) + c.source_sql;
+            persist_matview(c.table);
+            ivm_defs_[qn] = std::move(def);
+            ivm_set_cursor(qn, static_cast<std::int64_t>(db_.live_snap_seq()));
+            return ExecResult{};
+        }
         if (auto e = materialize_select(c.table, *c.as_select)) return ExecResult::failure(*e);
         if (c.materialized) {  // record the refreshable source, durably.
             matviews_[catalog_.qualify(c.table)] = c.source_sql;
@@ -1802,6 +1857,306 @@ private:
         }
         return ExecResult{};
     }
+
+    // ===================== K5: INCREMENTAL MATERIALIZED VIEWS =====================
+    // CREATE INCREMENTAL MATERIALIZED VIEW mv AS SELECT g..., COUNT(*), SUM(x)...
+    //   FROM base [WHERE pred] GROUP BY g...
+    // The view is maintained LAZILY from the CDC op-log: a read of mv first pulls the
+    // base table's committed ops past the view's cursor (the SAME export CHANGES
+    // serves), computes per-group deltas (old row image read at the cursor snapshot,
+    // new image from the feed), and applies them to the backing table + advances the
+    // cursor in ONE transaction (crash between = nothing applied, re-applied next
+    // read — never double-counted). If compaction ate the range, it falls back to a
+    // full REFRESH (clean, never silently wrong). v1 shape: single table; group
+    // columns are plain INT/TEXT columns; aggregates are COUNT(*) (REQUIRED — it
+    // detects group death) plus any number of SUM(col); WHERE is any row predicate.
+    // AVG/MIN/MAX are teaching errors (AVG: project SUM and COUNT(*) and divide in a
+    // view; MIN/MAX are not incrementally maintainable under deletes without a heap).
+    static constexpr const char* kIvmTag = "IVM|";
+    struct IvmDef {
+        std::string base;                     // qualified base table name
+        std::vector<std::string> group_cols;  // plain group columns (INT/TEXT)
+        std::vector<std::string> group_labels;
+        std::string cnt_label;                // the COUNT(*) output column
+        std::vector<std::string> sum_cols;    // SUM sources (INT)
+        std::vector<std::string> sum_labels;  // their output columns
+        std::shared_ptr<SelectStmt> sel;      // parsed source (for the WHERE predicate)
+    };
+    [[nodiscard]] std::optional<std::string> ivm_validate(const SelectStmt& sel, IvmDef& def) {
+        if (sel.from.size() > 1 || sel.distinct || sel.having.present() ||
+            !sel.order_by.empty() || sel.has_limit || !sel.ctes.empty()) {
+            return "incremental matview v1: single table, no DISTINCT/HAVING/ORDER/LIMIT/CTE";
+        }
+        if (!sel.from.empty() && sel.from[0].subquery) {
+            return "incremental matview v1: FROM subqueries are not maintainable";
+        }
+        const Table* t = catalog_.find(sel.table);
+        if (t == nullptr) return "unknown table '" + sel.table + "'";
+        if (t->columnar) return "incremental matview v1: the base table must be row-mode";
+        def.base = sel.table;
+        for (const std::string& g : sel.group_by) {
+            const auto ci = t->column_index(g);
+            if (!ci) return "GROUP BY column '" + g + "' not found";
+            const Type ty = t->columns[*ci].type;
+            if (ty != Type::Int && ty != Type::Text) {
+                return "incremental matview v1: group columns must be INT or TEXT";
+            }
+            def.group_cols.push_back(g);
+        }
+        for (const SelectItem& it : sel.items) {
+            if (it.kind == SelectItemKind::Column) {
+                bool grouped = false;
+                for (const std::string& g : def.group_cols) grouped = grouped || g == it.column;
+                if (!grouped) return "projected column '" + it.column + "' must be in GROUP BY";
+                def.group_labels.push_back(it.label);
+                continue;
+            }
+            if (it.kind != SelectItemKind::Aggregate || it.agg.distinct || it.agg.filter) {
+                return "incremental matview v1: items are group columns, COUNT(*), SUM(col)";
+            }
+            if (it.agg.kind == AggKind::CountStar) {
+                def.cnt_label = it.label;
+                continue;
+            }
+            if (it.agg.kind == AggKind::Sum) {
+                const auto ci = t->column_index(it.agg.column);
+                if (!ci || t->columns[*ci].type != Type::Int) {
+                    return "incremental matview v1: SUM over an INT column only";
+                }
+                def.sum_cols.push_back(it.agg.column);
+                def.sum_labels.push_back(it.label);
+                continue;
+            }
+            return "incremental matview v1: only COUNT(*) and SUM(col) are maintainable "
+                   "(AVG: project SUM and COUNT(*), divide in a view; MIN/MAX need a heap)";
+        }
+        if (def.group_labels.size() != def.group_cols.size()) {
+            return "incremental matview v1: every GROUP BY column must be projected";
+        }
+        if (def.cnt_label.empty()) {
+            return "incremental matview v1: COUNT(*) must be projected (it detects group death)";
+        }
+        def.sel = std::make_shared<SelectStmt>(sel);
+        return std::nullopt;
+    }
+    // Durable cursor: one row per view in the hidden __ivm table (written in the SAME
+    // transaction as the delta application — atomicity by construction).
+    ExecResult ivm_ensure_registry() {
+        if (catalog_.find("__ivm") != nullptr) return ExecResult{};
+        const bool saved = columnar_default_;
+        columnar_default_ = false;
+        ExecResult r = exec("CREATE TABLE __ivm (name TEXT, cur INT NOT NULL, PRIMARY KEY (name))");
+        columnar_default_ = saved;
+        return r;
+    }
+    void ivm_set_cursor(const std::string& qn, std::int64_t cur) {
+        (void)ivm_ensure_registry();
+        const ExecResult q = exec("SELECT cur FROM __ivm WHERE name = '" + qn + "'");
+        if (q.ok && !q.rows.empty()) {
+            (void)exec("UPDATE __ivm SET cur = " + std::to_string(cur) + " WHERE name = '" +
+                       qn + "'");
+        } else {
+            (void)exec("INSERT INTO __ivm (name, cur) VALUES ('" + qn + "', " +
+                       std::to_string(cur) + ")");
+        }
+    }
+    [[nodiscard]] std::int64_t ivm_cursor(const std::string& qn) {
+        const ExecResult q = exec("SELECT cur FROM __ivm WHERE name = '" + qn + "'");
+        return (q.ok && !q.rows.empty()) ? q.rows[0].cells[0].second.i : 0;
+    }
+    [[nodiscard]] static std::string ivm_lit(const Datum& d) {
+        if (d.is_null) return "NULL";
+        if (d.type == Type::Text) {
+            std::string out = "'";
+            for (const char c : d.s) out += (c == '\'') ? std::string("''") : std::string(1, c);
+            return out + "'";
+        }
+        return std::to_string(d.i);
+    }
+    // The catch-up: pull base-table ops past the cursor, fold per-group deltas, apply.
+    void ivm_catch_up(const std::string& qn) {
+        if (in_txn_ || ivm_busy_) return;  // stale reads inside a user txn (documented)
+        const auto dit = ivm_defs_.find(qn);
+        if (dit == ivm_defs_.end()) return;
+        ivm_busy_ = true;
+        struct Unbusy { bool& b; ~Unbusy() { b = false; } } ub{ivm_busy_};
+        const IvmDef& def = dit->second;
+        const Table* base = catalog_.find(def.base);
+        const Table* view = catalog_.find(qn);
+        if (base == nullptr || view == nullptr) return;
+        const std::int64_t cur = ivm_cursor(qn);
+        // CDC pull (the same export CHANGES uses).
+        auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());
+        if (we == nullptr) return;
+        std::vector<storage::ExportedOp> ops;
+        core::Error err{};
+        {
+            core::Promise<bool> done = core::make_promise<bool>(&db_.scheduler());
+            core::Future<bool> f = done.get_future();
+            db_.scheduler().spawn(cdc_export_task(*we, static_cast<storage::Seq>(cur) + 1,
+                                                  &ops, &err, std::move(done)));
+            db_.scheduler().run();
+            (void)f;
+        }
+        if (!err.ok()) {  // compacted past the cursor -> honest full-refresh fallback
+            (void)exec_refresh_matview(qn);
+            ivm_set_cursor(qn, static_cast<std::int64_t>(db_.live_snap_seq()));
+            return;
+        }
+        const Key pfx = table_prefix(base->id);
+        // Last op per pk-key within the batch (the final state), in first-seen order.
+        std::vector<std::pair<Key, const storage::ExportedOp*>> finals;
+        std::map<Key, std::size_t> at;
+        storage::Seq max_seq = static_cast<storage::Seq>(cur);
+        for (const storage::ExportedOp& op : ops) {
+            if (op.seq > max_seq) max_seq = op.seq;
+            if (op.key.size() <= pfx.size() || op.key.compare(0, pfx.size(), pfx) != 0) continue;
+            const auto it2 = at.find(op.key);
+            if (it2 == at.end()) {
+                at[op.key] = finals.size();
+                finals.emplace_back(op.key, &op);
+            } else {
+                finals[it2->second].second = &op;
+            }
+        }
+        if (finals.empty()) {
+            if (max_seq > static_cast<storage::Seq>(cur)) {
+                ivm_set_cursor(qn, static_cast<std::int64_t>(max_seq));
+            }
+            return;
+        }
+        // Fold deltas: old image at the cursor snapshot, new image from the feed.
+        struct GDelta {
+            std::vector<Datum> gvals;
+            std::int64_t dcnt = 0;
+            std::vector<std::int64_t> dsum;
+        };
+        std::map<std::string, GDelta> deltas;
+        auto contribute = [&](const std::vector<Datum>& row, int sign) -> bool {
+            if (def.sel->filter.present()) {
+                bool truth = false;
+                if (eval_pred(def.sel->filter, def.sel->filter.root, *base, row, nullptr,
+                              truth) != std::nullopt || !truth) {
+                    return true;  // filtered out (or eval error -> treat as no contribution)
+                }
+            }
+            std::string key;
+            std::vector<Datum> gvals;
+            for (const std::string& g : def.group_cols) {
+                const auto ci = base->column_index(g);
+                if (!ci) return false;
+                const Datum& d = row[*ci];
+                key += (d.is_null ? std::string("\x01N") : d.render()) + "\x1f";
+                gvals.push_back(d);
+            }
+            GDelta& gd = deltas[key];
+            if (gd.gvals.empty()) gd.gvals = std::move(gvals);
+            if (gd.dsum.empty()) gd.dsum.assign(def.sum_cols.size(), 0);
+            gd.dcnt += sign;
+            for (std::size_t k = 0; k < def.sum_cols.size(); ++k) {
+                const auto ci = base->column_index(def.sum_cols[k]);
+                if (ci && !row[*ci].is_null) gd.dsum[k] += sign * row[*ci].i;
+            }
+            return true;
+        };
+        for (const auto& [key, op] : finals) {
+            // OLD image: the newest version of this key at the cursor snapshot.
+            bool have_old = false;
+            std::vector<Datum> old_row;
+            (void)db_.engine().scan_visit(
+                storage::Range{key, key_successor(key), false},
+                static_cast<storage::Seq>(cur), [&](const Key& k2, const Value& v2) {
+                    if (k2 != key) return;
+                    old_row = decode_row(*base, k2, v2);
+                    have_old = true;
+                });
+            if (have_old && !contribute(old_row, -1)) return;
+            if (!op->tombstone) {
+                const std::vector<Datum> new_row = decode_row(*base, op->key, op->value);
+                if (!contribute(new_row, +1)) return;
+            }
+        }
+        // Apply all group deltas + the cursor advance as ONE commit_writes batch —
+        // atomic by construction (crash before the commit = nothing applied; the
+        // cursor still points at the old position, the next read re-derives the
+        // SAME deltas). Rows are written directly through the row codec (the K3
+        // pattern) because the view's hidden _ctid PK is not SQL-addressable.
+        Table* vt = catalog_.find_mut(qn);
+        const Table* reg = catalog_.find("__ivm");
+        if (vt == nullptr || reg == nullptr) return;
+        // Current view rows: group render key -> full row datums.
+        std::map<std::string, std::vector<Datum>> vrows;
+        {
+            const Key vpfx = table_prefix(vt->id);
+            (void)db_.engine().scan_visit(
+                storage::Range{vpfx, key_successor(vpfx), false}, db_.live_snap_seq(),
+                [&](const Key& k2, const Value& v2) {
+                    std::vector<Datum> row = decode_row(*vt, k2, v2);
+                    std::string key;
+                    for (const std::string& gl : def.group_labels) {
+                        const auto ci = vt->column_index(gl);
+                        const Datum& d = row[*ci];
+                        key += (d.is_null ? std::string("\x01N") : d.render()) + "\x1f";
+                    }
+                    vrows[key] = std::move(row);
+                });
+        }
+        std::vector<std::pair<Key, Value>> writes;
+        const auto cnt_ci = vt->column_index(def.cnt_label);
+        if (!cnt_ci) return;
+        for (const auto& [gkey, gd] : deltas) {
+            bool all_zero = gd.dcnt == 0;
+            for (const std::int64_t d : gd.dsum) all_zero = all_zero && d == 0;
+            if (all_zero) continue;
+            const auto vit = vrows.find(gkey);
+            if (vit == vrows.end()) {
+                if (gd.dcnt <= 0) continue;  // dead group already absent
+                std::vector<Datum> row(vt->columns.size());
+                row[0] = Datum::make_int(vt->next_auto_id++);
+                for (std::size_t g = 0; g < def.group_labels.size(); ++g) {
+                    const auto ci = vt->column_index(def.group_labels[g]);
+                    row[*ci] = gd.gvals[g];
+                }
+                row[*cnt_ci] = Datum::make_int(gd.dcnt);
+                for (std::size_t k = 0; k < def.sum_labels.size(); ++k) {
+                    const auto ci = vt->column_index(def.sum_labels[k]);
+                    row[*ci] = Datum::make_int(gd.dsum[k]);
+                }
+                tag_logical_cols(*vt, row);
+                emit_row_writes(*vt, row, writes);
+                continue;
+            }
+            std::vector<Datum>& row = vit->second;
+            const std::int64_t ncnt = row[*cnt_ci].i + gd.dcnt;
+            if (ncnt <= 0) {
+                writes.emplace_back(encode_key(*vt, row[0]), tombstone_marker());
+                continue;
+            }
+            row[*cnt_ci] = Datum::make_int(ncnt);
+            for (std::size_t k = 0; k < def.sum_labels.size(); ++k) {
+                const auto ci = vt->column_index(def.sum_labels[k]);
+                row[*ci] = Datum::make_int(row[*ci].i + gd.dsum[k]);
+            }
+            writes.emplace_back(encode_key(*vt, row[0]), encode_value(*vt, row));
+        }
+        // The cursor row rides the same batch (pk = name).
+        {
+            std::vector<Datum> crow(reg->columns.size());
+            const auto nci = reg->column_index("name");
+            const auto cci = reg->column_index("cur");
+            if (!nci || !cci) return;
+            crow[*nci] = Datum::make_text(qn);
+            crow[*cci] = Datum::make_int(static_cast<std::int64_t>(max_seq));
+            tag_logical_cols(*reg, crow);
+            writes.emplace_back(encode_key(*reg, crow[*nci]), encode_value(*reg, crow));
+        }
+        commit_writes(writes);
+        persist_schema(qn);  // next_auto_id advanced for births — keep it durable
+    }
+    std::map<std::string, IvmDef> ivm_defs_;
+    bool ivm_busy_ = false;
+    // =================== end K5 IVM ===================
+
 
     // REFRESH MATERIALIZED VIEW name — recompute the stored source and replace the table's rows.
     // Implemented as drop + re-materialize (non-incremental), so the result is exactly the query
@@ -1812,7 +2167,9 @@ private:
         if (it == matviews_.end()) {
             return ExecResult::failure("'" + name + "' is not a materialized view");
         }
-        const std::string src = it->second;  // copy (drop below mutates the catalog)
+        std::string src = it->second;  // copy (drop below mutates the catalog)
+        const bool was_ivm = src.rfind(kIvmTag, 0) == 0;
+        if (was_ivm) src = src.substr(std::string(kIvmTag).size());
         ParseResult pr = parse_sql(src);
         if (!pr.ok() || pr.stmt().kind != StmtKind::Select) {
             return ExecResult::failure("materialized view '" + name + "': stored source is not a SELECT");
@@ -1824,6 +2181,9 @@ private:
         (void)exec_drop_table(d, /*keep_matview=*/true);  // keep the matview registration
         if (auto e = materialize_select(name, pr.stmt().select)) return ExecResult::failure(*e);
         persist_matview(name);  // re-assert the source (drop tombstoned the schema record)
+        if (was_ivm) {  // K5: a full refresh re-bases the incremental cursor to NOW
+            ivm_set_cursor(qn, static_cast<std::int64_t>(db_.live_snap_seq()));
+        }
         return ExecResult{};
     }
 
