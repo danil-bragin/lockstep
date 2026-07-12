@@ -470,6 +470,41 @@ public:
                 advance();
             }
             r = ParseResult{std::move(st)};
+        } else if (kw == "publish") {  // K4.10: PUBLISH t, <expr>
+            advance();
+            Statement st;
+            st.kind = StmtKind::Publish;
+            if (auto e = expect_ident("a topic name after PUBLISH", st.queue.queue))
+                return ParseResult{*e};
+            if (auto e = expect(Tok::Comma, "',' after the topic name")) return ParseResult{*e};
+            for (;;) {  // batch form: PUBLISH t, p1, p2, ... (one commit for all)
+                std::shared_ptr<Expr> pe;
+                if (auto e = parse_scalar_expr(pe)) return ParseResult{*e};
+                st.queue.payloads.push_back(std::move(pe));
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
+            st.queue.payload = st.queue.payloads.front();
+            r = ParseResult{std::move(st)};
+        } else if (kw == "consume") {  // K4.10: CONSUME t SINCE off [LIMIT n]
+            advance();
+            Statement st;
+            st.kind = StmtKind::Consume;
+            if (auto e = expect_ident("a topic name after CONSUME", st.changes.feed))
+                return ParseResult{*e};
+            if (auto e = expect_kw("since")) return ParseResult{*e};
+            if (cur_.kind != Tok::IntLit || cur_.int_val < 0)
+                return err("SINCE expects a non-negative offset");
+            st.changes.since = cur_.int_val;
+            advance();
+            if (is_kw("limit")) {
+                advance();
+                if (cur_.kind != Tok::IntLit || cur_.int_val < 1)
+                    return err("LIMIT expects a positive integer");
+                st.changes.limit = cur_.int_val;
+                advance();
+            }
+            r = ParseResult{std::move(st)};
         } else if (kw == "fetch") {  // K4.4: FETCH cf [LIMIT n]
             advance();
             Statement st;
@@ -1275,6 +1310,14 @@ private:
             Statement st;
             st.kind = StmtKind::CreateQueue;
             if (auto e = expect_ident("a queue name after CREATE QUEUE", st.queue.queue))
+                return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
+        if (is_kw("topic")) {  // K4.10: CREATE TOPIC t
+            advance();
+            Statement st;
+            st.kind = StmtKind::CreateTopic;
+            if (auto e = expect_ident("a topic name after CREATE TOPIC", st.queue.queue))
                 return ParseResult{*e};
             return ParseResult{std::move(st)};
         }

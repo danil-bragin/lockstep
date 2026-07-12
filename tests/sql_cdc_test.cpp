@@ -258,6 +258,53 @@ int main() {
         }
     }
 
+    // (13) K4.10 topics: append-only log — publish/consume, txn outbox, restart.
+    {
+        SqlEngine d;
+        check(d.exec("CREATE TOPIC ev").ok, "CREATE TOPIC");
+        check(!d.exec("CREATE TOPIC ev").ok, "duplicate topic rejected");
+        check(!d.exec("PUBLISH ghost, 'x'").ok, "unknown topic rejected");
+        for (int i = 0; i < 5; ++i)
+            check(d.exec("PUBLISH ev, 'm" + std::to_string(i) + "'").ok, "PUBLISH");
+        const ExecResult c = d.exec("CONSUME ev SINCE 0");
+        check(c.ok && c.rows.size() == 5 && c.rows[0].cells[1].second.s == "m0" &&
+                  c.rows[4].cells[1].second.s == "m4",
+              "CONSUME returns all, FIFO by offset");
+        // Cursor discipline: resume from last offset + 1.
+        const std::int64_t last = c.rows[2].cells[0].second.i;
+        const ExecResult rest = d.exec("CONSUME ev SINCE " + std::to_string(last + 1));
+        check(rest.ok && rest.rows.size() == 2, "offset cursor resume");
+        check(d.exec("CONSUME ev SINCE 0 LIMIT 2").rows.size() == 2, "LIMIT");
+        // Transactional outbox: rollback publishes vanish; offsets stay dense.
+        d.exec("BEGIN");
+        d.exec("PUBLISH ev, 'doomed'");
+        d.exec("ROLLBACK");
+        check(d.exec("CONSUME ev SINCE 5").rows.empty(), "rolled-back publish absent");
+        check(d.exec("PUBLISH ev, 'm5'").rows[0].cells[0].second.i == 5,
+              "offsets dense after rollback");
+    }
+    {
+        lockstep::core::Scheduler sched;
+        lockstep::core::SimClock clock(sched);
+        lockstep::sim::SeededRandom rng(0x4Eull);
+        lockstep::sim::DiskFaultConfig dc;
+        lockstep::sim::SimDisk data(sched, clock, rng, dc), cat(sched, clock, rng, dc);
+        {
+            SqlEngine d(sched, data, sched, cat);
+            d.exec("CREATE TOPIC ev");
+            d.exec("PUBLISH ev, 'a'");
+            d.exec("PUBLISH ev, 'b'");
+        }
+        {
+            SqlEngine d(sched, data, sched, cat);
+            d.recover(data.logical_len(), cat.logical_len());
+            check(d.exec("CONSUME ev SINCE 0").rows.size() == 2, "topic survives restart");
+            const ExecResult p = d.exec("PUBLISH ev, 'c'");
+            check(p.ok && p.rows[0].cells[0].second.i == 2,
+                  "tail counter rebuilt from storage after restart");
+        }
+    }
+
     if (g_fail != 0) { std::printf("sql_cdc_test: FAILURES\n"); return 1; }
     std::printf("sql_cdc_test: ALL PASS\n");
     return 0;

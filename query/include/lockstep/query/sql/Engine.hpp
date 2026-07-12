@@ -1219,6 +1219,12 @@ public:
                 return exec_fetch(st.changes);
             case StmtKind::AckFeed:
                 return exec_ack_feed(st.changes);
+            case StmtKind::CreateTopic:
+                return exec_create_topic(st.queue);
+            case StmtKind::Publish:
+                return exec_publish(st.queue);
+            case StmtKind::Consume:
+                return exec_consume(st.changes);
             case StmtKind::CreateQueue:
                 return exec_create_queue(st.queue);
             case StmtKind::DropQueue:
@@ -1260,6 +1266,9 @@ public:
                 txn_writes_.clear();  // discard the buffered writes (nothing was committed)
                 txn_overlay_.clear();
                 savepoints_.clear();
+                topic_tail_.clear();  // K4.10: rolled-back PUBLISHes advanced the cached
+                                      // tail; drop the cache so it rebuilds from storage
+                                      // (offsets stay dense).
                 return ExecResult{};
             case StmtKind::Savepoint:
                 if (!in_txn_) return ExecResult::failure("SAVEPOINT can only be used in a transaction");
@@ -4227,6 +4236,133 @@ public:
     }
 
 private:
+    // K4.10: TOPICS — the append-only log object (the Kafka-shaped ingest path).
+    // A topic is NOT a table: PUBLISH writes key = '!' 't' + name + '\0' + be64(offset)
+    // with the RAW payload as the value — no PK-uniqueness read, no row codec, no
+    // sorted-by-user-key placement (offsets ascend, so the memtable insert is an
+    // append at the tail). Offsets are dense (0,1,2,...): the per-topic tail counter
+    // is rebuilt on first touch after recovery by scanning the prefix. PUBLISH inside
+    // BEGIN..COMMIT buffers like any write (transactional outbox for free); CONSUME
+    // is offset-cursor pull with exactly-once resume, same discipline as CHANGES.
+    static Key topic_prefix(const std::string& name) {
+        Key k;
+        k.push_back('!');
+        k.push_back('t');
+        k += name;
+        k.push_back('\0');
+        return k;
+    }
+    static Key topic_key(const std::string& name, std::uint64_t off) {
+        Key k = topic_prefix(name);
+        for (int b = 56; b >= 0; b -= 8)
+            k.push_back(static_cast<char>((off >> b) & 0xFF));
+        return k;
+    }
+    ExecResult exec_create_topic(const QueueStmt& qs) {
+        if (ExecResult r = cf_registry_ensure(); !r.ok) return r;  // reuse the registry
+        const ExecResult q = exec(std::string("SELECT tbl FROM ") + kCfRegistry +
+                                  " WHERE name = '@" + qs.queue + "'");
+        if (q.ok && !q.rows.empty()) {
+            return ExecResult::failure("topic '" + qs.queue + "' already exists");
+        }
+        return exec(std::string("INSERT INTO ") + kCfRegistry + " (name, tbl) VALUES ('@" +
+                    qs.queue + "', '!topic')");
+    }
+    bool topic_exists(const std::string& name) {
+        if (catalog_.find(kCfRegistry) == nullptr) return false;
+        const ExecResult q = exec(std::string("SELECT tbl FROM ") + kCfRegistry +
+                                  " WHERE name = '@" + name + "'");
+        return q.ok && !q.rows.empty();
+    }
+    // The next offset for a topic: cached; rebuilt from storage on first touch (crash-
+    // safe — offsets are dense, so tail = last key + 1; empty prefix = 0).
+    std::uint64_t topic_tail(const std::string& name) {
+        const auto it = topic_tail_.find(name);
+        if (it != topic_tail_.end()) return it->second;
+        const Key pfx = topic_prefix(name);
+        std::uint64_t next = 0;
+        (void)db_.engine().scan_visit(
+            storage::Range{pfx, key_successor(pfx), false}, db_.live_snap_seq(),
+            [&](const Key& k, const Value&) {
+                std::uint64_t off = 0;
+                for (std::size_t b = 0; b < 8 && pfx.size() + b < k.size(); ++b)
+                    off = (off << 8) | static_cast<unsigned char>(k[pfx.size() + b]);
+                next = off + 1;
+            });
+        topic_tail_[name] = next;
+        return next;
+    }
+    ExecResult exec_publish(const QueueStmt& qs) {
+        if (!topic_exists(qs.queue)) {
+            return ExecResult::failure("unknown topic '" + qs.queue + "'");
+        }
+        if (!qs.payload) return ExecResult::failure("PUBLISH requires a payload");
+        Datum pd;
+        const Table dummy_t{};
+        const std::vector<Datum> dummy;
+        if (auto e = eval_expr(*qs.payload, dummy_t, dummy, pd)) return ExecResult::failure(*e);
+        if (pd.is_null || pd.type != Type::Text) {
+            return ExecResult::failure("PUBLISH payload must be a TEXT value");
+        }
+        std::uint64_t off = topic_tail(qs.queue);
+        const std::uint64_t first = off;
+        // Batch form: every payload in ONE commit_writes call — one WAL batch, one
+        // coroutine round trip, N records (the producer-batching shape).
+        std::vector<std::pair<Key, Value>> kvs;
+        kvs.reserve(qs.payloads.size());
+        kvs.emplace_back(topic_key(qs.queue, off), pd.s);
+        ++off;
+        const std::vector<Datum> dummy2;
+        for (std::size_t i = 1; i < qs.payloads.size(); ++i) {
+            Datum d2;
+            if (auto e = eval_expr(*qs.payloads[i], dummy_t, dummy2, d2))
+                return ExecResult::failure(*e);
+            if (d2.is_null || d2.type != Type::Text) {
+                return ExecResult::failure("PUBLISH payload must be a TEXT value");
+            }
+            kvs.emplace_back(topic_key(qs.queue, off), d2.s);
+            ++off;
+        }
+        commit_writes(kvs);
+        topic_tail_[qs.queue] = off;
+        ExecResult r;
+        r.affected = kvs.size();
+        ResultRow row;
+        row.cells.emplace_back("_offset", Datum::make_int(static_cast<std::int64_t>(first)));
+        r.rows.push_back(std::move(row));
+        return r;
+    }
+    ExecResult exec_consume(const ChangesStmt& cs) {
+        if (!topic_exists(cs.feed)) {
+            return ExecResult::failure("unknown topic '" + cs.feed + "'");
+        }
+        const Key pfx = topic_prefix(cs.feed);
+        const Key lo = topic_key(cs.feed, static_cast<std::uint64_t>(cs.since));
+        ExecResult r;
+        bool full = false;
+        const bool visited = db_.engine().scan_visit(
+            storage::Range{lo, key_successor(pfx), false}, db_.live_snap_seq(),
+            [&](const Key& k, const Value& v) {
+                if (full || (cs.limit >= 0 &&
+                             static_cast<std::int64_t>(r.rows.size()) >= cs.limit)) {
+                    full = true;
+                    return;
+                }
+                std::uint64_t off = 0;
+                for (std::size_t b = 0; b < 8 && pfx.size() + b < k.size(); ++b)
+                    off = (off << 8) | static_cast<unsigned char>(k[pfx.size() + b]);
+                ResultRow row;
+                row.cells.emplace_back("_offset",
+                                       Datum::make_int(static_cast<std::int64_t>(off)));
+                row.cells.emplace_back("payload", Datum::make_text(std::string(v)));
+                r.rows.push_back(std::move(row));
+            });
+        if (!visited) return ExecResult::failure("CONSUME requires the scan-visit engine");
+        r.affected = r.rows.size();
+        return r;
+    }
+    std::map<std::string, std::uint64_t> topic_tail_;
+
     // =================== end K4 CDC ===================
 
     // ===================== K3: SQL queues (exactly-once messaging) =====================

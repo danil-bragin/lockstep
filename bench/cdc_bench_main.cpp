@@ -94,7 +94,38 @@ static int run_batch(std::size_t batch, std::size_t n) {
     return 0;
 }
 
+// --topic N: the log-shaped ingest path — PUBLISH (no PK read, no row codec,
+// tail-append keys). The Kafka-comparable produce number.
+static int run_topic(std::size_t n, std::size_t batch) {
+    SqlEngine e;
+    e.set_trace_enabled(false);
+    e.exec("CREATE TOPIC ev");
+    const auto t0 = Clock::now();
+    std::string sql;
+    for (std::size_t i = 0; i < n;) {
+        sql.assign("PUBLISH ev");
+        const std::size_t hi = i + batch < n ? i + batch : n;
+        for (; i < hi; ++i)
+            sql += ", 'payload-" + std::to_string(i) +
+                   "-0123456789012345678901234567890123456789'";
+        if (!e.exec(sql).ok) {
+            std::printf("BAD publish\n");
+            return 1;
+        }
+    }
+    const double ms = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                          Clock::now() - t0).count()) / 1000.0;
+    ExecResult c = e.exec("CONSUME ev SINCE 0 LIMIT 1");
+    std::printf("topic publish (batch=%zu): rows=%zu ingest=%.0fms -> %.0f ops/s (probe %s)\n",
+                batch, n, ms, n / ms * 1000, c.ok && !c.rows.empty() ? "ok" : "BAD");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 2 && std::strcmp(argv[1], "--topic") == 0) {
+        return run_topic(static_cast<std::size_t>(std::atoll(argv[2])),
+                         argc > 3 ? static_cast<std::size_t>(std::atoll(argv[3])) : 1);
+    }
     if (argc > 3 && std::strcmp(argv[1], "--batch") == 0) {
         return run_batch(static_cast<std::size_t>(std::atoll(argv[2])),
                          static_cast<std::size_t>(std::atoll(argv[3])));

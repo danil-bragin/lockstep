@@ -576,6 +576,9 @@ enum class StmtKind : std::uint8_t {
     DropChangefeed = 33,       // K4.4: DROP CHANGEFEED cf
     Fetch = 34,                // K4.4: FETCH cf [LIMIT n] — next batch after the acked cursor
     AckFeed = 35,              // K4.4: ACK CHANGEFEED cf AT <seq> — advance + auto-retention
+    CreateTopic = 36,          // K4.10: CREATE TOPIC t — append-only log (no PK tax)
+    Publish = 37,              // K4.10: PUBLISH t, <payload>
+    Consume = 38,              // K4.10: CONSUME t SINCE <off> [LIMIT n]
 };
 
 // K3: one queue statement. Visibility is measured in Seq UNITS (logical time): a
@@ -598,6 +601,7 @@ struct ChangesStmt {
 struct QueueStmt {
     std::string queue;
     std::shared_ptr<Expr> payload;   // SEND: the message body (constant TEXT expression)
+    std::vector<std::shared_ptr<Expr>> payloads;  // K4.10: PUBLISH t, p1, p2, ... (batch)
     std::int64_t batch = 1;          // RECEIVE BATCH n
     std::int64_t visibility = 100;   // RECEIVE VISIBILITY v (Seq units)
     std::int64_t mid = 0;            // ACK: the message id (first)

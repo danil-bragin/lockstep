@@ -122,6 +122,11 @@ public:
                 return ExecResult::failure(
                     "named changefeeds are per-shard — create/fetch/ack them on the "
                     "shard engine (one cursor per shard, like partition offsets)");
+            case StmtKind::CreateTopic:  // K4.10: a topic is one shard's log — like
+            case StmtKind::Publish:      // named feeds, manage it on the shard engine
+            case StmtKind::Consume:      // (offsets are per-shard, like partitions).
+                return ExecResult::failure(
+                    "topics are per-shard — create/publish/consume on the shard engine");
             case StmtKind::CreateQueue:  // K3 queues are single-engine v1 — a clean
             case StmtKind::DropQueue:    // refusal beats a silently-wrong route (a
             case StmtKind::Send:         // RECEIVE must see ONE queue, not a slice).
