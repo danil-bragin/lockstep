@@ -81,3 +81,15 @@ Also fixed by this run: the engine's JSON \uXXXX parser mishandled surrogate PAI
 proper 4-byte UTF-8.
 
 Repro: `OR_KEY=... python3 bench/compare/mcp/run_locomo.py ./build/release/cli/lockstep_mcpd locomo10.json`
+
+# memU-over-Lockstep PoC — recon verdict (2026-07-13)
+
+memU (NevaMind-AI) is an LLM orchestration layer OVER a pluggable store (inmemory /
+sqlite / postgres) — not a store competitor. Its postgres backend is SQLAlchemy +
+alembic: the gap list to run it over our PG wire today is (1) `CREATE EXTENSION
+vector` (accept as a no-op — our VECTOR is native), (2) `DateTime(timezone=True)` +
+`server_default now()` column machinery, (3) alembic's version table + the SQLAlchemy
+dialect's catalog introspection surface. That is an ORM-compatibility work package
+(its own session), not an evening PoC — recorded as the concrete next slice of the
+PG-surface roadmap. Strategically memU remains an INTEGRATION target (their layer,
+our engine), and any quality comparison must be at equal ingest budget.
