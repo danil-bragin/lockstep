@@ -1079,10 +1079,16 @@ public:
     // the full history is resident, so this always holds. A caller that has
     // flushed must archive BEFORE the flush (continuous archiving) or take a base
     // backup instead — the refusal is honest, never a silent gap.
-    [[nodiscard]] Future<Error> export_ops(Seq from_seq, std::vector<ExportedOp>& out) {
+    // `include_flushed=false` (the PITR default) keeps the original memtable-only
+    // contract byte-identical. `include_flushed=true` (the CDC changefeed) ALSO reads
+    // the live SSTables — a flush no longer truncates the exportable history; the
+    // retention horizon moves to COMPACTION (version GC under the read watermark),
+    // and a range compaction has GC'd still REFUSES as a gap, never a silent hole.
+    [[nodiscard]] Future<Error> export_ops(Seq from_seq, std::vector<ExportedOp>& out,
+                                           bool include_flushed = false) {
         Promise<Error> p = make_promise<Error>(sched_);
         Future<Error> f = p.get_future();
-        sched_->spawn(export_ops_task(std::move(p), from_seq, &out));
+        sched_->spawn(export_ops_task(std::move(p), from_seq, &out, include_flushed));
         return f;
     }
 
@@ -1093,9 +1099,36 @@ private:
     // the ops in ascending Seq order; on failure `*out` is cleared and the Error is
     // returned. NO memtable reference is held across the deref await (V-RKV1): the
     // versions are copied into `ops` first, then derefed.
-    core::Task export_ops_task(Promise<Error> p, Seq from_seq, std::vector<ExportedOp>* out) {
+    core::Task export_ops_task(Promise<Error> p, Seq from_seq, std::vector<ExportedOp>* out,
+                               bool include_flushed) {
         out->clear();
         std::vector<ExportedOp> ops;
+        if (include_flushed) {
+            // Flushed history: every live SSTable entry is a committed version with
+            // its original Seq (flush/compaction preserve seqs verbatim). Each Seq is
+            // unique engine-wide and a flush ERASES what it flushed from the memtable,
+            // so sstable + memtable versions are disjoint — a plain concat then sort
+            // by Seq reconstructs the op-log with no dedup step.
+            for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+                if (sst->max_seq < from_seq) {
+                    continue;  // wholly below the cursor — a tailing reader skips it
+                }
+                std::vector<SstEntry> run;
+                sst->collect_entries(run);
+                for (SstEntry& e : run) {
+                    if (e.seq < from_seq) {
+                        continue;
+                    }
+                    ExportedOp op;
+                    op.seq = e.seq;
+                    op.key = std::move(e.key);
+                    op.value = std::move(e.value);
+                    op.tombstone = e.tombstone;
+                    op.vlog = e.vlog;
+                    ops.push_back(std::move(op));
+                }
+            }
+        }
         for (const auto& [key, versions] : mem_.entries()) {
             for (const Memtable::Version& v : versions) {
                 if (v.seq < from_seq) {
@@ -1121,7 +1154,10 @@ private:
             if (ops.empty() || ops.front().seq != s0 || ops.back().seq != last_seq_ ||
                 static_cast<std::uint64_t>(ops.size()) != want) {
                 p.set_value(Error{ErrorCode::Corruption,
-                                  "pitr: op-log incomplete (flushed/truncated) — archive before flush"});
+                                  include_flushed
+                                      ? "cdc: op-log incomplete (compacted past the cursor)"
+                                      : "pitr: op-log incomplete (flushed/truncated) — "
+                                        "archive before flush"});
                 co_return;
             }
         } else {

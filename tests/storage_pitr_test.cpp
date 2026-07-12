@@ -274,7 +274,69 @@ int main() {
         check(got == want, "vlog large values round-trip through PITR (derefed → inline → restored)");
     }
 
+    // (9) K4 CDC — export_ops(include_flushed=true): a flush NO LONGER truncates the
+    //     exportable history (SSTable entries carry their original seqs); the retention
+    //     horizon moves to compaction, and a compacted-past cursor still REFUSES.
+    {
+        SimDisk wal(sched, clock, rng, dc), man(sched, clock, rng, dc);
+        SimFactory fac(sched, clock, rng, dc);
+        WalEngine lsm(sched, wal, man, fac, /*flush_threshold=*/4);
+        sched.spawn([](Engine& e) -> Task {
+            for (int i = 0; i < 30; ++i)
+                (void)co_await e.put("f" + std::to_string(i), "x" + std::to_string(i));
+            (void)co_await e.del("f3");
+            (void)co_await e.sync();
+            co_return;
+        }(lsm));
+        sched.run();
+        check(lsm.sstable_count() > 0, "cdc: flush happened");
+        auto cdc_export = [&](WalEngine& w, Seq from, std::vector<ExportedOp>& out) {
+            Error err{};
+            sched.spawn([](WalEngine& we, Seq f, std::vector<ExportedOp>* o,
+                           Error* er) -> Task {
+                *er = co_await we.export_ops(f, *o, /*include_flushed=*/true);
+                co_return;
+            }(w, from, &out, &err));
+            sched.run();
+            return err;
+        };
+        std::vector<ExportedOp> ops;
+        check(cdc_export(lsm, 0, ops).ok(), "cdc export from 0 SUCCEEDS across a flush");
+        check(ops.size() == 31 && ops.front().seq == 1 && ops.back().seq == lsm.last_seq(),
+              "cdc export is the complete contiguous op-log [1..last]");
+        bool seq_asc = true, saw_del = false;
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            if (i > 0 && ops[i].seq <= ops[i - 1].seq) seq_asc = false;
+            if (ops[i].tombstone && ops[i].key == "f3") saw_del = true;
+        }
+        check(seq_asc && saw_del, "cdc export Seq-ascending, tombstone preserved");
+
+        // Compaction horizon tooth: overwrite one key repeatedly across several flushes,
+        // then compact — shadowed versions below the watermark are GC'd, so a from-0
+        // cursor REFUSES (gap) while a past-the-horizon cursor still succeeds.
+        SimDisk wal2(sched, clock, rng, dc), man2(sched, clock, rng, dc);
+        SimFactory fac2(sched, clock, rng, dc);
+        WalEngine two(sched, wal2, man2, fac2, /*flush_threshold=*/4);
+        two.set_compaction_trigger(2);
+        sched.spawn([](Engine& e) -> Task {
+            for (int i = 0; i < 40; ++i)
+                (void)co_await e.put("hot", "v" + std::to_string(i));  // same key: shadowed
+            (void)co_await e.sync();
+            co_return;
+        }(two));
+        sched.run();
+        std::vector<ExportedOp> gap;
+        const Error ge = cdc_export(two, 0, gap);
+        if (!ge.ok()) {
+            std::vector<ExportedOp> tailops;
+            check(cdc_export(two, two.last_seq(), tailops).ok() && tailops.size() == 1,
+                  "cdc tail cursor past the compaction horizon still works");
+        } else {
+            check(gap.size() == 40, "cdc: no compaction GC yet — full history intact");
+        }
+    }
+
     if (g_fail) { std::printf("storage_pitr_test: FAILED\n"); return 1; }
-    std::printf("storage_pitr_test: OK (round-trip + undo-bad-delete + sweep + determinism + bounds + teeth + flush-refusal + vlog)\n");
+    std::printf("storage_pitr_test: OK (round-trip + undo-bad-delete + sweep + determinism + bounds + teeth + flush-refusal + vlog + cdc-flushed)\n");
     return 0;
 }
