@@ -476,6 +476,66 @@ int main() {
             check(has_type(ms, 'E'), "K1: binary result-format request -> clean ErrorResponse");
         }
     }
+    // (K4.5) LISTEN/NOTIFY over named changefeeds: push-wake + pull-batch.
+    {
+        auto notif = [](const std::vector<Msg>& ms) -> std::string {
+            for (const Msg& m : ms) {
+                if (m.type != 'A') continue;
+                // [int32 pid][channel cstr][payload cstr]
+                std::string chan, pay;
+                std::size_t i = 4;
+                while (i < m.body.size() && m.body[i] != std::byte{0})
+                    chan += std::to_integer<char>(m.body[i++]);
+                ++i;
+                while (i < m.body.size() && m.body[i] != std::byte{0})
+                    pay += std::to_integer<char>(m.body[i++]);
+                return chan + "=" + pay;
+            }
+            return "";
+        };
+        (void)session.feed(sp(query("CREATE CHANGEFEED cf FOR t")));
+        {
+            const auto ms = parse_backend(session.feed(sp(query("LISTEN ghost"))));
+            check(has_type(ms, 'E'), "LISTEN on an unknown feed errors");
+        }
+        {
+            // Rows already exist and are unacked -> LISTEN's own boundary announces them.
+            const auto ms = parse_backend(session.feed(sp(query("LISTEN cf"))));
+            check(has_type(ms, 'C') && has_type(ms, 'A'),
+                  "LISTEN ok + immediate 'A' for the existing unacked backlog");
+        }
+        {
+            const auto ms = parse_backend(session.feed(sp(query("SELECT id FROM t WHERE id = 1"))));
+            const std::string n = notif(ms);
+            check(n.empty(), "announced batch is not re-announced (de-dup)");
+        }
+        {
+            // ACK everything, then a quiet command: no notification.
+            const auto f = engine.exec("FETCH cf");
+            const std::int64_t tip = f.rows.back().cells[0].second.i;
+            (void)session.feed(sp(query("ACK CHANGEFEED cf AT " + std::to_string(tip))));
+            const auto ms = parse_backend(session.feed(sp(query("SELECT id FROM t WHERE id = 1"))));
+            check(notif(ms).empty(), "fully acked feed is silent");
+        }
+        {
+            // New commit -> next boundary carries 'A' with the first unacked _seq.
+            const auto ins = parse_backend(
+                session.feed(sp(query("INSERT INTO t (id, name) VALUES (7, 'push')"))));
+            const std::string n = notif(ins);
+            check(!n.empty() && n.rfind("cf=", 0) == 0, "new write announced on channel cf");
+            const auto f = engine.exec("FETCH cf LIMIT 1");
+            check(n == "cf=" + std::to_string(f.rows[0].cells[0].second.i),
+                  "payload = first unacked _seq");
+        }
+        {
+            const auto ms = parse_backend(session.feed(sp(query("UNLISTEN cf"))));
+            check(has_type(ms, 'C'), "UNLISTEN ok");
+            (void)session.feed(sp(query("INSERT INTO t (id, name) VALUES (8, 'quiet')")));
+            const auto ms2 = parse_backend(session.feed(sp(query("SELECT id FROM t WHERE id = 8"))));
+            check(notif(ms2).empty(), "after UNLISTEN: silence");
+        }
+    }
+
 
     if (g_fail) { std::printf("pg_wire_test: FAILED\n"); return 1; }
     std::printf("pg_wire_test: OK (handshake + simple query + EXTENDED protocol (bound $1) + "

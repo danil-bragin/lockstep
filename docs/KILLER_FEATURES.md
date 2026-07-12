@@ -144,7 +144,16 @@ the slowest consumer's lag (Kafka: guessed retention.ms + a separate offsets top
 group coordinators; here: one table and one min()). Named feeds are per-shard (the
 coordinator refuses, cursors ARE partition offsets). Gates: fetch/ack loop, crash-safe
 refetch, backwards-ACK tooth, two-feed min() horizon + DROP recompute, restart cursor
-survival (sql_cdc_test §11-12). Open: push sinks over the PG wire (NOTIFY-shaped), prod
+survival (sql_cdc_test §11-12). **K4.5 SHIPPED:** the PG push surface — `LISTEN <changefeed>` / `UNLISTEN` in the wire
+session (PG semantics are per-connection; the SQL core is untouched). At every
+ReadyForQuery boundary the session probes each listened feed (FETCH LIMIT 1 — the
+cursor never moves) and emits NotificationResponse 'A' (channel = feed, payload = the
+first unacked _seq) when an unannounced batch exists; de-duped per batch, an ACK
+re-arms. Push-wake + pull-batch over exactly-once cursors — a stock PG driver's
+LISTEN/NOTIFY loop becomes a Kafka consumer with durable offsets, no client library.
+Gates: unknown-feed error, backlog announce on LISTEN, de-dup, acked silence, new-write
+announce with exact payload, UNLISTEN silence (pg_wire_test). Open: server-initiated
+mid-idle push (the reactor already may call poll_notifications on commit hooks), prod
 replicated shards, fault-storm teeth, Kafka head-to-head harness.
 
 ### K5 — Incrementally-maintained materialized views *(L)* — TIER: BET *(TECH_PLAN K3)*

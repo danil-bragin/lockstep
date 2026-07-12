@@ -506,6 +506,7 @@ public:
             } else if (type == 'C') {  // Close (a statement or portal)
                 handle_close(out, payload, plen);
             } else if (type == 'S') {  // Sync (end of the extended-query cycle)
+                poll_notifications(out);
                 pg_ready_for_query(out);
             }
             // 'H' Flush and any unknown message: nothing to do (we return `out` already).
@@ -542,6 +543,52 @@ private:
         return "";
     }
 
+    // K4.5: LISTEN <changefeed> / UNLISTEN <changefeed> — the PG push surface over named
+    // changefeeds. PG semantics are per-connection, so this lives in the session, not the
+    // SQL engine. On every ReadyForQuery boundary the session checks each listened feed
+    // (FETCH cf LIMIT 1 — the cursor does not move) and, when unacked ops exist that it
+    // has not yet announced, emits a NotificationResponse 'A' with channel = the feed
+    // name and payload = the first unacked _seq. Push-wake + pull-batch: the consumer
+    // sleeps on the socket, wakes on 'A', then FETCH/ACK as usual — the exact shape of a
+    // long-polling Kafka consumer, atop exactly-once cursors. De-duped per (feed, seq):
+    // an unacked-but-announced batch is not re-announced; an ACK re-arms the feed.
+    [[nodiscard]] static std::optional<std::string> listen_channel_of(const std::string& s,
+                                                                      bool& unlisten) {
+        std::size_t b = 0, e = s.size();
+        while (b < e && std::isspace(static_cast<unsigned char>(s[b])) != 0) ++b;
+        while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1])) != 0) --e;
+        std::string t = s.substr(b, e - b);
+        std::string head;
+        for (const char c : t) {
+            if (std::isspace(static_cast<unsigned char>(c)) != 0) break;
+            head += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (head != "listen" && head != "unlisten") return std::nullopt;
+        unlisten = head == "unlisten";
+        std::string chan = t.substr(head.size());
+        b = 0;
+        while (b < chan.size() && std::isspace(static_cast<unsigned char>(chan[b])) != 0) ++b;
+        chan = chan.substr(b);
+        for (const char c : chan) {
+            if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_') return std::nullopt;
+        }
+        return chan;
+    }
+    void poll_notifications(std::vector<std::byte>& out) {
+        for (auto& [chan, announced] : listens_) {
+            const sql::ExecResult r = exec_("FETCH " + chan + " LIMIT 1");
+            if (!r.ok || r.rows.empty()) continue;  // feed gone or fully acked — silent
+            const std::int64_t first_unacked = r.rows[0].cells[0].second.i;
+            if (first_unacked == announced) continue;  // already announced this batch
+            announced = first_unacked;
+            std::vector<std::byte> a;
+            pg_put_i32(a, backend_pid_);
+            pg_put_str(a, chan);
+            pg_put_str(a, std::to_string(first_unacked));
+            pg_detail::emit(out, 'A', a);  // NotificationResponse
+        }
+    }
+
     // A simple-Query string may hold several ';'-separated statements; run each, then emit
     // exactly ONE ReadyForQuery. On the first error, stop (PG aborts the rest of the batch).
     void handle_query(std::vector<std::byte>& out, const std::string& sql) {
@@ -549,6 +596,23 @@ private:
         bool any = false;
         for (const std::string& s : stmts) {
             any = true;
+            bool unlisten = false;
+            if (const auto chan = listen_channel_of(s, unlisten); chan.has_value()) {
+                if (unlisten) {
+                    listens_.erase(*chan);
+                    pg_command_complete(out, "UNLISTEN");
+                    continue;
+                }
+                // LISTEN validates the feed exists (a probe FETCH; the cursor stays put).
+                const sql::ExecResult probe = exec_("FETCH " + *chan + " LIMIT 1");
+                if (!probe.ok) {
+                    pg_error_response(out, probe.error);
+                    break;
+                }
+                listens_.emplace(*chan, -1);
+                pg_command_complete(out, "LISTEN");
+                continue;
+            }
             const sql::ExecResult r = exec_(s);
             pg_reply_for_statement(out, s, r);
             if (!r.ok) break;
@@ -558,6 +622,7 @@ private:
             std::vector<std::byte> empty;
             pg_detail::emit(out, 'I', empty);
         }
+        poll_notifications(out);
         pg_ready_for_query(out);
     }
 
@@ -770,6 +835,7 @@ private:
     bool awaiting_password_ = false;  // sent AuthenticationCleartextPassword, awaiting 'p'
     std::string user_;            // the startup "user" parameter (for auth)
     bool closed_ = false;
+    std::map<std::string, std::int64_t> listens_;  // K4.5: feed -> last announced _seq (-1 = none)
     std::map<std::string, std::string> stmts_;  // prepared statements: name -> query
     std::map<std::string, Portal> portals_;     // bound portals: name -> {sql, cached}
     // K1: Parse-time declared parameter-type OIDs (decode key for binary-format Bind params).
