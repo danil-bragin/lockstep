@@ -192,17 +192,40 @@ int main() {
     check(e.exec("SET cdc.retain_seq = 1").ok, "SET cdc.retain_seq accepted");
     check(!e.exec("SET cdc.retain_seq = 'x'").ok, "non-integer retain_seq rejected");
 
-    // (10a) Columnar tooth: a columnar table refuses CHANGES with a teaching error
-    // (its delta->block maintenance would surface as false DELETEs) — never a
-    // silently empty feed.
+    // (10a) K5.4 COLUMNAR CDC: the delta-namespace feed carries the LOGICAL ops only —
+    // user writes as PUT, user deletes as DELETE, and the flush's maintenance
+    // tombstones NEVER surface (the false-delete trap this feed was refused over).
     {
         SqlEngine d;
         d.set_columnar_default(true);
         check(d.exec("CREATE TABLE ct (id INT, v INT, PRIMARY KEY (id))").ok, "columnar create");
         d.set_columnar_default(false);
-        const ExecResult r = d.exec("CHANGES ct SINCE 0");
-        check(!r.ok && r.error.find("columnar") != std::string::npos,
-              "columnar CHANGES: clean teaching refusal");
+        d.exec("INSERT INTO ct (id,v) VALUES (1,10), (2,20), (3,30)");
+        d.exec("DELETE FROM ct WHERE id = 2");
+        d.exec("UPDATE ct SET v = 99 WHERE id = 3");
+        // Force the columnar flush (delta -> blocks + maintenance tombstones).
+        check(!d.flush_columnar("ct").has_value(), "columnar flush runs");
+        const ExecResult f = d.exec("CHANGES ct SINCE 0");
+        check(f.ok && f.rows.size() == 5, "feed = 5 logical ops (3 ins + 1 del + 1 upd), "
+                                          "maintenance invisible");
+        int dels = 0, puts = 0;
+        std::int64_t last = 0;
+        for (const auto& row : f.rows) {
+            last = row.cells[0].second.i;
+            (row.cells[1].second.s == "DELETE" ? dels : puts)++;
+        }
+        check(dels == 1 && puts == 4, "one DELETE, four PUTs");
+        // Replay == table (same discipline as the row gate).
+        std::map<std::int64_t, std::string> shadow2;
+        apply_feed(f, shadow2);
+        std::map<std::int64_t, std::string> want2;
+        for (const auto& row : d.exec("SELECT id, v FROM ct ORDER BY id").rows)
+            want2[row.cells[0].second.i] = row.cells[1].second.render() + "|";
+        check(shadow2 == want2, "columnar replay == table across a flush");
+        // Post-flush writes keep flowing.
+        d.exec("INSERT INTO ct (id,v) VALUES (4,40)");
+        const ExecResult tail2 = d.exec("CHANGES ct SINCE " + std::to_string(last));
+        check(tail2.ok && tail2.rows.size() == 1, "post-flush tail = the new insert only");
     }
 
     // (10) Teeth: unknown table; LIMIT respected.

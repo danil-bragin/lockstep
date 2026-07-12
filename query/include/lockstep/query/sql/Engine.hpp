@@ -4555,14 +4555,7 @@ private:
             ivm_catch_up(iv->first);  // K6: the feed reflects a fresh view
         }
         if (const Table* ct = catalog_.find(cs.table); ct != nullptr && ct->columnar) {
-            // COLUMNAR CDC IS AN OPEN ITEM — refuse rather than lie. A columnar
-            // table's live writes land in the row-delta namespace and its background
-            // flush rewrites them into blocks via maintenance tombstones; a naive
-            // key-prefix feed would emit those as FALSE deletes. Until the feed can
-            // separate logical ops from maintenance, CDC sources must be row tables.
-            return ExecResult::failure(
-                "CHANGES on a columnar table is not supported yet — create the CDC "
-                "source table without the columnar layout");
+            return exec_changes_columnar(cs, *ct);  // K5.4: the delta-namespace feed
         }
         if (cs.shard >= 0) {
             return ExecResult::failure(
@@ -4621,6 +4614,69 @@ private:
         r.affected = r.rows.size();
         return r;
     }
+    // K5.4: COLUMNAR CDC. A columnar table's logical ops all pass through the row
+    // 'd' delta namespace with three EXACTLY distinguishable value classes:
+    //   * storage tombstone            -> the flush clearing the delta (MAINTENANCE — skip)
+    //   * the row_del_marker sentinel  -> a user DELETE (emit as a DELETE delta)
+    //   * a row-codec value            -> a user INSERT/UPDATE (emit as PUT)
+    // Block/overlay/manifest namespaces never enter the feed (prefix filter), so the
+    // stream is the logical op sequence — no heuristics, no false deletes. Same Seq
+    // cursor discipline as row-table CHANGES.
+    ExecResult exec_changes_columnar(const ChangesStmt& cs, const Table& t) {
+        auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());
+        if (we == nullptr) return ExecResult::failure("CHANGES requires the WAL engine");
+        std::vector<storage::ExportedOp> ops;
+        core::Error err{};
+        {
+            core::Promise<bool> done = core::make_promise<bool>(&db_.scheduler());
+            core::Future<bool> f = done.get_future();
+            db_.scheduler().spawn(cdc_export_task(
+                *we, static_cast<storage::Seq>(cs.since) + 1, &ops, &err, std::move(done)));
+            db_.scheduler().run();
+            (void)f;
+        }
+        if (!err.ok()) {
+            return ExecResult::failure(std::string("CHANGES: ") + std::string(err.detail) +
+                                       " (consume continuously, or restart the cursor "
+                                       "from a fresh snapshot)");
+        }
+        const Key pfx = row_delta_prefix(t.id);
+        ExecResult r;
+        for (const storage::ExportedOp& op : ops) {
+            if (cs.limit >= 0 && static_cast<std::int64_t>(r.rows.size()) >= cs.limit) break;
+            if (op.key.size() <= pfx.size() || op.key.compare(0, pfx.size(), pfx) != 0) {
+                continue;
+            }
+            if (op.tombstone) continue;  // the flush's delta clear — maintenance, not logic
+            ResultRow out;
+            out.cells.emplace_back("_seq", Datum::make_int(static_cast<std::int64_t>(op.seq)));
+            if (is_row_del_marker(op.value)) {
+                out.cells.emplace_back("_op", Datum::make_text("DELETE"));
+                std::vector<Datum> row(t.columns.size());
+                row[t.pk_index] = decode_pk_from_delta_key(t, op.key);
+                tag_logical_cols(t, row);
+                for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                    if (t.columns[c].dropped) continue;
+                    out.cells.emplace_back(t.columns[c].name,
+                                           c == t.pk_index ? row[c]
+                                                           : Datum::make_null(t.columns[c].type));
+                }
+            } else {
+                out.cells.emplace_back("_op", Datum::make_text("PUT"));
+                // The delta key shares the row key's 6-byte prefix layout, so the
+                // ordinary row decode applies verbatim.
+                std::vector<Datum> row = decode_row(t, op.key, op.value);
+                for (std::size_t c = 0; c < t.columns.size(); ++c) {
+                    if (t.columns[c].dropped) continue;
+                    out.cells.emplace_back(t.columns[c].name, row[c]);
+                }
+            }
+            r.rows.push_back(std::move(out));
+        }
+        r.affected = r.rows.size();
+        return r;
+    }
+
     // K4.4: named server-side changefeed cursors. The registry is a HIDDEN ROW TABLE
     // (__cf: name PK, tbl, acked) written through the ordinary SQL write path — so
     // cursors are durable, replicated, and deterministic exactly like user data (the
