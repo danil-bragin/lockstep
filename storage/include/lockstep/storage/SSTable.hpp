@@ -599,6 +599,19 @@ public:
     // byte-equivalent to SSTableLoader::parse(r.bytes, id, *this); the differential
     // gate in storage_sstable_test compares the two on every surface. Recovery paths
     // never use this (they parse real disk bytes, CRC and all).
+    // Whole-table key bounds (nullptr when empty) — used by compaction to detect
+    // pure topic-namespace segments that never need merging.
+    [[nodiscard]] const Key* first_key() const noexcept {
+        for (const auto& b : blocks_)
+            if (!b.empty()) return &b.front().key;
+        return nullptr;
+    }
+    [[nodiscard]] const Key* last_key() const noexcept {
+        for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it)
+            if (!it->empty()) return &it->back().key;
+        return nullptr;
+    }
+
     void adopt_built(const SstBuildResult& r, std::uint64_t id) {
         sstable_id = id;
         min_seq = r.min_seq;

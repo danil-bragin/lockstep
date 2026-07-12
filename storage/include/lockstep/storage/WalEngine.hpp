@@ -165,12 +165,12 @@ inline constexpr std::size_t kWalCrcBytes = 4;
     put_u64(buf, r.seq);
     put_u32(buf, static_cast<std::uint32_t>(r.key.size()));
     put_u32(buf, static_cast<std::uint32_t>(r.value.size()));
-    for (char c : r.key) {
-        buf.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(c)));
-    }
-    for (char c : r.value) {
-        buf.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(c)));
-    }
+    // Bulk copies (K4.11): the per-char push_back loops were a measurable share of
+    // the ingest profile; reserve() above already sized the buffer exactly.
+    const auto* kp = reinterpret_cast<const std::byte*>(r.key.data());
+    buf.insert(buf.end(), kp, kp + r.key.size());
+    const auto* vp = reinterpret_cast<const std::byte*>(r.value.data());
+    buf.insert(buf.end(), vp, vp + r.value.size());
     // CRC covers the whole payload up to here; append it last.
     const std::uint32_t crc = Crc32::compute(std::span<const std::byte>(buf.data(), buf.size()));
     put_u32(buf, crc);
@@ -1447,10 +1447,23 @@ private:
         // Correctness is untouched: entries carry their seqs, reads merge across
         // tables by seq (install order is irrelevant), and WAL truncation still uses
         // the max seq of the tables that ARE durable in the merge inputs.
+        // TOPIC SEGMENTS ARE NOT COMPACTED (K4.11): a table whose whole key range
+        // lies inside the append-only log namespace ("!t...") holds ascending,
+        // disjoint, immutable, never-shadowed records — merging them reclaims
+        // nothing and rewrites everything. Leave such segments live forever (the
+        // Kafka segment file, in LSM clothes); reads stay cheap because segment
+        // ranges are disjoint. Mixed tables (any non-topic key) compact as usual.
+        auto is_topic_segment = [](const SSTableReader& t) {
+            const Key* lo = t.first_key();
+            const Key* hi = t.last_key();
+            return lo != nullptr && hi != nullptr && lo->rfind("!t", 0) == 0 &&
+                   hi->rfind("!t", 0) == 0;
+        };
         std::size_t giant = sstables_.size();  // index of the excluded table (or none)
         {
             std::size_t total = 0, imax = 0, nmax = 0;
             for (std::size_t i = 0; i < sstables_.size(); ++i) {
+                if (is_topic_segment(*sstables_[i])) continue;
                 const std::size_t n = sstables_[i]->entry_count();
                 total += n;
                 if (n > nmax) { nmax = n; imax = i; }
@@ -1463,7 +1476,7 @@ private:
         std::vector<std::uint64_t> input_ids;
         Seq covered_max = kNoSeq;
         for (std::size_t i = 0; i < sstables_.size(); ++i) {
-            if (i == giant) {
+            if (i == giant || is_topic_segment(*sstables_[i])) {
                 continue;
             }
             const std::unique_ptr<SSTableReader>& sst = sstables_[i];
@@ -1474,6 +1487,10 @@ private:
             if (sst->max_seq > covered_max) {
                 covered_max = sst->max_seq;
             }
+        }
+
+        if (input_ids.size() < 2) {
+            co_return;  // all-topic (or one lone) input set — nothing worth merging
         }
 
         // (2) k-way merge + version GC under the watermark. The watermark is the
