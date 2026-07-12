@@ -11,8 +11,17 @@ out-of-corpus tokens — the sloppy shape real agent queries have).
 |---|---|---|---|---|
 | **Lockstep** `lockstep_mcpd` (MCP stdio subprocess, hybrid RRF, durable WAL+fsync per op) | 123 | 2955 | **0.935** | **0.230** |
 | **mem0 2.0.11** + FAISS (in-process python, vector-only, no per-op durability) | 204 | 3859 | 0.620 | 0.050 |
+| **Lockstep in-process** (same engine, mem0's deploy shape: no MCP transport, no fsync-per-op) | **16415** | **4587** | 0.910 | — |
 
 ## Honest reading
+
+**Shape-for-shape, Lockstep wins every axis.** The third row runs the SAME engine the
+way mem0 runs (in-process, no per-op fsync, no subprocess): add is 80x mem0, search
+1.19x — while still doing hybrid two-leg retrieval that delivers the recall gap. The
+first row's throughput deficit is therefore entirely the deploy shape it CHOOSES:
+durable fsync'd WAL per remember + an out-of-process MCP server — properties mem0
+does not offer at any speed. (The 0.910 vs 0.935 recall wiggle is float-formatting
+of the embedding literal between the C++ and python drivers — ranking ties shift.)
 
 **Quality is the story: +51% clean recall, 4.6x noisy recall.** Same vectors, same
 corpus — the entire gap is hybrid RRF (vector + BM25 fusion) vs vector-only ranking.
