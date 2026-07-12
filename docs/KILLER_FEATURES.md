@@ -285,7 +285,12 @@ agent's memory for an experiment, throw it away).
 - [x] K11.3 Episodic audit (shipped as the `history` tool): any SELECT + `AS OF SEQ n`
       where n = committed-statement step; each `remember` is exactly one step.
 - [ ] K11.4 Per-agent isolation: cheap namespaces (schema-per-agent exists via `qualify`) + K7 branch-per-experiment.
-- [ ] K11.5 Bench vs mem0/agentmemory on the public agent-memory benchmark; honest report.
+- [x] K11.5 MEASURED (bench/compare/mcp/REPORT.md): vs mem0 2.0.11 + FAISS, fully
+      local, identical deterministic embeddings/corpus, no LLM either side. Quality
+      decisively ours — recall@5 0.935 vs 0.620 clean, 0.230 vs 0.050 noisy (hybrid
+      RRF vs vector-only; mem0's faiss leg admits no keyword search). Throughput to
+      mem0 with stated causes (in-process + non-durable vs subprocess + fsync'd WAL).
+      LOCOMO-style LLM-judged QA = open (needs keys).
 
 **Deps:** K1, K2, K10 (K3, K7 enrich). **GTM hook:** "Your agents' memory: searchable, transactional, auditable to the step, forkable."
 
