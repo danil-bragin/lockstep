@@ -259,3 +259,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] **K2.1-K2.3 core**: deterministic tokenizer (ASCII, no locale/ICU/stemmer) · USING BM25 posting index ('t'+term+pk → tf,dl denormalised; 'S' → corpus stats, overlay read-modify-write in the row batch; backfill == live path) · top-k `ORDER BY bm25_score(col,'q') DESC LIMIT k` (classic k1=1.2/b=0.75, scan_visit per term, (score DESC, pk) total order) · MATCHES(col,'q') per-row predicate · planner exclusions · K2.6 differential gate = independent reference BM25 in sql_bm25_test (queries × maintenance × columnar × restart).
 - [ ] open (K2): projected bm25_score (needs stmt-scoped df/stats memo) · @@ operator sugar · stemmer/language packs (deterministic pinned tables) · K2.4 RRF hybrid helper over CTEs (vectors + BM25 — the flagship demo) · K2.5 relevance parity vs Elasticsearch (BEIR subset) · AT SNAPSHOT reads (leveled posting scans) · phrase/prefix queries.
+
+## K2.4 hybrid RRF (2026-07-12)
+
+- [x] `ORDER BY rrf_score(vec, '[q]', text, 'q') DESC LIMIT k` — fused RRF (k=60) over the two index-backed legs at depth max(60,3k); (score DESC, pk) total order; both-indexes required, clean error otherwise; reference-fusion gate row+columnar.
+- [ ] open: leg weights (rrf_score(..., w1, w2)) · projected rrf/bm25 scores · CTE-composable ranks · K2.5 BEIR parity harness.
