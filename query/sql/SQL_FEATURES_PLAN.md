@@ -264,3 +264,8 @@ INSERT/UPDATE/DELETE/point-SELECT route by PK hash; scan/aggregate scatter + mer
 
 - [x] `ORDER BY rrf_score(vec, '[q]', text, 'q') DESC LIMIT k` — fused RRF (k=60) over the two index-backed legs at depth max(60,3k); (score DESC, pk) total order; both-indexes required, clean error otherwise; reference-fusion gate row+columnar.
 - [ ] open: leg weights (rrf_score(..., w1, w2)) · projected rrf/bm25 scores · CTE-composable ranks · K2.5 BEIR parity harness.
+
+## K3 SQL queues v1 (2026-07-12)
+
+- [x] **K3.1-K3.3 core**: CREATE/DROP QUEUE · SEND (ordinary INSERT path → transactional outbox in BEGIN..COMMIT) · RECEIVE BATCH/VISIBILITY (atomic mark batch, FIFO by auto-mid, Seq-unit logical visibility — deterministic replicated redelivery) · ACK (idempotent delete) · DLQ after 5 deliveries + RECEIVE q DLQ peek. Queues = hidden row tables → durability/repl/backup free. Gate: exactly-once competing-consumer run + redelivery + outbox atomicity + restart.
+- [ ] open (K3): RECEIVE/ACK inside transactions · per-queue max_deliveries/default visibility knobs · consumer groups · K3.4 throughput bench vs pgmq · K3.5 full Raft fault-storm exactly-once oracle (leader kill mid-RECEIVE) · prod no-op Seq ticker.
