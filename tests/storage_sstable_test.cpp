@@ -635,8 +635,52 @@ void test_format_version() {
 
 }  // namespace
 
+// K4.9: adopt_built == parse — the reader the engine installs for its own built
+// image must be INDISTINGUISHABLE from the reader recovery would decode from the
+// same bytes: identical blocks, index keys, seq bounds, lookups, and bloom answers.
+void test_adopt_equals_parse() {
+    using namespace lockstep::storage;
+    std::vector<SstEntry> entries;
+    for (int k = 0; k < 500; ++k) {
+        const std::string key = "k" + std::to_string(1000 + k);
+        entries.push_back(SstEntry{key, "v" + std::to_string(k), Seq(k * 2 + 1), false, false});
+        if (k % 7 == 0) {  // extra version + tombstones sprinkled in
+            entries.push_back(SstEntry{key, "", Seq(k * 2 + 2), true, false});
+        }
+    }
+    const SstBuildResult built = SSTableBuilder::build(entries);
+    SSTableReader parsed, adopted;
+    CHECK(SSTableLoader::parse(built.bytes, 42, parsed), "loader parses own image");
+    adopted.adopt_built(built, 42);
+    CHECK(parsed.block_count() == adopted.block_count(), "block counts equal");
+    for (std::size_t b = 0; b < parsed.block_count(); ++b) {
+        const auto& pb = parsed.block(b);
+        const auto& ab = adopted.block(b);
+        CHECK(pb.size() == ab.size(), "block %zu size equal", b);
+        for (std::size_t i = 0; i < pb.size() && i < ab.size(); ++i) {
+            CHECK(pb[i].key == ab[i].key && pb[i].value == ab[i].value &&
+                      pb[i].seq == ab[i].seq && pb[i].tombstone == ab[i].tombstone &&
+                      pb[i].vlog == ab[i].vlog,
+                  "block %zu entry %zu identical", b, i);
+        }
+    }
+    CHECK(parsed.min_seq == adopted.min_seq && parsed.max_seq == adopted.max_seq,
+          "seq bounds equal");
+    for (const SstEntry& e : entries) {  // every key: same hit through both readers
+        const auto ph = parsed.lookup(e.key, Seq(100000));
+        const auto ah = adopted.lookup(e.key, Seq(100000));
+        CHECK(ph.covered == ah.covered && ph.seq == ah.seq && ph.value == ah.value &&
+                  ph.tombstone == ah.tombstone,
+              "lookup('%s') identical", e.key.c_str());
+    }
+    const auto pm = parsed.lookup("zz-missing", Seq(100000));
+    const auto am = adopted.lookup("zz-missing", Seq(100000));
+    CHECK(pm.covered == am.covered, "missing-key answer identical");
+}
+
 int main() {
     std::fprintf(stderr, "=== storage_sstable_test (flush + SSTable + manifest + scan) ===\n");
+    test_adopt_equals_parse();
     test_differential_with_flush();
     test_metamorphic_flush();
     test_crash_during_flush();

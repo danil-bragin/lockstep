@@ -257,6 +257,14 @@ struct SstBuildResult {
     std::vector<std::byte> bytes;  // the full SSTable image
     Seq min_seq = kNoSeq;
     Seq max_seq = kNoSeq;
+    // PERF (K4.9): the decoded reader state, captured AS the image is encoded, so the
+    // engine can install a reader for its OWN freshly-built table without re-parsing
+    // the bytes it just produced (profiles showed that decode+CRC of our own image as
+    // a top ingest cost). Recovery still parses from disk — this is only for adopt().
+    std::vector<std::vector<SstEntry>> blocks;   // entries per data block
+    std::vector<std::uint64_t> block_offs;       // framed block offsets (parallel)
+    std::vector<std::uint32_t> block_lens;       // framed block lengths (parallel)
+    BloomFilter bloom;
 };
 
 class SSTableBuilder {
@@ -292,6 +300,7 @@ public:
         while (i < entries.size()) {
             std::vector<std::byte> payload;
             const Key first_key = entries[i].key;
+            std::vector<SstEntry> block_entries;
             // Pack entries until the block would exceed the target (≥1 per block).
             while (i < entries.size()) {
                 const SstEntry& e = entries[i];
@@ -301,11 +310,15 @@ public:
                     break;
                 }
                 encode_entry(payload, e);
+                block_entries.push_back(e);
                 ++i;
             }
             const std::uint64_t block_off = out.size();
             const std::uint32_t framed_len = write_block(out, payload);
             index.push_back(IndexRec{block_off, framed_len, first_key});
+            res.blocks.push_back(std::move(block_entries));
+            res.block_offs.push_back(block_off);
+            res.block_lens.push_back(framed_len);
         }
 
         // --- INDEX BLOCK -------------------------------------------------------
@@ -320,8 +333,9 @@ public:
         const std::uint32_t index_len = write_block(out, index_payload);
 
         // --- BLOOM BLOCK -------------------------------------------------------
-        const BloomFilter bloom = BloomFilter::build(keys);
+        BloomFilter bloom = BloomFilter::build(keys);
         const std::vector<std::byte> bloom_payload = bloom.encode();
+        res.bloom = bloom;
         const std::uint64_t bloom_off = out.size();
         const std::uint32_t bloom_len = write_block(out, bloom_payload);
 
@@ -578,6 +592,25 @@ private:
     std::vector<IndexRec> index_;
     std::vector<std::vector<SstEntry>> blocks_;  // decoded data blocks (parallel)
     BloomFilter bloom_;
+
+public:
+    // PERF (K4.9): install this reader from the builder's own output — the state the
+    // loader would decode from `r.bytes`, captured at encode time instead. MUST be
+    // byte-equivalent to SSTableLoader::parse(r.bytes, id, *this); the differential
+    // gate in storage_sstable_test compares the two on every surface. Recovery paths
+    // never use this (they parse real disk bytes, CRC and all).
+    void adopt_built(const SstBuildResult& r, std::uint64_t id) {
+        sstable_id = id;
+        min_seq = r.min_seq;
+        max_seq = r.max_seq;
+        bloom_ = r.bloom;
+        blocks_ = r.blocks;
+        index_.clear();
+        for (std::size_t b = 0; b < r.blocks.size(); ++b) {
+            index_.push_back(IndexRec{r.block_offs[b], r.block_lens[b],
+                                      r.blocks[b].empty() ? Key{} : r.blocks[b].front().key});
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------

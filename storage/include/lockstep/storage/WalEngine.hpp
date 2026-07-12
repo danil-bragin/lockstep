@@ -1399,13 +1399,13 @@ private:
             co_return;
         }
 
-        // (5) the SSTable is now durably installed. Build its in-memory reader and
-        // drop the flushed versions from the memtable. We re-parse the just-built
-        // image so the live reader uses the SAME validated path as recovery.
+        // (5) the SSTable is now durably installed. Install its in-memory reader by
+        // ADOPTING the builder's own decoded state (K4.9) — decoding our own image we
+        // encoded a microsecond ago was a top ingest cost; recovery still parses real
+        // disk bytes through the validated loader (gate: adopt == parse, sstable test).
         auto reader = std::make_unique<SSTableReader>();
-        if (SSTableLoader::parse(built.bytes, sstable_id, *reader)) {
-            sstables_.push_back(std::move(reader));
-        }
+        reader->adopt_built(built, sstable_id);
+        sstables_.push_back(std::move(reader));
         // Drop only the flushed (non-resident) versions; resident (columnar) keys
         // stay. With no resident byte set this erases the whole memtable (== clear()).
         mem_.erase_flushable();
@@ -1439,10 +1439,34 @@ private:
         }
         // (1) snapshot the live inputs. Entries (key-asc/seq-asc within each run),
         // ids (to obsolete), and the max seq covered (the truncation candidate).
+        // TIERED INPUT SELECTION (K4.9): merging ALL tables every trigger rewrites the
+        // ever-growing survivor each round — O(N^2) bytes over a long ingest. Rule: if
+        // the single largest table holds more entries than every other table COMBINED,
+        // LEAVE IT OUT and merge only the rest; the giant is rewritten only once the
+        // newcomers' total reaches its size → geometric rounds, amortized O(N log N).
+        // Correctness is untouched: entries carry their seqs, reads merge across
+        // tables by seq (install order is irrelevant), and WAL truncation still uses
+        // the max seq of the tables that ARE durable in the merge inputs.
+        std::size_t giant = sstables_.size();  // index of the excluded table (or none)
+        {
+            std::size_t total = 0, imax = 0, nmax = 0;
+            for (std::size_t i = 0; i < sstables_.size(); ++i) {
+                const std::size_t n = sstables_[i]->entry_count();
+                total += n;
+                if (n > nmax) { nmax = n; imax = i; }
+            }
+            if (nmax > total - nmax && sstables_.size() > 2) {
+                giant = imax;
+            }
+        }
         std::vector<std::vector<SstEntry>> runs;
         std::vector<std::uint64_t> input_ids;
         Seq covered_max = kNoSeq;
-        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+        for (std::size_t i = 0; i < sstables_.size(); ++i) {
+            if (i == giant) {
+                continue;
+            }
+            const std::unique_ptr<SSTableReader>& sst = sstables_[i];
             std::vector<SstEntry> run;
             sst->collect_entries(run);
             runs.push_back(std::move(run));
@@ -1528,13 +1552,9 @@ private:
             co_return;
         }
 
-        // Build the in-memory reader for the merged SSTable (parsed via the same
-        // validated path as recovery) so it can be installed once obsoletes land.
+        // Reader for the merged SSTable: adopt the builder state (K4.9, same as flush).
         auto new_reader = std::make_unique<SSTableReader>();
-        if (!SSTableLoader::parse(built.bytes, new_id, *new_reader)) {
-            // Should never happen (we just built it); be safe — keep old set live.
-            co_return;
-        }
+        new_reader->adopt_built(built, new_id);
 
         // (5)+(6) obsolete the inputs + raise the WAL-truncation watermark.
         co_await obsolete_and_truncate(input_ids, /*new_id_present=*/true, new_id,

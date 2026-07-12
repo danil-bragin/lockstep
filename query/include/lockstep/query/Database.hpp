@@ -378,7 +378,10 @@ private:
     // Default-backing LSM tuning. flush_threshold bounds the FLUSH-ELIGIBLE (row-mode
     // / index) memtable; columnar namespaces stay resident (see kColumnarResident).
     static constexpr std::size_t kFlushThreshold = 50'000;
-    static constexpr std::size_t kCompactionTrigger = 4;
+    // K4.9: 8 (was 4) — with tiered input selection each compaction skips the giant
+    // survivor, and a higher trigger halves compaction rounds on sustained ingest;
+    // point-reads stay cheap across more live tables via the per-table bloom.
+    static constexpr std::size_t kCompactionTrigger = 8;
     // Leading bytes of the SQL columnar block/overlay/delta namespaces (Catalog.hpp:
     // 'B' blocks, 'M' overlay manifest, 'R' overlay runs, 'T' overlay tombstones,
     // 'Z' zone map, 'd' row delta, 'c' reserved). The columnar engine bulk-manages
