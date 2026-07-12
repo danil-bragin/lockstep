@@ -432,6 +432,16 @@ public:
     [[nodiscard]] std::int32_t cancel_target_pid() const noexcept { return cancel_pid_; }
     [[nodiscard]] std::int32_t cancel_target_secret() const noexcept { return cancel_secret_; }
 
+    // K4.14: server-initiated push — the OWNING server calls this after any OTHER
+    // session's traffic (a commit may have landed) or on an idle tick; returns the
+    // NotificationResponse bytes to write to THIS session's socket (empty = silent).
+    // Same de-dup discipline as the RFQ-boundary polls: one announce per batch.
+    [[nodiscard]] std::vector<std::byte> pump_notifications() {
+        std::vector<std::byte> out;
+        if (started_) poll_notifications(out);
+        return out;
+    }
+
     // Feed raw bytes read off the socket; returns raw bytes to write back (possibly empty).
     [[nodiscard]] std::vector<std::byte> feed(std::span<const std::byte> input) {
         buf_.insert(buf_.end(), input.begin(), input.end());

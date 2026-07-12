@@ -162,6 +162,15 @@ private:
         if (it->second->closed()) {
             close_conn(fd);
         }
+        // K4.14: MID-IDLE PUSH — this session's traffic may have committed writes some
+        // OTHER session is LISTENing for. Sweep the rest and push their pending
+        // notifications now, instead of making them wait for their own next query.
+        // (LISTEN-less sessions return empty instantly; de-dup keeps this quiet.)
+        for (auto& [ofd, osess] : conns_) {
+            if (ofd == fd || !osess) continue;
+            const std::vector<std::byte> push = osess->pump_notifications();
+            if (!push.empty()) write_all(ofd, push);
+        }
     }
 
     // W3.3: the statement-timeout watchdog. Sleeps in short ticks; when a query is active

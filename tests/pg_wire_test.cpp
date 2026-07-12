@@ -588,6 +588,23 @@ int main() {
         const auto bad = ext("PUBLISH wire_ev, $3", {"x"});
         check(has_type(bad, 'E'), "unbound $3 is a clean error");
     }
+    // (K4.14) Mid-idle push: session A LISTENs; session B (another connection, same
+    // engine) commits; the server-side pump delivers 'A' to A without A sending a byte.
+    {
+        pw::PgSession a([&engine](const std::string& s) -> ExecResult { return engine.exec(s); });
+        pw::PgSession b([&engine](const std::string& s) -> ExecResult { return engine.exec(s); });
+        (void)a.feed(sp(startup()));
+        (void)b.feed(sp(startup()));
+        (void)engine.exec("CREATE TABLE push_t (id INT, PRIMARY KEY (id))");
+        (void)engine.exec("CREATE CHANGEFEED pushcf FOR push_t");
+        (void)a.feed(sp(query("LISTEN pushcf")));
+        check(a.pump_notifications().empty(), "no backlog -> pump silent");
+        (void)b.feed(sp(query("INSERT INTO push_t (id) VALUES (1)")));
+        const auto push = parse_backend(a.pump_notifications());
+        check(has_type(push, 'A'), "B's commit pushed to listening A mid-idle");
+        check(a.pump_notifications().empty(), "pushed batch de-duped on the next pump");
+    }
+
 
 
 
