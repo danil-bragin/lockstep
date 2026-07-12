@@ -93,3 +93,20 @@ dialect's catalog introspection surface. That is an ORM-compatibility work packa
 (its own session), not an evening PoC — recorded as the concrete next slice of the
 PG-surface roadmap. Strategically memU remains an INTEGRATION target (their layer,
 our engine), and any quality comparison must be at equal ingest budget.
+
+## Equal-ingest-budget LOCOMO (2026-07-13)
+
+Same protocol, but ONE LLM extraction pass per session (identical extracted facts fed
+to BOTH systems — the ingest budget is equal by construction, and it is the regime
+mem0/memU market in):
+
+| | overall | multi-hop | temporal | open | single-hop |
+|---|---|---|---|---|---|
+| **Lockstep** (hybrid RRF) | **49/120 = 40.8%** | 6/34 | **26/54** | 6/9 | 11/23 |
+| mem0 + FAISS (vector-only) | 26/120 = 21.7% | 2/34 | 13/54 | 4/9 | 7/23 |
+
+Extraction lifts BOTH sides (29.2% -> 40.8% ours; 10.8% -> 21.7% mem0), and the
+retrieval gap PERSISTS through the better regime: 1.9x overall, 2x temporal, 3x
+multi-hop. The store's contribution does not wash out when the pipeline improves —
+it compounds with it. (Still hash embeddings, still a 2-conversation subset, still
+one judge model; not a leaderboard number.)
