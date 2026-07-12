@@ -72,6 +72,12 @@ if(TARGET lockstep_storage AND TARGET lockstep_runtime
     # query lib (which pulls txn + storage + runtime + sim), NOT the storage bench
     # harness.
     if(TARGET lockstep_query)
+        # cdc_bench: K4 changefeed drain throughput (ops/s delivered to a consumer).
+        add_executable(lockstep_cdc_bench_driver cdc_bench_main.cpp)
+        target_link_libraries(lockstep_cdc_bench_driver
+            PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+                    lockstep_storage lockstep_runtime lockstep_providers_sim)
+
         add_executable(lockstep_sql_bench_driver sql_bench_main.cpp)
         target_link_libraries(lockstep_sql_bench_driver
             PRIVATE
