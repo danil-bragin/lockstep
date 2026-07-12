@@ -255,7 +255,17 @@ public:
     // them all). An ordered map keeps the SORTED iteration the scan / SSTable flush rely on, so the
     // observable key order + MVCC version lists are byte-identical (V-DET unaffected).
     void insert(const Key& key, Seq seq, Value value, bool tombstone, bool vlog = false) {
-        map_[key].push_back(Version{seq, std::move(value), tombstone, vlog});
+        // ASCENDING-APPEND FAST PATH (K4.12): a key sorting after everything present
+        // (topics, auto-increment PKs, any sequential load) inserts with an end()
+        // hint — O(1) amortized instead of a full-tree compare descent. The map's
+        // contents and iteration order are IDENTICAL either way (pure placement
+        // optimization); equal/smaller keys take the ordinary lookup below.
+        if (map_.empty() || map_.rbegin()->first < key) {
+            map_.emplace_hint(map_.end(), key, std::vector<Version>{})
+                ->second.push_back(Version{seq, std::move(value), tombstone, vlog});
+        } else {
+            map_[key].push_back(Version{seq, std::move(value), tombstone, vlog});
+        }
         ++total_versions_;  // running count: version_count() is O(1), not an O(N) scan per put
         if (!is_resident(key)) {
             ++flushable_versions_;  // versions of FLUSH-ELIGIBLE keys (the threshold metric)
