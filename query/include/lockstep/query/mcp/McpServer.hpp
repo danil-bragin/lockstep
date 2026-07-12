@@ -57,6 +57,16 @@ public:
         }
     }
 
+    // K11 RBAC: register agent tokens (token -> agent name). Once ANY token is
+    // registered the session starts UNAUTHENTICATED: only `initialize` (carrying
+    // params.token) and notifications are accepted; everything else gets -32001.
+    // A valid token BINDS the session to that agent's schema for its lifetime —
+    // the client cannot switch agents afterwards (the token IS the identity).
+    void set_tokens(std::map<std::string, std::string> token_to_agent) {
+        tokens_ = std::move(token_to_agent);
+        authed_ = tokens_.empty();
+    }
+
     // One inbound line -> one outbound line ("" for notifications / no response).
     [[nodiscard]] std::string handle_line(const std::string& line) {
         JVal req;
@@ -71,7 +81,24 @@ public:
         }
         const std::string& m = method->text;
         const JVal* params = find(req, "params");
-        if (m == "initialize") return initialize_line(*id);
+        if (m == "initialize") {
+            if (!authed_) {
+                const JVal* tok = params ? find(*params, "token") : nullptr;
+                const auto tit = (tok != nullptr && tok->kind == JVal::Str)
+                                     ? tokens_.find(tok->text)
+                                     : tokens_.end();
+                if (tit == tokens_.end()) {
+                    return error_line(id ? *id : JVal{}, -32001, "invalid or missing token");
+                }
+                authed_ = true;
+                agent_ = tit->second;  // bind the session to the token's agent
+                (void)eng_->exec("CREATE SCHEMA IF NOT EXISTS agent_" + agent_);
+            }
+            return initialize_line(*id);
+        }
+        if (!authed_ && m.rfind("notifications/", 0) != 0) {
+            return error_line(id ? *id : JVal{}, -32001, "not authenticated (initialize with a token)");
+        }
         if (m == "notifications/initialized" || m.rfind("notifications/", 0) == 0) return "";
         if (m == "ping") return result_line(*id, obj({}));
         if (m == "tools/list") return tools_list_line(*id);
@@ -400,6 +427,8 @@ private:
 
     sql::SqlEngine* eng_;
     std::string agent_;
+    std::map<std::string, std::string> tokens_;  // K11 RBAC: token -> agent
+    bool authed_ = true;                          // false once tokens are registered
     std::size_t mem_dim_ = 0;  // embedding dim once provisioned (0 = text-only store)
 };
 

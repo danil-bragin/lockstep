@@ -149,6 +149,34 @@ int main() {
         check(has(audit, "\\\"1\\\""), "audit at the captured version sees exactly step one");
     }
 
+    // (9) K11 RBAC tokens: unauthenticated sessions are locked out; a token binds
+    // the session to ITS agent's schema — token isolation == agent isolation.
+    {
+        SqlEngine sec;
+        mcp::McpSession sa(sec);
+        std::map<std::string, std::string> toks{{"s3cr3t", "alice"}, {"hunter2", "bob"}};
+        sa.set_tokens(toks);
+        check(has(sa.handle_line(R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})"), "-32001"),
+              "pre-auth call rejected");
+        check(has(sa.handle_line(
+                      R"({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"token":"wrong"}})"),
+                  "-32001"),
+              "bad token rejected");
+        check(has(sa.handle_line(
+                      R"({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"token":"s3cr3t"}})"),
+                  "protocolVersion"),
+              "good token initializes");
+        check(!has(call(sa, 4, "remember", R"({"content":"alice token secret"})"),
+                   "isError\":true"),
+              "post-auth tool works");
+        mcp::McpSession sb(sec);
+        sb.set_tokens(toks);
+        (void)sb.handle_line(
+            R"({"jsonrpc":"2.0","id":5,"method":"initialize","params":{"token":"hunter2"}})");
+        const std::string br = call(sb, 6, "recall", R"({"query":"token secret"})");
+        check(!has(br, "alice token secret"), "bob's token cannot see alice's memory");
+    }
+
     if (g_fail != 0) { std::printf("mcp_server_test: FAILURES\n"); return 1; }
     std::printf("mcp_server_test: ALL PASS\n");
     return 0;

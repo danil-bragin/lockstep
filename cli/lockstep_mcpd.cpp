@@ -23,6 +23,24 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--data-dir") == 0) data_dir = argv[i + 1];
         if (std::strcmp(argv[i], "--agent") == 0) agent = argv[i + 1];
     }
+    // K11 RBAC: --tokens alice:s3cr3t,bob:hunter2 — a client must initialize with a
+    // registered token; the token binds the session to that agent's schema.
+    std::map<std::string, std::string> tokens;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--tokens") != 0) continue;
+        std::string spec = argv[i + 1];
+        std::size_t pos = 0;
+        while (pos < spec.size()) {
+            const std::size_t comma = spec.find(',', pos);
+            const std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            const std::size_t colon = item.find(':');
+            if (colon != std::string::npos) {
+                tokens[item.substr(colon + 1)] = item.substr(0, colon);
+            }
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+    }
     core::Scheduler d_sched;
     core::Scheduler c_sched;
     prod::ProdDisk d_disk(d_sched, data_dir + "/mcp-data.wal");
@@ -32,6 +50,7 @@ int main(int argc, char** argv) {
     engine.set_trace_enabled(false);  // prod posture
 
     lockstep::query::mcp::McpSession session(engine, agent);
+    if (!tokens.empty()) session.set_tokens(std::move(tokens));
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
