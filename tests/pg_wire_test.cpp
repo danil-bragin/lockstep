@@ -604,6 +604,27 @@ int main() {
         check(has_type(push, 'A'), "B's commit pushed to listening A mid-idle");
         check(a.pump_notifications().empty(), "pushed batch de-duped on the next pump");
     }
+    // (K6) LIVE DASHBOARD LOOP over the wire: A LISTENs on a changefeed over an
+    // INCREMENTAL matview; B commits to the BASE table; the server pump delivers 'A'
+    // to A — the maintained aggregate delta reached a parked client with nobody
+    // SELECTing the view. K4 CDC + K4.5 push + K5 IVM composed.
+    {
+        pw::PgSession a([&engine](const std::string& s) -> ExecResult { return engine.exec(s); });
+        pw::PgSession b([&engine](const std::string& s) -> ExecResult { return engine.exec(s); });
+        (void)a.feed(sp(startup()));
+        (void)b.feed(sp(startup()));
+        (void)engine.exec("CREATE TABLE sales (id INT, cat INT, amount INT, PRIMARY KEY (id))");
+        (void)engine.exec("CREATE INCREMENTAL MATERIALIZED VIEW live_mv AS "
+                          "SELECT cat, COUNT(*) AS n, SUM(amount) AS s FROM sales GROUP BY cat");
+        (void)engine.exec("CREATE CHANGEFEED live_dash FOR live_mv");
+        (void)a.feed(sp(query("LISTEN live_dash")));
+        check(a.pump_notifications().empty(), "live wire: quiet before any base write");
+        (void)b.feed(sp(query("INSERT INTO sales (id,cat,amount) VALUES (1, 2, 40)")));
+        const auto push = parse_backend(a.pump_notifications());
+        check(has_type(push, 'A'),
+              "live wire: base commit -> maintained view delta pushed to the listener");
+    }
+
 
 
 

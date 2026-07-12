@@ -187,8 +187,17 @@ heap under deletes). REFRESH on an incremental view re-bases the cursor. Gate:
 incremental == full recompute, byte-for-byte, sampled through a 220-round seeded
 storm (inserts/updates/deletes, txn commits AND rollbacks, group birth+death,
 filter-boundary rows), across a restart, and after REFRESH (sql_ivm_test, 146th).
-Open: delta-joins, SUM over REAL, per-write eager mode, K6 composition (LISTEN on
-the view's table = push-on-change dashboards — the pieces now exist).
+**K6.1 SHIPPED (the composition):** FETCH/CHANGES on a feed over an incremental view
+drive its catch-up first — so base-table commits flow into the view's changefeed with
+NOBODY ever SELECTing the view. The full live-dashboard loop over a stock PG driver:
+`LISTEN dash` (a changefeed over the view) → another session commits to the BASE
+table → the server pump delivers 'A' → `FETCH dash` returns the maintained AGGREGATE
+deltas (group updates as PUT rows, group death as DELETE) → apply, `ACK`. Strongly
+consistent live queries — Supabase-Realtime-shaped UX with Materialize-shaped
+semantics, from one engine. Gates: SQL-level loop incl. group-death DELETE delta +
+DROP retiring the registry and durable cursor (sql_ivm_test), wire-level push on a
+parked listener (pg_wire_test). Open: delta-joins, SUM over REAL, eager per-write
+mode, dist/columnar bases.
 
 ### K6 — Realtime live queries (subscriptions) *(M after K4/K5)* — TIER: FAST-FOLLOW
 

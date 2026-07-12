@@ -126,6 +126,47 @@ int main() {
         oracle(e, "after restart + group death");
     }
 
+    // (K6 composition) LIVE FEED: a changefeed over the view delivers view DELTAS on
+    // base-table commits — with NOBODY ever SELECTing the view (FETCH drives the
+    // catch-up). This is the push-dashboard loop: LISTEN 'A' -> FETCH -> apply -> ACK.
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE t (id INT, cat INT, amount INT, PRIMARY KEY (id))");
+        check(e.exec(std::string("CREATE INCREMENTAL MATERIALIZED VIEW mv AS ") + kSrc).ok,
+              "live: create view");
+        check(e.exec("CREATE CHANGEFEED dash FOR mv").ok, "live: changefeed over the view");
+        (void)e.exec("INSERT INTO t (id,cat,amount) VALUES (1, 4, 20)");
+        (void)e.exec("INSERT INTO t (id,cat,amount) VALUES (2, 4, 30)");
+        const ExecResult f1 = e.exec("FETCH dash");
+        check(f1.ok && !f1.rows.empty(), "live: FETCH alone surfaces the view delta");
+        bool saw = false;
+        for (const auto& row : f1.rows) {
+            std::string flat;
+            for (const auto& c : row.cells) flat += c.first + "=" + c.second.render() + "|";
+            if (flat.find("cat=4") != std::string::npos &&
+                flat.find("n=2") != std::string::npos &&
+                flat.find("s=50") != std::string::npos) {
+                saw = true;
+            }
+        }
+        check(saw, "live: the delta row is the maintained aggregate (cat=4, n=2, s=50)");
+        const std::int64_t last = f1.rows.back().cells[0].second.i;
+        check(e.exec("ACK CHANGEFEED dash AT " + std::to_string(last)).ok, "live: ack");
+        check(e.exec("FETCH dash").rows.empty(), "live: quiet after ack");
+        (void)e.exec("DELETE FROM t WHERE id = 1");
+        (void)e.exec("DELETE FROM t WHERE id = 2");
+        const ExecResult f2 = e.exec("FETCH dash");
+        bool saw_death = false;
+        for (const auto& row : f2.rows) {
+            saw_death = saw_death || row.cells[1].second.s == "DELETE";
+        }
+        check(f2.ok && saw_death, "live: group death arrives as a DELETE delta");
+        // DROP cleans the registry + cursor row.
+        check(e.exec("DROP TABLE mv").ok, "live: drop view");
+        check(e.exec("SELECT cur FROM __ivm WHERE name = 'mv'").rows.empty(),
+              "live: durable cursor retired on drop");
+    }
+
     if (g_fail != 0) { std::printf("sql_ivm_test: FAILURES\n"); return 1; }
     std::printf("sql_ivm_test: ALL PASS\n");
     return 0;

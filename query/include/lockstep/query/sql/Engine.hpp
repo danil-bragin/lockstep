@@ -3513,6 +3513,10 @@ private:
             if (matviews_.erase(qn) != 0) {
                 retire_matview(dt.table);
             }
+            // K5: an incremental view also retires its registry entry + durable cursor.
+            if (ivm_defs_.erase(qn) != 0 && catalog_.find("__ivm") != nullptr) {
+                (void)exec("DELETE FROM __ivm WHERE name = '" + qn + "'");
+            }
         }
         // Invalidate any decoded-block / zone caches that keyed on this table's flush_gen.
         chunk_cache_.clear();
@@ -4433,6 +4437,9 @@ private:
         done.set_value(true);
     }
     ExecResult exec_changes(const ChangesStmt& cs) {
+        if (const auto iv = ivm_defs_.find(catalog_.qualify(cs.table)); iv != ivm_defs_.end()) {
+            ivm_catch_up(iv->first);  // K6: the feed reflects a fresh view
+        }
         if (const Table* ct = catalog_.find(cs.table); ct != nullptr && ct->columnar) {
             // COLUMNAR CDC IS AN OPEN ITEM — refuse rather than lie. A columnar
             // table's live writes land in the row-delta namespace and its background
@@ -4567,6 +4574,12 @@ private:
         std::int64_t acked = 0;
         ExecResult r;
         if (!cf_lookup(cs.feed, tbl, acked, r)) return r;
+        // K6: a FETCH on a feed over an incremental matview IS a read of the view —
+        // catch it up first, so base-table commits flow into the feed without anyone
+        // ever SELECTing the view (the push-dashboard loop's missing link).
+        if (const auto iv = ivm_defs_.find(catalog_.qualify(tbl)); iv != ivm_defs_.end()) {
+            ivm_catch_up(iv->first);
+        }
         ChangesStmt run;
         run.table = tbl;
         run.since = acked;
