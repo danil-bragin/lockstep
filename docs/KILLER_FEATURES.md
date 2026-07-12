@@ -124,9 +124,18 @@ gets a clean teaching error. Scaling (thread-per-shard, engines share nothing,
 TSan-clean; release, laptop): aggregate ingest+deliver 128k → 199k → 394k → 605k ops/s
 at 1/2/4/8 shards (~linear to the physical perf cores, honest efficiency-core rolloff
 at 8). Gate: union of per-shard replays == the whole distributed table + per-shard
-exactly-once resume (sql_cdc_test §8). Open: CREATE CHANGEFEED (named server-side
-cursors), push sinks over the PG wire (NOTIFY-shaped), CHANGES over the wire-shard
-transport + prod replicated shards, fault-storm teeth, Kafka head-to-head harness.
+exactly-once resume (sql_cdc_test §8). **K4.3 SHIPPED:** retention knob + wire transport. `SET cdc.retain_seq = <h>` (engine:
+`set_cdc_retain_from`) clamps compaction's version GC below a retained feed cursor —
+the op-log suffix [h..] stays consumable through compaction. Kafka's retention horizon,
+but CURSOR-EXACT instead of time-guessed: advance h as consumers acknowledge, disk cost
+tracks actual lag. Gate: identical overwrite workload — control engine GC refuses a
+from-0 cursor, retained engine replays all 40 ops contiguously (storage_pitr_test §9).
+And CHANGES t SHARD i runs unchanged over the WIRE shard transport (statement routes to
+the remote engine): union of per-shard wire feeds == the whole distributed table
+(sql_distributed_wire_test) — the prod consumer topology, one wire cursor per shard.
+Open: CREATE CHANGEFEED (named server-side cursors, auto-advance retain), push sinks
+over the PG wire (NOTIFY-shaped), prod replicated shards, fault-storm teeth, Kafka
+head-to-head harness.
 
 ### K5 — Incrementally-maintained materialized views *(L)* — TIER: BET *(TECH_PLAN K3)*
 

@@ -314,26 +314,48 @@ int main() {
         // Compaction horizon tooth: overwrite one key repeatedly across several flushes,
         // then compact — shadowed versions below the watermark are GC'd, so a from-0
         // cursor REFUSES (gap) while a past-the-horizon cursor still succeeds.
+        // Same-key overwrites; the read watermark is raised to the tip mid-stream so
+        // compaction's version GC has real teeth (watermark 0 = keep-everything).
+        auto overwrite_hot = [&](WalEngine& w) {
+            sched.spawn([](WalEngine& e) -> Task {
+                for (int i = 0; i < 20; ++i)
+                    (void)co_await e.put("hot", "a" + std::to_string(i));
+                e.set_read_watermark(e.last_seq());  // no snapshot older than here
+                for (int i = 0; i < 20; ++i)
+                    (void)co_await e.put("hot", "b" + std::to_string(i));
+                (void)co_await e.sync();
+                co_return;
+            }(w));
+            sched.run();
+        };
         SimDisk wal2(sched, clock, rng, dc), man2(sched, clock, rng, dc);
         SimFactory fac2(sched, clock, rng, dc);
         WalEngine two(sched, wal2, man2, fac2, /*flush_threshold=*/4);
         two.set_compaction_trigger(2);
-        sched.spawn([](Engine& e) -> Task {
-            for (int i = 0; i < 40; ++i)
-                (void)co_await e.put("hot", "v" + std::to_string(i));  // same key: shadowed
-            (void)co_await e.sync();
-            co_return;
-        }(two));
-        sched.run();
+        overwrite_hot(two);
         std::vector<ExportedOp> gap;
-        const Error ge = cdc_export(two, 0, gap);
-        if (!ge.ok()) {
-            std::vector<ExportedOp> tailops;
-            check(cdc_export(two, two.last_seq(), tailops).ok() && tailops.size() == 1,
-                  "cdc tail cursor past the compaction horizon still works");
-        } else {
-            check(gap.size() == 40, "cdc: no compaction GC yet — full history intact");
-        }
+        check(!cdc_export(two, 0, gap).ok(),
+              "compaction GC'd shadowed versions -> from-0 cursor REFUSES (control)");
+        std::vector<ExportedOp> tailops;
+        check(cdc_export(two, two.last_seq(), tailops).ok() && tailops.size() == 1,
+              "cdc tail cursor past the compaction horizon still works");
+
+        // RETENTION KNOB: the identical workload with cdc_retain_from=1 — the GC
+        // clamp keeps the WHOLE op-log consumable from 0 (Kafka's retention horizon,
+        // but cursor-exact instead of time-guessed).
+        SimDisk wal3(sched, clock, rng, dc), man3(sched, clock, rng, dc);
+        SimFactory fac3(sched, clock, rng, dc);
+        WalEngine three(sched, wal3, man3, fac3, /*flush_threshold=*/4);
+        three.set_compaction_trigger(2);
+        three.set_cdc_retain_from(1);
+        overwrite_hot(three);
+        std::vector<ExportedOp> kept;
+        check(cdc_export(three, 0, kept).ok() && kept.size() == 40,
+              "cdc_retain_from=1: full overwrite history survives the same compaction");
+        bool hot_asc = true;
+        for (std::size_t i = 1; i < kept.size(); ++i)
+            hot_asc = hot_asc && kept[i].seq == kept[i - 1].seq + 1;
+        check(hot_asc, "retained history is the exact contiguous op-log");
     }
 
     if (g_fail) { std::printf("storage_pitr_test: FAILED\n"); return 1; }

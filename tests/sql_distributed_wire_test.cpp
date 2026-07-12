@@ -178,6 +178,32 @@ int main() {
         std::printf("sql_distributed_wire_test: FAILED\n");
         return 1;
     }
+    // K4.2: per-shard changefeeds OVER THE WIRE — CHANGES t SHARD i routes the raw
+    // statement to the remote shard engine; the union of every shard's replayed feed
+    // must equal the whole distributed table (the prod consumer topology: one wire
+    // cursor per shard).
+    {
+        std::map<std::string, int> feed_rows;   // pk -> count seen (dup detection)
+        std::size_t total = 0;
+        bool ok_all = true, seq_asc_all = true;
+        for (std::size_t sh = 0; sh < dist.shard_count(); ++sh) {
+            const ExecResult f = dist.exec("CHANGES t SHARD " + std::to_string(sh) + " SINCE 0");
+            ok_all = ok_all && f.ok;
+            std::int64_t prev = 0;
+            for (const auto& row : f.rows) {
+                if (row.cells[0].second.i <= prev) seq_asc_all = false;
+                prev = row.cells[0].second.i;
+                ++feed_rows[row.cells[2].second.render()];
+                ++total;
+            }
+        }
+        check(ok_all, "CHANGES SHARD i over the wire ok on every shard");
+        check(seq_asc_all, "per-shard wire feeds Seq-ascending");
+        check(total == kRows && feed_rows.size() == kRows,
+              "union of wire feeds == whole table, no dup, no loss");
+        check(!dist.exec("CHANGES t SINCE 0").ok, "wire cluster also demands SHARD");
+    }
+
     std::printf("sql_distributed_wire_test: OK (distributed SQL OVER THE WIRE == single-node, %zu shards)\n",
                 kShards);
     return 0;

@@ -1863,6 +1863,25 @@ private:
             }
             set_max_query_memory(bytes);
         }
+        if (name == "cdc.retain_seq") {  // K4: changefeed retention horizon (0 = off)
+            std::uint64_t n = 0;
+            for (const char c : value) {
+                if (c < '0' || c > '9') {
+                    return ExecResult::failure(
+                        "SET cdc.retain_seq expects a non-negative Seq (0 = off)");
+                }
+                n = n * 10 + static_cast<std::uint64_t>(c - '0');
+            }
+            if (value.empty()) {
+                return ExecResult::failure(
+                    "SET cdc.retain_seq expects a non-negative Seq (0 = off)");
+            }
+            auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());
+            if (we == nullptr) {
+                return ExecResult::failure("cdc.retain_seq requires the WAL engine");
+            }
+            we->set_cdc_retain_from(static_cast<storage::Seq>(n));
+        }
         if (name == "ivfflat.probes") {  // K1.3: session override of the per-index probes default
             std::uint64_t n = 0;
             for (const char c : value) {

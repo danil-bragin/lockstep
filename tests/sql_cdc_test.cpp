@@ -186,7 +186,11 @@ int main() {
     }
     check(!e.exec("CHANGES t SHARD 0 SINCE 0").ok, "SHARD on a single engine rejected");
 
-    // (9) Teeth: unknown table; LIMIT respected.
+    // (9) Retention knob surface: SET cdc.retain_seq wires through to the engine.
+    check(e.exec("SET cdc.retain_seq = 1").ok, "SET cdc.retain_seq accepted");
+    check(!e.exec("SET cdc.retain_seq = 'x'").ok, "non-integer retain_seq rejected");
+
+    // (10) Teeth: unknown table; LIMIT respected.
     check(!e.exec("CHANGES nosuch SINCE 0").ok, "unknown table rejected");
     check(e.exec("CHANGES t SINCE 0 LIMIT 2").rows.size() == 2, "LIMIT respected");
 

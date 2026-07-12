@@ -442,6 +442,15 @@ public:
     // `n` (n>=2), the next flush merges them all into one. 0 disables compaction.
     void set_compaction_trigger(std::size_t n) noexcept { compaction_trigger_ = n; }
 
+    // K4: CDC retention — keep the op-log suffix [h..] through compaction so a
+    // changefeed cursor at h stays consumable (compaction's version GC is clamped
+    // below h). 0 = off (GC purely by the snapshot watermark). The operator (or a
+    // future named-changefeed manager) ADVANCES h as consumers acknowledge — the
+    // exact role of Kafka's retention horizon, but per-cursor-precise instead of
+    // time-guessed. Trades disk for replayability; monotone advance recommended.
+    void set_cdc_retain_from(Seq h) noexcept { cdc_retain_from_ = h; }
+    [[nodiscard]] Seq cdc_retain_from() const noexcept { return cdc_retain_from_; }
+
     // SELECTIVE FLUSH: mark each leading byte in `prefixes` as keep-resident — keys
     // in those namespaces stay in the memtable forever (never flushed to an SSTable),
     // because a higher layer manages their bulk lifecycle (the SQL columnar engine's
@@ -1445,7 +1454,13 @@ private:
 
         // (2) k-way merge + version GC under the watermark. The watermark is the
         // oldest live snapshot Seq; below-shadowed versions are dropped (V-GC).
-        std::vector<SstEntry> merged = compact_merge(runs, read_watermark_);
+        // CDC retention clamp: version GC never crosses below a retained feed
+        // cursor (seq >= cdc_retain_from_ must survive; watermark < h keeps them).
+        Seq gc_watermark = read_watermark_;
+        if (cdc_retain_from_ > 0 && cdc_retain_from_ <= gc_watermark) {
+            gc_watermark = cdc_retain_from_ - 1;
+        }
+        std::vector<SstEntry> merged = compact_merge(runs, gc_watermark);
 
         // (2b) WiscKey VLOG GC (V-GC for values): the version GC above already
         // dropped dead LSM entries; their large values in the OLD vlog generations
@@ -1993,6 +2008,7 @@ private:
     // ---- LSM state (null/empty in step-2 WAL-only mode) -------------------
     IDisk* manifest_disk_ = nullptr;          // the atomic-install log backing
     IDiskFactory* factory_ = nullptr;         // mints per-SSTable IDisks
+    Seq cdc_retain_from_ = 0;                 // K4: op-log suffix kept through compaction (0 = off)
     std::size_t flush_threshold_ = 0;         // memtable version count to flush at
     std::vector<std::unique_ptr<SSTableReader>> sstables_;  // install order (old→new)
     std::uint64_t next_sstable_id_ = 0;       // next SSTable backing id
