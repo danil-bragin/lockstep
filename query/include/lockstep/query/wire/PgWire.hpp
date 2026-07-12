@@ -647,7 +647,25 @@ private:
                 pg_command_complete(out, "LISTEN");
                 continue;
             }
+            // PG TXN-CONTROL LENIENCY (the shim layer, not the engine): PostgreSQL
+            // answers a nested BEGIN / a bare COMMIT/ROLLBACK with a WARNING and
+            // completes; drivers (SQLAlchemy autobegin among them) rely on that.
+            // The SQL core stays strict — the session tracks txn state and skips
+            // the redundant statement instead of surfacing the strict error.
+            const std::string head = statement_head(s);
+            if (head == "begin" && in_txn_) {
+                pg_command_complete(out, "BEGIN");
+                continue;
+            }
+            if ((head == "commit" || head == "rollback") && !in_txn_) {
+                pg_command_complete(out, head == "commit" ? "COMMIT" : "ROLLBACK");
+                continue;
+            }
             const sql::ExecResult r = exec_(s);
+            if (r.ok) {
+                if (head == "begin") in_txn_ = true;
+                if (head == "commit" || head == "rollback") in_txn_ = false;
+            }
             pg_reply_for_statement(out, s, r);
             if (!r.ok) break;
         }
@@ -897,6 +915,16 @@ private:
     bool awaiting_password_ = false;  // sent AuthenticationCleartextPassword, awaiting 'p'
     std::string user_;            // the startup "user" parameter (for auth)
     bool closed_ = false;
+    [[nodiscard]] static std::string statement_head(const std::string& s) {
+        std::size_t b = 0;
+        while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b])) != 0) ++b;
+        std::string h;
+        while (b < s.size() && std::isalpha(static_cast<unsigned char>(s[b])) != 0) {
+            h += static_cast<char>(std::tolower(static_cast<unsigned char>(s[b++])));
+        }
+        return h;
+    }
+    bool in_txn_ = false;  // shim-level txn tracking (PG leniency for drivers)
     std::map<std::string, std::int64_t> listens_;  // K4.5: feed -> last announced _seq (-1 = none)
     std::map<std::string, std::string> stmts_;  // prepared statements: name -> query
     std::map<std::string, Portal> portals_;     // bound portals: name -> {sql, cached}

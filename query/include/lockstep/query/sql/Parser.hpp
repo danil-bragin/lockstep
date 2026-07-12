@@ -687,6 +687,18 @@ public:
                 if (auto e = expect_kw("from")) return *e;
                 st.kind = StmtKind::Describe;
                 if (auto e = expect_table_name("a table name", st.truncate.table)) return ParseResult{*e};
+            } else if (cur_.kind == Tok::Ident) {
+                // ORM-compat: SHOW <guc name...> (PG session parameters; drivers probe
+                // these on connect). The name may be several words / dotted.
+                st.kind = StmtKind::SetParam;      // reuse the param fields
+                st.set_param_value = "\x01show";  // marker: this is SHOW, not SET
+                std::string nm;
+                while (cur_.kind == Tok::Ident || cur_.kind == Tok::Dot) {
+                    if (cur_.kind == Tok::Dot) nm += ".";
+                    else nm += (nm.empty() || nm.back() == '.' ? "" : " ") + lower(cur_.text);
+                    advance();
+                }
+                st.set_param_name = nm;
             } else {
                 return err("expected TABLES or COLUMNS after SHOW");
             }
@@ -2628,6 +2640,18 @@ private:
         if (cur_.kind == Tok::Ident) {
             const std::string name = cur_.text;
             advance();
+            return parse_scalar_primary_named(name, out);
+        }
+        return make_err("expected a scalar expression");
+    }
+
+    // The Ident-headed tail of the scalar primary (function call or column ref),
+    // with `name` ALREADY consumed — shared by the plain path and the ORM-compat
+    // pg_catalog-qualified path (pg_catalog.version() strips its schema qualifier
+    // and re-enters here).
+    [[nodiscard]] std::optional<ParseError> parse_scalar_primary_named(
+        const std::string& name, std::shared_ptr<Expr>& out) {
+        {
             // A function call NAME '(' args ')'.
             if (cur_.kind == Tok::LParen) {
                 advance();
@@ -2670,12 +2694,19 @@ private:
                 out = n;
                 return std::nullopt;
             }
-            // A column reference (optionally qualified `table.col`).
+            // A column reference (optionally qualified `table.col`) — or, ORM-compat,
+            // a pg_catalog-qualified FUNCTION call (pg_catalog.version() etc.): the
+            // schema qualifier is stripped and the call re-enters the primary parser.
             auto n = mk_expr(ExprKind::Col);
             n->column = name;
             if (cur_.kind == Tok::Dot) {
                 advance();
                 if (cur_.kind != Tok::Ident) return make_err("expected a column name after '.'");
+                if (lower(name) == "pg_catalog") {
+                    const std::string fname = cur_.text;
+                    advance();
+                    return parse_scalar_primary_named(fname, out);
+                }
                 n->qualifier = name;
                 n->column = cur_.text;
                 advance();

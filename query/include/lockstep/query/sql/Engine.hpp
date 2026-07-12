@@ -2331,6 +2331,29 @@ private:
     // lockstep.max_query_memory (bytes; 0 = unlimited) and ivfflat.probes (K1.3; pgvector's
     // query-time recall knob — 0 restores each index's own default).
     ExecResult exec_set_param(const std::string& name, const std::string& value) {
+        if (value == "\x01show") {  // ORM-compat: SHOW <guc> — one row, one column
+            static const std::map<std::string, std::string> kGucs = {
+                {"transaction isolation level", "serializable"},  // honest: strict-serializable
+                {"standard_conforming_strings", "on"},
+                {"client_encoding", "UTF8"},
+                {"server_encoding", "UTF8"},
+                {"server_version", "16.0"},
+                {"timezone", "UTC"},
+                {"datestyle", "ISO, MDY"},
+                {"integer_datetimes", "on"},
+                {"search_path", "public"},
+                {"default_transaction_isolation", "serializable"},
+            };
+            const auto it = kGucs.find(name);
+            if (it == kGucs.end()) {
+                return ExecResult::failure("unrecognized configuration parameter \"" + name + "\"");
+            }
+            ExecResult r;
+            ResultRow row;
+            row.cells.emplace_back(name, Datum::make_text(it->second));
+            r.rows.push_back(std::move(row));
+            return r;
+        }
         if (name == "lockstep.max_query_memory") {
             std::size_t bytes = 0;
             for (const char c : value) {

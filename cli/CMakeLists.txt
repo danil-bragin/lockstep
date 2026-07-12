@@ -73,6 +73,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
         lockstep_providers_prod)
   endif()
 
+  # --- lockstep_pgd_lite — PORTABLE PG-wire daemon for driver-compat work (no epoll).
+  if(TARGET lockstep_providers_prod)
+    add_executable(lockstep_pgd_lite lockstep_pgd_lite.cpp)
+    target_link_libraries(lockstep_pgd_lite
+      PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+              lockstep_storage lockstep_runtime lockstep_providers_prod)
+  endif()
+
   # on Linux (if(UNIX AND NOT APPLE)) so the macOS host stays green (target absent).
   # NOT in the providers/ lint-exempt zone: forbidden-lint scans it (no raw syscall
   # here — only the provider surfaces). Links the query lib (wire::Server) + the prod
