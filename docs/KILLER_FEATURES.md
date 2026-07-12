@@ -152,9 +152,20 @@ first unacked _seq) when an unannounced batch exists; de-duped per batch, an ACK
 re-arms. Push-wake + pull-batch over exactly-once cursors — a stock PG driver's
 LISTEN/NOTIFY loop becomes a Kafka consumer with durable offsets, no client library.
 Gates: unknown-feed error, backlog announce on LISTEN, de-dup, acked silence, new-write
-announce with exact payload, UNLISTEN silence (pg_wire_test). Open: server-initiated
-mid-idle push (the reactor already may call poll_notifications on commit hooks), prod
-replicated shards, fault-storm teeth, Kafka head-to-head harness.
+announce with exact payload, UNLISTEN silence (pg_wire_test). **K4.6 SHIPPED:** the fault-storm oracle — 12 deterministic seeded storms (160 rounds
+each): writer (rows, txns, ~1/3 rolled back) × consumer (FETCH, partial ACK,
+idempotent apply) × 8-17 crash/recover cycles per storm, including between FETCH and
+ACK and mid-transaction. Oracle: V1 replayed shadow == SELECT *; V2 delivered seq-set
+== the exact op-log (no loss, no rollback leak); V3 delivery always past the durable
+cursor. Mutation-verified (ACK+1 kills V1+V2). Exactly-once through crashes is a GATE
+(sql_cdc_storm_test). **K4.7 MEASURED** (bench/compare/cdc/REPORT.md): Kafka 3.7
+head-to-head, both at server-side best case. Kafka wins raw produce (725k
+rec/s/partition batched blobs vs our 148k durable SQL rows; 1.52M vs 605k at 8-way).
+We win consume (2.37M decoded rows/s vs 513k msg/s e2e) and per-record latency
+(sub-ms vs 231ms-avg batching / 2ms p50 paced) — and our numbers carry durable
+cursors + storm-gated exactly-once, which his perf tool does not attempt. Open:
+server-initiated mid-idle push (poll_notifications hook exists), prod replicated
+shards.
 
 ### K5 — Incrementally-maintained materialized views *(L)* — TIER: BET *(TECH_PLAN K3)*
 
