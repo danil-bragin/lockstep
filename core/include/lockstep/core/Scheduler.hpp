@@ -82,7 +82,7 @@ public:
         std::uint64_t id = next_task_id_++;
         h.promise().task_id = id;
         owned_frames_.push_back(h);
-        trace(TraceAction::Spawn, std::string("id=") + std::to_string(id));
+        if (trace_.enabled()) trace(TraceAction::Spawn, std::string("id=") + std::to_string(id));
         ready_.push(detail::ReadyItem{h, enqueue_seq_++});
     }
 
@@ -95,7 +95,7 @@ public:
         for (;;) {
             if (!ready_.empty()) {
                 detail::ReadyItem item = ready_.pop();
-                trace(TraceAction::Resume, std::string("seq=") + std::to_string(item.seq));
+                if (trace_.enabled()) trace(TraceAction::Resume, std::string("seq=") + std::to_string(item.seq));
                 item.handle.resume(); // the ONE and ONLY resume site (L1)
                 continue;
             }
@@ -154,7 +154,7 @@ public:
         for (;;) {
             if (!ready_.empty()) {
                 detail::ReadyItem item = ready_.pop();
-                trace(TraceAction::Resume, std::string("seq=") + std::to_string(item.seq));
+                if (trace_.enabled()) trace(TraceAction::Resume, std::string("seq=") + std::to_string(item.seq));
                 item.handle.resume(); // the ONE and ONLY resume site (L1)
                 if (max_steps != 0 && ++steps >= max_steps) {
                     trace(TraceAction::RunEnd, {});
@@ -189,6 +189,7 @@ public:
     std::uint64_t trace(TraceAction action, std::string payload) override {
         return trace_.record(action, vtime_, std::move(payload));
     }
+    [[nodiscard]] bool trace_wanted() const noexcept override { return trace_.enabled(); }
 
     [[nodiscard]] std::int64_t vtime() const noexcept override { return vtime_; }
 
@@ -205,8 +206,10 @@ public:
         Tick due = vtime_ + (d > 0 ? d : 0);
         std::uint64_t arm = timer_arm_seq_++;
         timers_.push_back(Timer{due, arm, std::move(p)});
-        trace(TraceAction::TimerArm,
-              std::string("due=") + std::to_string(due) + " arm=" + std::to_string(arm));
+        if (trace_.enabled()) {
+            trace(TraceAction::TimerArm,
+                  std::string("due=") + std::to_string(due) + " arm=" + std::to_string(arm));
+        }
         return f;
     }
 
@@ -248,7 +251,7 @@ private:
         Tick target = timers_[min_idx].due;
         if (target > vtime_) {
             vtime_ = target; // jump forward; clock advances ONLY here (L4)
-            trace(TraceAction::ClockAdvance, std::string("to=") + std::to_string(vtime_));
+            if (trace_.enabled()) trace(TraceAction::ClockAdvance, std::string("to=") + std::to_string(vtime_));
         }
         // Fire all timers due at `target`, in arm order, deterministically.
         // Collect their indices, sort by arm_seq, fire, then erase.
@@ -280,7 +283,7 @@ private:
         }
         // Fire: fulfilling each Promise SCHEDULES its waiter (L1). Trace each.
         for (Timer& t : firing) {
-            trace(TraceAction::TimerFire, std::string("arm=") + std::to_string(t.arm_seq));
+            if (trace_.enabled()) trace(TraceAction::TimerFire, std::string("arm=") + std::to_string(t.arm_seq));
             t.promise.set_value();
         }
     }

@@ -369,6 +369,7 @@ public:
         ready_.push(core::detail::ReadyItem{h, enqueue_seq_++});
     }
 
+    [[nodiscard]] bool trace_wanted() const noexcept override { return trace_.enabled(); }
     std::uint64_t trace(core::TraceAction action, std::string payload) override {
         // PERF (S8.6): no-op when tracing is off — no trace_ growth, no payload retained.
         // Hot call sites also guard with traced() so the payload string is never built.

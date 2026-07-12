@@ -41,6 +41,14 @@ public:
     // promise being set). Returns the assigned sequence number.
     virtual std::uint64_t trace(TraceAction action, std::string payload) = 0;
 
+    // PERF HINT: whether trace() will actually STORE the event. Callers that must
+    // BUILD a payload string (an allocation) consult this first and skip the build
+    // when storage is off — the whole emit then costs one virtual call instead of a
+    // malloc + format + discard. Default true (store), so a sink that never disables
+    // tracing behaves exactly as before; when tracing IS enabled the guarded calls
+    // all still happen, keeping the trace byte-identical.
+    [[nodiscard]] virtual bool trace_wanted() const noexcept { return true; }
+
     // Current virtual time, for trace stamping at the primitive layer.
     [[nodiscard]] virtual std::int64_t vtime() const noexcept = 0;
 

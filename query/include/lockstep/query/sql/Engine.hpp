@@ -4212,6 +4212,14 @@ private:
     }
 
 public:
+    // PERF (bench/prod): stop STORING scheduler trace events (spawn/resume/promise-set,
+    // ~6 allocations+pushes per commit — the dominant single-thread ingest tax when on).
+    // Observational only: default ON keeps every sim gate byte-identical.
+    void set_trace_enabled(bool on) noexcept {
+        db_.scheduler().set_trace_enabled(on);
+        catalog_db_.scheduler().set_trace_enabled(on);
+    }
+
     // Test/admin visibility: the current auto/manual CDC retention horizon (0 = off).
     [[nodiscard]] std::int64_t cdc_retain_seq() {
         auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());

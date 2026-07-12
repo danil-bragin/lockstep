@@ -70,7 +70,7 @@ public:
             [[nodiscard]] bool await_ready() const noexcept { return false; }
             void await_suspend(std::coroutine_handle<promise_type> h) noexcept {
                 promise_type& p = h.promise();
-                if (p.sink != nullptr) {
+                if (p.sink != nullptr && p.sink->trace_wanted()) {
                     p.sink->trace(TraceAction::TaskDone,
                                   std::string("id=") + std::to_string(p.task_id));
                 }

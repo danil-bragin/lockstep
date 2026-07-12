@@ -31,6 +31,7 @@ static int run_dist(std::size_t m, std::size_t n_per_shard) {
             // The engine lives ENTIRELY on its shard thread (built, used, destroyed
             // here) — the prod thread-per-shard shape; engines share nothing.
             SqlEngine e;
+            e.set_trace_enabled(false);
             e.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
             std::int64_t cur = 0;
             std::size_t seen = 0;
@@ -64,7 +65,40 @@ static int run_dist(std::size_t m, std::size_t n_per_shard) {
     return 0;
 }
 
+// --batch B N: Kafka-parity produce — multi-row INSERT batches (B rows/statement),
+// the SQL analogue of the producer's record batching. Reports ingest ops/s.
+static int run_batch(std::size_t batch, std::size_t n) {
+    SqlEngine e;
+    e.set_trace_enabled(false);
+    e.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
+    const auto t0 = Clock::now();
+    std::size_t id = 0;
+    std::string sql;
+    while (id < n) {
+        sql.assign("INSERT INTO t (id,name,score) VALUES ");
+        const std::size_t hi = id + batch < n ? id + batch : n;
+        for (std::size_t i = id; i < hi; ++i) {
+            if (i != id) sql += ',';
+            const std::string v = std::to_string(i);
+            sql += "(" + v + ",'u" + v + "'," + std::to_string((i * 7) % 1000) + ")";
+        }
+        id = hi;
+        if (!e.exec(sql).ok) { std::printf("BAD batch insert\n"); return 1; }
+    }
+    const double ms = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                          Clock::now() - t0).count()) / 1000.0;
+    ExecResult all = e.exec("CHANGES t SINCE 0");
+    const bool drained = all.ok && all.rows.size() == n;
+    std::printf("batch=%zu rows=%zu ingest=%.0fms -> %.0f ops/s (feed drain %s)\n", batch, n,
+                ms, n / ms * 1000, drained ? "ok" : "REFUSED(flushed) - expected at scale");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 3 && std::strcmp(argv[1], "--batch") == 0) {
+        return run_batch(static_cast<std::size_t>(std::atoll(argv[2])),
+                         static_cast<std::size_t>(std::atoll(argv[3])));
+    }
     if (argc > 2 && std::strcmp(argv[1], "--dist") == 0) {
         const std::size_t m = static_cast<std::size_t>(std::atoll(argv[2]));
         const std::size_t nps =
@@ -73,6 +107,7 @@ int main(int argc, char** argv) {
     }
     const std::size_t n = argc > 1 ? static_cast<std::size_t>(std::atoll(argv[1])) : 200000;
     SqlEngine e;
+    e.set_trace_enabled(false);  // bench = prod posture: no observational trace tax
     e.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
     const auto t0 = Clock::now();
     for (std::size_t i = 0; i < n; ++i) {
@@ -114,6 +149,7 @@ int main(int argc, char** argv) {
     // the cursor stays inside the memtable window no matter how large the table grows.
     const std::size_t big = n * 4;
     SqlEngine e2;
+    e2.set_trace_enabled(false);
     e2.exec("CREATE TABLE t (id INT, name TEXT, score INT, PRIMARY KEY (id))");
     std::int64_t c2 = 0;
     std::size_t seen = 0;

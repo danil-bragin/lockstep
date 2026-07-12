@@ -68,7 +68,7 @@ public:
     void complete() {
         assert(!ready_ && "future completed twice");
         ready_ = true;
-        if (sink_ != nullptr) {
+        if (sink_ != nullptr && sink_->trace_wanted()) {
             sink_->trace(TraceAction::PromiseSet,
                          std::string("err=") + (result_.has_error() ? "1" : "0"));
         }
