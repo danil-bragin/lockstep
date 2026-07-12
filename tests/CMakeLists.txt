@@ -1488,6 +1488,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_cdc_test COMMAND lockstep_sql_cdc_test)
 
+  # storage_branch_test: K7 branch fork — snapshot oracle + divergence + refcount rule.
+  add_executable(lockstep_storage_branch_test storage_branch_test.cpp)
+  target_include_directories(lockstep_storage_branch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_storage_branch_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_storage lockstep_runtime
+            lockstep_providers_sim)
+  add_test(NAME storage_branch_test COMMAND lockstep_storage_branch_test)
+
   # sql_ivm_test: K5 incremental matviews — incremental == full recompute oracle.
   add_executable(lockstep_sql_ivm_test sql_ivm_test.cpp)
   target_include_directories(lockstep_sql_ivm_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

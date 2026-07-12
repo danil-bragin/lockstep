@@ -561,7 +561,7 @@ public:
             best_val = mh.value;
             found = true;
         }
-        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+        for (const std::shared_ptr<SSTableReader>& sst : sstables_) {
             const SSTableReader::Hit h = sst->lookup(key, at);
             if (h.covered && (!found || h.seq >= best_seq)) {
                 best_seq = h.seq;
@@ -840,7 +840,7 @@ public:
                 offer(it->first, h.seq, std::move(h.value), h.tombstone, h.vlog);
             }
         }
-        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+        for (const std::shared_ptr<SSTableReader>& sst : sstables_) {
             std::vector<std::pair<Key, SSTableReader::ScanCand>> acc;
             const Key hi = range.hi_unbounded ? Key{} : range.hi;
             sst->scan_into(range.lo, hi, at, range.hi_unbounded, acc);
@@ -909,7 +909,7 @@ public:
         };
         std::vector<SstCur> scs;
         scs.reserve(sstables_.size());
-        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+        for (const std::shared_ptr<SSTableReader>& sst : sstables_) {
             scs.push_back(SstCur{sst.get(), sst->scan_start_block(range.lo), 0, {}});
         }
         const auto advance_sst = [&](SstCur& sc) {
@@ -1072,11 +1072,47 @@ public:
     // GC-space metric the GC-safety test measures before/after a compaction.
     [[nodiscard]] std::size_t live_version_count() const noexcept {
         std::size_t n = mem_.version_count();
-        for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+        for (const std::shared_ptr<SSTableReader>& sst : sstables_) {
             n += sst->entry_count();
         }
         return n;
     }
+    // K7: BRANCH FORK — an O(metadata) writable fork of THIS engine's current state.
+    // The branch SHARES the parent's immutable in-memory SSTable readers (shared_ptr
+    // IS the refcount — K7.1's ownership rule in its in-process form: a parent
+    // compaction obsoletes only the PARENT's references and disks; the branch's
+    // shared readers stay alive and self-contained, so its reads are undisturbed)
+    // and COPIES only the memtable (bounded by the flush threshold — never O(data)).
+    // The branch writes to ITS OWN WAL/manifest/factory from Seq = the parent's tip:
+    // divergence is free, a merge does not exist (v1 — Neon-style ephemeral branch).
+    // Durability caveat (v1, honest): the branch's own WAL replays only the
+    // branch-side writes; the inherited state lives in the shared readers + copied
+    // memtable, so a branch does NOT survive a process restart — it is a test/
+    // experiment environment, exactly the "database per pull request" shape.
+    [[nodiscard]] std::unique_ptr<WalEngine> fork_branch(Scheduler& sched, IDisk& wal_disk,
+                                                         IDisk& manifest_disk,
+                                                         IDiskFactory& factory,
+                                                         std::size_t flush_threshold) const {
+        if (value_log_active()) {
+            return nullptr;  // v1: shared readers would deref the PARENT's vlog
+                             // generations through the BRANCH's factory — refuse
+                             // cleanly rather than serve wrong bytes (open item).
+        }
+        auto b = std::make_unique<WalEngine>(sched, wal_disk, manifest_disk, factory,
+                                             flush_threshold);
+        b->sstables_ = sstables_;  // shared immutable readers — the O(metadata) part
+        for (const auto& [key, versions] : mem_.entries()) {
+            for (const Memtable::Version& v : versions) {
+                b->mem_.insert(key, v.seq, v.value, v.tombstone, v.vlog);
+            }
+        }
+        b->last_seq_ = last_seq_;
+        b->next_sstable_id_ = next_sstable_id_;
+        b->compaction_trigger_ = compaction_trigger_;
+        b->cdc_retain_from_ = cdc_retain_from_;
+        return b;
+    }
+
     // Reclaimed SSTable backing ids (obsoleted by compaction) — the disk-GC proof.
     [[nodiscard]] const std::vector<std::uint64_t>& obsoleted_ids() const noexcept {
         return obsoleted_ids_;
@@ -1128,7 +1164,7 @@ private:
             // unique engine-wide and a flush ERASES what it flushed from the memtable,
             // so sstable + memtable versions are disjoint — a plain concat then sort
             // by Seq reconstructs the op-log with no dedup step.
-            for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+            for (const std::shared_ptr<SSTableReader>& sst : sstables_) {
                 if (sst->max_seq < from_seq) {
                     continue;  // wholly below the cursor — a tailing reader skips it
                 }
@@ -1413,7 +1449,7 @@ private:
         // ADOPTING the builder's own decoded state (K4.9) — decoding our own image we
         // encoded a microsecond ago was a top ingest cost; recovery still parses real
         // disk bytes through the validated loader (gate: adopt == parse, sstable test).
-        auto reader = std::make_unique<SSTableReader>();
+        auto reader = std::make_shared<SSTableReader>();
         reader->adopt_built(built, sstable_id);
         sstables_.push_back(std::move(reader));
         // Drop only the flushed (non-resident) versions; resident (columnar) keys
@@ -1487,7 +1523,7 @@ private:
         std::size_t chosen_bucket = SIZE_MAX;
         {
             std::map<std::size_t, std::size_t> bucket_counts;
-            for (const std::unique_ptr<SSTableReader>& sst : sstables_) {
+            for (const std::shared_ptr<SSTableReader>& sst : sstables_) {
                 if (is_topic_segment(*sst)) continue;
                 ++bucket_counts[bucket_of(sst->entry_count())];
             }
@@ -1506,7 +1542,7 @@ private:
                 bucket_of(sstables_[i]->entry_count()) != chosen_bucket) {
                 continue;
             }
-            const std::unique_ptr<SSTableReader>& sst = sstables_[i];
+            const std::shared_ptr<SSTableReader>& sst = sstables_[i];
             std::vector<SstEntry> run;
             sst->collect_entries(run);
             runs.push_back(std::move(run));
@@ -1597,7 +1633,7 @@ private:
         }
 
         // Reader for the merged SSTable: adopt the builder state (K4.9, same as flush).
-        auto new_reader = std::make_unique<SSTableReader>();
+        auto new_reader = std::make_shared<SSTableReader>();
         new_reader->adopt_built(built, new_id);
 
         // (5)+(6) obsolete the inputs + raise the WAL-truncation watermark.
@@ -1712,7 +1748,7 @@ private:
     // partial obsolete suffix — see recovery).
     core::Task obsolete_and_truncate(std::vector<std::uint64_t> input_ids,
                                      bool new_id_present, std::uint64_t new_id,
-                                     std::unique_ptr<SSTableReader> new_reader,
+                                     std::shared_ptr<SSTableReader> new_reader,
                                      Seq covered_max,
                                      std::vector<std::uint64_t> reclaim_gens) {
         for (std::uint64_t oid : input_ids) {
@@ -1777,8 +1813,8 @@ private:
 
         // (7) swap the in-memory live set. Remove obsoleted readers, add the merged
         // reader (if any). Reclaim the obsoleted backing disks.
-        std::vector<std::unique_ptr<SSTableReader>> kept;
-        for (std::unique_ptr<SSTableReader>& sst : sstables_) {
+        std::vector<std::shared_ptr<SSTableReader>> kept;
+        for (std::shared_ptr<SSTableReader>& sst : sstables_) {
             bool obsolete = false;
             for (std::uint64_t oid : input_ids) {
                 if (sst->sstable_id == oid) {
@@ -1923,7 +1959,7 @@ private:
         Seq loaded_sst_max = kNoSeq;
         for (const LiveRec& lr : live) {
             IDisk& sdisk = factory_->disk_for(lr.sstable_id);
-            auto reader = std::make_unique<SSTableReader>();
+            auto reader = std::make_shared<SSTableReader>();
             Error lerr{};
             co_await SSTableLoader::load(sdisk, lr.sst_len, lr.sstable_id, *reader, lerr);
             if (!lerr.ok()) {
@@ -2074,7 +2110,7 @@ private:
     IDiskFactory* factory_ = nullptr;         // mints per-SSTable IDisks
     Seq cdc_retain_from_ = 0;                 // K4: op-log suffix kept through compaction (0 = off)
     std::size_t flush_threshold_ = 0;         // memtable version count to flush at
-    std::vector<std::unique_ptr<SSTableReader>> sstables_;  // install order (old→new)
+    std::vector<std::shared_ptr<SSTableReader>> sstables_;  // install order (old→new)
     std::uint64_t next_sstable_id_ = 0;       // next SSTable backing id
     std::uint64_t manifest_tip_ = 0;          // last committed manifest entry_no
     bool manifest_started_ = false;           // W2: one-time manifest stream header written?

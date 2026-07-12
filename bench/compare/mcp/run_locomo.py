@@ -38,6 +38,29 @@ def embed(text):
     n = sum(x * x for x in v) ** 0.5 or 1.0
     return [x / n for x in v]
 
+# --extract mode (equal-ingest budget): ONE LLM pass per session distills the raw
+# turns into fact memories; BOTH systems then ingest the IDENTICAL extracted facts —
+# the regime mem0/memU market in, with the extraction cost identical by construction.
+def extract_session(date, turns):
+    convo = "\n".join(f'{t["speaker"]}: {t.get("text","")}' +
+                      (f' [photo: {t["blip_caption"]}]' if t.get("blip_caption") else "")
+                      for t in turns)
+    out = llm("Extract the important durable facts from this conversation session as a "
+              "list, one fact per line, each self-contained and mentioning who and, if "
+              "relevant, when. Session date: " + date + "\n\n" + convo +
+              "\n\nFacts (one per line):", max_tokens=700)
+    return [f'On {date}: {ln.lstrip("-* 0123456789.").strip()}'
+            for ln in out.splitlines() if ln.strip()]
+
+def memories_of_extracted(conv):
+    out = []
+    i = 1
+    while f"session_{i}" in conv:
+        out.extend(extract_session(conv.get(f"session_{i}_date_time", ""),
+                                   conv[f"session_{i}"] or []))
+        i += 1
+    return out
+
 def memories_of(conv):
     out = []
     i = 1
@@ -120,11 +143,12 @@ def run_mem0(mems, qas):
 if __name__ == "__main__":
     binary = sys.argv[1]
     data = json.load(open(sys.argv[2]))
+    extract = len(sys.argv) > 3 and sys.argv[3] == "--extract"
     total = {"ls": [0, 0], "m0": [0, 0]}
     per_all = {"ls": {}, "m0": {}}
     for ci in CONVS:
         conv = data[ci]
-        mems = memories_of(conv["conversation"])
+        mems = (memories_of_extracted if extract else memories_of)(conv["conversation"])
         qas = [q for q in conv["qa"] if q.get("category") in (1, 2, 3, 4)][:QA_PER_CONV]
         print(f"conv {ci}: {len(mems)} memories, {len(qas)} questions", flush=True)
         for name, fn in (("ls", lambda: run_lockstep(binary, mems, qas)),
