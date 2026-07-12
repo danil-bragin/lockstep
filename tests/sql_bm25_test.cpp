@@ -85,6 +85,23 @@ std::vector<std::int64_t> ref_topk(const std::map<std::int64_t, std::string>& co
     return out;
 }
 
+
+// Reference RRF: fuse two reference rankings with 1/(60+rank), (score DESC, id ASC).
+std::vector<std::int64_t> ref_rrf(const std::vector<std::int64_t>& a,
+                                  const std::vector<std::int64_t>& b, std::size_t k) {
+    std::map<std::int64_t, double> f;
+    for (std::size_t i = 0; i < a.size(); ++i) f[a[i]] += 1.0 / (60.0 + i + 1);
+    for (std::size_t i = 0; i < b.size(); ++i) f[b[i]] += 1.0 / (60.0 + i + 1);
+    std::vector<std::pair<double, std::int64_t>> h;
+    for (const auto& [id, s] : f) h.emplace_back(s, id);
+    std::sort(h.begin(), h.end(), [](const auto& x, const auto& y) {
+        if (x.first != y.first) return x.first > y.first;
+        return x.second < y.second;
+    });
+    std::vector<std::int64_t> out;
+    for (std::size_t i = 0; i < h.size() && i < k; ++i) out.push_back(h[i].second);
+    return out;
+}
 std::map<std::int64_t, std::string> corpus() {
     return {{1, "the quick brown fox jumps over the lazy dog"},
             {2, "a quick brown cat sits on the mat"},
@@ -148,6 +165,37 @@ int main() {
         e.exec("DELETE FROM docs WHERE id = 9");
         c.erase(9);
         expect_topk(e, c, "raft consensus", 3, tag + "post-DELETE ");
+
+
+        // --- K2.4: hybrid RRF (vectors + BM25 in ONE query) ---
+        e.exec("CREATE TABLE hyb (id INT, emb VECTOR(2) NOT NULL, body TEXT, PRIMARY KEY (id))");
+        e.exec("INSERT INTO hyb (id,emb,body) VALUES "
+               "(1,'[0,0]','raft consensus replication'), (2,'[0.2,0]','quick brown fox'), "
+               "(3,'[5,5]','raft consensus protocol'), (4,'[0.1,0.1]','database queries'), "
+               "(5,'[5,5.2]','lazy dog sleeps'), (6,'[0.3,0.2]','raft leader election')");
+        if (columnar) e.flush_columnar("hyb");
+        e.exec("CREATE INDEX hyb_v ON hyb (emb) USING IVFFLAT WITH (lists = 2, probes = 2)");
+        e.exec("CREATE INDEX hyb_t ON hyb (body) USING BM25");
+        {
+            // Reference legs: exact vector ranking (engine exact path == gated) and the
+            // reference BM25 over the hyb corpus; fuse with reference RRF.
+            const ExecResult vr = e.exec(
+                "SELECT id, l2_distance(emb,'[0,0]') AS d FROM hyb ORDER BY d LIMIT 60");
+            std::map<std::int64_t, std::string> hc = {
+                {1, "raft consensus replication"}, {2, "quick brown fox"},
+                {3, "raft consensus protocol"},    {4, "database queries"},
+                {5, "lazy dog sleeps"},            {6, "raft leader election"}};
+            const auto want = ref_rrf(ids(vr), ref_topk(hc, "raft consensus", 60), 3);
+            const ExecResult r = e.exec(
+                "SELECT id FROM hyb ORDER BY rrf_score(emb, '[0,0]', body, 'raft consensus') "
+                "DESC LIMIT 3");
+            check(r.ok && ids(r) == want, tag + "hybrid RRF == reference fusion");
+        }
+        // Hybrid teeth: missing either index -> clean RRF_SCORE error (no silent scan).
+        e.exec("CREATE TABLE hyb2 (id INT, emb VECTOR(2) NOT NULL, body TEXT, PRIMARY KEY (id))");
+        e.exec("INSERT INTO hyb2 (id,emb,body) VALUES (1,'[0,0]','x y')");
+        check(!e.exec("SELECT id FROM hyb2 ORDER BY rrf_score(emb,'[0,0]',body,'x') DESC LIMIT 1").ok,
+              tag + "RRF without indexes is a clean error");
 
         // Teeth.
         check(!e.exec("CREATE INDEX bad1 ON docs (id) USING BM25").ok,

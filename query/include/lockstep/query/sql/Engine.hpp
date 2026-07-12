@@ -8191,6 +8191,10 @@ private:
         if (auto fts = bm25_try_topk(*t, sel)) {
             return std::move(*fts);
         }
+        // K2.4: hybrid RRF — vectors + BM25 fused in one query.
+        if (auto hyb = rrf_try_topk(*t, sel)) {
+            return std::move(*hyb);
+        }
 
         // (1) READ — pick the storage read (PK fast path vs full scan), run at the
         // call-site-visible D5 level. The fast path is taken only when the WHERE is
@@ -9660,6 +9664,12 @@ private:
             }
             out = Datum::make_int(all);
             return std::nullopt;
+        }
+        // K2.4: RRF_SCORE is served by the fused hybrid top-k path (ORDER BY
+        // rrf_score(vec_col, '[q]', text_col, 'q') DESC LIMIT k) — see rrf_try_topk.
+        if (f == "RRF_SCORE") {
+            return "RRF_SCORE is supported in ORDER BY rrf_score(vec_col, '[qvec]', text_col, "
+                   "'qtext') DESC LIMIT k over IVFFLAT + BM25 indexed columns";
         }
         // K2: BM25_SCORE is served by the index-backed top-k path (ORDER BY
         // bm25_score(col,'q') DESC LIMIT k). Projecting the score per row would need
@@ -11932,6 +11942,152 @@ private:
             }
         }
         return {};
+    }
+
+    // K2.4: the HYBRID top-k path — Reciprocal Rank Fusion of the vector k-NN and the
+    // BM25 rankings in ONE query:
+    //   SELECT ... ORDER BY rrf_score(vec_col, '[qvec]', text_col, 'qtext') DESC LIMIT k
+    // Both legs run through the EXISTING index-backed top-k paths (ivfflat_try_knn /
+    // bm25_try_topk) as synthetic pk-only sub-selects at depth max(60, 3*(k+offset));
+    // fusion: score(d) = sum over legs of 1/(60 + rank_d) (the standard RRF, k=60), and
+    // the final order (score DESC, pk ASC) is total + deterministic because both leg
+    // rankings are. Requires an IVFFLAT index on the vector column AND a BM25 index on
+    // the text column — the flagship "hybrid search in one SQL query" shape.
+    [[nodiscard]] std::optional<ExecResult> rrf_try_topk(const Table& t, const SelectStmt& sel) {
+        if (sel.has_aggregates || !sel.group_by.empty() || sel.distinct || sel.filter.present() ||
+            sel.having.present() || !sel.has_limit || sel.order_by.size() != 1 || gs_mode_) {
+            return std::nullopt;
+        }
+        if (sel.level != Level::StrictSerializable || sel.snapshot_version != kNoSeq) {
+            return std::nullopt;
+        }
+        const OrderKey& okey = sel.order_by[0];
+        if (!okey.expr || !okey.descending || okey.nulls != NullsOrder::Default) return std::nullopt;
+        const Expr& e = *okey.expr;
+        if (e.kind != ExprKind::Func || e.func != "RRF_SCORE" || e.args.size() != 4) {
+            return std::nullopt;
+        }
+        for (int a2 = 0; a2 < 4; ++a2) {
+            if (!e.args[static_cast<std::size_t>(a2)]) return std::nullopt;
+        }
+        if (e.args[0]->kind != ExprKind::Col || e.args[2]->kind != ExprKind::Col ||
+            expr_has_col(*e.args[1]) || expr_has_col(*e.args[3])) {
+            return std::nullopt;
+        }
+        for (const SelectItem& it : sel.items) {
+            if (it.kind == SelectItemKind::Window) return std::nullopt;
+            if (it.kind == SelectItemKind::Expr && it.expr && it.expr->kind == ExprKind::Func &&
+                (it.expr->func == "UNNEST" || it.expr->func == "RRF_SCORE")) {
+                return std::nullopt;
+            }
+        }
+        const std::size_t want = static_cast<std::size_t>(
+            std::max<std::int64_t>(0, sel.limit) + std::max<std::int64_t>(0, sel.offset));
+        const std::size_t depth = std::max<std::size_t>(60, 3 * want);
+        // Build the two pk-only leg sub-selects and run them through the index paths.
+        const auto leg = [&](const char* fn, const std::shared_ptr<Expr>& colref,
+                             const std::shared_ptr<Expr>& query, bool desc,
+                             bool is_bm25) -> std::optional<std::vector<Key>> {
+            SelectStmt sub;
+            sub.table = sel.table;
+            sub.level = Level::StrictSerializable;
+            SelectItem it;
+            it.kind = SelectItemKind::Column;
+            it.column = t.pk().name;
+            it.label = t.pk().name;
+            sub.items.push_back(std::move(it));
+            OrderKey k2;
+            auto fx = std::make_shared<Expr>();
+            fx->kind = ExprKind::Func;
+            fx->func = fn;
+            fx->args = {colref, query};
+            k2.expr = fx;
+            k2.descending = desc;
+            sub.order_by.push_back(std::move(k2));
+            sub.has_limit = true;
+            sub.limit = static_cast<std::int64_t>(depth);
+            const auto r2 = is_bm25 ? bm25_try_topk(t, sub) : ivfflat_try_knn(t, sub);
+            if (!r2 || !r2->ok) return std::nullopt;  // missing index / leg error -> no fusion
+            std::vector<Key> pks;
+            pks.reserve(r2->rows.size());
+            for (const ResultRow& row : r2->rows) pks.push_back(encode_pk(row.cells[0].second));
+            return pks;
+        };
+        const auto vleg = leg("<->", e.args[0], e.args[1], /*desc=*/false, /*is_bm25=*/false);
+        if (!vleg) return std::nullopt;
+        const auto tleg = leg("BM25_SCORE", e.args[2], e.args[3], /*desc=*/true, /*is_bm25=*/true);
+        if (!tleg) return std::nullopt;
+        constexpr double kRrf = 60.0;
+        std::map<Key, double> fused;  // pk bytes -> RRF score (deterministic iteration)
+        for (std::size_t rank = 0; rank < vleg->size(); ++rank)
+            fused[(*vleg)[rank]] += 1.0 / (kRrf + static_cast<double>(rank + 1));
+        for (std::size_t rank = 0; rank < tleg->size(); ++rank)
+            fused[(*tleg)[rank]] += 1.0 / (kRrf + static_cast<double>(rank + 1));
+        struct FHit {
+            double s;
+            Key pk;
+        };
+        std::vector<FHit> hits;
+        hits.reserve(fused.size());
+        for (const auto& [pk, s2] : fused) hits.push_back(FHit{s2, pk});
+        const auto better = [](const FHit& a, const FHit& b) {
+            const int c = Datum::real_cmp(a.s, b.s);
+            if (c != 0) return c > 0;
+            return a.pk < b.pk;
+        };
+        if (hits.size() > want) {
+            std::partial_sort(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(want),
+                              hits.end(), better);
+            hits.resize(want);
+        } else {
+            std::sort(hits.begin(), hits.end(), better);
+        }
+        ExecResult r;
+        for (const FHit& h : hits) {
+            const Key rkey = table_prefix(t.id) + h.pk;
+            std::vector<Datum> row;
+            bool have = false;
+            if (t.columnar) {
+                auto rr = read_columnar_row(t, decode_pk(t, rkey));
+                if (rr) {
+                    row = std::move(*rr);
+                    have = true;
+                }
+            } else {
+                (void)db_.engine().scan_visit(
+                    storage::Range{rkey, key_successor(rkey), /*hi_unbounded=*/false},
+                    db_.live_snap_seq(), [&](const Key&, const Value& v2) {
+                        row = decode_row(t, rkey, v2);
+                        have = true;
+                    });
+            }
+            if (!have) continue;
+            ResultRow out;
+            if (sel.star) {
+                for (std::size_t i = 0; i < t.columns.size(); ++i) {
+                    if (t.columns[i].dropped) continue;
+                    out.cells.emplace_back(t.columns[i].name, row[i]);
+                }
+            } else {
+                for (const SelectItem& item : sel.items) {
+                    Datum d2;
+                    if (item.kind == SelectItemKind::Expr) {
+                        if (auto err = eval_expr(*item.expr, t, row, d2)) {
+                            return ExecResult::failure(*err);
+                        }
+                    } else {
+                        const auto idx2 = t.column_index(item.column);
+                        if (!idx2) return ExecResult::failure("unknown column '" + item.column + "'");
+                        d2 = row[*idx2];
+                    }
+                    out.cells.emplace_back(item.label, d2);
+                }
+            }
+            r.rows.push_back(std::move(out));
+        }
+        apply_limit(sel, r.rows);
+        r.affected = r.rows.size();
+        return r;
     }
 
     // K2: the BM25 top-k path — `SELECT ... ORDER BY bm25_score(col, 'query') DESC LIMIT k`
