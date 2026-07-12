@@ -54,24 +54,43 @@ inline void skip_ws(const std::string& s, std::size_t& p) {
                 case 'r': out.push_back('\r'); break;
                 case 'b': out.push_back('\b'); break;
                 case 'f': out.push_back('\f'); break;
-                case 'u': {  // \uXXXX -> raw bytes (BMP only; deterministic UTF-8 encode)
-                    if (p + 4 > s.size()) return false;
+                case 'u': {  // \uXXXX -> UTF-8 bytes; surrogate PAIRS combine (emoji etc.)
+                    const auto hex4 = [&](unsigned& cp) -> bool {
+                        if (p + 4 > s.size()) return false;
+                        cp = 0;
+                        for (int k = 0; k < 4; ++k) {
+                            const char h = s[p++];
+                            cp <<= 4;
+                            if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+                            else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+                            else return false;
+                        }
+                        return true;
+                    };
                     unsigned cp = 0;
-                    for (int k = 0; k < 4; ++k) {
-                        const char h = s[p++];
-                        cp <<= 4;
-                        if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
-                        else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
-                        else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
-                        else return false;
+                    if (!hex4(cp)) return false;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {  // high surrogate: need \uDC00-\uDFFF
+                        if (p + 6 > s.size() || s[p] != '\\' || s[p + 1] != 'u') return false;
+                        p += 2;
+                        unsigned lo = 0;
+                        if (!hex4(lo) || lo < 0xDC00 || lo > 0xDFFF) return false;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        return false;  // a lone low surrogate is malformed
                     }
                     if (cp < 0x80) {
                         out.push_back(static_cast<char>(cp));
                     } else if (cp < 0x800) {
                         out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
                         out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-                    } else {
+                    } else if (cp < 0x10000) {
                         out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                    } else {
+                        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
                         out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
                         out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
                     }

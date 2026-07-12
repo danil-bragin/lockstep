@@ -46,3 +46,38 @@ per-agent schema isolation, and CHANGES feeds over the memory table.
 
 Repro: `python3 bench/compare/mcp/run_mem0.py ./build/release/cli/lockstep_mcpd`
 (venv: `pip install mem0ai faiss-cpu`; env `MEM0_TELEMETRY=False OPENAI_API_KEY=sk-unused`).
+
+# K11.5b — LOCOMO end-to-end QA (2026-07-13)
+
+LOCOMO (Maharana et al. 2024): very long multi-session dialogues + QA over them —
+THE public agent-memory benchmark mem0 markets against. Subset run for budget:
+conversations 0-1, 60 questions each (categories 1-4; 5 = adversarial excluded, as
+in mem0's own reporting). Both systems ingest IDENTICAL raw turn-memories
+("On <date>, <speaker> said: ...", mem0 add(infer=False)), identical deterministic
+hash embeddings, retrieval top-10, answers and judging by the SAME model
+(openai/gpt-4o-mini via OpenRouter, temperature 0). The ONLY variable is the
+retrieval layer.
+
+| | overall | multi-hop | temporal | open | single-hop |
+|---|---|---|---|---|---|
+| **Lockstep** (hybrid RRF) | **35/120 = 29.2%** | 7/34 | **19/54** | 4/9 | 5/23 |
+| mem0 + FAISS (vector-only) | 13/120 = 10.8% | 2/34 | 4/54 | 4/9 | 3/23 |
+
+**2.7x end-to-end QA accuracy, same LLM, same memories, same embeddings** — the gap
+is the retrieval layer alone. Largest on temporal questions (4.75x): dates live in
+the memory TEXT ("On 7 May 2023, ..."), and BM25 anchors on them where the hash
+vector cannot; the RRF fusion carries that signal through.
+
+**Honest bounds.** Absolute numbers are far below mem0's marketed ~67% or memU's
+~92% — those regimes spend LLM calls on ingest (fact extraction / categorization)
+and use real semantic embeddings; ours here spends ZERO ingest LLM cost and uses
+32-dim hash vectors. This run isolates the STORE's contribution, not the whole
+pipeline's. A fair fight with memU/mem0-full requires an equal-ingest-budget run
+(both sides given the same extraction pass) — recorded as the next step. Judged by
+a single model, single seed subset; not a leaderboard submission.
+
+Also fixed by this run: the engine's JSON \uXXXX parser mishandled surrogate PAIRS
+(emoji in LOCOMO turns became invalid UTF-8 in tool responses) — now combined into
+proper 4-byte UTF-8.
+
+Repro: `OR_KEY=... python3 bench/compare/mcp/run_locomo.py ./build/release/cli/lockstep_mcpd locomo10.json`
