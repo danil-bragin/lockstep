@@ -487,9 +487,14 @@ public:
             if (auto e = expect_ident("a queue name after ACK", st.queue.queue))
                 return ParseResult{*e};
             if (auto e = expect(Tok::Comma, "',' after the queue name")) return ParseResult{*e};
-            if (cur_.kind != Tok::IntLit) return err("ACK expects a message id");
-            st.queue.mid = cur_.int_val;
-            advance();
+            for (;;) {
+                if (cur_.kind != Tok::IntLit) return err("ACK expects a message id");
+                st.queue.mids.push_back(cur_.int_val);
+                advance();
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
+            st.queue.mid = st.queue.mids.front();
             r = ParseResult{std::move(st)};
         } else if (kw == "insert") {
             r = parse_insert();

@@ -582,7 +582,8 @@ struct QueueStmt {
     std::shared_ptr<Expr> payload;   // SEND: the message body (constant TEXT expression)
     std::int64_t batch = 1;          // RECEIVE BATCH n
     std::int64_t visibility = 100;   // RECEIVE VISIBILITY v (Seq units)
-    std::int64_t mid = 0;            // ACK: the message id
+    std::int64_t mid = 0;            // ACK: the message id (first)
+    std::vector<std::int64_t> mids;  // ACK: full id list (batched ack, one commit)
     bool dlq = false;                // RECEIVE ... DLQ — read-only peek at the dead letters
 };
 

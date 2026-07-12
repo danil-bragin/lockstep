@@ -4117,8 +4117,26 @@ private:
         const std::string qt = queue_table(qs.queue);
         const Table* t = catalog_.find(qt);
         if (t == nullptr) return ExecResult::failure("unknown queue '" + qs.queue + "'");
-        // Idempotent delete-by-mid through the ordinary DELETE path.
-        return exec("DELETE FROM " + qt + " WHERE mid = " + std::to_string(qs.mid));
+        // Idempotent BATCHED ack: tombstone every listed live message in ONE commit
+        // (pgmq parity with delete(ids[]); a per-message round trip dominated the
+        // consumer loop). Absent ids are skipped — ACK stays idempotent.
+        std::vector<std::pair<Key, Value>> writes;
+        std::int64_t acked = 0;
+        for (const std::int64_t m : qs.mids) {
+            const Key rkey = encode_key(*t, Datum::make_int(m));
+            bool live = false;
+            (void)db_.engine().scan_visit(
+                storage::Range{rkey, key_successor(rkey), /*hi_unbounded=*/false},
+                db_.live_snap_seq(), [&](const Key&, const Value&) { live = true; });
+            if (live) {
+                writes.emplace_back(rkey, tombstone_marker());
+                ++acked;
+            }
+        }
+        if (!writes.empty()) commit_writes(writes);
+        ExecResult r;
+        r.affected = static_cast<std::size_t>(acked);
+        return r;
     }
     // =================== end K3 queues ===================
 
