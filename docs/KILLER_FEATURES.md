@@ -106,6 +106,20 @@ Seq-cursor changefeeds over `export_ops`; globally-ordered (vs Cockroach's per-r
 resolved-timestamp complexity); exactly-once resume free. Steps as in TECH_PLAN
 (CREATE CHANGEFEED → retention interaction → sinks → storm teeth). Feeds K10 realtime.
 
+**K4.1 SHIPPED:** `CHANGES t SINCE <seq> [LIMIT n]` pull changefeed — rows
+`(_seq, _op PUT|DELETE, <all columns>)` in the engine's TOTAL commit order; the client's
+cursor is just the last `_seq` it processed → exactly-once resume BY CONSTRUCTION (no
+consumer-group protocol). Storage: `export_ops(..., include_flushed=true)` also reads
+live SSTables (entries keep their original seqs), so a flush no longer truncates the
+feed; the retention horizon = COMPACTION (like Kafka's segment retention), and a
+compacted-past cursor gets a clean refusal, never a silent gap. Gates: replay-from-0 ==
+live table, split-cursor == single pass, restart byte-stable, cross-table filtering,
+compaction-horizon tooth (storage_pitr_test §9). Throughput (release, one core):
+full drain 4.7M ops/s; cold chunked cursor 860k ops/s; LIVE TAIL (ingest+consume
+interleaved, 800k rows) 2.37M ops/s delivered. Open: CREATE CHANGEFEED (named cursors,
+server-side), push sinks over the PG wire (NOTIFY-shaped), per-shard feeds (M shards →
+M independent Seq lines, Kafka-partition-shaped scaling), fault-storm teeth.
+
 ### K5 — Incrementally-maintained materialized views *(L)* — TIER: BET *(TECH_PLAN K3)*
 
 Materialize/pg_ivm demand; deterministic total order → *exact* deltas, no

@@ -1480,6 +1480,14 @@ if(TARGET lockstep_query AND TARGET lockstep_txn AND TARGET lockstep_storage
             lockstep_storage lockstep_runtime lockstep_providers_sim)
   add_test(NAME sql_real_test COMMAND lockstep_sql_real_test)
 
+  # sql_cdc_test: K4 CDC — CHANGES t SINCE s; replay==table gate, exactly-once resume.
+  add_executable(lockstep_sql_cdc_test sql_cdc_test.cpp)
+  target_include_directories(lockstep_sql_cdc_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(lockstep_sql_cdc_test
+    PRIVATE lockstep_warnings lockstep_sanitizers lockstep_query lockstep_txn
+            lockstep_storage lockstep_runtime lockstep_providers_sim)
+  add_test(NAME sql_cdc_test COMMAND lockstep_sql_cdc_test)
+
   # sql_queue_test: K3 SQL queues — SEND/RECEIVE/ACK/DLQ, transactional outbox, exactly-once.
   add_executable(lockstep_sql_queue_test sql_queue_test.cpp)
   target_include_directories(lockstep_sql_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

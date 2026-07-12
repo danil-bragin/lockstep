@@ -444,6 +444,25 @@ public:
             if (auto e = expect_table_name("a name after REFRESH MATERIALIZED VIEW", st.truncate.table))
                 return ParseResult{*e};
             r = ParseResult{std::move(st)};
+        } else if (kw == "changes") {  // K4: CHANGES t SINCE n [LIMIT k]
+            advance();
+            Statement st;
+            st.kind = StmtKind::Changes;
+            if (auto e = expect_table_name("a table name after CHANGES", st.changes.table))
+                return ParseResult{*e};
+            if (auto e = expect_kw("since")) return ParseResult{*e};
+            if (cur_.kind != Tok::IntLit || cur_.int_val < 0)
+                return err("SINCE expects a non-negative Seq");
+            st.changes.since = cur_.int_val;
+            advance();
+            if (is_kw("limit")) {
+                advance();
+                if (cur_.kind != Tok::IntLit || cur_.int_val < 1)
+                    return err("LIMIT expects a positive integer");
+                st.changes.limit = cur_.int_val;
+                advance();
+            }
+            r = ParseResult{std::move(st)};
         } else if (kw == "send") {  // K3: SEND q, <payload>
             advance();
             Statement st;

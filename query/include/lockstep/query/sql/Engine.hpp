@@ -1209,6 +1209,8 @@ public:
                 return exec_create_view(st.create_view);
             case StmtKind::DropView:
                 return exec_drop_view(st.drop_view);
+            case StmtKind::Changes:
+                return exec_changes(st.changes);
             case StmtKind::CreateQueue:
                 return exec_create_queue(st.queue);
             case StmtKind::DropQueue:
@@ -4003,6 +4005,78 @@ private:
         return out;
     }
 
+
+    // ===================== K4: CDC changefeeds =====================
+    // CHANGES t SINCE <seq> [LIMIT n] — the pull-based changefeed over the committed
+    // op-log (the SAME read-only export the PITR archive uses). Output rows:
+    //   (_seq INT, _op TEXT 'PUT'|'DELETE', <every table column>)
+    // PUT carries the full row image (consumers apply it as an idempotent upsert);
+    // DELETE carries the PK (other columns NULL). Ordering is the engine's TOTAL commit
+    // order — Seq is a global resume token (vs Kafka's per-partition order): consuming
+    // [since+1 ..] after a crash from the last processed _seq is exactly-once BY
+    // CONSTRUCTION. Honest bound (same as PITR): the op-log source is the memtable, so
+    // a flush that ate the requested range REFUSES with a clean error instead of a
+    // silent gap — consume continuously or start a new cursor from a base snapshot.
+    static core::Task cdc_export_task(storage::WalEngine& we, storage::Seq from,
+                                      std::vector<storage::ExportedOp>* out,
+                                      core::Error* err, core::Promise<bool> done) {
+        *err = co_await we.export_ops(from, *out, /*include_flushed=*/true);
+        done.set_value(true);
+    }
+    ExecResult exec_changes(const ChangesStmt& cs) {
+        const Table* t = catalog_.find(cs.table);
+        if (t == nullptr) return ExecResult::failure("unknown table '" + cs.table + "'");
+        auto* we = dynamic_cast<storage::WalEngine*>(&db_.engine());
+        if (we == nullptr) return ExecResult::failure("CHANGES requires the WAL engine");
+        std::vector<storage::ExportedOp> ops;
+        core::Error err{};
+        {
+            core::Promise<bool> done = core::make_promise<bool>(&db_.scheduler());
+            core::Future<bool> f = done.get_future();
+            db_.scheduler().spawn(cdc_export_task(
+                *we, static_cast<storage::Seq>(cs.since) + 1, &ops, &err, std::move(done)));
+            db_.scheduler().run();
+            (void)f;
+        }
+        if (!err.ok()) {
+            return ExecResult::failure(std::string("CHANGES: ") + std::string(err.detail) +
+                                       " (consume continuously, or restart the cursor "
+                                       "from a fresh snapshot)");
+        }
+        const Key pfx = table_prefix(t->id);
+        ExecResult r;
+        for (const storage::ExportedOp& op : ops) {
+            if (cs.limit >= 0 && static_cast<std::int64_t>(r.rows.size()) >= cs.limit) break;
+            if (op.key.size() <= pfx.size() || op.key.compare(0, pfx.size(), pfx) != 0) {
+                continue;  // another table / an index / queue internals
+            }
+            ResultRow out;
+            out.cells.emplace_back("_seq", Datum::make_int(static_cast<std::int64_t>(op.seq)));
+            if (op.tombstone) {
+                out.cells.emplace_back("_op", Datum::make_text("DELETE"));
+                std::vector<Datum> row(t->columns.size());
+                row[t->pk_index] = decode_pk(*t, op.key);
+                tag_logical_cols(*t, row);
+                for (std::size_t c = 0; c < t->columns.size(); ++c) {
+                    if (t->columns[c].dropped) continue;
+                    out.cells.emplace_back(t->columns[c].name,
+                                           c == t->pk_index ? row[c]
+                                                            : Datum::make_null(t->columns[c].type));
+                }
+            } else {
+                out.cells.emplace_back("_op", Datum::make_text("PUT"));
+                const std::vector<Datum> row = decode_row(*t, op.key, op.value);
+                for (std::size_t c = 0; c < t->columns.size(); ++c) {
+                    if (t->columns[c].dropped) continue;
+                    out.cells.emplace_back(t->columns[c].name, row[c]);
+                }
+            }
+            r.rows.push_back(std::move(out));
+        }
+        r.affected = r.rows.size();
+        return r;
+    }
+    // =================== end K4 CDC ===================
 
     // ===================== K3: SQL queues (exactly-once messaging) =====================
     // A queue is SUGAR over two hidden row-mode tables sharing all verified machinery
