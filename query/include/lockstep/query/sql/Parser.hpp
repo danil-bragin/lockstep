@@ -444,6 +444,53 @@ public:
             if (auto e = expect_table_name("a name after REFRESH MATERIALIZED VIEW", st.truncate.table))
                 return ParseResult{*e};
             r = ParseResult{std::move(st)};
+        } else if (kw == "send") {  // K3: SEND q, <payload>
+            advance();
+            Statement st;
+            st.kind = StmtKind::Send;
+            if (auto e = expect_ident("a queue name after SEND", st.queue.queue))
+                return ParseResult{*e};
+            if (auto e = expect(Tok::Comma, "',' after the queue name")) return ParseResult{*e};
+            if (auto e = parse_scalar_expr(st.queue.payload)) return ParseResult{*e};
+            r = ParseResult{std::move(st)};
+        } else if (kw == "receive") {  // K3: RECEIVE q [BATCH n] [VISIBILITY v] [DLQ]
+            advance();
+            Statement st;
+            st.kind = StmtKind::Receive;
+            if (auto e = expect_ident("a queue name after RECEIVE", st.queue.queue))
+                return ParseResult{*e};
+            for (;;) {
+                if (is_kw("batch")) {
+                    advance();
+                    if (cur_.kind != Tok::IntLit || cur_.int_val < 1)
+                        return err("BATCH expects a positive integer");
+                    st.queue.batch = cur_.int_val;
+                    advance();
+                } else if (is_kw("visibility")) {
+                    advance();
+                    if (cur_.kind != Tok::IntLit || cur_.int_val < 1)
+                        return err("VISIBILITY expects a positive integer (Seq units)");
+                    st.queue.visibility = cur_.int_val;
+                    advance();
+                } else if (is_kw("dlq")) {
+                    advance();
+                    st.queue.dlq = true;
+                } else {
+                    break;
+                }
+            }
+            r = ParseResult{std::move(st)};
+        } else if (kw == "ack") {  // K3: ACK q, <mid>
+            advance();
+            Statement st;
+            st.kind = StmtKind::Ack;
+            if (auto e = expect_ident("a queue name after ACK", st.queue.queue))
+                return ParseResult{*e};
+            if (auto e = expect(Tok::Comma, "',' after the queue name")) return ParseResult{*e};
+            if (cur_.kind != Tok::IntLit) return err("ACK expects a message id");
+            st.queue.mid = cur_.int_val;
+            advance();
+            r = ParseResult{std::move(st)};
         } else if (kw == "insert") {
             r = parse_insert();
         } else if (kw == "update") {
@@ -1164,6 +1211,14 @@ private:
         if (is_kw("view")) {  // H1: CREATE [OR REPLACE] VIEW name [(cols)] AS SELECT ...
             return parse_create_view(or_replace);  // consumes VIEW itself
         }
+        if (is_kw("queue")) {  // K3: CREATE QUEUE q
+            advance();
+            Statement st;
+            st.kind = StmtKind::CreateQueue;
+            if (auto e = expect_ident("a queue name after CREATE QUEUE", st.queue.queue))
+                return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
         if (is_kw("materialized")) {  // CREATE MATERIALIZED VIEW name AS SELECT ...
             advance();  // MATERIALIZED
             if (auto e = expect_kw("view")) return ParseResult{*e};
@@ -1587,6 +1642,14 @@ private:
             if (is_kw("if")) { advance(); (void)expect_kw("exists"); return true; }
             return false;
         };
+        if (is_kw("queue")) {  // K3: DROP QUEUE q
+            advance();
+            Statement st;
+            st.kind = StmtKind::DropQueue;
+            if (auto e = expect_ident("a queue name after DROP QUEUE", st.queue.queue))
+                return ParseResult{*e};
+            return ParseResult{std::move(st)};
+        }
         if (is_kw("schema")) {  // E4: DROP SCHEMA [IF EXISTS] s
             advance();
             Statement st;

@@ -1209,6 +1209,16 @@ public:
                 return exec_create_view(st.create_view);
             case StmtKind::DropView:
                 return exec_drop_view(st.drop_view);
+            case StmtKind::CreateQueue:
+                return exec_create_queue(st.queue);
+            case StmtKind::DropQueue:
+                return exec_drop_queue(st.queue);
+            case StmtKind::Send:
+                return exec_send(st.queue);
+            case StmtKind::Receive:
+                return exec_receive(st.queue);
+            case StmtKind::Ack:
+                return exec_ack(st.queue);
             case StmtKind::SetParam:
                 return exec_set_param(st.set_param_name, st.set_param_value);
             case StmtKind::RefreshMatView:
@@ -3987,6 +3997,130 @@ private:
         }
         return out;
     }
+
+
+    // ===================== K3: SQL queues (exactly-once messaging) =====================
+    // A queue is SUGAR over two hidden row-mode tables sharing all verified machinery
+    // (durability, replication, backup, conformance):
+    //   __q_<name>      (mid AUTO_INCREMENT PK, payload, state 0=ready|1=in-flight,
+    //                    deliveries, visible_seq)
+    //   __q_<name>_dlq  (mid PK, payload, deliveries)
+    // SEND lowers onto the ordinary INSERT path — so inside BEGIN..COMMIT it commits
+    // ATOMICALLY with data writes (the transactional outbox in one statement). RECEIVE
+    // atomically marks up to BATCH messages in-flight (state=1, deliveries+1,
+    // visible_seq = live Seq + VISIBILITY) in ONE batch; a message whose deliveries
+    // would exceed kQueueMaxDeliveries moves to the DLQ instead of being delivered.
+    // VISIBILITY is in Seq UNITS (logical time): redelivery decisions are pure functions
+    // of replicated state, so replicas replaying the same statement stream agree byte
+    // for byte (a wall clock would diverge them). ACK deletes; it is idempotent.
+    static constexpr std::int64_t kQueueMaxDeliveries = 5;
+    [[nodiscard]] static std::string queue_table(const std::string& q) { return "__q_" + q; }
+
+    ExecResult exec_create_queue(const QueueStmt& qs) {
+        const std::string qt = queue_table(qs.queue);
+        if (catalog_.find(qt) != nullptr) {
+            return ExecResult::failure("queue '" + qs.queue + "' already exists");
+        }
+        // Queue tables are always ROW-mode: RECEIVE writes rows directly via the row codec.
+        const bool saved = columnar_default_;
+        columnar_default_ = false;
+        ExecResult r = exec(
+            "CREATE TABLE " + qt +
+            " (mid INT AUTO_INCREMENT, payload TEXT NOT NULL, state INT DEFAULT 0, "
+            "deliveries INT DEFAULT 0, visible_seq INT DEFAULT 0, PRIMARY KEY (mid))");
+        if (r.ok) {
+            r = exec("CREATE TABLE " + qt +
+                     "_dlq (mid INT, payload TEXT NOT NULL, deliveries INT DEFAULT 0, "
+                     "PRIMARY KEY (mid))");
+        }
+        columnar_default_ = saved;
+        return r;
+    }
+    ExecResult exec_drop_queue(const QueueStmt& qs) {
+        const std::string qt = queue_table(qs.queue);
+        if (catalog_.find(qt) == nullptr) {
+            return ExecResult::failure("unknown queue '" + qs.queue + "'");
+        }
+        ExecResult r = exec("DROP TABLE " + qt);
+        if (r.ok) r = exec("DROP TABLE " + qt + "_dlq");
+        return r;
+    }
+    ExecResult exec_send(const QueueStmt& qs) {
+        const std::string qt = queue_table(qs.queue);
+        const Table* t = catalog_.find(qt);
+        if (t == nullptr) return ExecResult::failure("unknown queue '" + qs.queue + "'");
+        if (!qs.payload) return ExecResult::failure("SEND requires a payload");
+        Datum pd;
+        const std::vector<Datum> dummy(t->columns.size());
+        if (auto e = eval_expr(*qs.payload, *t, dummy, pd)) return ExecResult::failure(*e);
+        if (pd.is_null || pd.type != Type::Text) {
+            return ExecResult::failure("SEND payload must be a TEXT value");
+        }
+        // The ordinary INSERT path: transactional-outbox semantics inside BEGIN..COMMIT.
+        return exec("INSERT INTO " + qt + " (payload) VALUES (" + sql_quote(pd.s) + ")");
+    }
+    ExecResult exec_receive(const QueueStmt& qs) {
+        if (in_txn_) {
+            return ExecResult::failure("RECEIVE inside a transaction is not supported");
+        }
+        const std::string qt = queue_table(qs.queue) + (qs.dlq ? "_dlq" : "");
+        const Table* t = catalog_.find(qt);
+        if (t == nullptr) return ExecResult::failure("unknown queue '" + qs.queue + "'");
+        if (qs.dlq) {  // read-only peek at the dead letters
+            return exec("SELECT mid, payload, deliveries FROM " + qt + " ORDER BY mid LIMIT " +
+                        std::to_string(qs.batch));
+        }
+        const Table* dt = catalog_.find(queue_table(qs.queue) + "_dlq");
+        if (dt == nullptr) return ExecResult::failure("queue DLQ table missing");
+        const std::int64_t now = static_cast<std::int64_t>(db_.live_snap_seq());
+        std::vector<storage::KeyValue> kvs;
+        {
+            Query<Strict> q;
+            q.scan(table_prefix(t->id), table_prefix_end(t->id));
+            collect(db_.run(q), kvs);
+        }
+        std::vector<std::pair<Key, Value>> writes;
+        ExecResult r;
+        for (const storage::KeyValue& kv : kvs) {
+            if (static_cast<std::int64_t>(r.rows.size()) >= qs.batch) break;
+            if (is_tombstone(kv.second)) continue;
+            std::vector<Datum> row = decode_row(*t, kv.first, kv.second);
+            const std::int64_t state = row[2].i, vis = row[4].i;
+            if (!(state == 0 || (state == 1 && vis <= now))) continue;  // in flight
+            const std::int64_t nd = row[3].i + 1;
+            if (nd > kQueueMaxDeliveries) {
+                // Dead-letter: move (mid, payload, deliveries) and retire the message.
+                std::vector<Datum> drow(dt->columns.size());
+                drow[0] = row[0];
+                drow[1] = row[1];
+                drow[2] = Datum::make_int(nd);
+                writes.emplace_back(encode_key(*dt, drow[0]), encode_value(*dt, drow));
+                writes.emplace_back(kv.first, tombstone_marker());
+                continue;  // not delivered — it is dead
+            }
+            row[2] = Datum::make_int(1);
+            row[3] = Datum::make_int(nd);
+            row[4] = Datum::make_int(now + qs.visibility);
+            writes.emplace_back(kv.first, encode_value(*t, row));
+            ResultRow out;
+            out.cells.emplace_back("mid", row[0]);
+            out.cells.emplace_back("payload", row[1]);
+            out.cells.emplace_back("deliveries", row[3]);
+            r.rows.push_back(std::move(out));
+        }
+        if (!writes.empty()) commit_writes(writes);  // marks + DLQ moves, ONE atomic batch
+        r.affected = r.rows.size();
+        return r;
+    }
+    ExecResult exec_ack(const QueueStmt& qs) {
+        if (in_txn_) return ExecResult::failure("ACK inside a transaction is not supported");
+        const std::string qt = queue_table(qs.queue);
+        const Table* t = catalog_.find(qt);
+        if (t == nullptr) return ExecResult::failure("unknown queue '" + qs.queue + "'");
+        // Idempotent delete-by-mid through the ordinary DELETE path.
+        return exec("DELETE FROM " + qt + " WHERE mid = " + std::to_string(qs.mid));
+    }
+    // =================== end K3 queues ===================
 
     // ===================== K2: BM25 full-text search =====================
     // Deterministic tokenizer: ASCII lowercase, alphanumeric runs, length >= 2. No

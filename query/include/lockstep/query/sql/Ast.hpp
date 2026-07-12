@@ -566,6 +566,24 @@ enum class StmtKind : std::uint8_t {
     DropView = 23,             // H1: DROP VIEW [IF EXISTS] name
     SetParam = 24,             // W3.1: SET <name> = <value> (session parameter, e.g. lockstep.max_query_memory)
     RefreshMatView = 25,       // REFRESH MATERIALIZED VIEW name — recompute a materialized view
+    CreateQueue = 26,          // K3: CREATE QUEUE q
+    DropQueue = 27,            // K3: DROP QUEUE q
+    Send = 28,                 // K3: SEND q, <payload expr>
+    Receive = 29,              // K3: RECEIVE q [BATCH n] [VISIBILITY v] [DLQ]
+    Ack = 30,                  // K3: ACK q, <mid>
+};
+
+// K3: one queue statement. Visibility is measured in Seq UNITS (logical time): a
+// received-but-unacked message becomes visible again once the engine Seq has advanced
+// past its deadline — a pure function of replicated state, so every replica running the
+// same statement stream makes the SAME redelivery decisions (wall clocks would diverge).
+struct QueueStmt {
+    std::string queue;
+    std::shared_ptr<Expr> payload;   // SEND: the message body (constant TEXT expression)
+    std::int64_t batch = 1;          // RECEIVE BATCH n
+    std::int64_t visibility = 100;   // RECEIVE VISIBILITY v (Seq units)
+    std::int64_t mid = 0;            // ACK: the message id
+    bool dlq = false;                // RECEIVE ... DLQ — read-only peek at the dead letters
 };
 
 struct Statement {
@@ -579,6 +597,7 @@ struct Statement {
     DropIndexStmt drop_index;
     DropTableStmt drop_table;
     TruncateStmt truncate;  // E2
+    QueueStmt queue;        // K3
     std::string schema_arg;       // E4: CREATE/DROP SCHEMA name, or SET search_path target
     bool schema_if_not_exists = false;  // E4
     bool schema_if_exists = false;      // E4
