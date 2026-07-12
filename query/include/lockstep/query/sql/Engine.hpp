@@ -1231,6 +1231,7 @@ public:
                 if (in_txn_) return ExecResult::failure("already in a transaction");
                 in_txn_ = true;
                 txn_writes_.clear();
+                txn_overlay_.clear();
                 savepoints_.clear();
                 return ExecResult{};
             case StmtKind::Commit: {
@@ -1239,6 +1240,7 @@ public:
                 savepoints_.clear();
                 std::vector<std::pair<Key, Value>> flush;
                 flush.swap(txn_writes_);
+                txn_overlay_.clear();
                 if (!flush.empty()) commit_writes(flush);  // now in_txn_ is false -> actually commits
                 return ExecResult{};
             }
@@ -1246,6 +1248,7 @@ public:
                 if (!in_txn_) return ExecResult::failure("ROLLBACK with no active transaction");
                 in_txn_ = false;
                 txn_writes_.clear();  // discard the buffered writes (nothing was committed)
+                txn_overlay_.clear();
                 savepoints_.clear();
                 return ExecResult{};
             case StmtKind::Savepoint:
@@ -1263,6 +1266,8 @@ public:
                     return ExecResult::failure("no such savepoint: " + st.savepoint_name);
                 if (savepoints_[at].second < txn_writes_.size()) {
                     txn_writes_.resize(savepoints_[at].second);  // undo writes since the savepoint
+                    txn_overlay_.clear();  // rebuild the RYW index from the kept prefix
+                    for (const auto& kv : txn_writes_) txn_overlay_[kv.first] = kv.second;
                 }
                 savepoints_.resize(at + 1);  // drop later savepoints; keep the target (re-rollback ok)
                 return ExecResult{};
@@ -4056,8 +4061,14 @@ private:
         if (pd.is_null || pd.type != Type::Text) {
             return ExecResult::failure("SEND payload must be a TEXT value");
         }
-        // The ordinary INSERT path: transactional-outbox semantics inside BEGIN..COMMIT.
-        return exec("INSERT INTO " + qt + " (payload) VALUES (" + sql_quote(pd.s) + ")");
+        // The ordinary INSERT path — built PROGRAMMATICALLY (no quote-and-reparse round
+        // trip per message); exec_insert buffers under BEGIN..COMMIT, so the
+        // transactional-outbox semantics are unchanged.
+        InsertStmt ins;
+        ins.table = qt;
+        ins.columns = {"payload"};
+        ins.values = {pd};
+        return exec_insert(ins);
     }
     ExecResult exec_receive(const QueueStmt& qs) {
         if (in_txn_) {
@@ -14244,10 +14255,9 @@ private:
         // G1: read-your-writes — inside a transaction, the latest buffered write for `key` shadows
         // the committed store (so dup-PK / UPDATE / DELETE see uncommitted changes within the txn).
         if (in_txn_) {
-            for (auto it = txn_writes_.rbegin(); it != txn_writes_.rend(); ++it) {
-                if (it->first == key) {
-                    return it->second;
-                }
+            const auto it = txn_overlay_.find(key);  // latest buffered write (K3.4: O(log n))
+            if (it != txn_overlay_.end()) {
+                return it->second;
             }
         }
         Query<Strict> q;
@@ -14317,7 +14327,10 @@ private:
         // them all atomically at COMMIT; ROLLBACK discards them. (DDL writes the catalog directly via
         // commit_batch and is not buffered — DDL inside a txn auto-commits.)
         if (in_txn_) {
-            for (const auto& kv : kvs) txn_writes_.push_back(kv);
+            for (const auto& kv : kvs) {
+                txn_writes_.push_back(kv);
+                txn_overlay_[kv.first] = kv.second;  // keep the read-your-writes index hot
+            }
             return;
         }
         // GROUP COMMIT: defer the fsync when the caller (wire::Server, net-backed) will sync()
@@ -14349,6 +14362,12 @@ private:
     bool soa_overflow_ = false;        // K1: a 128-bit SoA SUM overflowed => bail to the row path (errors)
     bool in_txn_ = false;              // G1: inside an explicit BEGIN..COMMIT transaction
     std::vector<std::pair<Key, Value>> txn_writes_;  // G1: buffered DML writes (committed at COMMIT)
+    // K3.4 perf: the LATEST buffered value per key — read_committed's read-your-writes
+    // lookup was a LINEAR walk of txn_writes_ per in-txn read (every INSERT's dup-PK
+    // check), turning an N-statement transaction into O(N^2). The map mirrors the
+    // vector (last write wins) and is rebuilt from the vector prefix on ROLLBACK TO
+    // SAVEPOINT (rare); the vector stays the source of ORDER for COMMIT/savepoints.
+    std::map<Key, Value> txn_overlay_;
     // G6: SAVEPOINT stack — (name, txn_writes_ length when the savepoint was set). ROLLBACK TO
     // truncates txn_writes_ back to that length (undoing writes since the savepoint) and drops
     // savepoints established after it; RELEASE just forgets the savepoint (keeps the writes).
