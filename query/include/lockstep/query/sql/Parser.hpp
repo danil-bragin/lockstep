@@ -110,6 +110,7 @@ enum class Tok : std::uint8_t {
     Minus,    // -
     Slash,    // /
     Percent,  // %
+    Param,    // $N (K4.13: an extended-protocol bind placeholder; int_val = N)
     LBracket, // [  (F12 array literal / subscript)
     RBracket, // ]
     Arrow,    // ->   (F13 JSON get)
@@ -157,6 +158,14 @@ public:
         }
         if (c == '\'') {
             return lex_string();
+        }
+        if (c == '$' && i_ + 1 < src_.size() && is_digit(src_[i_ + 1])) {
+            ++i_;  // K4.13: $N bind placeholder
+            std::int64_t n = 0;
+            while (i_ < src_.size() && is_digit(src_[i_])) n = n * 10 + (src_[i_++] - '0');
+            t.kind = Tok::Param;
+            t.int_val = n;
+            return t;
         }
         switch (c) {
             case '(':
@@ -2331,6 +2340,8 @@ private:
     // A readable, deterministic output label for an UNALIASED projected expression.
     static std::string expr_label(const Expr& e) {
         switch (e.kind) {
+            case ExprKind::Param:
+                return "$" + std::to_string(e.param_idx);
             case ExprKind::Col:
                 return e.qualifier.empty() ? e.column : e.qualifier + "." + e.column;
             case ExprKind::Lit:
@@ -2512,6 +2523,13 @@ private:
             }
             auto n = mk_expr(ExprKind::Lit);
             n->lit = Datum::make_real(d);
+            advance();
+            out = n;
+            return std::nullopt;
+        }
+        if (cur_.kind == Tok::Param) {  // K4.13: $N placeholder
+            auto n = mk_expr(ExprKind::Param);
+            n->param_idx = static_cast<std::int32_t>(cur_.int_val);
             advance();
             out = n;
             return std::nullopt;

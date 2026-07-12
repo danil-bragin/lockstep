@@ -281,12 +281,14 @@ struct Predicate {
 // Evaluated to a Datum over a row. Held by shared_ptr so the tree stays copyable.
 // F12: Array — ARRAY[e0,e1,...] (elements in `args`). Subscript — arr[idx] (`left`=array, `right`=index).
 enum class ExprKind : std::uint8_t {
-    Col = 0, Lit = 1, Neg = 2, Bin = 3, Func = 4, Case = 5, Array = 6, Subscript = 7
+    Col = 0, Lit = 1, Neg = 2, Bin = 3, Func = 4, Case = 5, Array = 6, Subscript = 7,
+    Param = 8  // K4.13: $N extended-protocol placeholder (param_idx = N, 1-based)
 };
 enum class BinOp : std::uint8_t { Add = 0, Sub = 1, Mul = 2, Div = 3, Mod = 4 };
 
 struct Expr {
     ExprKind kind = ExprKind::Lit;
+    std::int32_t param_idx = 0;  // Param: 1-based $N
     // Col
     std::string qualifier;
     std::string column;

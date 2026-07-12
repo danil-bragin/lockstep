@@ -121,7 +121,48 @@ static int run_topic(std::size_t n, std::size_t batch) {
     return 0;
 }
 
+// --prepared N B: the extended-protocol produce shape — ONE constant statement text
+// "PUBLISH ev, $1..$B" (a single parse-cache entry) + typed Datum arrays. No literal
+// lexing, no SQL string building per batch.
+static int run_prepared(std::size_t n, std::size_t batch) {
+    SqlEngine e;
+    e.set_trace_enabled(false);
+    e.exec("CREATE TOPIC ev");
+    std::string sql = "PUBLISH ev";
+    for (std::size_t k = 1; k <= batch; ++k) sql += (k == 1 ? ", $" : ", $") + std::to_string(k);
+    const auto t0 = Clock::now();
+    std::vector<Datum> params(batch);
+    for (std::size_t i = 0; i < n;) {
+        const std::size_t hi = i + batch < n ? i + batch : n;
+        std::size_t k = 0;
+        for (; i < hi; ++i, ++k)
+            params[k] = Datum::make_text("payload-" + std::to_string(i) +
+                                         "-0123456789012345678901234567890123456789");
+        if (k < batch) {  // partial tail: a shorter statement shape (parsed once too)
+            params.resize(k);
+            std::string tail_sql = "PUBLISH ev";
+            for (std::size_t j = 1; j <= k; ++j) tail_sql += ", $" + std::to_string(j);
+            if (!e.exec_prepared(tail_sql, params).ok) {
+                std::printf("BAD prepared publish\n");
+                return 1;
+            }
+            continue;
+        }
+        if (!e.exec_prepared(sql, params).ok) { std::printf("BAD prepared publish\n"); return 1; }
+    }
+    const double ms = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                          Clock::now() - t0).count()) / 1000.0;
+    ExecResult c = e.exec("CONSUME ev SINCE 0 LIMIT 1");
+    std::printf("prepared publish (batch=%zu): rows=%zu ingest=%.0fms -> %.0f ops/s (probe %s)\n",
+                batch, n, ms, n / ms * 1000, c.ok && !c.rows.empty() ? "ok" : "BAD");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 3 && std::strcmp(argv[1], "--prepared") == 0) {
+        return run_prepared(static_cast<std::size_t>(std::atoll(argv[2])),
+                            static_cast<std::size_t>(std::atoll(argv[3])));
+    }
     if (argc > 2 && std::strcmp(argv[1], "--topic") == 0) {
         return run_topic(static_cast<std::size_t>(std::atoll(argv[2])),
                          argc > 3 ? static_cast<std::size_t>(std::atoll(argv[3])) : 1);

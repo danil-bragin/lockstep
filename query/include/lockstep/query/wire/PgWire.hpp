@@ -377,6 +377,23 @@ inline void pg_reply_for_statement(std::vector<std::byte>& out, const std::strin
 // COMPLETE PG frontend message available, handles each, and returns the bytes to write
 // back. It self-frames PG messages; the transport is a plain byte stream.
 // ----------------------------------------------------------------------------------------
+// K4.13: text wire value + declared OID -> a typed engine Datum. Unknown/0 OID = TEXT
+// (the engine coerces where needed, same as a quoted literal would).
+[[nodiscard]] inline sql::Datum pg_typed_datum(std::int32_t oid, const std::string& txt) {
+    if (oid == 20 || oid == 23 || oid == 21) {  // int8 / int4 / int2
+        errno = 0;
+        char* end = nullptr;
+        const long long v = std::strtoll(txt.c_str(), &end, 10);
+        if (errno == 0 && end != nullptr && *end == 0) return sql::Datum::make_int(v);
+    }
+    if (oid == 700 || oid == 701) {  // float4 / float8
+        double d = 0.0;
+        if (sql::parse_double_strict(txt.data(), txt.data() + txt.size(), d))
+            return sql::Datum::make_real(d);
+    }
+    return sql::Datum::make_text(txt);
+}
+
 class PgSession {
 public:
     using ExecFn = std::function<sql::ExecResult(const std::string&)>;
@@ -384,8 +401,15 @@ public:
     // password requested), preserving the open path. When set, the shim requests a
     // cleartext password on startup and validates it (map user -> RBAC role here).
     using AuthFn = std::function<bool(const std::string& user, const std::string& password)>;
-    explicit PgSession(ExecFn exec, AuthFn auth = {})
-        : exec_(std::move(exec)), auth_(std::move(auth)) {}
+    // K4.13: optional typed-parameter executor (SqlEngine::exec_prepared). When set,
+    // Bind keeps the statement text INTACT (with its $N placeholders — one parse-cache
+    // entry per statement shape) and carries the parameters as typed Datums; Execute
+    // runs through it. When unset, the classic substitute-into-text path is used.
+    using ExecPreparedFn =
+        std::function<sql::ExecResult(const std::string&, std::vector<sql::Datum>)>;
+    explicit PgSession(ExecFn exec, AuthFn auth = {}, ExecPreparedFn exec_prepared = {})
+        : exec_(std::move(exec)), auth_(std::move(auth)),
+          exec_prepared_(std::move(exec_prepared)) {}
 
     // W3.5 backpressure: the largest single protocol frame accepted. A frame claiming more
     // (a firehose / oversized query) is rejected with a 54000 error and the connection closed,
@@ -628,7 +652,9 @@ private:
 
     // ---- EXTENDED protocol (prepared statements) -------------------------------------
     struct Portal {
-        std::string sql;                          // the query with $N substituted
+        std::string sql;                          // substituted text, or (typed path) raw $N text
+        std::vector<sql::Datum> params;           // K4.13: typed parameters (typed path only)
+        bool typed = false;                       // route through exec_prepared_
         std::optional<sql::ExecResult> cached;    // filled by Describe, consumed by Execute
     };
 
@@ -687,12 +713,18 @@ private:
         if (pos + 2 > plen) return;
         const std::int16_t nparams = pg_get_i16(p + pos);
         pos += 2;
+        const bool typed = static_cast<bool>(exec_prepared_);
+        std::vector<sql::Datum> dparams;
         std::vector<std::string> lits;
         for (std::int16_t k = 0; k < nparams && pos + 4 <= plen; ++k) {
             const std::int32_t vlen = pg_get_i32(p + pos);
             pos += 4;
             if (vlen < 0) {
-                lits.push_back(pg_param_literal("", true));
+                if (typed) {
+                    dparams.push_back(sql::Datum::make_null(sql::Type::Text));
+                } else {
+                    lits.push_back(pg_param_literal("", true));
+                }
                 continue;
             }
             const std::byte* vp = p + pos;
@@ -705,11 +737,19 @@ private:
                                            "binary parameter format is not supported for this type");
                     return;
                 }
-                lits.push_back(pg_param_literal(*txt, false));
+                if (typed) {
+                    dparams.push_back(pg_typed_datum(oid_for(static_cast<std::size_t>(k)), *txt));
+                } else {
+                    lits.push_back(pg_param_literal(*txt, false));
+                }
             } else {
-                lits.push_back(pg_param_literal(
-                    std::string(reinterpret_cast<const char*>(vp), static_cast<std::size_t>(vlen)),
-                    false));
+                const std::string raw(reinterpret_cast<const char*>(vp),
+                                      static_cast<std::size_t>(vlen));
+                if (typed) {
+                    dparams.push_back(pg_typed_datum(oid_for(static_cast<std::size_t>(k)), raw));
+                } else {
+                    lits.push_back(pg_param_literal(raw, false));
+                }
             }
         }
         // Result-format codes: only TEXT results are produced; reject a binary request clean.
@@ -725,8 +765,14 @@ private:
             }
         }
         const auto it = stmts_.find(stmt);
-        const std::string sql = (it != stmts_.end()) ? pg_substitute_params(it->second, lits) : std::string();
-        portals_[portal] = Portal{sql, std::nullopt};
+        if (typed) {
+            portals_[portal] = Portal{it != stmts_.end() ? it->second : std::string(),
+                                      std::move(dparams), true, std::nullopt};
+        } else {
+            const std::string sql =
+                (it != stmts_.end()) ? pg_substitute_params(it->second, lits) : std::string();
+            portals_[portal] = Portal{sql, {}, false, std::nullopt};
+        }
         pg_bind_complete(out);
     }
 
@@ -746,7 +792,9 @@ private:
         // 'P' portal
         const auto it = portals_.find(name);
         if (it == portals_.end()) { pg_no_data(out); return; }
-        it->second.cached = exec_(it->second.sql);
+        it->second.cached = it->second.typed
+                                ? exec_prepared_(it->second.sql, it->second.params)
+                                : exec_(it->second.sql);
         const sql::ExecResult& r = *it->second.cached;
         if (r.ok && (pg_is_select(it->second.sql) || !r.rows.empty())) {
             pg_row_description(out, pg_cols_of(r));
@@ -762,7 +810,10 @@ private:
         const auto it = portals_.find(portal);
         if (it == portals_.end()) { pg_error_response(out, "unknown portal"); return; }
         const bool had_describe = it->second.cached.has_value();
-        const sql::ExecResult r = had_describe ? *it->second.cached : exec_(it->second.sql);
+        const sql::ExecResult r = had_describe ? *it->second.cached
+                                  : it->second.typed
+                                      ? exec_prepared_(it->second.sql, it->second.params)
+                                      : exec_(it->second.sql);
         it->second.cached.reset();
         if (!r.ok) { pg_error_response(out, r.error); return; }
         const bool is_sel = pg_is_select(it->second.sql) || !r.rows.empty();
@@ -830,6 +881,7 @@ private:
 
     ExecFn exec_;
     AuthFn auth_;                  // optional (user,password)->allowed; unset = trust
+    ExecPreparedFn exec_prepared_;  // K4.13: typed-parameter path (unset = substitute)
     std::vector<std::byte> buf_;  // unconsumed input bytes
     bool started_ = false;        // startup handshake completed
     bool awaiting_password_ = false;  // sent AuthenticationCleartextPassword, awaiting 'p'

@@ -1147,6 +1147,17 @@ public:
     [[nodiscard]] bool canceled() const noexcept { return cancel_ != nullptr && cancel_->load(); }
 
     // Parse + execute one SQL string. Parse errors surface as ExecResult::failure.
+    // K4.13: the extended-protocol produce path — CONSTANT statement text with $N
+    // placeholders + a parameter array. The text hits the parse cache (one parse per
+    // statement SHAPE, ever), and values arrive as typed Datums: no literal lexing,
+    // no quoting, no per-call SQL string building.
+    ExecResult exec_prepared(const std::string& sql, std::vector<Datum> params) {
+        bind_params_ = std::move(params);
+        ExecResult r = exec(sql);
+        bind_params_.clear();
+        return r;
+    }
+
     ExecResult exec(const std::string& sql) {
         // W9.2 PARSE CACHE: parsing is a pure function of the SQL text (the parser has no
         // catalog), so a cached AST is ALWAYS valid — no invalidation on DDL (execution
@@ -3956,6 +3967,8 @@ private:
     // seed an EMPTY-table index; once rows exist every write re-validates against the live value.
     [[nodiscard]] Type infer_index_expr_type(const Expr& e, const Table& t) {
         switch (e.kind) {
+            case ExprKind::Param:
+                return Type::Text;  // K4.13: unbound at DDL time — text is the safe default
             case ExprKind::Lit:
                 return e.lit.type;
             case ExprKind::Col: {
@@ -9188,6 +9201,13 @@ private:
     [[nodiscard]] std::optional<std::string> eval_expr(const Expr& e, const Table& t,
                                                        const std::vector<Datum>& row, Datum& out) {
         switch (e.kind) {
+            case ExprKind::Param:  // K4.13: $N resolves from the bound-parameter array
+                if (e.param_idx < 1 ||
+                    static_cast<std::size_t>(e.param_idx) > bind_params_.size()) {
+                    return "no value bound for parameter $" + std::to_string(e.param_idx);
+                }
+                out = bind_params_[static_cast<std::size_t>(e.param_idx) - 1];
+                return std::nullopt;
             case ExprKind::Lit:
                 out = e.lit;
                 return std::nullopt;
@@ -9688,6 +9708,7 @@ private:
                 if (!t.column_index(e.column))
                     return "unknown column '" + e.column + "' in expression";
                 return std::nullopt;
+            case ExprKind::Param:
             case ExprKind::Lit:
                 return std::nullopt;
             case ExprKind::Neg:
@@ -12090,6 +12111,8 @@ private:
         if (a == nullptr || b == nullptr) return a == b;
         if (a->kind != b->kind) return false;
         switch (a->kind) {
+            case ExprKind::Param:
+                return a->param_idx == b->param_idx;
             case ExprKind::Lit:
                 return a->lit == b->lit && a->lit.is_null == b->lit.is_null;
             case ExprKind::Col:
@@ -14781,6 +14804,7 @@ private:
     // W9.2: parse cache (sql text -> parsed AST). Always valid (parsing is catalog-independent).
     static constexpr std::size_t kParseCacheCap = 1024;
     std::unordered_map<std::string, Statement> parse_cache_;
+    std::vector<Datum> bind_params_;  // K4.13: live only inside exec_prepared
 
     // W3.2 CANCELLATION seam. An externally-owned flag (the prod reactor's statement-timeout
     // deadline timer, or a PG CancelRequest handler, sets it; a test sets it deterministically).

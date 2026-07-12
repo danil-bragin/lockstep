@@ -535,6 +535,60 @@ int main() {
             check(notif(ms2).empty(), "after UNLISTEN: silence");
         }
     }
+    // (K4.13) TYPED Bind path: a session built with exec_prepared keeps $N in the
+    // statement text (parse-cache hit per shape) and passes typed Datums. Must be
+    // indistinguishable from the substitution path on the wire.
+    {
+        pw::PgSession ts([&engine](const std::string& s) -> ExecResult { return engine.exec(s); },
+                         {},
+                         [&engine](const std::string& s, std::vector<lockstep::query::sql::Datum> ps)
+                             -> ExecResult { return engine.exec_prepared(s, std::move(ps)); });
+        (void)ts.feed(sp(startup()));
+        auto ext = [&](const std::string& q, const std::vector<std::string>& params) {
+            std::vector<std::byte> msg;
+            // Parse
+            std::vector<std::byte> body;
+            body.push_back(std::byte{0});  // unnamed stmt
+            for (char c : q) body.push_back(std::byte(static_cast<unsigned char>(c)));
+            body.push_back(std::byte{0});
+            pw::pg_put_i16(body, 0);
+            pw::pg_detail::emit(msg, 'P', body);
+            // Bind (all text-format params)
+            body.clear();
+            body.push_back(std::byte{0});  // portal
+            body.push_back(std::byte{0});  // stmt
+            pw::pg_put_i16(body, 0);
+            pw::pg_put_i16(body, static_cast<std::int16_t>(params.size()));
+            for (const std::string& v : params) {
+                pw::pg_put_i32(body, static_cast<std::int32_t>(v.size()));
+                for (char c : v) body.push_back(std::byte(static_cast<unsigned char>(c)));
+            }
+            pw::pg_put_i16(body, 0);
+            pw::pg_detail::emit(msg, 'B', body);
+            body.clear();
+            body.push_back(std::byte{0});
+            pw::pg_put_i32(body, 0);
+            pw::pg_detail::emit(msg, 'E', body);
+            body.clear();
+            pw::pg_detail::emit(msg, 'S', body);
+            return parse_backend(ts.feed(sp(msg)));
+        };
+        (void)engine.exec("CREATE TOPIC wire_ev");
+        const auto pub = ext("PUBLISH wire_ev, $1, $2", {"alpha", "beta"});
+        check(has_type(pub, 'C') && !has_type(pub, 'E'), "typed PUBLISH $1,$2 ok");
+        const auto c = engine.exec("CONSUME wire_ev SINCE 0");
+        check(c.rows.size() == 2 && c.rows[0].cells[1].second.s == "alpha" &&
+                  c.rows[1].cells[1].second.s == "beta",
+              "typed params landed verbatim (no quoting round trip)");
+        // v1 scope: $N lives in the scalar-expression grammar (PUBLISH/SEND payloads,
+        // projected expressions). The WHERE predicate parser + point-read routing is a
+        // recorded open item; it errors CLEANLY today:
+        const auto sel = ext("SELECT name FROM t WHERE id = $1", {"1"});
+        check(has_type(sel, 'E'), "WHERE $1: clean not-yet-supported error (open item)");
+        const auto bad = ext("PUBLISH wire_ev, $3", {"x"});
+        check(has_type(bad, 'E'), "unbound $3 is a clean error");
+    }
+
 
 
     if (g_fail) { std::printf("pg_wire_test: FAILED\n"); return 1; }
