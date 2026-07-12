@@ -544,14 +544,16 @@ int main() {
                          [&engine](const std::string& s, std::vector<lockstep::query::sql::Datum> ps)
                              -> ExecResult { return engine.exec_prepared(s, std::move(ps)); });
         (void)ts.feed(sp(startup()));
-        auto ext = [&](const std::string& q, const std::vector<std::string>& params) {
+        auto ext = [&](const std::string& q, const std::vector<std::string>& params,
+                       const std::vector<std::int32_t>& oids = {}) {
             std::vector<std::byte> msg;
-            // Parse
+            // Parse (declares the param-type OIDs, as real drivers do)
             std::vector<std::byte> body;
             body.push_back(std::byte{0});  // unnamed stmt
             for (char c : q) body.push_back(std::byte(static_cast<unsigned char>(c)));
             body.push_back(std::byte{0});
-            pw::pg_put_i16(body, 0);
+            pw::pg_put_i16(body, static_cast<std::int16_t>(oids.size()));
+            for (const std::int32_t o : oids) pw::pg_put_i32(body, o);
             pw::pg_detail::emit(msg, 'P', body);
             // Bind (all text-format params)
             body.clear();
@@ -580,11 +582,17 @@ int main() {
         check(c.rows.size() == 2 && c.rows[0].cells[1].second.s == "alpha" &&
                   c.rows[1].cells[1].second.s == "beta",
               "typed params landed verbatim (no quoting round trip)");
-        // v1 scope: $N lives in the scalar-expression grammar (PUBLISH/SEND payloads,
-        // projected expressions). The WHERE predicate parser + point-read routing is a
-        // recorded open item; it errors CLEANLY today:
-        const auto sel = ext("SELECT name FROM t WHERE id = $1", {"1"});
-        check(has_type(sel, 'E'), "WHERE $1: clean not-yet-supported error (open item)");
+        // K5.2: $N in literal positions — WHERE predicates and INSERT VALUES resolve
+        // against the bound parameters on a per-execution copy (the cached AST keeps
+        // markers, so one prepared shape serves every value).
+        const auto sel = ext("SELECT name FROM t WHERE id = $1", {"1"}, {23});
+        check(has_type(sel, 'D'), "WHERE id = $1 returns the row");
+        const auto ins = ext("INSERT INTO t (id, name) VALUES ($1, $2)", {"41", "bound"}, {23, 25});
+        check(has_type(ins, 'C') && !has_type(ins, 'E'), "INSERT VALUES ($1,$2)");
+        const auto sel2 = ext("SELECT name FROM t WHERE id = $1", {"41"}, {23});
+        check(has_type(sel2, 'D'), "bound insert readable back via bound select");
+        const auto missing = ext("SELECT name FROM t WHERE id = $2", {"1"}, {23});
+        check(has_type(missing, 'E'), "unbound $2 in WHERE is a clean error");
         const auto bad = ext("PUBLISH wire_ev, $3", {"x"});
         check(has_type(bad, 'E'), "unbound $3 is a clean error");
     }

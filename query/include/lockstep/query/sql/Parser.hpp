@@ -1067,6 +1067,15 @@ private:
         if (cur_.kind == Tok::Bad) {
             return make_err(cur_.bad_msg);
         }
+        if (cur_.kind == Tok::Param) {  // K5.2: $N in a literal position — a MARKER
+            // Datum (logical 120, i = N) resolved against the bound parameters at the
+            // top of exec(Statement) on a per-execution copy; the cached AST keeps the
+            // marker, so one prepared shape serves every parameter value.
+            out = Datum::make_int(cur_.int_val);
+            out.logical = 120;
+            advance();
+            return std::nullopt;
+        }
         // F9: BOOL literals TRUE/FALSE -> INT 1/0.
         if (is_kw("true") || is_kw("false")) {
             out = Datum::make_int(is_kw("true") ? 1 : 0);

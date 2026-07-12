@@ -1192,8 +1192,83 @@ public:
         return exec(ins->second);  // run over the cached AST (no extra copy)
     }
 
+    // K5.2: resolve $N literal markers (logical 120) against the bound parameters on
+    // a per-execution COPY of the statement — the parse-cached AST keeps the markers.
+    [[nodiscard]] static bool datum_is_param(const Datum& d) {
+        return d.type == Type::Int && d.logical == 120;
+    }
+    std::optional<std::string> resolve_param(Datum& d) {
+        if (!datum_is_param(d)) return std::nullopt;
+        const std::int64_t idx = d.i;
+        if (idx < 1 || static_cast<std::size_t>(idx) > bind_params_.size()) {
+            return "no value bound for parameter $" + std::to_string(idx);
+        }
+        d = bind_params_[static_cast<std::size_t>(idx) - 1];
+        return std::nullopt;
+    }
+    std::optional<std::string> resolve_pred_params(Predicate& p) {
+        for (PredNode& n : p.nodes) {
+            if (auto e = resolve_param(n.literal)) return e;
+        }
+        return std::nullopt;
+    }
+    [[nodiscard]] static bool stmt_has_params(const Statement& st) {
+        auto pred_has = [](const Predicate& p) {
+            for (const PredNode& n : p.nodes) {
+                if (datum_is_param(n.literal)) return true;
+            }
+            return false;
+        };
+        switch (st.kind) {
+            case StmtKind::Select:
+                return datum_is_param(st.select.eq_value) || datum_is_param(st.select.lo_value) ||
+                       datum_is_param(st.select.hi_value) || pred_has(st.select.filter);
+            case StmtKind::Insert:
+                for (const Datum& d : st.insert.values) {
+                    if (datum_is_param(d)) return true;
+                }
+                return false;
+            case StmtKind::Update:
+                return datum_is_param(st.update.set_value) || datum_is_param(st.update.where_value);
+            case StmtKind::Delete:
+                return datum_is_param(st.del.where_value);
+            default:
+                return false;
+        }
+    }
+    ExecResult exec_resolved(Statement st) {  // st IS the mutable per-execution copy
+        std::optional<std::string> e;
+        switch (st.kind) {
+            case StmtKind::Select:
+                if (!e) e = resolve_param(st.select.eq_value);
+                if (!e) e = resolve_param(st.select.lo_value);
+                if (!e) e = resolve_param(st.select.hi_value);
+                if (!e) e = resolve_pred_params(st.select.filter);
+                break;
+            case StmtKind::Insert:
+                for (Datum& d : st.insert.values) {
+                    if (!e) e = resolve_param(d);
+                }
+                break;
+            case StmtKind::Update:
+                if (!e) e = resolve_param(st.update.set_value);
+                if (!e) e = resolve_param(st.update.where_value);
+                break;
+            case StmtKind::Delete:
+                if (!e) e = resolve_param(st.del.where_value);
+                break;
+            default:
+                break;
+        }
+        if (e) return ExecResult::failure(*e);
+        return exec(static_cast<const Statement&>(st));
+    }
+
     // Execute an already-parsed statement.
     ExecResult exec(const Statement& st) {
+        if (!bind_params_.empty() && stmt_has_params(st)) {
+            return exec_resolved(st);  // copy + substitute, then run the copy
+        }
         // W3.1: reset the per-statement memory counter at the OUTERMOST exec() only (nested
         // materialization calls exec_select, not exec(Statement) — but guard by depth so a
         // future nested exec() can never clear a parent's accounting mid-flight).
