@@ -1279,12 +1279,21 @@ public:
         switch (st.kind) {
             case StmtKind::Create:
                 return exec_create(st.create);
-            case StmtKind::Insert:
-                return exec_insert(st.insert);
-            case StmtKind::Update:
-                return exec_update(st.update);
-            case StmtKind::Delete:
-                return exec_delete(st.del);
+            case StmtKind::Insert: {
+                ExecResult r = exec_insert(st.insert);
+                if (r.ok) ivm_after_write(st.insert.table);  // K5.3 eager
+                return r;
+            }
+            case StmtKind::Update: {
+                ExecResult r = exec_update(st.update);
+                if (r.ok) ivm_after_write(st.update.table);
+                return r;
+            }
+            case StmtKind::Delete: {
+                ExecResult r = exec_delete(st.del);
+                if (r.ok) ivm_after_write(st.del.table);
+                return r;
+            }
             case StmtKind::Select: {
                 // K5: any incremental matview referenced by this SELECT catches up first.
                 if (!ivm_defs_.empty()) {
@@ -1995,7 +2004,18 @@ private:
             }
             if (it.agg.kind == AggKind::Sum) {
                 const auto ci = t->column_index(it.agg.column);
-                if (!ci || t->columns[*ci].type != Type::Int) {
+                if (!ci) return "SUM column '" + it.agg.column + "' not found";
+                if (t->columns[*ci].type == Type::Text && t->columns[*ci].logical == 14) {  // REAL
+                    // DELIBERATE: float addition is non-associative, so an
+                    // incrementally-maintained REAL sum drifts from a full recompute
+                    // and the view's exactness oracle (incremental == recompute,
+                    // byte-for-byte) would be a lie. pg_ivm quietly accepts the
+                    // drift; we refuse and name the fix.
+                    return "incremental matview: SUM over REAL cannot stay byte-exact "
+                           "(float addition is order-dependent) — store fixed-point INT "
+                           "(e.g. cents) or use a plain matview + REFRESH";
+                }
+                if (t->columns[*ci].type != Type::Int) {
                     return "incremental matview v1: SUM over an INT column only";
                 }
                 def.sum_cols.push_back(it.agg.column);
@@ -2325,6 +2345,12 @@ private:
                     "SET lockstep.max_query_memory expects a non-negative integer (bytes)");
             }
             set_max_query_memory(bytes);
+        }
+        if (name == "ivm.eager") {  // K5.3: 0 = lazy (default) | 1 = catch up on write
+            if (value != "0" && value != "1") {
+                return ExecResult::failure("SET ivm.eager expects 0 or 1");
+            }
+            ivm_eager_ = value == "1";
         }
         if (name == "cdc.retain_seq") {  // K4: changefeed retention horizon (0 = off)
             std::uint64_t n = 0;
@@ -4511,6 +4537,19 @@ private:
         *err = co_await we.export_ops(from, *out, /*include_flushed=*/true);
         done.set_value(true);
     }
+    // K5.3: EAGER mode (SET ivm.eager = 1) — dependent views catch up right after a
+    // committed write statement to their base table, instead of at the next read.
+    // Same maintenance code, same oracle; the knob only moves WHEN the work happens
+    // (write latency vs read latency). Off by default (lazy).
+    void ivm_after_write(const std::string& table) {
+        if (!ivm_eager_ || ivm_defs_.empty() || in_txn_) return;
+        const std::string base = catalog_.qualify(table);
+        for (const auto& [qn, def] : ivm_defs_) {
+            if (def.base == base || def.base == table) ivm_catch_up(qn);
+        }
+    }
+    bool ivm_eager_ = false;
+
     ExecResult exec_changes(const ChangesStmt& cs) {
         if (const auto iv = ivm_defs_.find(catalog_.qualify(cs.table)); iv != ivm_defs_.end()) {
             ivm_catch_up(iv->first);  // K6: the feed reflects a fresh view

@@ -167,6 +167,34 @@ int main() {
               "live: durable cursor retired on drop");
     }
 
+    // (K5.3) EAGER mode: after SET ivm.eager = 1 a base write maintains the view
+    // immediately — the feed sees the delta with NO read and NO fetch in between.
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE t (id INT, cat INT, amount INT, PRIMARY KEY (id))");
+        (void)e.exec(std::string("CREATE INCREMENTAL MATERIALIZED VIEW mv AS ") + kSrc);
+        check(e.exec("SET ivm.eager = 1").ok, "eager knob");
+        (void)e.exec("INSERT INTO t (id,cat,amount) VALUES (1, 6, 20)");
+        // Read the BACKING TABLE's feed directly — maintenance already happened.
+        const ExecResult raw = e.exec("CHANGES mv SINCE 0");
+        check(raw.ok && !raw.rows.empty(), "eager: view rows exist before any read");
+        oracle(e, "eager");
+        check(!e.exec("SET ivm.eager = 2").ok, "eager knob teeth");
+    }
+
+    // (K5.4 decision) SUM over REAL: refused BY DESIGN with the reason named — float
+    // addition is order-dependent, so an incremental REAL sum cannot honor the
+    // byte-exact oracle. The error must say so.
+    {
+        SqlEngine e;
+        e.exec("CREATE TABLE r (id INT, cat INT, price REAL, PRIMARY KEY (id))");
+        const ExecResult r = e.exec(
+            "CREATE INCREMENTAL MATERIALIZED VIEW rv AS SELECT cat, COUNT(*) AS n, "
+            "SUM(price) AS s FROM r GROUP BY cat");
+        check(!r.ok && r.error.find("order-dependent") != std::string::npos,
+              "SUM(REAL): deliberate refusal names the float-exactness reason");
+    }
+
     if (g_fail != 0) { std::printf("sql_ivm_test: FAILURES\n"); return 1; }
     std::printf("sql_ivm_test: ALL PASS\n");
     return 0;
