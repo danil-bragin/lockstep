@@ -192,6 +192,19 @@ int main() {
     check(e.exec("SET cdc.retain_seq = 1").ok, "SET cdc.retain_seq accepted");
     check(!e.exec("SET cdc.retain_seq = 'x'").ok, "non-integer retain_seq rejected");
 
+    // (10a) Columnar tooth: a columnar table refuses CHANGES with a teaching error
+    // (its delta->block maintenance would surface as false DELETEs) — never a
+    // silently empty feed.
+    {
+        SqlEngine d;
+        d.set_columnar_default(true);
+        check(d.exec("CREATE TABLE ct (id INT, v INT, PRIMARY KEY (id))").ok, "columnar create");
+        d.set_columnar_default(false);
+        const ExecResult r = d.exec("CHANGES ct SINCE 0");
+        check(!r.ok && r.error.find("columnar") != std::string::npos,
+              "columnar CHANGES: clean teaching refusal");
+    }
+
     // (10) Teeth: unknown table; LIMIT respected.
     check(!e.exec("CHANGES nosuch SINCE 0").ok, "unknown table rejected");
     check(e.exec("CHANGES t SINCE 0 LIMIT 2").rows.size() == 2, "LIMIT respected");

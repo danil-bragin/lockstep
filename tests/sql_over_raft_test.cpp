@@ -124,6 +124,29 @@ int main() {
         for (std::size_t k = 1; k < states.size(); ++k)
             if (states[k] != states[0]) all_agree = false;
         check(all_agree, "SQL-over-Raft: every replica's applied SQL state is IDENTICAL");
+
+        // K4.15: the REPLICATED-CDC invariant. The changefeed is a pure function of
+        // the applied prefix, so CHANGES kv SINCE 0 must be BYTE-IDENTICAL on every
+        // replica — same seqs, same ops, same rows. That is what makes a consumer's
+        // cursor PORTABLE: it can fail over to any replica and resume exactly-once
+        // (Kafka needs follower-fetch machinery for this; here it falls out of
+        // determinism).
+        std::vector<std::string> feeds;
+        for (auto& node : nodes) {
+            const auto f = node->engine.exec("CHANGES kv SINCE 0");
+            std::string r;
+            for (const auto& row : f.rows) {
+                for (const auto& c : row.cells) r += c.first + "=" + c.second.render() + "|";
+                r += "\n";
+            }
+            feeds.push_back((f.ok ? "ok:" : "err:") + r);
+        }
+        bool feeds_agree = true;
+        for (std::size_t k = 1; k < feeds.size(); ++k)
+            if (feeds[k] != feeds[0]) feeds_agree = false;
+        check(feeds_agree, "replicated CDC: CHANGES byte-identical on every replica");
+        check(!feeds.empty() && feeds[0].rfind("ok:", 0) == 0 && feeds[0].size() > 4,
+              "replicated CDC: the feed is non-trivial");
         check(!states.empty() && !states[0].empty(),
               "the replicated SQL state is non-trivial (rows committed)");
     }

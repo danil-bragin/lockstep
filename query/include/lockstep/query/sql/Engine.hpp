@@ -4073,6 +4073,16 @@ private:
         done.set_value(true);
     }
     ExecResult exec_changes(const ChangesStmt& cs) {
+        if (const Table* ct = catalog_.find(cs.table); ct != nullptr && ct->columnar) {
+            // COLUMNAR CDC IS AN OPEN ITEM — refuse rather than lie. A columnar
+            // table's live writes land in the row-delta namespace and its background
+            // flush rewrites them into blocks via maintenance tombstones; a naive
+            // key-prefix feed would emit those as FALSE deletes. Until the feed can
+            // separate logical ops from maintenance, CDC sources must be row tables.
+            return ExecResult::failure(
+                "CHANGES on a columnar table is not supported yet — create the CDC "
+                "source table without the columnar layout");
+        }
         if (cs.shard >= 0) {
             return ExecResult::failure(
                 "CHANGES ... SHARD is a distributed-coordinator statement (a single "
