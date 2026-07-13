@@ -112,6 +112,7 @@ struct SelectStmt;  // fwd (defined below) — InsertStmt::select_source for INS
 // INSERT INTO <t> (<cols>) VALUES (<vals>)
 struct InsertStmt {
     std::string table;
+    std::vector<std::string> returning;  // ORM-compat: RETURNING col[, ...] ('*' = all)
     std::vector<std::string> columns;  // the named columns, in stated order
     std::vector<Datum> values;         // row 0: one value per named column (parsed literal)
     // D6 multi-row: VALUES (..),(..),... — rows 1..N-1 (row 0 stays in `values` for back-compat).

@@ -1280,8 +1280,58 @@ public:
             case StmtKind::Create:
                 return exec_create(st.create);
             case StmtKind::Insert: {
+                // ORM-compat RETURNING: capture the auto-id watermark first, so the
+                // inserted PKs are known afterwards (explicit PKs come from VALUES).
+                std::int64_t auto_before = 0;
+                const Table* rt = nullptr;
+                if (!st.insert.returning.empty()) {
+                    rt = catalog_.find(st.insert.table);
+                    if (rt != nullptr) auto_before = rt->next_auto_id;
+                }
                 ExecResult r = exec_insert(st.insert);
                 if (r.ok) ivm_after_write(st.insert.table);  // K5.3 eager
+                if (r.ok && rt != nullptr && !st.insert.returning.empty()) {
+                    std::vector<Datum> pks;
+                    std::ptrdiff_t pk_at = -1;
+                    for (std::size_t c = 0; c < st.insert.columns.size(); ++c) {
+                        if (st.insert.columns[c] == rt->pk().name) {
+                            pk_at = static_cast<std::ptrdiff_t>(c);
+                        }
+                    }
+                    if (pk_at >= 0) {
+                        pks.push_back(st.insert.values[static_cast<std::size_t>(pk_at)]);
+                        for (const auto& row : st.insert.more_rows) {
+                            pks.push_back(row[static_cast<std::size_t>(pk_at)]);
+                        }
+                    } else {  // auto-increment: the contiguous run just consumed
+                        for (std::int64_t k = auto_before;
+                             k < catalog_.find(st.insert.table)->next_auto_id; ++k) {
+                            pks.push_back(Datum::make_int(k));
+                        }
+                    }
+                    // Build the RETURNING rows from the statement itself (values + the
+                    // assigned pks) — works inside a transaction too, where a SELECT
+                    // would not see the still-buffered writes.
+                    const std::size_t nrows = 1 + st.insert.more_rows.size();
+                    for (std::size_t ri = 0; ri < nrows && ri < pks.size(); ++ri) {
+                        const std::vector<Datum>& vals =
+                            ri == 0 ? st.insert.values : st.insert.more_rows[ri - 1];
+                        ResultRow out_row;
+                        for (const std::string& rc : st.insert.returning) {
+                            if (rc == rt->pk().name || rc == "*") {
+                                out_row.cells.emplace_back(rt->pk().name, pks[ri]);
+                                if (rc != "*") continue;
+                            }
+                            for (std::size_t c = 0; c < st.insert.columns.size(); ++c) {
+                                if (rc == "*" ? st.insert.columns[c] != rt->pk().name
+                                              : st.insert.columns[c] == rc) {
+                                    out_row.cells.emplace_back(st.insert.columns[c], vals[c]);
+                                }
+                            }
+                        }
+                        r.rows.push_back(std::move(out_row));
+                    }
+                }
                 return r;
             }
             case StmtKind::Update: {
@@ -2712,25 +2762,54 @@ private:
                                 Datum::make_text("lockstep")});
             }
         } else if (lower_name == "pg_catalog.pg_namespace" || lower_name == "pg_namespace") {
-            cols = {{"nspname", Type::Text}};
+            // oid: deterministic synthetic (schemas sorted, 100+index) — pg_class's
+            // relnamespace joins against it (the SQLAlchemy introspection shape).
+            cols = {{"oid", Type::Int}, {"nspname", Type::Text}};
             std::set<std::string> schemas{"public", "information_schema", "pg_catalog"};
             for (const auto& [qn, t] : catalog_.all()) {
                 (void)t;
                 if (is_ephemeral(qn)) continue;
                 schemas.insert(split_schema(qn).first);
             }
-            for (const std::string& s : schemas) rows.push_back({Datum::make_text(s)});
+            std::int64_t oid = 100;
+            for (const std::string& sch : schemas) {
+                rows.push_back({Datum::make_int(oid++), Datum::make_text(sch)});
+            }
         } else if (lower_name == "pg_catalog.pg_class" || lower_name == "pg_class") {
-            // relkind: 'r' ordinary table, 'v' view (the two we synthesise).
-            cols = {{"relname", Type::Text}, {"relkind", Type::Text}};
+            // relkind: 'r' ordinary table, 'v' view (the two we synthesise). oid is a
+            // deterministic synthetic (10000+row); relnamespace matches pg_namespace's
+            // synthetic oids (same sorted-schema numbering).
+            cols = {{"oid", Type::Int}, {"relname", Type::Text}, {"relkind", Type::Text},
+                    {"relnamespace", Type::Int}};
+            std::set<std::string> schemas{"public", "information_schema", "pg_catalog"};
             for (const auto& [qn, t] : catalog_.all()) {
                 (void)t;
                 if (is_ephemeral(qn)) continue;
-                rows.push_back({Datum::make_text(split_schema(qn).second), Datum::make_text("r")});
+                schemas.insert(split_schema(qn).first);
+            }
+            const auto ns_oid = [&](const std::string& sch) {
+                std::int64_t oid = 100;
+                for (const std::string& x : schemas) {
+                    if (x == sch) return oid;
+                    ++oid;
+                }
+                return std::int64_t{0};
+            };
+            std::int64_t roid = 10000;
+            for (const auto& [qn, t] : catalog_.all()) {
+                (void)t;
+                if (is_ephemeral(qn)) continue;
+                rows.push_back({Datum::make_int(roid++),
+                                Datum::make_text(split_schema(qn).second),
+                                Datum::make_text("r"),
+                                Datum::make_int(ns_oid(split_schema(qn).first))});
             }
             for (const auto& [qn, v] : catalog_.all_views()) {
                 (void)v;
-                rows.push_back({Datum::make_text(split_schema(qn).second), Datum::make_text("v")});
+                rows.push_back({Datum::make_int(roid++),
+                                Datum::make_text(split_schema(qn).second),
+                                Datum::make_text("v"),
+                                Datum::make_int(ns_oid(split_schema(qn).first))});
             }
         } else if (lower_name == "pg_catalog.pg_type" || lower_name == "pg_type") {
             // K1: the type OIDs the PG wire shim advertises — enough for client-side type
@@ -10350,6 +10429,10 @@ private:
         // AT SNAPSHOT read at. Lets a client capture "now" and audit it later exactly
         // (SELECT CURRENT_VERSION() -> n; ... later ... SELECT ... AS OF SEQ n). This is
         // NOT the CHANGES _seq line (storage ops) — the two are documented separately.
+        if (f == "PG_TABLE_IS_VISIBLE" && need(1)) {  // ORM-compat: everything visible
+            out = Datum::make_int(1);
+            return std::nullopt;
+        }
         if (f == "CURRENT_VERSION" && need(0)) {
             out = Datum::make_int(static_cast<std::int64_t>(db_.tip()));
             return std::nullopt;
@@ -11050,7 +11133,15 @@ private:
             const std::string& qualifier, const std::string& column,
             std::size_t& out) const {
             if (!qualifier.empty()) {
-                const auto it = alias_span.find(qualifier);
+                auto it = alias_span.find(qualifier);
+                if (it == alias_span.end()) {
+                    // ORM-compat: a schema-qualified reference (pg_catalog.pg_class.col)
+                    // falls back to the bare table name, PG-style.
+                    const std::size_t dot = qualifier.rfind('.');
+                    if (dot != std::string::npos) {
+                        it = alias_span.find(qualifier.substr(dot + 1));
+                    }
+                }
                 if (it == alias_span.end()) {
                     return std::string("unknown table/alias '" + qualifier +
                                        "' in column reference");

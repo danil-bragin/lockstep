@@ -53,22 +53,52 @@ int main(int argc, char** argv) {
         const int fd = accept(lfd, nullptr, nullptr);
         if (fd < 0) continue;
         std::thread([fd, &engine, &engine_mu] {
-            pw::PgSession sess([&engine, &engine_mu](const std::string& s) {
-                std::lock_guard<std::mutex> lk(engine_mu);
-                return engine.exec(s);
-            });
+            pw::PgSession sess(
+                [&engine, &engine_mu](const std::string& s) {
+                    std::lock_guard<std::mutex> lk(engine_mu);
+                    return engine.exec(s);
+                },
+                {},
+                [&engine, &engine_mu](const std::string& s,
+                                      std::vector<lockstep::query::sql::Datum> ps) {
+                    std::lock_guard<std::mutex> lk(engine_mu);
+                    return engine.exec_prepared(s, std::move(ps));
+                });
             std::vector<std::byte> buf(1 << 16);
             while (!sess.closed()) {
                 const ssize_t n = read(fd, buf.data(), buf.size());
                 if (n <= 0) break;
+                std::string in_t, out_t;
+                for (ssize_t k = 0; k < n;) {  // debug: frontend message types
+                    in_t += static_cast<char>(std::to_integer<unsigned char>(buf[static_cast<std::size_t>(k)]));
+                    in_t += ' ';
+                    if (k + 5 > n) break;
+                    std::int32_t l;
+                    std::memcpy(&l, buf.data() + k + 1, 4);
+                    l = static_cast<std::int32_t>(ntohl(static_cast<std::uint32_t>(l)));
+                    k += 1 + l;
+                }
                 const std::vector<std::byte> out =
                     sess.feed(std::span<const std::byte>(buf.data(), static_cast<std::size_t>(n)));
+                for (std::size_t k = 0; k < out.size();) {
+                    out_t += static_cast<char>(std::to_integer<unsigned char>(out[k]));
+                    out_t += ' ';
+                    std::int32_t l;
+                    std::memcpy(&l, out.data() + k + 1, 4);
+                    l = static_cast<std::int32_t>(ntohl(static_cast<std::uint32_t>(l)));
+                    k += 1 + static_cast<std::size_t>(l);
+                }
+                std::fprintf(stderr, "IN[%s] OUT[%s]\n", in_t.c_str(), out_t.c_str());
                 std::size_t off = 0;
                 while (off < out.size()) {
                     const ssize_t w = write(fd, out.data() + off, out.size() - off);
                     if (w <= 0) break;
                     off += static_cast<std::size_t>(w);
                 }
+            }
+            if (sess.mid_txn()) {  // a dead connection must not wedge the shared engine
+                std::lock_guard<std::mutex> lk(engine_mu);
+                (void)engine.exec("ROLLBACK");
             }
             close(fd);
         }).detach();

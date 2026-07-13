@@ -111,6 +111,7 @@ enum class Tok : std::uint8_t {
     Slash,    // /
     Percent,  // %
     Param,    // $N (K4.13: an extended-protocol bind placeholder; int_val = N)
+    DblColon, // ::  (ORM-compat: PG postfix cast — absorbed, the value keeps its type)
     LBracket, // [  (F12 array literal / subscript)
     RBracket, // ]
     Arrow,    // ->   (F13 JSON get)
@@ -188,6 +189,13 @@ public:
                 ++i_;
                 t.kind = Tok::Comma;
                 return t;
+            case ':':
+                if (i_ + 1 < src_.size() && src_[i_ + 1] == ':') {
+                    i_ += 2;  // ORM-compat: '::' postfix cast (PG syntax)
+                    t.kind = Tok::DblColon;
+                    return t;
+                }
+                break;  // a lone ':' stays unrecognized (falls to the Bad path)
             case '=':
                 ++i_;
                 t.kind = Tok::Eq;
@@ -847,6 +855,21 @@ private:
     //   `col`      => qualifier="",     column="col"
     // The qualifier is resolved against the joined schema at plan time (NOT here — the
     // parser has no catalog). A trailing '.' with no column name is a clean error.
+    // ORM-compat: absorb a PG postfix cast `::typename` (e.g. %s::VARCHAR in driver
+    // introspection SQL). v1 semantics: the value keeps its parsed type — PG's text
+    // casts on already-typed parameters are no-ops for the shapes drivers emit.
+    void absorb_pg_cast() {
+        while (cur_.kind == Tok::DblColon) {
+            advance();
+            if (cur_.kind == Tok::Ident) advance();
+            if (cur_.kind == Tok::LParen) {  // e.g. ::VARCHAR(64)
+                advance();
+                if (cur_.kind == Tok::IntLit) advance();
+                if (cur_.kind == Tok::RParen) advance();
+            }
+        }
+    }
+
     [[nodiscard]] std::optional<ParseError> expect_qualified_column(
         const char* what, std::string& qualifier_out, std::string& column_out) {
         std::string first;
@@ -858,6 +881,15 @@ private:
             std::string second;
             if (auto e = expect_ident("a column name after '.'", second)) {
                 return e;
+            }
+            if (cur_.kind == Tok::Dot) {  // ORM-compat: schema.table.col — fold the
+                advance();                // schema into the table qualifier
+                std::string third;
+                if (auto e = expect_ident("a column name after '.'", third)) return e;
+                qualifier_out = first + "." + second;
+                column_out = std::move(third);
+                absorb_pg_cast();
+                return std::nullopt;
             }
             qualifier_out = std::move(first);
             column_out = std::move(second);
@@ -895,6 +927,14 @@ private:
         if (is_kw("int") || is_kw("bigint") || is_kw("integer") || is_kw("bool") ||
             is_kw("boolean")) {
             out = Type::Int;
+            advance();
+            return std::nullopt;
+        }
+        // ORM-compat: SERIAL family = INT + AUTO_INCREMENT (PG's sequence-backed ints;
+        // ours is the same monotonic per-table counter AUTO_INCREMENT already provides).
+        if (is_kw("serial") || is_kw("bigserial") || is_kw("smallserial")) {
+            out = Type::Int;
+            col.auto_increment = true;
             advance();
             return std::nullopt;
         }
@@ -1076,6 +1116,11 @@ private:
 
     // Consume a literal (int or string) into `out`. Used by INSERT/UPDATE/WHERE.
     [[nodiscard]] std::optional<ParseError> expect_literal(Datum& out) {
+        if (auto e = expect_literal_raw(out)) return e;
+        absorb_pg_cast();  // ORM-compat: any literal may carry a ::TYPE postfix
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<ParseError> expect_literal_raw(Datum& out) {
         if (cur_.kind == Tok::Bad) {
             return make_err(cur_.bad_msg);
         }
@@ -1904,6 +1949,21 @@ private:
             if (auto e = parse_on_conflict(st.insert)) {
                 return ParseResult{*e};
             }
+            if (is_kw("returning")) {
+                advance();
+                for (;;) {
+                    if (cur_.kind == Tok::Star) { st.insert.returning.push_back("*"); advance(); }
+                    else {
+                        std::string rq, rc;
+                        if (auto e = expect_qualified_column("a column after RETURNING", rq, rc))
+                            return ParseResult{*e};
+                        if (is_kw("as")) { advance(); if (cur_.kind == Tok::Ident) advance(); }
+                        st.insert.returning.push_back(rc);
+                    }
+                    if (cur_.kind == Tok::Comma) { advance(); continue; }
+                    break;
+                }
+            }
             return ParseResult{std::move(st)};
         }
         if (auto e = expect_kw("values")) {
@@ -1966,6 +2026,21 @@ private:
         }
         if (auto e = parse_on_conflict(st.insert)) {
             return ParseResult{*e};
+        }
+        if (is_kw("returning")) {
+            advance();
+            for (;;) {
+                if (cur_.kind == Tok::Star) { st.insert.returning.push_back("*"); advance(); }
+                else {
+                    std::string rq, rc;
+                    if (auto e = expect_qualified_column("a column after RETURNING", rq, rc))
+                        return ParseResult{*e};
+                    if (is_kw("as")) { advance(); if (cur_.kind == Tok::Ident) advance(); }
+                    st.insert.returning.push_back(rc);
+                }
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
         }
         return ParseResult{std::move(st)};
     }
@@ -2045,6 +2120,26 @@ private:
         }
         if (auto e = parse_pk_eq_where(st.del.where_column, st.del.where_value)) {
             return ParseResult{*e};
+        }
+        if (is_kw("returning")) {  // ORM-compat: INSERT ... RETURNING col[, ...]
+            advance();
+            for (;;) {
+                if (cur_.kind == Tok::Star) {
+                    st.insert.returning.push_back("*");
+                    advance();
+                } else {
+                    std::string rq, rc;
+                    if (auto e = expect_qualified_column("a column after RETURNING", rq, rc))
+                        return ParseResult{*e};
+                    if (is_kw("as")) {  // aliases: keep the source column
+                        advance();
+                        if (cur_.kind == Tok::Ident) advance();
+                    }
+                    st.insert.returning.push_back(rc);
+                }
+                if (cur_.kind == Tok::Comma) { advance(); continue; }
+                break;
+            }
         }
         return ParseResult{std::move(st)};
     }
@@ -2501,6 +2596,8 @@ private:
                 sub->left = out;
                 sub->right = idx;
                 out = sub;
+            } else if (cur_.kind == Tok::DblColon) {
+                absorb_pg_cast();  // ORM-compat: `expr::type` keeps expr as-is
             } else if (cur_.kind == Tok::Arrow || cur_.kind == Tok::ArrowText) {
                 // F13: JSON access `json -> key`/`json ->> key` -> a Func over (json, key).
                 const bool as_text = cur_.kind == Tok::ArrowText;
@@ -2705,11 +2802,27 @@ private:
                 if (lower(name) == "pg_catalog") {
                     const std::string fname = cur_.text;
                     advance();
+                    if (cur_.kind == Tok::Dot) {  // pg_catalog.table.col (3-part column)
+                        advance();
+                        if (cur_.kind != Tok::Ident) return make_err("expected a column after '.'");
+                        n->qualifier = "pg_catalog." + fname;
+                        n->column = cur_.text;
+                        advance();
+                        out = n;
+                        return std::nullopt;
+                    }
                     return parse_scalar_primary_named(fname, out);
                 }
                 n->qualifier = name;
                 n->column = cur_.text;
                 advance();
+                if (cur_.kind == Tok::Dot) {  // schema.table.col (general 3-part)
+                    advance();
+                    if (cur_.kind != Tok::Ident) return make_err("expected a column after '.'");
+                    n->qualifier = name + "." + n->column;
+                    n->column = cur_.text;
+                    advance();
+                }
             }
             out = n;
             return std::nullopt;
@@ -3478,6 +3591,16 @@ private:
 
         CmpOp op{};
         if (!cmp_op(op)) {
+            if (leaf.operand == OperandKind::Expr && leaf.expr &&
+                leaf.expr->kind == ExprKind::Func) {
+                // ORM-compat: a BARE boolean function call as a predicate
+                // (pg_table_is_visible(...) AND ...) — PG truthiness: != 0.
+                leaf.op = CmpOp::Ne;
+                leaf.literal = Datum::make_int(0);
+                p.nodes.push_back(std::move(leaf));
+                out = static_cast<std::int32_t>(p.nodes.size() - 1);
+                return std::nullopt;
+            }
             return make_err("expected a comparison operator (=, !=, <, <=, >, >=) or "
                             "BETWEEN");
         }

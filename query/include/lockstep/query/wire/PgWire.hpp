@@ -284,6 +284,12 @@ inline void pg_error_response(std::vector<std::byte>& out, const std::string& ms
 
 // Does this statement produce a result set (rows to describe)? By first keyword.
 [[nodiscard]] inline bool pg_is_select(const std::string& sql) {
+    // ORM-compat: INSERT/UPDATE/DELETE ... RETURNING produce rows too.
+    {
+        std::string low;
+        for (const char c : sql) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (low.find(" returning ") != std::string::npos) return true;
+    }
     std::size_t i = 0;
     while (i < sql.size() && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n' || sql[i] == '\r' ||
                               sql[i] == '(')) ++i;
@@ -418,6 +424,7 @@ public:
     static constexpr std::int32_t kMaxMessageBytes = 64 * 1024 * 1024;
 
     [[nodiscard]] bool closed() const noexcept { return closed_; }
+    [[nodiscard]] bool mid_txn() const noexcept { return in_txn_; }
 
     // W3.4: the server assigns this session's cancel key BEFORE the handshake, so accept()
     // can advertise it in BackendKeyData. 0/0 (the default) suppresses BackendKeyData.
@@ -652,22 +659,14 @@ private:
             // completes; drivers (SQLAlchemy autobegin among them) rely on that.
             // The SQL core stays strict — the session tracks txn state and skips
             // the redundant statement instead of surfacing the strict error.
-            const std::string head = statement_head(s);
-            if (head == "begin" && in_txn_) {
-                pg_command_complete(out, "BEGIN");
+            std::string tag;
+            const std::optional<sql::ExecResult> r = run_statement(s, tag);
+            if (!r.has_value()) {
+                pg_command_complete(out, tag);
                 continue;
             }
-            if ((head == "commit" || head == "rollback") && !in_txn_) {
-                pg_command_complete(out, head == "commit" ? "COMMIT" : "ROLLBACK");
-                continue;
-            }
-            const sql::ExecResult r = exec_(s);
-            if (r.ok) {
-                if (head == "begin") in_txn_ = true;
-                if (head == "commit" || head == "rollback") in_txn_ = false;
-            }
-            pg_reply_for_statement(out, s, r);
-            if (!r.ok) break;
+            pg_reply_for_statement(out, s, *r);
+            if (!r->ok) break;
         }
         if (!any) {
             // An empty query string: PG replies with EmptyQueryResponse 'I'.
@@ -683,6 +682,7 @@ private:
         std::string sql;                          // substituted text, or (typed path) raw $N text
         std::vector<sql::Datum> params;           // K4.13: typed parameters (typed path only)
         bool typed = false;                       // route through exec_prepared_
+        bool stmt_described = false;              // Describe('S') already sent RowDescription
         std::optional<sql::ExecResult> cached;    // filled by Describe, consumed by Execute
     };
 
@@ -700,6 +700,7 @@ private:
         const std::string name = read_cstring(p, plen, pos);
         const std::string query = read_cstring(p, plen, pos);
         stmts_[name] = query;
+        described_stmts_.erase(name);  // a re-Parsed name is a NEW statement
         std::vector<std::int32_t> types;
         if (pos + 2 <= plen) {
             const std::int16_t n = pg_get_i16(p + pos);
@@ -793,13 +794,14 @@ private:
             }
         }
         const auto it = stmts_.find(stmt);
+        const bool sdesc = described_stmts_.count(stmt) != 0;
         if (typed) {
             portals_[portal] = Portal{it != stmts_.end() ? it->second : std::string(),
-                                      std::move(dparams), true, std::nullopt};
+                                      std::move(dparams), true, sdesc, std::nullopt};
         } else {
             const std::string sql =
                 (it != stmts_.end()) ? pg_substitute_params(it->second, lits) : std::string();
-            portals_[portal] = Portal{sql, {}, false, std::nullopt};
+            portals_[portal] = Portal{sql, {}, false, sdesc, std::nullopt};
         }
         pg_bind_complete(out);
     }
@@ -814,6 +816,69 @@ private:
         if (what == 'S') {
             const auto it = stmts_.find(name);
             pg_parameter_description(out, it != stmts_.end() ? count_params(it->second) : 0);
+            // ORM-compat: a DML ... RETURNING statement DOES return rows — announce
+            // the RETURNING column names (TEXT-typed; the data rows are text) so the
+            // driver does not pre-close the result as row-less.
+            if (it != stmts_.end()) {
+                std::string low;
+                for (const char c : it->second)
+                    low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                const std::size_t rp = low.find(" returning ");
+                if (rp != std::string::npos) {
+                    std::vector<std::string> cols;
+                    std::string cur;
+                    for (std::size_t k = rp + 11; k <= low.size(); ++k) {
+                        const char c = k < low.size() ? it->second[k] : ',';
+                        if (c == ',') {
+                            while (!cur.empty() && cur.front() == ' ') cur.erase(0, 1);
+                            while (!cur.empty() && cur.back() == ' ') cur.pop_back();
+                            const std::size_t dot = cur.rfind('.');
+                            if (dot != std::string::npos) cur = cur.substr(dot + 1);
+                            if (!cur.empty()) cols.push_back(cur);
+                            cur.clear();
+                        } else {
+                            cur += c;
+                        }
+                    }
+                    if (!cols.empty()) {
+                        // Type the RETURNING columns from the target table's schema
+                        // (drivers coerce by the announced OID; a TEXT pk breaks the
+                        // ORM's new-primary-key handling).
+                        std::map<std::string, std::int32_t> col_oid;
+                        {
+                            const std::size_t into = low.find("into ");
+                            if (into != std::string::npos) {
+                                std::size_t b = into + 5, e2 = b;
+                                while (e2 < it->second.size() &&
+                                       (std::isalnum(static_cast<unsigned char>(
+                                            it->second[e2])) != 0 ||
+                                        it->second[e2] == '_' || it->second[e2] == '.')) {
+                                    ++e2;
+                                }
+                                const sql::ExecResult d =
+                                    exec_("DESCRIBE " + it->second.substr(b, e2 - b));
+                                if (d.ok) {
+                                    for (const auto& row : d.rows) {
+                                        const std::string ty = row.cells[1].second.render();
+                                        col_oid[row.cells[0].second.render()] =
+                                            ty.rfind("INT", 0) == 0     ? 20
+                                            : ty.rfind("REAL", 0) == 0 ? 701
+                                                                       : 25;
+                                    }
+                                }
+                            }
+                        }
+                        std::vector<std::pair<std::string, std::int32_t>> fields;
+                        for (const std::string& cn : cols) {
+                            const auto oit = col_oid.find(cn);
+                            fields.emplace_back(cn, oit != col_oid.end() ? oit->second : 25);
+                        }
+                        pg_row_description(out, fields);
+                        described_stmts_.insert(name);
+                        return;
+                    }
+                }
+            }
             pg_no_data(out);  // columns are unknown before execution
             return;
         }
@@ -838,15 +903,26 @@ private:
         const auto it = portals_.find(portal);
         if (it == portals_.end()) { pg_error_response(out, "unknown portal"); return; }
         const bool had_describe = it->second.cached.has_value();
+        const std::string head = statement_head(it->second.sql);
+        const bool txn_ctl = head == "begin" || head == "commit" || head == "rollback";
+        std::string lt;
+        std::optional<sql::ExecResult> lr;
+        if (!had_describe && (!it->second.typed || txn_ctl)) {
+            lr = run_statement(it->second.sql, lt);  // leniency covers BOTH protocols
+            if (!lr.has_value()) {
+                pg_command_complete(out, lt);
+                return;
+            }
+        }
         const sql::ExecResult r = had_describe ? *it->second.cached
-                                  : it->second.typed
-                                      ? exec_prepared_(it->second.sql, it->second.params)
-                                      : exec_(it->second.sql);
+                                  : lr.has_value()
+                                      ? *lr
+                                      : exec_prepared_(it->second.sql, it->second.params);
         it->second.cached.reset();
         if (!r.ok) { pg_error_response(out, r.error); return; }
         const bool is_sel = pg_is_select(it->second.sql) || !r.rows.empty();
-        if (!had_describe && is_sel) {  // no prior Describe -> include RowDescription
-            pg_row_description(out, pg_cols_of(r));
+        if (!had_describe && !it->second.stmt_described && is_sel) {
+            pg_row_description(out, pg_cols_of(r));  // no prior Describe of any kind
         }
         for (const sql::ResultRow& row : r.rows) pg_data_row(out, row);
         pg_command_complete(out, pg_command_tag(it->second.sql, r, is_sel));
@@ -915,6 +991,25 @@ private:
     bool awaiting_password_ = false;  // sent AuthenticationCleartextPassword, awaiting 'p'
     std::string user_;            // the startup "user" parameter (for auth)
     bool closed_ = false;
+    // Shared lenient executor (both protocols): PG txn-control semantics + session
+    // txn tracking. Returns nullopt when the statement was absorbed as a no-op
+    // (redundant BEGIN / bare COMMIT/ROLLBACK) — the caller emits CommandComplete.
+    [[nodiscard]] std::optional<sql::ExecResult> run_statement(const std::string& s,
+                                                               std::string& tag_out) {
+        const std::string head = statement_head(s);
+        if (head == "begin" && in_txn_) { tag_out = "BEGIN"; return std::nullopt; }
+        if ((head == "commit" || head == "rollback") && !in_txn_) {
+            tag_out = head == "commit" ? "COMMIT" : "ROLLBACK";
+            return std::nullopt;
+        }
+        sql::ExecResult r = exec_(s);
+        if (r.ok) {
+            if (head == "begin") in_txn_ = true;
+            if (head == "commit" || head == "rollback") in_txn_ = false;
+        }
+        return r;
+    }
+
     [[nodiscard]] static std::string statement_head(const std::string& s) {
         std::size_t b = 0;
         while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b])) != 0) ++b;
@@ -926,6 +1021,7 @@ private:
     }
     bool in_txn_ = false;  // shim-level txn tracking (PG leniency for drivers)
     std::map<std::string, std::int64_t> listens_;  // K4.5: feed -> last announced _seq (-1 = none)
+    std::set<std::string> described_stmts_;     // stmts whose RowDescription already went out
     std::map<std::string, std::string> stmts_;  // prepared statements: name -> query
     std::map<std::string, Portal> portals_;     // bound portals: name -> {sql, cached}
     // K1: Parse-time declared parameter-type OIDs (decode key for binary-format Bind params).
